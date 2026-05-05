@@ -21,5 +21,5 @@ resolve_repo_dir() {
   printf '%s\n' "${INSTALL_DIR}"
 }
 
-REPO_DIR="$(resolve_repo_dir)"
+REPO_DIR="$(resolve_repo_dir | tail -n 1)"
 python3 "${REPO_DIR}/scripts/install.py" --repo-dir "${REPO_DIR}" install
