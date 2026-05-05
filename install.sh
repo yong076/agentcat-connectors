@@ -13,10 +13,10 @@ resolve_repo_dir() {
   fi
 
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
-    git -C "${INSTALL_DIR}" pull --ff-only
+    git -C "${INSTALL_DIR}" pull --ff-only >&2
   else
     mkdir -p "$(dirname "${INSTALL_DIR}")"
-    git clone "${REPO_URL}" "${INSTALL_DIR}"
+    git clone "${REPO_URL}" "${INSTALL_DIR}" >&2
   fi
   printf '%s\n' "${INSTALL_DIR}"
 }
