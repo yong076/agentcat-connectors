@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import datetime as dt
 import json
 import os
@@ -186,7 +187,7 @@ def display_model(value: Any) -> Optional[str]:
 
 def init_db() -> None:
     ensure_dirs()
-    with sqlite3.connect(EVENTS_DB) as conn:
+    with closing(sqlite3.connect(EVENTS_DB)) as conn:
         conn.execute(
             """
             create table if not exists events (
@@ -200,17 +201,19 @@ def init_db() -> None:
             """
         )
         conn.execute("create index if not exists idx_events_provider_ts on events(provider, ts desc)")
+        conn.commit()
 
 
 def store_event(provider: str, source: str, event_type: Optional[str], payload: Any) -> Dict[str, Any]:
     init_db()
     sanitized = sanitize_payload(payload)
-    with sqlite3.connect(EVENTS_DB) as conn:
+    with closing(sqlite3.connect(EVENTS_DB)) as conn:
         cur = conn.execute(
             "insert into events(ts, provider, source, event_type, payload_json) values (?, ?, ?, ?, ?)",
             (int(time.time()), provider, source, event_type, json.dumps(sanitized, ensure_ascii=False, sort_keys=True)),
         )
         event_id = int(cur.lastrowid)
+        conn.commit()
     return {
         "id": event_id,
         "provider": provider,
@@ -240,7 +243,7 @@ def parse_event_row(row: Tuple[Any, ...]) -> Dict[str, Any]:
 def latest_events_by_provider() -> Dict[str, Any]:
     init_db()
     latest: Dict[str, Any] = {}
-    with sqlite3.connect(EVENTS_DB) as conn:
+    with closing(sqlite3.connect(EVENTS_DB)) as conn:
         rows = conn.execute(
             "select id, ts, provider, source, event_type, payload_json from events order by ts desc, id desc limit 200"
         ).fetchall()
