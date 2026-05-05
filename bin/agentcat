@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-HOME = Path.home()
-AGENTCAT_HOME = Path(os.environ.get("AGENTCAT_HOME", HOME / ".agentcat"))
+HOME = Path(os.environ.get("HOME") or str(Path.home())).expanduser().resolve()
+AGENTCAT_HOME = Path(os.environ.get("AGENTCAT_HOME") or str(HOME / ".agentcat")).expanduser().resolve()
 EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
@@ -549,6 +549,10 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
 
 def build_snapshot() -> Dict[str, Any]:
     ensure_dirs()
+    try:
+        latest_by_provider: Dict[str, Any] = latest_events_by_provider()
+    except Exception as exc:
+        latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
     snapshot = {
         "schemaVersion": 1,
         "generatedAt": now_iso(),
@@ -559,7 +563,7 @@ def build_snapshot() -> Dict[str, Any]:
             "gemini": gemini_snapshot(),
         },
         "events": {
-            "latestByProvider": latest_events_by_provider(),
+            "latestByProvider": latest_by_provider,
         },
     }
     tmp_path = LATEST_SNAPSHOT.with_suffix(".json.tmp")
@@ -634,7 +638,10 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if self.path == "/v1/snapshot":
-            self.send_json(200, build_snapshot())
+            try:
+                self.send_json(200, build_snapshot())
+            except Exception as exc:
+                self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return
         self.send_json(404, {"error": "not_found"})
 

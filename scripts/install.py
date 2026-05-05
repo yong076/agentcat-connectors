@@ -120,6 +120,10 @@ def plist_text() -> str:
   <string>{AGENTCAT_HOME}/agentcatd.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>AGENTCAT_HOME</key>
+    <string>{AGENTCAT_HOME}</string>
+    <key>HOME</key>
+    <string>{HOME}</string>
     <key>PATH</key>
     <string>{LOCAL_BIN}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
@@ -390,4 +394,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
