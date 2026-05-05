@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import subprocess
 import sqlite3
 import sys
 import time
@@ -35,6 +36,33 @@ TOKEN_KEYS = {
     "totaltokens": "totalTokens",
     "tokens_used": "totalTokens",
     "tokensused": "totalTokens",
+}
+
+IGNORED_EXECUTABLES = {
+    "awk",
+    "bash",
+    "cat",
+    "csh",
+    "egrep",
+    "fgrep",
+    "fish",
+    "grep",
+    "head",
+    "less",
+    "more",
+    "osascript",
+    "pgrep",
+    "pkill",
+    "ps",
+    "rg",
+    "sed",
+    "sh",
+    "tail",
+    "tee",
+    "tmux",
+    "vim",
+    "watch",
+    "zsh",
 }
 
 SENSITIVE_KEY_PARTS = (
@@ -407,11 +435,124 @@ def gemini_snapshot() -> Dict[str, Any]:
     return result
 
 
+def executable_name(command: str) -> Optional[str]:
+    text = command.strip()
+    if not text:
+        return None
+    first = text.split(maxsplit=1)[0]
+    if first.endswith("/node") and len(text.split()) > 1:
+        first = text.split()[1]
+    return Path(first).name.lower()
+
+
+def classify_process(command: str) -> Optional[str]:
+    lower = command.lower()
+    if "/agent cat.app/" in lower or "/agentcatmac/" in lower or "agentcat-connectors/bin/agentcat" in lower:
+        return None
+    if "/applications/claude.app/contents/" in lower:
+        return None
+
+    executable = executable_name(command)
+    if not executable or executable in IGNORED_EXECUTABLES:
+        return None
+
+    if executable == "codex" or "@openai/codex" in lower:
+        return "codex"
+    if executable == "claude" or "@anthropic-ai/claude" in lower or "claude-code" in lower:
+        return "claude"
+    if executable in {"gemini", "gemini-cli"} or "@google/gemini" in lower:
+        return "gemini"
+    return None
+
+
+def motion_stage(process_count: int, total_cpu: float) -> str:
+    if process_count <= 0:
+        return "sleeping"
+    if process_count >= 8 or total_cpu >= 120:
+        return "sprinting"
+    if process_count >= 5 or total_cpu >= 45:
+        return "running"
+    if total_cpu >= 5:
+        return "jogging"
+    return "walking"
+
+
+def terminal_activity_snapshot() -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "status": "unknown",
+        "updatedAt": now_iso(),
+        "processCount": 0,
+        "totalCPUPercent": 0,
+        "motionStage": "sleeping",
+        "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0},
+        "processes": [],
+    }
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,ppid=,pcpu=,stat=,command="],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+
+    rows: List[Dict[str, Any]] = []
+    for raw_line in completed.stdout.splitlines():
+        parts = raw_line.split(None, 4)
+        if len(parts) != 5:
+            continue
+        try:
+            pid = int(parts[0])
+            parent_id = int(parts[1])
+            cpu = float(parts[2])
+        except ValueError:
+            continue
+        state = parts[3]
+        command = parts[4]
+        provider = classify_process(command)
+        if provider is None:
+            continue
+        rows.append(
+            {
+                "pid": pid,
+                "parentID": parent_id,
+                "kind": provider,
+                "cpuPercent": cpu,
+                "state": state,
+                "command": command[:180],
+            }
+        )
+
+    rows.sort(key=lambda row: (-float(row["cpuPercent"]), str(row["kind"])))
+    counts = {"codex": 0, "claude": 0, "gemini": 0}
+    for row in rows:
+        counts[str(row["kind"])] = counts.get(str(row["kind"]), 0) + 1
+    total_cpu = sum(float(row["cpuPercent"]) for row in rows)
+
+    result.update(
+        {
+            "status": "ok",
+            "processCount": len(rows),
+            "totalCPUPercent": total_cpu,
+            "motionStage": motion_stage(len(rows), total_cpu),
+            "countsByProvider": counts,
+            "processes": rows,
+        }
+    )
+    return result
+
+
 def build_snapshot() -> Dict[str, Any]:
     ensure_dirs()
     snapshot = {
         "schemaVersion": 1,
         "generatedAt": now_iso(),
+        "activity": terminal_activity_snapshot(),
         "providers": {
             "codex": codex_snapshot(),
             "claude": claude_snapshot(),

@@ -54,7 +54,7 @@ curl http://127.0.0.1:8765/healthz
 curl http://127.0.0.1:8765/v1/snapshot
 ```
 
-Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API.
+Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The snapshot includes usage plus `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, and `activity.motionStage` so sandboxed Mac builds can use the connector instead of direct process scanning.
 
 ## Uninstall
 
