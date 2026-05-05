@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import sqlite3
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+HOME = Path.home()
+AGENTCAT_HOME = Path(os.environ.get("AGENTCAT_HOME", HOME / ".agentcat"))
+EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
+LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
+GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
+
+TOKEN_KEYS = {
+    "inputtokens": "inputTokens",
+    "outputtokens": "outputTokens",
+    "cachereadinputtokens": "cacheReadInputTokens",
+    "cachecreationinputtokens": "cacheCreationInputTokens",
+    "input_token_count": "inputTokens",
+    "output_token_count": "outputTokens",
+    "cached_content_token_count": "cacheReadInputTokens",
+    "thoughts_token_count": "thoughtTokens",
+    "tool_token_count": "toolTokens",
+    "total_token_count": "totalTokens",
+    "total_input_tokens": "inputTokens",
+    "total_output_tokens": "outputTokens",
+    "totaltokens": "totalTokens",
+    "tokens_used": "totalTokens",
+    "tokensused": "totalTokens",
+}
+
+SENSITIVE_KEY_PARTS = (
+    "prompt",
+    "completion",
+    "content",
+    "message",
+    "messages",
+    "transcript",
+    "conversation",
+    "input_text",
+    "output_text",
+)
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def ensure_dirs() -> None:
+    AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
+    GEMINI_TELEMETRY.parent.mkdir(parents=True, exist_ok=True)
+
+
+def read_stdin_payload() -> Any:
+    data = sys.stdin.read()
+    if not data.strip():
+        return {}
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError:
+        return {"raw": data[:4000]}
+
+
+def normalized_key(key: Any) -> str:
+    return str(key).replace("-", "_").replace(" ", "_").lower()
+
+
+def sanitize_payload(value: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return "[truncated]"
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, child in value.items():
+            key_s = str(key)
+            key_norm = normalized_key(key_s)
+            if key_norm not in TOKEN_KEYS and any(part in key_norm for part in SENSITIVE_KEY_PARTS):
+                out[key_s] = "[redacted]"
+            else:
+                out[key_s] = sanitize_payload(child, depth + 1)
+        return out
+    if isinstance(value, list):
+        return [sanitize_payload(item, depth + 1) for item in value[:50]]
+    if isinstance(value, str) and len(value) > 1000:
+        return value[:1000] + "...[truncated]"
+    return value
+
+
+def extract_tokens(value: Any) -> Dict[str, int]:
+    totals: Dict[str, int] = {}
+
+    def add(name: str, raw: Any) -> None:
+        if isinstance(raw, bool):
+            return
+        if isinstance(raw, (int, float)):
+            amount = int(raw)
+        elif isinstance(raw, str) and raw.isdigit():
+            amount = int(raw)
+        else:
+            return
+        totals[name] = totals.get(name, 0) + max(0, amount)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                canonical = TOKEN_KEYS.get(normalized_key(key))
+                if canonical:
+                    add(canonical, child)
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    if "totalTokens" not in totals:
+        partial_total = sum(
+            amount
+            for key, amount in totals.items()
+            if key in {"inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "thoughtTokens", "toolTokens"}
+        )
+        if partial_total:
+            totals["totalTokens"] = partial_total
+    return totals
+
+
+def find_first_key(value: Any, keys: Iterable[str]) -> Optional[Any]:
+    wanted = {normalized_key(key) for key in keys}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if normalized_key(key) in wanted:
+                return child
+        for child in value.values():
+            found = find_first_key(child, wanted)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_first_key(child, wanted)
+            if found is not None:
+                return found
+    return None
+
+
+def display_model(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return str(value.get("display_name") or value.get("id") or value) if value else None
+    return str(value)
+
+
+def init_db() -> None:
+    ensure_dirs()
+    with sqlite3.connect(EVENTS_DB) as conn:
+        conn.execute(
+            """
+            create table if not exists events (
+              id integer primary key autoincrement,
+              ts integer not null,
+              provider text not null,
+              source text not null,
+              event_type text,
+              payload_json text not null
+            )
+            """
+        )
+        conn.execute("create index if not exists idx_events_provider_ts on events(provider, ts desc)")
+
+
+def store_event(provider: str, source: str, event_type: Optional[str], payload: Any) -> Dict[str, Any]:
+    init_db()
+    sanitized = sanitize_payload(payload)
+    with sqlite3.connect(EVENTS_DB) as conn:
+        cur = conn.execute(
+            "insert into events(ts, provider, source, event_type, payload_json) values (?, ?, ?, ?, ?)",
+            (int(time.time()), provider, source, event_type, json.dumps(sanitized, ensure_ascii=False, sort_keys=True)),
+        )
+        event_id = int(cur.lastrowid)
+    return {
+        "id": event_id,
+        "provider": provider,
+        "source": source,
+        "eventType": event_type,
+        "tokens": extract_tokens(sanitized),
+    }
+
+
+def parse_event_row(row: Tuple[Any, ...]) -> Dict[str, Any]:
+    event_id, ts, provider, source, event_type, payload_json = row
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError:
+        payload = {}
+    return {
+        "id": event_id,
+        "timestamp": dt.datetime.fromtimestamp(int(ts), dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "provider": provider,
+        "source": source,
+        "eventType": event_type,
+        "tokens": extract_tokens(payload),
+        "model": display_model(find_first_key(payload, ["model", "modelName", "model_name"])),
+    }
+
+
+def latest_events_by_provider() -> Dict[str, Any]:
+    init_db()
+    latest: Dict[str, Any] = {}
+    with sqlite3.connect(EVENTS_DB) as conn:
+        rows = conn.execute(
+            "select id, ts, provider, source, event_type, payload_json from events order by ts desc, id desc limit 200"
+        ).fetchall()
+    for row in rows:
+        event = parse_event_row(row)
+        latest.setdefault(event["provider"], event)
+    return latest
+
+
+def read_json(path: Path) -> Optional[Any]:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return {"_agentcat_error": str(exc)}
+
+
+def parse_timestamp(raw: Any) -> Optional[dt.datetime]:
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        value = float(raw)
+        if value > 10_000_000_000:
+            value = value / 1000.0
+        try:
+            return dt.datetime.fromtimestamp(value, dt.timezone.utc)
+        except Exception:
+            return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.isdigit():
+            return parse_timestamp(int(text))
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = dt.datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            return parsed.astimezone(dt.timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def empty_periods() -> Dict[str, int]:
+    return {"today": 0, "week": 0, "month": 0, "all": 0}
+
+
+def add_to_periods(periods: Dict[str, int], amount: int, when: Optional[dt.datetime]) -> None:
+    periods["all"] += amount
+    if when is None:
+        return
+    now = dt.datetime.now(dt.timezone.utc)
+    if when.date() == now.date():
+        periods["today"] += amount
+    if when >= now - dt.timedelta(days=7):
+        periods["week"] += amount
+    if when >= now - dt.timedelta(days=30):
+        periods["month"] += amount
+
+
+def codex_snapshot() -> Dict[str, Any]:
+    paths = sorted((HOME / ".codex").glob("state_*.sqlite"))
+    result: Dict[str, Any] = {
+        "status": "not_found",
+        "source": None,
+        "tokens": empty_periods(),
+        "models": {},
+    }
+    if not paths:
+        return result
+
+    db_path = paths[-1]
+    result["source"] = str(db_path)
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        columns = [row[1] for row in conn.execute("pragma table_info(threads)").fetchall()]
+        if "tokens_used" not in columns:
+            result["status"] = "unsupported_schema"
+            result["columns"] = columns
+            return result
+        model_col = "model" if "model" in columns else "null"
+        updated_col = "updated_at" if "updated_at" in columns else ("created_at" if "created_at" in columns else "null")
+        rows = conn.execute(f"select tokens_used, {model_col}, {updated_col} from threads where tokens_used is not null").fetchall()
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    models: Dict[str, Dict[str, int]] = {}
+    for tokens_raw, model_raw, updated_raw in rows:
+        try:
+            tokens = int(tokens_raw or 0)
+        except (TypeError, ValueError):
+            continue
+        if tokens <= 0:
+            continue
+        when = parse_timestamp(updated_raw)
+        add_to_periods(result["tokens"], tokens, when)
+        model = str(model_raw or "unknown")
+        model_periods = models.setdefault(model, empty_periods())
+        add_to_periods(model_periods, tokens, when)
+
+    result["status"] = "ok"
+    result["threads"] = len(rows)
+    result["models"] = models
+    return result
+
+
+def claude_snapshot() -> Dict[str, Any]:
+    path = HOME / ".claude" / "stats-cache.json"
+    raw = read_json(path)
+    result: Dict[str, Any] = {
+        "status": "not_found",
+        "source": str(path),
+        "tokens": {},
+        "models": {},
+    }
+    if raw is None:
+        return result
+    if isinstance(raw, dict) and raw.get("_agentcat_error"):
+        result["status"] = "error"
+        result["error"] = raw["_agentcat_error"]
+        return result
+
+    result["status"] = "ok"
+    result["tokens"] = extract_tokens(raw)
+    model_usage = raw.get("modelUsage") if isinstance(raw, dict) else None
+    if isinstance(model_usage, dict):
+        for model, payload in model_usage.items():
+            result["models"][str(model)] = extract_tokens(payload)
+
+    daily_model_tokens = raw.get("dailyModelTokens") if isinstance(raw, dict) else None
+    if isinstance(daily_model_tokens, dict):
+        result["dailyModelTokensDays"] = len(daily_model_tokens)
+    daily_activity = raw.get("dailyActivity") if isinstance(raw, dict) else None
+    if isinstance(daily_activity, dict):
+        result["dailyActivityDays"] = len(daily_activity)
+    return result
+
+
+def gemini_snapshot() -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "status": "no_telemetry_yet",
+        "source": str(GEMINI_TELEMETRY),
+        "tokens": {},
+        "models": {},
+        "events": 0,
+    }
+    if not GEMINI_TELEMETRY.exists():
+        return result
+
+    tokens: Dict[str, int] = {}
+    models: Dict[str, Dict[str, int]] = {}
+    events = 0
+    try:
+        with GEMINI_TELEMETRY.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                event_tokens = extract_tokens(payload)
+                if not event_tokens:
+                    continue
+                events += 1
+                for key, amount in event_tokens.items():
+                    tokens[key] = tokens.get(key, 0) + amount
+                model = find_first_key(payload, ["model", "modelName", "model_name"]) or "unknown"
+                model_tokens = models.setdefault(str(model), {})
+                for key, amount in event_tokens.items():
+                    model_tokens[key] = model_tokens.get(key, 0) + amount
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+
+    result["status"] = "ok" if events else "no_token_events_yet"
+    result["tokens"] = tokens
+    result["models"] = models
+    result["events"] = events
+    return result
+
+
+def build_snapshot() -> Dict[str, Any]:
+    ensure_dirs()
+    snapshot = {
+        "schemaVersion": 1,
+        "generatedAt": now_iso(),
+        "providers": {
+            "codex": codex_snapshot(),
+            "claude": claude_snapshot(),
+            "gemini": gemini_snapshot(),
+        },
+        "events": {
+            "latestByProvider": latest_events_by_provider(),
+        },
+    }
+    tmp_path = LATEST_SNAPSHOT.with_suffix(".json.tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(snapshot, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    tmp_path.replace(LATEST_SNAPSHOT)
+    return snapshot
+
+
+def concise_snapshot_text(snapshot: Dict[str, Any]) -> str:
+    lines = ["Agent Cat snapshot"]
+    for provider, data in snapshot.get("providers", {}).items():
+        status = data.get("status", "unknown")
+        tokens = data.get("tokens") or {}
+        if provider == "codex":
+            total = tokens.get("all", 0)
+            week = tokens.get("week", 0)
+            lines.append(f"- codex: {status}, {total:,} tokens all-time, {week:,} last 7d")
+        else:
+            total = tokens.get("totalTokens") or sum(v for v in tokens.values() if isinstance(v, int))
+            lines.append(f"- {provider}: {status}, {int(total):,} tokens captured")
+    return "\n".join(lines)
+
+
+def statusline_text(payload: Any) -> str:
+    model = display_model(find_first_key(payload, ["model", "modelName", "model_name"]))
+    tokens = extract_tokens(payload)
+    chunks = ["Agent Cat"]
+    if model:
+        chunks.append(str(model))
+    if isinstance(payload, dict):
+        context = payload.get("context_window")
+        if isinstance(context, dict) and context.get("used_percentage") is not None:
+            chunks.append(f"ctx {context.get('used_percentage')}%")
+        limits = payload.get("rate_limits")
+        if isinstance(limits, dict):
+            five_hour = limits.get("five_hour")
+            seven_day = limits.get("seven_day")
+            if isinstance(five_hour, dict) and five_hour.get("used_percentage") is not None:
+                chunks.append(f"5h {five_hour.get('used_percentage')}%")
+            if isinstance(seven_day, dict) and seven_day.get("used_percentage") is not None:
+                chunks.append(f"7d {seven_day.get('used_percentage')}%")
+    if tokens.get("totalTokens"):
+        chunks.append(f"{tokens['totalTokens']:,} tok")
+    elif len(chunks) == 1:
+        chunks.append("collecting")
+    return " · ".join(chunks)
+
+
+class AgentCatHandler(BaseHTTPRequestHandler):
+    server_version = "AgentCat/1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def send_json(self, status: int, payload: Any) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if self.path == "/healthz":
+            body = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/v1/snapshot":
+            self.send_json(200, build_snapshot())
+            return
+        self.send_json(404, {"error": "not_found"})
+
+    def do_POST(self) -> None:
+        if self.path != "/v1/events":
+            self.send_json(404, {"error": "not_found"})
+            return
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except json.JSONDecodeError:
+            self.send_json(400, {"error": "invalid_json"})
+            return
+        provider = str(payload.get("provider") or "unknown")
+        source = str(payload.get("source") or "http")
+        event_type = payload.get("eventType")
+        event = store_event(provider, source, event_type, payload.get("payload", payload))
+        self.send_json(201, event)
+
+
+def run_daemon(args: argparse.Namespace) -> int:
+    ensure_dirs()
+    build_snapshot()
+    server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
+    print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        server.server_close()
+    return 0
+
+
+def command_snapshot(args: argparse.Namespace) -> int:
+    snapshot = build_snapshot()
+    if args.json:
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(concise_snapshot_text(snapshot))
+    return 0
+
+
+def command_event(args: argparse.Namespace) -> int:
+    payload = read_stdin_payload()
+    event = store_event(args.provider, args.source, args.event, payload)
+    build_snapshot()
+    if args.json:
+        print(json.dumps(event, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def command_claude_statusline(args: argparse.Namespace) -> int:
+    payload = read_stdin_payload()
+    store_event("claude", "claude-statusline", "statusline", payload)
+    build_snapshot()
+    print(statusline_text(payload))
+    return 0
+
+
+def command_claude_hook(args: argparse.Namespace) -> int:
+    payload = read_stdin_payload()
+    store_event("claude", "claude-hook", args.event, payload)
+    build_snapshot()
+    print("{}")
+    return 0
+
+
+def command_gemini_hook(args: argparse.Namespace) -> int:
+    payload = read_stdin_payload()
+    store_event("gemini", "gemini-hook", args.event, payload)
+    build_snapshot()
+    print("{}")
+    return 0
+
+
+def command_codex_notify(args: argparse.Namespace) -> int:
+    payload = read_stdin_payload()
+    store_event("codex", "codex-notify", "notify", payload)
+    build_snapshot()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="agentcat")
+    subparsers = parser.add_subparsers(dest="command")
+
+    daemon = subparsers.add_parser("daemon")
+    daemon.add_argument("--host", default="127.0.0.1")
+    daemon.add_argument("--port", default=8765, type=int)
+    daemon.set_defaults(func=run_daemon)
+
+    snapshot = subparsers.add_parser("snapshot")
+    snapshot.add_argument("--json", action="store_true")
+    snapshot.set_defaults(func=command_snapshot)
+
+    event = subparsers.add_parser("event")
+    event.add_argument("--provider", required=True)
+    event.add_argument("--source", required=True)
+    event.add_argument("--event")
+    event.add_argument("--json", action="store_true")
+    event.set_defaults(func=command_event)
+
+    claude_statusline = subparsers.add_parser("claude-statusline")
+    claude_statusline.set_defaults(func=command_claude_statusline)
+
+    claude_hook = subparsers.add_parser("claude-hook")
+    claude_hook.add_argument("--event", required=True)
+    claude_hook.set_defaults(func=command_claude_hook)
+
+    gemini_hook = subparsers.add_parser("gemini-hook")
+    gemini_hook.add_argument("--event", required=True)
+    gemini_hook.set_defaults(func=command_gemini_hook)
+
+    codex_notify = subparsers.add_parser("codex-notify")
+    codex_notify.set_defaults(func=command_codex_notify)
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args, _unknown = parser.parse_known_args(argv)
+    if not getattr(args, "command", None):
+        args = parser.parse_args(["snapshot"])
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

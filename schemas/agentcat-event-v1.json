@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yong076/agentcat-connectors/schemas/agentcat-event-v1.json",
+  "title": "Agent Cat Event",
+  "type": "object",
+  "required": ["provider", "source"],
+  "properties": {
+    "provider": {
+      "type": "string",
+      "enum": ["codex", "claude", "gemini", "unknown"]
+    },
+    "source": {
+      "type": "string",
+      "examples": ["codex-notify", "claude-statusline", "claude-hook", "gemini-telemetry"]
+    },
+    "eventType": {
+      "type": "string"
+    },
+    "sessionId": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "tokens": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}
+
