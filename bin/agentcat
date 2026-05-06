@@ -636,27 +636,9 @@ def gemini_snapshot() -> Dict[str, Any]:
 
     tokens: Dict[str, int] = {}
     models: Dict[str, Dict[str, int]] = {}
-    events = 0
     try:
-        with GEMINI_TELEMETRY.open("r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                text = line.strip()
-                if not text:
-                    continue
-                try:
-                    payload = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                event_tokens = extract_tokens(payload)
-                if not event_tokens:
-                    continue
-                events += 1
-                for key, amount in event_tokens.items():
-                    tokens[key] = tokens.get(key, 0) + amount
-                model = find_first_key(payload, ["model", "modelName", "model_name"]) or "unknown"
-                model_tokens = models.setdefault(str(model), {})
-                for key, amount in event_tokens.items():
-                    model_tokens[key] = model_tokens.get(key, 0) + amount
+        text = GEMINI_TELEMETRY.read_text(encoding="utf-8", errors="replace")
+        tokens, models, events = parse_gemini_telemetry(text)
     except Exception as exc:
         result["status"] = "error"
         result["error"] = str(exc)
@@ -669,13 +651,162 @@ def gemini_snapshot() -> Dict[str, Any]:
     return result
 
 
+def iter_json_objects(text: str) -> Iterable[Any]:
+    decoder = json.JSONDecoder()
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        if text[index] != "{":
+            next_object = text.find("{", index + 1)
+            if next_object < 0:
+                break
+            index = next_object
+        try:
+            payload, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            next_object = text.find("{", index + 1)
+            if next_object < 0:
+                break
+            index = next_object
+            continue
+        yield payload
+        index = end
+
+
+def metric_name(metric: Any) -> Optional[str]:
+    if not isinstance(metric, dict):
+        return None
+    descriptor = metric.get("descriptor")
+    if not isinstance(descriptor, dict):
+        return None
+    name = descriptor.get("name")
+    return str(name) if name is not None else None
+
+
+def metric_value(raw: Any) -> Optional[int]:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return max(0, int(raw))
+    if isinstance(raw, dict):
+        for key in ("sum", "value", "count"):
+            value = metric_value(raw.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def timestamp_from_otel(raw: Any) -> Optional[dt.datetime]:
+    if isinstance(raw, list) and raw and isinstance(raw[0], (int, float)):
+        seconds = float(raw[0])
+        nanos = float(raw[1]) if len(raw) > 1 and isinstance(raw[1], (int, float)) else 0.0
+        try:
+            return dt.datetime.fromtimestamp(seconds + nanos / 1_000_000_000, dt.timezone.utc)
+        except Exception:
+            return None
+    return parse_timestamp(raw)
+
+
+def gemini_token_key(raw: Any) -> Optional[str]:
+    token_type = normalized_key(raw)
+    if token_type in {"input", "input_token", "input_tokens"}:
+        return "inputTokens"
+    if token_type in {"output", "output_token", "output_tokens"}:
+        return "outputTokens"
+    if token_type in {"cache", "cached", "cached_content", "cache_read"}:
+        return "cacheReadInputTokens"
+    if token_type in {"thought", "thoughts", "reasoning"}:
+        return "thoughtTokens"
+    if token_type in {"tool", "tools"}:
+        return "toolTokens"
+    return None
+
+
+def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime]]]:
+    records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime]]] = []
+    if not isinstance(payload, dict):
+        return records
+
+    for scope in payload.get("scopeMetrics") or []:
+        if not isinstance(scope, dict):
+            continue
+        for metric in scope.get("metrics") or []:
+            if metric_name(metric) != preferred_metric:
+                continue
+            for point in metric.get("dataPoints") or []:
+                if not isinstance(point, dict):
+                    continue
+                attributes = point.get("attributes") if isinstance(point.get("attributes"), dict) else {}
+                if preferred_metric == "gemini_cli.token.usage":
+                    token_key = gemini_token_key(attributes.get("type"))
+                    model = str(attributes.get("model") or "unknown")
+                else:
+                    token_key = gemini_token_key(attributes.get("gen_ai.token.type"))
+                    model = str(attributes.get("gen_ai.response.model") or attributes.get("gen_ai.request.model") or "unknown")
+                amount = metric_value(point.get("value"))
+                if token_key is None or amount is None:
+                    continue
+                when = timestamp_from_otel(point.get("endTime")) or timestamp_from_otel(point.get("startTime"))
+                identity = (
+                    preferred_metric,
+                    attributes.get("session.id"),
+                    model,
+                    token_key,
+                    tuple(point.get("startTime") or []),
+                )
+                records.append((identity, token_key, model, amount, when))
+    return records
+
+
+def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]], int]:
+    records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime]]] = []
+    for payload in iter_json_objects(text):
+        records.extend(gemini_metric_records(payload, "gemini_cli.token.usage"))
+
+    if not records:
+        for payload in iter_json_objects(text):
+            records.extend(gemini_metric_records(payload, "gen_ai.client.token.usage"))
+
+    by_identity: Dict[Tuple[Any, ...], Tuple[str, str, int, Optional[dt.datetime]]] = {}
+    for identity, token_key, model, amount, when in records:
+        current = by_identity.get(identity)
+        if current is None or amount > current[2]:
+            by_identity[identity] = (token_key, model, amount, when)
+
+    tokens: Dict[str, int] = {}
+    models: Dict[str, Dict[str, int]] = {}
+    periods = empty_periods()
+    for token_key, model, amount, when in by_identity.values():
+        tokens[token_key] = tokens.get(token_key, 0) + amount
+        model_tokens = models.setdefault(model, {})
+        model_tokens[token_key] = model_tokens.get(token_key, 0) + amount
+        add_to_periods(periods, amount, when)
+
+    total = sum(tokens.values())
+    if total > 0:
+        tokens["totalTokens"] = total
+        for key, amount in periods.items():
+            if amount > 0:
+                tokens[key] = amount
+    return tokens, models, len(by_identity)
+
+
 def executable_name(command: str) -> Optional[str]:
     text = command.strip()
     if not text:
         return None
-    first = text.split(maxsplit=1)[0]
-    if first.endswith("/node") and len(text.split()) > 1:
-        first = text.split()[1]
+    parts = text.split()
+    first = parts[0]
+    if Path(first).name.lower() == "node" and len(parts) > 1:
+        for part in parts[1:]:
+            if part.startswith("-"):
+                continue
+            first = part
+            break
     return Path(first).name.lower()
 
 

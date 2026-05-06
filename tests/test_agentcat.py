@@ -144,6 +144,78 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["month"], 60)
         self.assertEqual(snapshot["tokens"]["all"], 100)
 
+    def test_gemini_snapshot_reads_otel_token_metrics(self) -> None:
+        agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        start_time = [int(now.timestamp()), 0]
+        next_start_time = [int(now.timestamp()) + 1, 0]
+
+        def point(token_type: str, value: int, start: list[int]) -> dict:
+            return {
+                "attributes": {
+                    "model": "gemini-test",
+                    "session.id": "session-a",
+                    "type": token_type,
+                },
+                "startTime": start,
+                "endTime": "[Circular]",
+                "value": {"sum": value},
+            }
+
+        payload = {
+            "scopeMetrics": [
+                {
+                    "metrics": [
+                        {
+                            "descriptor": {"name": "gemini_cli.token.usage"},
+                            "dataPoints": [
+                                point("input", 100, start_time),
+                                point("input", 125, start_time),
+                                point("output", 20, next_start_time),
+                                point("cache", 300, next_start_time),
+                                point("thought", 5, next_start_time),
+                                point("tool", 0, next_start_time),
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+
+        # Gemini CLI writes pretty-printed OpenTelemetry objects back-to-back,
+        # not newline-delimited JSON.
+        agentcat.GEMINI_TELEMETRY.write_text(
+            json.dumps({"resourceMetrics": []}, indent=2) + "\n" + json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.gemini_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 5)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 125)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 20)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 300)
+        self.assertEqual(snapshot["tokens"]["thoughtTokens"], 5)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 450)
+        self.assertEqual(snapshot["tokens"]["today"], 450)
+        self.assertEqual(snapshot["tokens"]["week"], 450)
+        self.assertEqual(snapshot["tokens"]["month"], 450)
+        self.assertEqual(snapshot["tokens"]["all"], 450)
+        self.assertEqual(snapshot["models"]["gemini-test"]["inputTokens"], 125)
+
+    def test_classify_gemini_node_wrapper_processes(self) -> None:
+        self.assertEqual(
+            agentcat.classify_process("node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"),
+            "gemini",
+        )
+        self.assertEqual(
+            agentcat.classify_process(
+                "/opt/homebrew/Cellar/node/25.8.1_1/bin/node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"
+            ),
+            "gemini",
+        )
+
     def test_claude_runtime_limits_reads_statusline_event(self) -> None:
         agentcat.store_event(
             "claude",
