@@ -60,7 +60,12 @@ Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The
 
 ## Limits
 
-Vendor weekly, monthly, and per-session limits are not exposed reliably on-device. Agent Cat therefore only displays limits that are explicitly configured in `~/.agentcat/limits.json`; missing values are reported as `not_configured`.
+Agent Cat auto-detects the quota data that local agent runtimes already expose:
+
+- Codex: latest `token_count` event in `~/.codex/sessions/**/rollout-*.jsonl`
+- Claude Code: latest `claude-statusline` payload captured by Agent Cat hooks
+
+These sources expose rolling-window percentages and model context size. They do not expose every absolute provider cap, and Gemini CLI does not currently expose a reliable local quota payload. For missing or absolute limits, use `~/.agentcat/limits.json`; configured values override auto-detected values.
 
 Example:
 

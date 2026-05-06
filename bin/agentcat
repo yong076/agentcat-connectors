@@ -279,6 +279,22 @@ def int_limit(raw: Any) -> Optional[int]:
     return value if value > 0 else None
 
 
+def float_percent(raw: Any) -> Optional[float]:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    elif isinstance(raw, str):
+        text = raw.strip().removesuffix("%").strip()
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    return min(max(value, 0.0), 100.0)
+
+
 def empty_limits(status: str = "not_configured", error: Optional[str] = None) -> Dict[str, Any]:
     limits: Dict[str, Any] = {
         "status": status,
@@ -286,6 +302,12 @@ def empty_limits(status: str = "not_configured", error: Optional[str] = None) ->
         "weeklyTokens": None,
         "monthlyTokens": None,
         "sessionTokens": None,
+        "weeklyUsedPercent": None,
+        "weeklyResetAt": None,
+        "shortUsedPercent": None,
+        "shortWindowMinutes": None,
+        "shortResetAt": None,
+        "planType": None,
     }
     if error:
         limits["error"] = error
@@ -316,6 +338,19 @@ def normalize_limits(raw: Any) -> Dict[str, Any]:
     return limits
 
 
+def merge_limits(configured: Dict[str, Any], detected: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(detected)
+    for key in ("weeklyTokens", "monthlyTokens", "sessionTokens"):
+        if configured.get(key) is not None:
+            merged[key] = configured[key]
+    if configured.get("status") == "ok":
+        merged["status"] = "ok"
+        merged["source"] = configured.get("source") or merged.get("source")
+    elif merged.get("status") in {None, "not_configured"}:
+        merged = dict(configured)
+    return merged
+
+
 def configured_limits() -> Dict[str, Dict[str, Any]]:
     base = {provider: empty_limits() for provider in ("codex", "claude", "gemini")}
     raw = read_json(LIMITS_FILE)
@@ -330,6 +365,116 @@ def configured_limits() -> Dict[str, Dict[str, Any]]:
     for provider in base:
         base[provider] = normalize_limits(providers.get(provider))
     return base
+
+
+def latest_event_payload(provider: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    init_db()
+    query = "select payload_json from events where provider = ?"
+    params: List[Any] = [provider]
+    if source:
+        query += " and source = ?"
+        params.append(source)
+    query += " order by ts desc, id desc limit 1"
+    try:
+        with closing(sqlite3.connect(EVENTS_DB)) as conn:
+            row = conn.execute(query, params).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    try:
+        payload = json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def codex_runtime_limits() -> Dict[str, Any]:
+    limits = empty_limits()
+    session_files = sorted(
+        (HOME / ".codex" / "sessions").glob("**/rollout-*.jsonl"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:30]
+    for path in session_files:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if "rate_limits" not in line and "model_context_window" not in line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            rate_limits = payload.get("rate_limits")
+            info = payload.get("info")
+            if not isinstance(rate_limits, dict):
+                continue
+
+            limits = empty_limits(status="auto")
+            limits["source"] = str(path)
+            limits["planType"] = rate_limits.get("plan_type")
+
+            secondary = rate_limits.get("secondary")
+            if isinstance(secondary, dict):
+                limits["weeklyUsedPercent"] = float_percent(secondary.get("used_percent"))
+                limits["weeklyResetAt"] = int_limit(secondary.get("resets_at"))
+
+            primary = rate_limits.get("primary")
+            if isinstance(primary, dict):
+                limits["shortUsedPercent"] = float_percent(primary.get("used_percent"))
+                limits["shortWindowMinutes"] = int_limit(primary.get("window_minutes"))
+                limits["shortResetAt"] = int_limit(primary.get("resets_at"))
+
+            if isinstance(info, dict):
+                limits["sessionTokens"] = int_limit(info.get("model_context_window"))
+
+            if any(limits.get(key) is not None for key in ("weeklyUsedPercent", "shortUsedPercent", "sessionTokens")):
+                return limits
+    return limits
+
+
+def claude_runtime_limits() -> Dict[str, Any]:
+    payload = latest_event_payload("claude", "claude-statusline")
+    if not payload:
+        return empty_limits()
+
+    limits = empty_limits(status="auto")
+    limits["source"] = "claude-statusline"
+
+    context_window = payload.get("context_window")
+    if isinstance(context_window, dict):
+        limits["sessionTokens"] = int_limit(context_window.get("context_window_size"))
+
+    rate_limits = payload.get("rate_limits")
+    if isinstance(rate_limits, dict):
+        seven_day = rate_limits.get("seven_day")
+        if isinstance(seven_day, dict):
+            limits["weeklyUsedPercent"] = float_percent(seven_day.get("used_percentage"))
+            limits["weeklyResetAt"] = int_limit(seven_day.get("resets_at"))
+
+        five_hour = rate_limits.get("five_hour")
+        if isinstance(five_hour, dict):
+            limits["shortUsedPercent"] = float_percent(five_hour.get("used_percentage"))
+            limits["shortWindowMinutes"] = 300
+            limits["shortResetAt"] = int_limit(five_hour.get("resets_at"))
+
+    if any(limits.get(key) is not None for key in ("weeklyUsedPercent", "shortUsedPercent", "sessionTokens")):
+        return limits
+    return empty_limits()
+
+
+def runtime_limits() -> Dict[str, Dict[str, Any]]:
+    return {
+        "codex": codex_runtime_limits(),
+        "claude": claude_runtime_limits(),
+        "gemini": empty_limits(),
+    }
 
 
 def parse_timestamp(raw: Any) -> Optional[dt.datetime]:
@@ -649,13 +794,17 @@ def build_snapshot() -> Dict[str, Any]:
     except Exception as exc:
         latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
     limits_by_provider = configured_limits()
+    runtime_limits_by_provider = runtime_limits()
     providers = {
         "codex": codex_snapshot(),
         "claude": claude_snapshot(),
         "gemini": gemini_snapshot(),
     }
     for provider, data in providers.items():
-        data["limits"] = limits_by_provider.get(provider, empty_limits())
+        data["limits"] = merge_limits(
+            limits_by_provider.get(provider, empty_limits()),
+            runtime_limits_by_provider.get(provider, empty_limits()),
+        )
     snapshot = {
         "schemaVersion": 1,
         "generatedAt": now_iso(),
