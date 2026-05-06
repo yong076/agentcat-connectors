@@ -54,7 +54,9 @@ curl http://127.0.0.1:8765/healthz
 curl http://127.0.0.1:8765/v1/snapshot
 ```
 
-Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The snapshot includes usage plus `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, and `activity.motionStage` so sandboxed Mac builds can use the connector instead of direct process scanning.
+Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The snapshot includes usage plus `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, `activity.runnableProcessCount`, `activity.activityScore`, and `activity.motionStage` so sandboxed Mac builds can use the connector instead of direct process scanning.
+
+`activity.motionStage` is based on current activity, not raw agent count. The connector uses `totalCPUPercent + runnableProcessCount * 3` as the activity score: `jogging` starts at 5, `running` at 25, and `sprinting` at 60.
 
 ## Uninstall
 

@@ -468,14 +468,16 @@ def classify_process(command: str) -> Optional[str]:
     return None
 
 
-def motion_stage(process_count: int, total_cpu: float) -> str:
+def motion_stage(process_count: int, total_cpu: float, runnable_process_count: int) -> str:
     if process_count <= 0:
         return "sleeping"
-    if process_count >= 8 or total_cpu >= 120:
+
+    activity_score = total_cpu + float(runnable_process_count) * 3.0
+    if activity_score >= 60:
         return "sprinting"
-    if process_count >= 5 or total_cpu >= 45:
+    if activity_score >= 25:
         return "running"
-    if total_cpu >= 5:
+    if activity_score >= 5:
         return "jogging"
     return "walking"
 
@@ -536,13 +538,17 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
     for row in rows:
         counts[str(row["kind"])] = counts.get(str(row["kind"]), 0) + 1
     total_cpu = sum(float(row["cpuPercent"]) for row in rows)
+    runnable_process_count = sum(1 for row in rows if str(row.get("state", "")).upper().startswith("R"))
+    activity_score = total_cpu + float(runnable_process_count) * 3.0
 
     result.update(
         {
             "status": "ok",
             "processCount": len(rows),
             "totalCPUPercent": total_cpu,
-            "motionStage": motion_stage(len(rows), total_cpu),
+            "runnableProcessCount": runnable_process_count,
+            "activityScore": activity_score,
+            "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
             "countsByProvider": counts,
             "processes": rows,
         }
