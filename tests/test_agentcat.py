@@ -1,5 +1,7 @@
 import importlib.util
+import datetime as dt
 import json
+import sqlite3
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -117,6 +119,30 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["weeklyUsedPercent"], 13.0)
         self.assertEqual(limits["weeklyResetAt"], 1770000200)
         self.assertEqual(limits["planType"], "pro")
+
+    def test_codex_snapshot_counts_today_week_month_and_all_tokens(self) -> None:
+        codex_dir = agentcat.HOME / ".codex"
+        codex_dir.mkdir(parents=True)
+        db_path = codex_dir / "state_test.sqlite"
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = [
+            (10, "gpt-test", now.isoformat()),
+            (20, "gpt-test", (now - dt.timedelta(days=3)).isoformat()),
+            (30, "gpt-test", (now - dt.timedelta(days=20)).isoformat()),
+            (40, "gpt-test", (now - dt.timedelta(days=45)).isoformat()),
+        ]
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("create table threads(tokens_used integer, model text, updated_at text)")
+            conn.executemany("insert into threads(tokens_used, model, updated_at) values (?, ?, ?)", rows)
+            conn.commit()
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["today"], 10)
+        self.assertEqual(snapshot["tokens"]["week"], 30)
+        self.assertEqual(snapshot["tokens"]["month"], 60)
+        self.assertEqual(snapshot["tokens"]["all"], 100)
 
     def test_claude_runtime_limits_reads_statusline_event(self) -> None:
         agentcat.store_event(
