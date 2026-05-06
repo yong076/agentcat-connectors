@@ -22,6 +22,12 @@ Then verify:
 agentcat snapshot
 ```
 
+To copy the prompt you can paste into Codex, Claude Code, or Gemini CLI after installation:
+
+```bash
+agentcat setup-prompt
+```
+
 ## What It Installs
 
 - `~/.local/bin/agentcat`: local collector CLI

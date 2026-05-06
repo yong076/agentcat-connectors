@@ -862,6 +862,31 @@ def statusline_text(payload: Any) -> str:
     return " · ".join(chunks)
 
 
+def setup_prompt_text() -> str:
+    install_command = "curl -fsSL https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.sh | bash"
+    return f"""Set up Agent Cat on this Mac for Codex, Claude Code, and Gemini CLI.
+
+First run this local connector install command if `agentcat` is missing:
+
+{install_command}
+
+Then verify the local snapshot:
+
+agentcat snapshot --json
+
+If this runtime supports skills or MCP tools, install or use the Agent Cat Usage skill from:
+https://github.com/yong076/agentcat-connectors/tree/main/skills/agentcat-usage
+
+Expected behavior:
+- Use `agentcat snapshot --json` as the source of truth for Codex, Claude Code, and Gemini CLI usage.
+- Codex should use local state plus the Agent Cat notify hook when configured.
+- Claude Code should use local stats plus Agent Cat statusLine/hooks when configured.
+- Gemini CLI should use local telemetry configured by Agent Cat.
+- Report exact provider quotas only when the snapshot exposes them. Otherwise say unavailable.
+- Never store or report prompt text, message content, transcripts, or conversation bodies.
+"""
+
+
 class AgentCatHandler(BaseHTTPRequestHandler):
     server_version = "AgentCat/1"
 
@@ -974,6 +999,11 @@ def command_codex_notify(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_setup_prompt(args: argparse.Namespace) -> int:
+    print(setup_prompt_text().rstrip())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentcat")
     subparsers = parser.add_subparsers(dest="command")
@@ -1007,6 +1037,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     codex_notify = subparsers.add_parser("codex-notify")
     codex_notify.set_defaults(func=command_codex_notify)
+
+    setup_prompt = subparsers.add_parser("setup-prompt")
+    setup_prompt.set_defaults(func=command_setup_prompt)
 
     return parser
 
