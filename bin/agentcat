@@ -6,6 +6,8 @@ from contextlib import closing
 import datetime as dt
 import json
 import os
+import re
+import shutil
 import subprocess
 import sqlite3
 import sys
@@ -13,6 +15,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import urllib.error
+import urllib.parse
+import urllib.request
 
 
 HOME = Path(os.environ.get("HOME") or str(Path.home())).expanduser().resolve()
@@ -21,6 +26,19 @@ EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
+LIVE_LIMITS_CACHE = AGENTCAT_HOME / "live-limits-cache.json"
+CODEX_USAGE_URLS = (
+    "https://chatgpt.com/backend-api/codex/usage",
+    "https://chatgpt.com/backend-api/wham/usage",
+    "https://chatgpt.com/api/codex/usage",
+)
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
+GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"const OAUTH_CLIENT_ID = '([^']+)';")
+GEMINI_OAUTH_CLIENT_SECRET_RE = re.compile(r"const OAUTH_CLIENT_SECRET = '([^']+)';")
 
 TOKEN_KEYS = {
     "inputtokens": "inputTokens",
@@ -295,6 +313,125 @@ def float_percent(raw: Any) -> Optional[float]:
     return min(max(value, 0.0), 100.0)
 
 
+def float_value(raw: Any) -> Optional[float]:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        text = raw.strip().replace(",", "").replace("_", "")
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def remaining_percent_from_used(raw: Any) -> Optional[float]:
+    used = float_percent(raw)
+    if used is None:
+        return None
+    return min(max(100.0 - used, 0.0), 100.0)
+
+
+def reset_epoch(raw: Any) -> Optional[int]:
+    parsed = parse_timestamp(raw)
+    return int(parsed.timestamp()) if parsed else None
+
+
+def quota_entry(
+    quota_id: str,
+    label: str,
+    *,
+    used_percent: Any = None,
+    remaining_percent: Any = None,
+    reset_at: Any = None,
+    unit: Optional[str] = "percent",
+    used: Any = None,
+    remaining: Any = None,
+    limit: Any = None,
+    window: Optional[str] = None,
+    model: Optional[str] = None,
+    source: Optional[str] = None,
+) -> Dict[str, Any]:
+    used_pct = float_percent(used_percent)
+    remaining_pct = float_percent(remaining_percent)
+    if remaining_pct is None and used_pct is not None:
+        remaining_pct = remaining_percent_from_used(used_pct)
+    if used_pct is None and remaining_pct is not None:
+        used_pct = remaining_percent_from_used(remaining_pct)
+
+    return {
+        "id": quota_id,
+        "label": label,
+        "window": window,
+        "unit": unit,
+        "used": float_value(used),
+        "remaining": float_value(remaining),
+        "limit": float_value(limit),
+        "usedPercent": used_pct,
+        "remainingPercent": remaining_pct,
+        "resetAt": reset_epoch(reset_at),
+        "model": model,
+        "source": source,
+    }
+
+
+def live_limit_error(exc: Exception, source: str) -> Dict[str, Any]:
+    limits = empty_limits(status="error", error=str(exc))
+    limits["source"] = source
+    return limits
+
+
+def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = False) -> Optional[Dict[str, Any]]:
+    raw = read_json(LIVE_LIMITS_CACHE)
+    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+        return None
+    entry = raw.get(provider)
+    if not isinstance(entry, dict):
+        return None
+    cached_at = int_limit(entry.get("cachedAt"))
+    limits = entry.get("limits")
+    if cached_at is None or not isinstance(limits, dict):
+        return None
+    age = int(time.time()) - cached_at
+    if age > max_age_seconds and not allow_stale:
+        return None
+    out = dict(limits)
+    out["cachedAt"] = cached_at
+    out["cacheAgeSeconds"] = max(age, 0)
+    if age > max_age_seconds:
+        out["stale"] = True
+    return out
+
+
+def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
+    if limits.get("status") not in {"auto", "ok"} or not limits.get("quotas"):
+        return
+    try:
+        ensure_dirs()
+        raw = read_json(LIVE_LIMITS_CACHE)
+        cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+        cache[provider] = {
+            "cachedAt": int(time.time()),
+            "limits": limits,
+        }
+        tmp_path = LIVE_LIMITS_CACHE.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        tmp_path.replace(LIVE_LIMITS_CACHE)
+    except Exception:
+        pass
+
+
 def empty_limits(status: str = "not_configured", error: Optional[str] = None) -> Dict[str, Any]:
     limits: Dict[str, Any] = {
         "status": status,
@@ -308,6 +445,7 @@ def empty_limits(status: str = "not_configured", error: Optional[str] = None) ->
         "shortWindowMinutes": None,
         "shortResetAt": None,
         "planType": None,
+        "quotas": [],
     }
     if error:
         limits["error"] = error
@@ -469,11 +607,622 @@ def claude_runtime_limits() -> Dict[str, Any]:
     return empty_limits()
 
 
+def oauth_tokens(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    tokens = raw.get("tokens")
+    if isinstance(tokens, dict):
+        return tokens
+    return raw
+
+
+def read_codex_auth() -> Optional[Dict[str, Any]]:
+    raw = read_json(HOME / ".codex" / "auth.json")
+    return raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else None
+
+
+def refresh_codex_access_token(auth: Dict[str, Any]) -> Optional[str]:
+    tokens = oauth_tokens(auth)
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
+
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        CODEX_OAUTH_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    token = payload.get("access_token")
+    return token if isinstance(token, str) and token else None
+
+
+def codex_usage_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "AgentCat/1.0",
+    }
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def codex_window_quota(
+    quota_id: str,
+    label: str,
+    window: Any,
+    *,
+    source: str,
+    model: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(window, dict):
+        return None
+    used = float_percent(first_present(window.get("used_percent"), window.get("utilization")))
+    if used is None:
+        return None
+    seconds = int_limit(window.get("limit_window_seconds") or window.get("window_secs"))
+    window_label = f"{seconds // 3600}h" if seconds and seconds % 3600 == 0 else None
+    return quota_entry(
+        quota_id,
+        label,
+        used_percent=used,
+        reset_at=first_present(window.get("reset_at"), window.get("resets_at")),
+        window=window_label,
+        model=model,
+        source=source,
+    )
+
+
+def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "codex-usage-api") -> Dict[str, Any]:
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    limits["planType"] = payload.get("plan_type") or payload.get("plan")
+
+    rate_limit = payload.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        rate_limit = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
+
+    primary = rate_limit.get("primary_window") or rate_limit.get("primary")
+    secondary = rate_limit.get("secondary_window") or rate_limit.get("secondary")
+
+    quotas: List[Dict[str, Any]] = []
+    primary_quota = codex_window_quota("codex:5h", "5시간", primary, source=source)
+    if primary_quota:
+        quotas.append(primary_quota)
+        limits["shortUsedPercent"] = primary_quota.get("usedPercent")
+        limits["shortResetAt"] = primary_quota.get("resetAt")
+        if isinstance(primary, dict):
+            seconds = int_limit(primary.get("limit_window_seconds") or primary.get("window_secs"))
+            if seconds:
+                limits["shortWindowMinutes"] = seconds // 60
+
+    secondary_quota = codex_window_quota("codex:7d", "7일", secondary, source=source)
+    if secondary_quota:
+        quotas.append(secondary_quota)
+        limits["weeklyUsedPercent"] = secondary_quota.get("usedPercent")
+        limits["weeklyResetAt"] = secondary_quota.get("resetAt")
+
+    additional = payload.get("additional_rate_limits")
+    if isinstance(additional, list):
+        for item in additional:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("limit_name") or item.get("name") or "model")
+            sub_rate = item.get("rate_limit") if isinstance(item.get("rate_limit"), dict) else {}
+            p = codex_window_quota(
+                f"codex:{name}:primary",
+                f"{name} 5시간",
+                sub_rate.get("primary_window") or sub_rate.get("primary"),
+                source=source,
+                model=name,
+            )
+            if p:
+                quotas.append(p)
+            s = codex_window_quota(
+                f"codex:{name}:secondary",
+                f"{name} 7일",
+                sub_rate.get("secondary_window") or sub_rate.get("secondary"),
+                source=source,
+                model=name,
+            )
+            if s:
+                quotas.append(s)
+
+    code_review = payload.get("code_review_rate_limit")
+    if isinstance(code_review, dict):
+        review_quota = codex_window_quota(
+            "codex:code_review",
+            "리뷰",
+            code_review.get("primary_window") or code_review.get("primary"),
+            source=source,
+        )
+        if review_quota:
+            quotas.append(review_quota)
+
+    limits["quotas"] = quotas
+    if not quotas and not limits.get("planType"):
+        limits["status"] = "not_configured"
+    return limits
+
+
+def codex_live_limits() -> Dict[str, Any]:
+    cached = cached_live_limits("codex", 180)
+    if cached:
+        return cached
+    auth = read_codex_auth()
+    if not auth:
+        return empty_limits()
+    tokens = oauth_tokens(auth)
+    access_token = tokens.get("access_token")
+    account_id = tokens.get("account_id") or auth.get("account_id") or ""
+    if not isinstance(access_token, str) or not access_token:
+        return empty_limits()
+
+    last_error: Optional[Exception] = None
+    for attempt in range(2):
+        for url in CODEX_USAGE_URLS:
+            try:
+                payload = codex_usage_request(access_token, str(account_id), url)
+                limits = codex_limits_from_usage_response(payload, source=url)
+                write_live_limits_cache("codex", limits)
+                return limits
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code in (401, 403) and attempt == 0:
+                    break
+            except Exception as exc:
+                last_error = exc
+        if attempt == 0:
+            try:
+                refreshed = refresh_codex_access_token(auth)
+            except Exception as exc:
+                last_error = exc
+                refreshed = None
+            if not refreshed:
+                break
+            access_token = refreshed
+    stale = cached_live_limits("codex", 180, allow_stale=True)
+    if stale:
+        stale["liveError"] = str(last_error or RuntimeError("Codex usage API failed"))
+        return stale
+    return live_limit_error(last_error or RuntimeError("Codex usage API failed"), "codex-usage-api")
+
+
+def read_claude_oauth_token() -> Optional[str]:
+    candidates: List[Any] = []
+    if sys.platform == "darwin":
+        try:
+            raw = subprocess.check_output(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            )
+            candidates.append(json.loads(raw))
+        except Exception:
+            pass
+
+    for path in (HOME / ".claude" / ".credentials.json", HOME / ".claude" / "credentials.json"):
+        raw = read_json(path)
+        if isinstance(raw, dict) and not raw.get("_agentcat_error"):
+            candidates.append(raw)
+
+    for item in candidates:
+        oauth = item.get("claudeAiOauth") if isinstance(item, dict) else None
+        if not isinstance(oauth, dict):
+            oauth = item.get("claude_ai_oauth") if isinstance(item, dict) else None
+        token = None
+        if isinstance(oauth, dict):
+            token = oauth.get("accessToken") or oauth.get("access_token")
+        if token is None and isinstance(item, dict):
+            token = item.get("accessToken") or item.get("access_token")
+        if isinstance(token, str) and token:
+            return token
+    return None
+
+
+def claude_quota_label(key: str) -> str:
+    labels = {
+        "five_hour": "5시간",
+        "seven_day": "7일",
+        "seven_day_sonnet": "Sonnet 7일",
+        "seven_day_opus": "Opus 7일",
+        "extra_usage": "월별 크레딧",
+        "monthly_limit": "월별 한도",
+    }
+    return labels.get(key, key.replace("_", " "))
+
+
+def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
+    order = {
+        "claude:five_hour": 0,
+        "claude:seven_day": 1,
+        "claude:extra_usage": 2,
+        "claude:seven_day_sonnet": 3,
+        "claude:seven_day_opus": 4,
+    }
+    return (order.get(str(quota.get("id")), 100), str(quota.get("id")))
+
+
+def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "claude-oauth-usage-api") -> Dict[str, Any]:
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    quotas: List[Dict[str, Any]] = []
+
+    for key, entry in payload.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("is_enabled") is False:
+            continue
+
+        if key == "extra_usage" or entry.get("monthly_limit") is not None:
+            limit = float_value(entry.get("monthly_limit"))
+            used = float_value(entry.get("used_credits")) or 0.0
+            currency = str(entry.get("currency") or "credits")
+            if limit and limit > 0:
+                remaining = max(limit - used, 0.0)
+                used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
+                quotas.append(
+                    quota_entry(
+                        f"claude:{key}",
+                        claude_quota_label(key),
+                        used_percent=used_percent,
+                        used=used,
+                        remaining=remaining,
+                        limit=limit,
+                        unit=currency,
+                        window="monthly",
+                        source=source,
+                    )
+                )
+            continue
+
+        used = float_percent(first_present(entry.get("utilization"), entry.get("used_percentage")))
+        if used is None:
+            continue
+        quota = quota_entry(
+            f"claude:{key}",
+            claude_quota_label(key),
+            used_percent=used,
+            reset_at=entry.get("resets_at"),
+            window="5h" if key == "five_hour" else "7d" if key.startswith("seven_day") else None,
+            source=source,
+        )
+        quotas.append(quota)
+
+        if key == "five_hour":
+            limits["shortUsedPercent"] = quota.get("usedPercent")
+            limits["shortWindowMinutes"] = 300
+            limits["shortResetAt"] = quota.get("resetAt")
+        elif key == "seven_day":
+            limits["weeklyUsedPercent"] = quota.get("usedPercent")
+            limits["weeklyResetAt"] = quota.get("resetAt")
+
+    quotas.sort(key=claude_quota_sort_key)
+    limits["quotas"] = quotas
+    if not quotas:
+        limits["status"] = "not_configured"
+    return limits
+
+
+def claude_live_limits() -> Dict[str, Any]:
+    cached = cached_live_limits("claude", 300)
+    if cached:
+        return cached
+    token = read_claude_oauth_token()
+    if not token:
+        return empty_limits()
+    req = urllib.request.Request(
+        CLAUDE_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.1.69",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        limits = claude_limits_from_usage_response(payload if isinstance(payload, dict) else {}, source=CLAUDE_USAGE_URL)
+        write_live_limits_cache("claude", limits)
+        return limits
+    except Exception as exc:
+        stale = cached_live_limits("claude", 300, allow_stale=True)
+        if stale:
+            stale["liveError"] = str(exc)
+            return stale
+        return live_limit_error(exc, CLAUDE_USAGE_URL)
+
+
+def gemini_display_name(model: Any) -> str:
+    names = {
+        "gemini-2.5-pro": "Gemini Pro",
+        "gemini-2.5-flash": "Gemini Flash",
+        "gemini-2.5-flash-lite": "Gemini Flash Lite",
+        "gemini-3-pro-preview": "Gemini 3 Pro",
+        "gemini-3-flash-preview": "Gemini 3 Flash",
+        "gemini-3.1-flash-lite-preview": "Gemini 3.1 Flash Lite",
+        "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
+    }
+    key = str(model or "")
+    return names.get(key, key or "Gemini")
+
+
+def read_gemini_auth_type() -> Optional[str]:
+    for path in (Path.cwd() / ".gemini" / "settings.json", HOME / ".gemini" / "settings.json"):
+        raw = read_json(path)
+        if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+            continue
+        security = raw.get("security")
+        auth = security.get("auth") if isinstance(security, dict) else None
+        selected = auth.get("selectedType") if isinstance(auth, dict) else None
+        if isinstance(selected, str) and selected:
+            return selected
+    if os.environ.get("GOOGLE_GENAI_USE_GCA") == "true":
+        return "oauth-personal"
+    if os.environ.get("GEMINI_API_KEY"):
+        return "gemini-api-key"
+    if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") == "true":
+        return "vertex-ai"
+    return None
+
+
+def read_gemini_oauth_credentials() -> Optional[Dict[str, Any]]:
+    raw = read_json(HOME / ".gemini" / "oauth_creds.json")
+    return raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else None
+
+
+def gemini_oauth2_source_candidates() -> List[Path]:
+    candidates: List[Path] = []
+    gemini_bin = shutil.which("gemini")
+    if gemini_bin:
+        resolved = Path(gemini_bin).resolve()
+        candidates.extend([resolved.parent, resolved.parent.parent, resolved.parent.parent / "libexec"])
+    candidates.extend(
+        [
+            Path("/opt/homebrew/lib"),
+            Path("/opt/homebrew/Cellar/gemini-cli"),
+            Path("/usr/local/lib"),
+            HOME / ".nvm" / "versions",
+        ]
+    )
+    return [path for path in candidates if path.exists()]
+
+
+def gemini_cli_oauth_client_credentials() -> Optional[Tuple[str, str]]:
+    rels = (
+        Path("node_modules") / "@google" / "gemini-cli-core" / "dist" / "src" / "code_assist" / "oauth2.js",
+        Path("node_modules")
+        / "@google"
+        / "gemini-cli"
+        / "node_modules"
+        / "@google"
+        / "gemini-cli-core"
+        / "dist"
+        / "src"
+        / "code_assist"
+        / "oauth2.js",
+        Path("lib") / "node_modules" / "@google" / "gemini-cli" / "node_modules" / "@google" / "gemini-cli-core" / "dist" / "src" / "code_assist" / "oauth2.js",
+        Path("libexec") / "lib" / "node_modules" / "@google" / "gemini-cli" / "node_modules" / "@google" / "gemini-cli-core" / "dist" / "src" / "code_assist" / "oauth2.js",
+    )
+    for root in gemini_oauth2_source_candidates():
+        for rel in rels:
+            path = root / rel
+            if not path.exists():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            client_id = GEMINI_OAUTH_CLIENT_ID_RE.search(text)
+            client_secret = GEMINI_OAUTH_CLIENT_SECRET_RE.search(text)
+            if client_id and client_secret:
+                return client_id.group(1), client_secret.group(1)
+    return None
+
+
+def gemini_oauth_client_credentials(creds: Dict[str, Any]) -> Tuple[str, str]:
+    env_id = os.environ.get("GEMINI_OAUTH_CLIENT_ID")
+    env_secret = os.environ.get("GEMINI_OAUTH_CLIENT_SECRET")
+    if env_id and env_secret:
+        return env_id, env_secret
+    client_id = creds.get("client_id")
+    client_secret = creds.get("client_secret")
+    if isinstance(client_id, str) and isinstance(client_secret, str) and client_id and client_secret:
+        return client_id, client_secret
+    live = gemini_cli_oauth_client_credentials()
+    if live:
+        return live
+    raise RuntimeError("Gemini OAuth metadata not found; run `gemini` once or set GEMINI_OAUTH_CLIENT_ID/GEMINI_OAUTH_CLIENT_SECRET")
+
+
+def refresh_gemini_access_token(creds: Dict[str, Any]) -> Dict[str, Any]:
+    refresh_token = creds.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise RuntimeError("No refresh token in ~/.gemini/oauth_creds.json")
+    client_id, client_secret = gemini_oauth_client_credentials(creds)
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        GEMINI_OAUTH_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    updated = dict(creds)
+    updated["access_token"] = payload.get("access_token") or updated.get("access_token")
+    updated["token_type"] = payload.get("token_type") or updated.get("token_type") or "Bearer"
+    updated["expiry_date"] = int(time.time() * 1000) + int(payload.get("expires_in") or 3600) * 1000
+    if payload.get("id_token"):
+        updated["id_token"] = payload.get("id_token")
+    return updated
+
+
+def gemini_access_token() -> Optional[str]:
+    creds = read_gemini_oauth_credentials()
+    if not creds:
+        return None
+    expires_at = int_limit(creds.get("expiry_date")) or 0
+    if expires_at and time.time() * 1000 >= expires_at - 60_000:
+        creds = refresh_gemini_access_token(creds)
+    token = creds.get("access_token")
+    return token if isinstance(token, str) and token else None
+
+
+def gemini_code_assist_post(method: str, payload: Dict[str, Any], access_token: str) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        f"{GEMINI_CODE_ASSIST_URL}:{method}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "AgentCat/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
+def gemini_limits_from_quota_response(
+    quota_payload: Dict[str, Any],
+    tier_payload: Optional[Dict[str, Any]] = None,
+    source: str = "gemini-code-assist-quota-api",
+) -> Dict[str, Any]:
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    tier_payload = tier_payload or {}
+    current_tier = tier_payload.get("currentTier") if isinstance(tier_payload.get("currentTier"), dict) else {}
+    paid_tier = tier_payload.get("paidTier") if isinstance(tier_payload.get("paidTier"), dict) else {}
+    plan = paid_tier.get("name") or current_tier.get("name") or paid_tier.get("id") or current_tier.get("id")
+    limits["planType"] = str(plan) if plan else None
+
+    quotas: List[Dict[str, Any]] = []
+    buckets = quota_payload.get("buckets")
+    if isinstance(buckets, list):
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            model = str(bucket.get("modelId") or "")
+            remaining_fraction = float_value(bucket.get("remainingFraction"))
+            remaining_percent = None
+            used_percent = None
+            if remaining_fraction is not None:
+                remaining_percent = min(max(remaining_fraction * 100.0, 0.0), 100.0)
+                used_percent = min(max(100.0 - remaining_percent, 0.0), 100.0)
+            remaining = int_limit(bucket.get("remainingAmount"))
+            limit = None
+            if remaining is not None and remaining_fraction and remaining_fraction > 0:
+                limit = round(remaining / remaining_fraction)
+            token_type = str(bucket.get("tokenType") or "REQUESTS").lower()
+            quotas.append(
+                quota_entry(
+                    f"gemini:{model or len(quotas)}",
+                    gemini_display_name(model),
+                    used_percent=used_percent,
+                    remaining_percent=remaining_percent,
+                    reset_at=bucket.get("resetTime"),
+                    unit="requests" if token_type == "requests" else token_type,
+                    used=None if remaining is None or limit is None else max(limit - remaining, 0),
+                    remaining=remaining,
+                    limit=limit,
+                    window="daily",
+                    model=model or None,
+                    source=source,
+                )
+            )
+
+    quotas.sort(key=lambda q: (0 if "pro" in str(q.get("model")).lower() else 1, str(q.get("label"))))
+    limits["quotas"] = quotas
+    if not quotas:
+        limits["status"] = "not_configured"
+    return limits
+
+
+def gemini_live_limits() -> Dict[str, Any]:
+    cached = cached_live_limits("gemini", 180)
+    if cached:
+        return cached
+    auth_type = read_gemini_auth_type()
+    if auth_type != "oauth-personal":
+        return empty_limits()
+    try:
+        token = gemini_access_token()
+        if not token:
+            return empty_limits()
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
+        metadata = {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        }
+        if project_id:
+            metadata["duetProject"] = project_id
+        tier_payload = gemini_code_assist_post(
+            "loadCodeAssist",
+            {"cloudaicompanionProject": project_id, "metadata": metadata},
+            token,
+        )
+        project_id = str(tier_payload.get("cloudaicompanionProject") or project_id or "")
+        if not project_id:
+            return empty_limits(status="error", error="Gemini Code Assist project ID unavailable")
+        quota_payload = gemini_code_assist_post("retrieveUserQuota", {"project": project_id}, token)
+        limits = gemini_limits_from_quota_response(quota_payload, tier_payload, source=GEMINI_CODE_ASSIST_URL)
+        write_live_limits_cache("gemini", limits)
+        return limits
+    except Exception as exc:
+        stale = cached_live_limits("gemini", 180, allow_stale=True)
+        if stale:
+            stale["liveError"] = str(exc)
+            return stale
+        return live_limit_error(exc, GEMINI_CODE_ASSIST_URL)
+
+
+def prefer_live_limits(live: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    if live.get("status") in {"auto", "ok"} and (
+        live.get("quotas") or any(live.get(key) is not None for key in ("weeklyUsedPercent", "shortUsedPercent"))
+    ):
+        if fallback.get("sessionTokens") is not None and live.get("sessionTokens") is None:
+            live = dict(live)
+            live["sessionTokens"] = fallback.get("sessionTokens")
+        return live
+    if fallback.get("status") not in {None, "not_configured"}:
+        if live.get("error"):
+            fallback = dict(fallback)
+            fallback["liveError"] = live.get("error")
+        return fallback
+    return live
+
+
 def runtime_limits() -> Dict[str, Dict[str, Any]]:
+    codex_fallback = codex_runtime_limits()
+    claude_fallback = claude_runtime_limits()
     return {
-        "codex": codex_runtime_limits(),
-        "claude": claude_runtime_limits(),
-        "gemini": empty_limits(),
+        "codex": prefer_live_limits(codex_live_limits(), codex_fallback),
+        "claude": prefer_live_limits(claude_live_limits(), claude_fallback),
+        "gemini": gemini_live_limits(),
     }
 
 

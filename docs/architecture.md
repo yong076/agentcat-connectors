@@ -22,9 +22,9 @@ Agent Cat Connectors is a local-first bridge between terminal AI tools and the A
 
 | Provider | Local running state | Token usage | Quota/capacity | Install hook |
 | --- | --- | --- | --- | --- |
-| Codex | Helper process scan | `~/.codex/state_*.sqlite` | Not exposed locally | `notify` when no existing notify is configured |
-| Claude Code | Helper process scan | `~/.claude/stats-cache.json` + hook payloads | Status-line input when Claude provides it | `statusLine` + hooks |
-| Gemini CLI | Helper process scan | Local telemetry after future runs | `/stats` is interactive; exact cap not stored by this collector yet | telemetry settings |
+| Codex | Helper process scan | `~/.codex/state_*.sqlite` | Codex OAuth usage API plus local `token_count` fallback | `notify` when no existing notify is configured |
+| Claude Code | Helper process scan | `~/.claude/stats-cache.json` + hook payloads | Claude Code OAuth usage API plus status-line fallback | `statusLine` + hooks |
+| Gemini CLI | Helper process scan | Local telemetry after future runs | Gemini Code Assist quota API for Google-login sessions | telemetry settings |
 
 ## Boundaries
 

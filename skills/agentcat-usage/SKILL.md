@@ -30,8 +30,10 @@ Use the local `agentcat` command instead of guessing provider usage.
 ## Interpretation
 
 - Codex totals come from local `~/.codex/state_*.sqlite`.
-- Claude totals come from `~/.claude/stats-cache.json` and future hook/status-line payloads.
-- Gemini totals appear after future Gemini CLI runs with local telemetry enabled.
-- Do not infer exact provider quota/capacity unless the snapshot includes it.
+- Codex remaining quotas appear under `providers.codex.limits.quotas[]` when `~/.codex/auth.json` can call the Codex usage API.
+- Claude totals come from `~/.claude/stats-cache.json`, hooks, and Claude Code OAuth usage when available.
+- Claude remaining quotas appear under `providers.claude.limits.quotas[]`, including 5-hour, 7-day, model, and monthly extra credit entries when the provider exposes them.
+- Gemini totals appear after Gemini CLI runs with local telemetry enabled.
+- Gemini remaining request quotas appear under `providers.gemini.limits.quotas[]` when Google-login Gemini CLI OAuth credentials can call Code Assist quota APIs.
+- Report exact provider quota/capacity only when the snapshot includes `remaining`, `limit`, or `remainingPercent`. Otherwise say unavailable.
 - Do not report prompt content. Agent Cat snapshots are intended to contain metadata only.
-

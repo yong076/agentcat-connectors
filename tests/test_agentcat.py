@@ -27,6 +27,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             "LATEST_SNAPSHOT": agentcat.LATEST_SNAPSHOT,
             "LIMITS_FILE": agentcat.LIMITS_FILE,
             "GEMINI_TELEMETRY": agentcat.GEMINI_TELEMETRY,
+            "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
         }
 
         home = self.root / "home"
@@ -39,6 +40,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat.LATEST_SNAPSHOT = agentcat_home / "latest-snapshot.json"
         agentcat.LIMITS_FILE = agentcat_home / "limits.json"
         agentcat.GEMINI_TELEMETRY = agentcat_home / "gemini" / "telemetry.log"
+        agentcat.LIVE_LIMITS_CACHE = agentcat_home / "live-limits-cache.json"
 
     def tearDown(self) -> None:
         for name, value in self.old_paths.items():
@@ -72,6 +74,14 @@ class AgentCatConnectorTests(unittest.TestCase):
         detected["weeklyUsedPercent"] = 13.0
         detected["shortUsedPercent"] = 8.0
         detected["sessionTokens"] = 128000
+        detected["quotas"] = [
+            {
+                "id": "codex:7d",
+                "label": "7일",
+                "usedPercent": 13.0,
+                "remainingPercent": 87.0,
+            }
+        ]
 
         merged = agentcat.merge_limits(configured, detected)
 
@@ -80,6 +90,111 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(merged["sessionTokens"], 2000)
         self.assertEqual(merged["weeklyUsedPercent"], 13.0)
         self.assertEqual(merged["shortUsedPercent"], 8.0)
+        self.assertEqual(merged["quotas"][0]["remainingPercent"], 87.0)
+
+    def test_codex_usage_api_payload_builds_remaining_quota_entries(self) -> None:
+        limits = agentcat.codex_limits_from_usage_response(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 3,
+                        "reset_at": 1770000100,
+                        "limit_window_seconds": 18000,
+                    },
+                    "secondary_window": {
+                        "used_percent": 18,
+                        "reset_at": 1770000200,
+                        "limit_window_seconds": 604800,
+                    },
+                },
+                "additional_rate_limits": [
+                    {
+                        "limit_name": "GPT-5.3-Codex-Spark",
+                        "rate_limit": {
+                            "primary_window": {"used_percent": 0, "reset_at": 1770000300},
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["planType"], "pro")
+        self.assertEqual(limits["shortUsedPercent"], 3.0)
+        self.assertEqual(limits["weeklyUsedPercent"], 18.0)
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 97.0)
+        self.assertEqual(limits["quotas"][1]["remainingPercent"], 82.0)
+        self.assertEqual(limits["quotas"][2]["remainingPercent"], 100.0)
+
+    def test_claude_usage_api_payload_builds_weekly_and_monthly_remaining(self) -> None:
+        limits = agentcat.claude_limits_from_usage_response(
+            {
+                "five_hour": {"utilization": 2.0, "resets_at": "2026-05-06T15:50:00Z"},
+                "seven_day": {"utilization": 17.0, "resets_at": "2026-05-08T07:00:00Z"},
+                "seven_day_sonnet": {"utilization": 5.0, "resets_at": "2026-05-08T07:00:00Z"},
+                "extra_usage": {
+                    "is_enabled": True,
+                    "monthly_limit": 5000,
+                    "used_credits": 1250,
+                    "currency": "USD",
+                },
+            }
+        )
+
+        self.assertEqual(limits["shortUsedPercent"], 2.0)
+        self.assertEqual(limits["weeklyUsedPercent"], 17.0)
+        self.assertEqual([q["id"] for q in limits["quotas"][:3]], ["claude:five_hour", "claude:seven_day", "claude:extra_usage"])
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 98.0)
+        self.assertEqual(limits["quotas"][1]["remainingPercent"], 83.0)
+        self.assertEqual(limits["quotas"][2]["remaining"], 3750.0)
+        self.assertEqual(limits["quotas"][2]["remainingPercent"], 75.0)
+
+    def test_gemini_quota_api_payload_builds_model_remaining(self) -> None:
+        limits = agentcat.gemini_limits_from_quota_response(
+            {
+                "buckets": [
+                    {
+                        "modelId": "gemini-2.5-flash",
+                        "remainingFraction": 0.984,
+                        "resetTime": "2026-05-07T02:57:47Z",
+                        "tokenType": "REQUESTS",
+                    },
+                    {
+                        "modelId": "gemini-2.5-pro",
+                        "remainingFraction": 1,
+                        "resetTime": "2026-05-07T11:19:25Z",
+                        "tokenType": "REQUESTS",
+                    },
+                ]
+            },
+            {"paidTier": {"id": "g1-pro-tier", "name": "Gemini Code Assist in Google One AI Pro"}},
+        )
+
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["planType"], "Gemini Code Assist in Google One AI Pro")
+        self.assertEqual(limits["quotas"][0]["label"], "Gemini Pro")
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 100.0)
+        self.assertAlmostEqual(limits["quotas"][1]["usedPercent"], 1.6)
+
+    def test_live_limit_cache_returns_stale_limits_when_allowed(self) -> None:
+        limits = agentcat.empty_limits(status="auto")
+        limits["quotas"] = [
+            {
+                "id": "claude:seven_day",
+                "label": "7일",
+                "remainingPercent": 83.0,
+                "usedPercent": 17.0,
+            }
+        ]
+        agentcat.write_live_limits_cache("claude", limits)
+
+        fresh = agentcat.cached_live_limits("claude", 300)
+        stale = agentcat.cached_live_limits("claude", -1, allow_stale=True)
+
+        self.assertIsNotNone(fresh)
+        self.assertEqual(fresh["quotas"][0]["remainingPercent"], 83.0)
+        self.assertTrue(stale["stale"])
 
     def test_codex_runtime_limits_reads_latest_token_count_event(self) -> None:
         session_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "05" / "06"

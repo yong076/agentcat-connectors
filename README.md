@@ -40,11 +40,11 @@ agentcat setup-prompt
 
 ## Provider Support
 
-| Provider | MVP signal | Notes |
+| Provider | Signal | Notes |
 | --- | --- | --- |
-| Codex | local SQLite token totals + optional notify hook | Exact weekly/monthly quota is not exposed by Codex CLI locally. |
-| Claude Code | `stats-cache.json`, status line input, hooks | Uses local stats when present and captures future status-line/hook payloads. |
-| Gemini CLI | local telemetry file | Token data appears after Gemini runs with local telemetry enabled. |
+| Codex | local SQLite token totals + Codex OAuth usage API | Shows remaining 5-hour, 7-day, and exposed model/review quota percentages when `~/.codex/auth.json` is present. |
+| Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
+| Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
 
 ## Privacy
 
@@ -68,12 +68,16 @@ Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The
 
 ## Limits
 
-Agent Cat auto-detects the quota data that local agent runtimes already expose:
+Agent Cat reports remaining quota when a provider exposes it through the same local auth state used by its CLI:
 
-- Codex: latest `token_count` event in `~/.codex/sessions/**/rollout-*.jsonl`
-- Claude Code: latest `claude-statusline` payload captured by Agent Cat hooks
+- Codex: reads `~/.codex/auth.json`, then calls the ChatGPT Codex usage endpoint for rolling 5-hour/7-day utilization and reset times.
+- Claude Code: reads Claude Code OAuth credentials from Keychain or `~/.claude`, then calls the Claude Code OAuth usage endpoint for 5-hour/7-day/model utilization plus monthly extra-usage credits.
+- Gemini CLI: reads `~/.gemini/oauth_creds.json` and `~/.gemini/settings.json`, then calls Gemini Code Assist `loadCodeAssist` and `retrieveUserQuota` for model request quota fractions and reset times.
+- Fallback: if live quota lookup fails, Codex/Claude still use the latest local status-line or session `token_count` event when available.
 
-These sources expose rolling-window percentages and model context size. They do not expose every absolute provider cap, and Gemini CLI does not currently expose a reliable local quota payload. For missing or absolute limits, use `~/.agentcat/limits.json`; configured values override auto-detected values.
+The normalized snapshot includes `providers.<name>.limits.quotas[]`. Each quota entry prefers `remaining` or `remainingPercent`, with `usedPercent` and `resetAt` for progress meters. Some providers expose percentages only, not absolute token or request counts; Agent Cat marks unavailable values as unavailable instead of guessing.
+
+For missing or manually managed caps, use `~/.agentcat/limits.json`; configured values override compatible auto-detected token caps while live quota cards remain visible.
 
 Example:
 
