@@ -64,7 +64,7 @@ curl http://127.0.0.1:8765/v1/snapshot
 
 Agent Cat은 `~/.agentcat/latest-snapshot.json`을 읽거나 로컬 API를 호출할 수 있습니다. 스냅샷에는 provider별 사용량과 함께 `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, `activity.runnableProcessCount`, `activity.activityScore`, `activity.motionStage`가 들어 있습니다. 그래서 sandboxed Mac 빌드도 직접 process scan을 하지 않고 커넥터를 통해 활동 상태를 받을 수 있습니다.
 
-`activity.motionStage`는 단순 에이전트 갯수가 아니라 현재 활동량으로 계산합니다. 커넥터는 `totalCPUPercent + runnableProcessCount * 3`을 활동 점수로 사용합니다. `jogging`은 5점부터, `running`은 25점부터, `sprinting`은 60점부터 시작합니다.
+`activity.motionStage`는 단순 에이전트 갯수가 아니라 현재 활동량으로 계산합니다. 커넥터는 `totalCPUPercent + runnableProcessCount * 3`을 활동 점수로 사용합니다. `jogging`은 2점부터, `running`은 8점부터, `sprinting`은 20점부터, `hyperSprinting`은 45점부터 시작합니다.
 
 ## 한도
 

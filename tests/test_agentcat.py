@@ -331,6 +331,15 @@ class AgentCatConnectorTests(unittest.TestCase):
             "gemini",
         )
 
+    def test_motion_stage_uses_granular_activity_thresholds(self) -> None:
+        self.assertEqual(agentcat.motion_stage(0, 100, 10), "sleeping")
+        self.assertEqual(agentcat.motion_stage(1, 0, 0), "walking")
+        self.assertEqual(agentcat.motion_stage(1, 2, 0), "jogging")
+        self.assertEqual(agentcat.motion_stage(1, 8, 0), "running")
+        self.assertEqual(agentcat.motion_stage(1, 20, 0), "sprinting")
+        self.assertEqual(agentcat.motion_stage(1, 45, 0), "hyperSprinting")
+        self.assertEqual(agentcat.motion_stage(1, 0, 15), "hyperSprinting")
+
     def test_claude_runtime_limits_reads_statusline_event(self) -> None:
         agentcat.store_event(
             "claude",

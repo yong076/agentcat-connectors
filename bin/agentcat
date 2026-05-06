@@ -1584,11 +1584,13 @@ def motion_stage(process_count: int, total_cpu: float, runnable_process_count: i
         return "sleeping"
 
     activity_score = total_cpu + float(runnable_process_count) * 3.0
-    if activity_score >= 60:
+    if activity_score >= 45:
+        return "hyperSprinting"
+    if activity_score >= 20:
         return "sprinting"
-    if activity_score >= 25:
+    if activity_score >= 8:
         return "running"
-    if activity_score >= 5:
+    if activity_score >= 2:
         return "jogging"
     return "walking"
 
