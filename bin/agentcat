@@ -19,6 +19,7 @@ HOME = Path(os.environ.get("HOME") or str(Path.home())).expanduser().resolve()
 AGENTCAT_HOME = Path(os.environ.get("AGENTCAT_HOME") or str(HOME / ".agentcat")).expanduser().resolve()
 EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
+LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 
 TOKEN_KEYS = {
@@ -263,6 +264,74 @@ def read_json(path: Path) -> Optional[Any]:
         return {"_agentcat_error": str(exc)}
 
 
+def int_limit(raw: Any) -> Optional[int]:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        value = int(raw)
+    elif isinstance(raw, str):
+        text = raw.strip().replace(",", "").replace("_", "")
+        if not text.isdigit():
+            return None
+        value = int(text)
+    else:
+        return None
+    return value if value > 0 else None
+
+
+def empty_limits(status: str = "not_configured", error: Optional[str] = None) -> Dict[str, Any]:
+    limits: Dict[str, Any] = {
+        "status": status,
+        "source": str(LIMITS_FILE),
+        "weeklyTokens": None,
+        "monthlyTokens": None,
+        "sessionTokens": None,
+    }
+    if error:
+        limits["error"] = error
+    return limits
+
+
+def normalize_limits(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return empty_limits()
+
+    aliases = {
+        "weeklyTokens": ("weeklyTokens", "weekTokens", "week", "weekly", "weeklyLimit", "weekly_token_limit"),
+        "monthlyTokens": ("monthlyTokens", "monthTokens", "month", "monthly", "monthlyLimit", "monthly_token_limit"),
+        "sessionTokens": ("sessionTokens", "session", "context", "contextWindow", "sessionLimit", "session_token_limit"),
+    }
+    limits = empty_limits(status="ok")
+    configured = False
+    normalized = {normalized_key(key): value for key, value in raw.items()}
+    for canonical, keys in aliases.items():
+        for key in keys:
+            value = int_limit(normalized.get(normalized_key(key)))
+            if value is not None:
+                limits[canonical] = value
+                configured = True
+                break
+    if not configured:
+        limits["status"] = "not_configured"
+    return limits
+
+
+def configured_limits() -> Dict[str, Dict[str, Any]]:
+    base = {provider: empty_limits() for provider in ("codex", "claude", "gemini")}
+    raw = read_json(LIMITS_FILE)
+    if raw is None:
+        return base
+    if isinstance(raw, dict) and raw.get("_agentcat_error"):
+        return {provider: empty_limits("error", str(raw["_agentcat_error"])) for provider in base}
+    if not isinstance(raw, dict):
+        return {provider: empty_limits("error", "limits.json must be a JSON object") for provider in base}
+
+    providers = raw.get("providers") if isinstance(raw.get("providers"), dict) else raw
+    for provider in base:
+        base[provider] = normalize_limits(providers.get(provider))
+    return base
+
+
 def parse_timestamp(raw: Any) -> Optional[dt.datetime]:
     if raw is None:
         return None
@@ -386,8 +455,25 @@ def claude_snapshot() -> Dict[str, Any]:
     daily_model_tokens = raw.get("dailyModelTokens") if isinstance(raw, dict) else None
     if isinstance(daily_model_tokens, dict):
         result["dailyModelTokensDays"] = len(daily_model_tokens)
+    elif isinstance(daily_model_tokens, list):
+        periods = empty_periods()
+        for item in daily_model_tokens:
+            if not isinstance(item, dict):
+                continue
+            tokens_by_model = item.get("tokensByModel")
+            if not isinstance(tokens_by_model, dict):
+                continue
+            total = sum(int_limit(value) or 0 for value in tokens_by_model.values())
+            if total > 0:
+                add_to_periods(periods, total, parse_timestamp(item.get("date")))
+        result["dailyModelTokensDays"] = len(daily_model_tokens)
+        for key in ("today", "week", "month", "all"):
+            if periods[key] > 0:
+                result["tokens"][key] = periods[key]
     daily_activity = raw.get("dailyActivity") if isinstance(raw, dict) else None
     if isinstance(daily_activity, dict):
+        result["dailyActivityDays"] = len(daily_activity)
+    elif isinstance(daily_activity, list):
         result["dailyActivityDays"] = len(daily_activity)
     return result
 
@@ -562,15 +648,19 @@ def build_snapshot() -> Dict[str, Any]:
         latest_by_provider: Dict[str, Any] = latest_events_by_provider()
     except Exception as exc:
         latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
+    limits_by_provider = configured_limits()
+    providers = {
+        "codex": codex_snapshot(),
+        "claude": claude_snapshot(),
+        "gemini": gemini_snapshot(),
+    }
+    for provider, data in providers.items():
+        data["limits"] = limits_by_provider.get(provider, empty_limits())
     snapshot = {
         "schemaVersion": 1,
         "generatedAt": now_iso(),
         "activity": terminal_activity_snapshot(),
-        "providers": {
-            "codex": codex_snapshot(),
-            "claude": claude_snapshot(),
-            "gemini": gemini_snapshot(),
-        },
+        "providers": providers,
         "events": {
             "latestByProvider": latest_by_provider,
         },

@@ -58,6 +58,34 @@ Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The
 
 `activity.motionStage` is based on current activity, not raw agent count. The connector uses `totalCPUPercent + runnableProcessCount * 3` as the activity score: `jogging` starts at 5, `running` at 25, and `sprinting` at 60.
 
+## Limits
+
+Vendor weekly, monthly, and per-session limits are not exposed reliably on-device. Agent Cat therefore only displays limits that are explicitly configured in `~/.agentcat/limits.json`; missing values are reported as `not_configured`.
+
+Example:
+
+```json
+{
+  "providers": {
+    "codex": {
+      "week": 1000000000,
+      "month": 4000000000,
+      "session": 200000
+    },
+    "claude": {
+      "week": 500000000,
+      "month": 2000000000,
+      "session": 200000
+    },
+    "gemini": {
+      "week": 500000000,
+      "month": 2000000000,
+      "session": 1000000
+    }
+  }
+}
+```
+
 ## Uninstall
 
 ```bash
