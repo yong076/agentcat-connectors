@@ -1,5 +1,7 @@
 # Agent Cat Connectors
 
+[English](README.md) | [한국어](README.ko.md)
+
 Agent Cat Connectors lets the Agent Cat menu bar app see local CLI-agent activity from Codex, Claude Code, and Gemini CLI.
 
 It installs a small local collector, keeps data under `~/.agentcat`, and patches supported CLI settings so future sessions can report activity without sending prompts to a remote server.
