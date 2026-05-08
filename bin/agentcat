@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import closing
 import datetime as dt
 import json
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sqlite3
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +40,33 @@ CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"const OAUTH_CLIENT_ID = '([^']+)';")
+GEMINI_TELEMETRY_PARSE_BYTES = int(os.environ.get("AGENTCAT_GEMINI_PARSE_BYTES", str(64 * 1024 * 1024)))
+GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECONDS", "10"))
+LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
+LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.19.0")
+CONNECTOR_CAPABILITIES = (
+    "snapshot.metadata",
+    "activity.terminal",
+    "events.sqlite",
+    "usage.dailyTokens",
+    "limits.liveCache",
+    "limits.errorBackoff",
+    "limits.quotaFallbackOn429",
+    "limits.codex.oauthUsage",
+    "limits.claude.oauthUsage",
+    "limits.claude.statusline",
+    "limits.claude.statuslineQuotas",
+    "limits.gemini.codeAssist",
+    "hooks.codexNotify",
+    "hooks.claudeStatusline",
+    "hooks.claudeHooks",
+    "hooks.geminiTelemetry",
+)
+_GEMINI_CACHE_LOCK = threading.Lock()
+_GEMINI_CACHE_KEY: Optional[Tuple[int, int]] = None
+_GEMINI_CACHE_VALUE: Optional[Dict[str, Any]] = None
+_GEMINI_CACHE_LOADED_AT = 0.0
 GEMINI_OAUTH_CLIENT_SECRET_RE = re.compile(r"const OAUTH_CLIENT_SECRET = '([^']+)';")
 
 TOKEN_KEYS = {
@@ -402,18 +431,22 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     if cached_at is None or not isinstance(limits, dict):
         return None
     age = int(time.time()) - cached_at
-    if age > max_age_seconds and not allow_stale:
+    effective_max_age = LIVE_LIMITS_ERROR_BACKOFF_SECONDS if limits.get("status") == "error" else max_age_seconds
+    if age > effective_max_age and not allow_stale:
         return None
     out = dict(limits)
     out["cachedAt"] = cached_at
     out["cacheAgeSeconds"] = max(age, 0)
-    if age > max_age_seconds:
+    if age > effective_max_age:
         out["stale"] = True
     return out
 
 
 def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
-    if limits.get("status") not in {"auto", "ok"} or not limits.get("quotas"):
+    status = limits.get("status")
+    if status == "error":
+        pass
+    elif status not in {"auto", "ok"} or not limits.get("quotas"):
         return
     try:
         ensure_dirs()
@@ -584,10 +617,22 @@ def claude_runtime_limits() -> Dict[str, Any]:
 
     limits = empty_limits(status="auto")
     limits["source"] = "claude-statusline"
+    quotas: List[Dict[str, Any]] = []
 
     context_window = payload.get("context_window")
     if isinstance(context_window, dict):
         limits["sessionTokens"] = int_limit(context_window.get("context_window_size"))
+        if limits["sessionTokens"] is not None:
+            quotas.append(
+                quota_entry(
+                    "claude:session",
+                    "세션 한도",
+                    limit=limits["sessionTokens"],
+                    unit="tokens",
+                    window="session",
+                    source="claude-statusline",
+                )
+            )
 
     rate_limits = payload.get("rate_limits")
     if isinstance(rate_limits, dict):
@@ -595,14 +640,38 @@ def claude_runtime_limits() -> Dict[str, Any]:
         if isinstance(seven_day, dict):
             limits["weeklyUsedPercent"] = float_percent(seven_day.get("used_percentage"))
             limits["weeklyResetAt"] = int_limit(seven_day.get("resets_at"))
+            if limits["weeklyUsedPercent"] is not None:
+                quotas.append(
+                    quota_entry(
+                        "claude:seven_day",
+                        "7일",
+                        used_percent=limits["weeklyUsedPercent"],
+                        reset_at=limits["weeklyResetAt"],
+                        window="7d",
+                        source="claude-statusline",
+                    )
+                )
 
         five_hour = rate_limits.get("five_hour")
         if isinstance(five_hour, dict):
             limits["shortUsedPercent"] = float_percent(five_hour.get("used_percentage"))
             limits["shortWindowMinutes"] = 300
             limits["shortResetAt"] = int_limit(five_hour.get("resets_at"))
+            if limits["shortUsedPercent"] is not None:
+                quotas.append(
+                    quota_entry(
+                        "claude:five_hour",
+                        "5시간",
+                        used_percent=limits["shortUsedPercent"],
+                        reset_at=limits["shortResetAt"],
+                        window="5h",
+                        source="claude-statusline",
+                    )
+                )
 
     if any(limits.get(key) is not None for key in ("weeklyUsedPercent", "shortUsedPercent", "sessionTokens")):
+        quotas.sort(key=claude_quota_sort_key)
+        limits["quotas"] = quotas
         return limits
     return empty_limits()
 
@@ -758,7 +827,7 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
 
 
 def codex_live_limits() -> Dict[str, Any]:
-    cached = cached_live_limits("codex", 180)
+    cached = cached_live_limits("codex", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
         return cached
     auth = read_codex_auth()
@@ -793,11 +862,13 @@ def codex_live_limits() -> Dict[str, Any]:
             if not refreshed:
                 break
             access_token = refreshed
-    stale = cached_live_limits("codex", 180, allow_stale=True)
+    stale = cached_live_limits("codex", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
     if stale:
         stale["liveError"] = str(last_error or RuntimeError("Codex usage API failed"))
         return stale
-    return live_limit_error(last_error or RuntimeError("Codex usage API failed"), "codex-usage-api")
+    limits = live_limit_error(last_error or RuntimeError("Codex usage API failed"), "codex-usage-api")
+    write_live_limits_cache("codex", limits)
+    return limits
 
 
 def read_claude_oauth_token() -> Optional[str]:
@@ -849,9 +920,10 @@ def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
     order = {
         "claude:five_hour": 0,
         "claude:seven_day": 1,
-        "claude:extra_usage": 2,
-        "claude:seven_day_sonnet": 3,
-        "claude:seven_day_opus": 4,
+        "claude:session": 2,
+        "claude:extra_usage": 3,
+        "claude:seven_day_sonnet": 4,
+        "claude:seven_day_opus": 5,
     }
     return (order.get(str(quota.get("id")), 100), str(quota.get("id")))
 
@@ -918,7 +990,7 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
 
 
 def claude_live_limits() -> Dict[str, Any]:
-    cached = cached_live_limits("claude", 300)
+    cached = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
         return cached
     token = read_claude_oauth_token()
@@ -941,11 +1013,13 @@ def claude_live_limits() -> Dict[str, Any]:
         write_live_limits_cache("claude", limits)
         return limits
     except Exception as exc:
-        stale = cached_live_limits("claude", 300, allow_stale=True)
+        stale = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
         if stale:
             stale["liveError"] = str(exc)
             return stale
-        return live_limit_error(exc, CLAUDE_USAGE_URL)
+        limits = live_limit_error(exc, CLAUDE_USAGE_URL)
+        write_live_limits_cache("claude", limits)
+        return limits
 
 
 def gemini_display_name(model: Any) -> str:
@@ -1162,7 +1236,7 @@ def gemini_limits_from_quota_response(
 
 
 def gemini_live_limits() -> Dict[str, Any]:
-    cached = cached_live_limits("gemini", 180)
+    cached = cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
         return cached
     auth_type = read_gemini_auth_type()
@@ -1193,11 +1267,13 @@ def gemini_live_limits() -> Dict[str, Any]:
         write_live_limits_cache("gemini", limits)
         return limits
     except Exception as exc:
-        stale = cached_live_limits("gemini", 180, allow_stale=True)
+        stale = cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
         if stale:
             stale["liveError"] = str(exc)
             return stale
-        return live_limit_error(exc, GEMINI_CODE_ASSIST_URL)
+        limits = live_limit_error(exc, GEMINI_CODE_ASSIST_URL)
+        write_live_limits_cache("gemini", limits)
+        return limits
 
 
 def prefer_live_limits(live: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
@@ -1270,6 +1346,21 @@ def add_to_periods(periods: Dict[str, int], amount: int, when: Optional[dt.datet
         periods["month"] += amount
 
 
+def day_key_for_timestamp(when: Optional[dt.datetime]) -> Optional[str]:
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return when.astimezone().date().isoformat()
+
+
+def add_to_daily(daily: Dict[str, int], amount: int, when: Optional[dt.datetime]) -> None:
+    key = day_key_for_timestamp(when)
+    if key is None:
+        return
+    daily[key] = daily.get(key, 0) + amount
+
+
 def codex_snapshot() -> Dict[str, Any]:
     paths = sorted((HOME / ".codex").glob("state_*.sqlite"))
     result: Dict[str, Any] = {
@@ -1277,6 +1368,7 @@ def codex_snapshot() -> Dict[str, Any]:
         "source": None,
         "tokens": empty_periods(),
         "models": {},
+        "dailyTokens": {},
     }
     if not paths:
         return result
@@ -1313,6 +1405,7 @@ def codex_snapshot() -> Dict[str, Any]:
             continue
         when = parse_timestamp(updated_raw)
         add_to_periods(result["tokens"], tokens, when)
+        add_to_daily(result["dailyTokens"], tokens, when)
         model = str(model_raw or "unknown")
         model_periods = models.setdefault(model, empty_periods())
         add_to_periods(model_periods, tokens, when)
@@ -1331,6 +1424,7 @@ def claude_snapshot() -> Dict[str, Any]:
         "source": str(path),
         "tokens": {},
         "models": {},
+        "dailyTokens": {},
     }
     if raw is None:
         return result
@@ -1359,7 +1453,13 @@ def claude_snapshot() -> Dict[str, Any]:
                 continue
             total = sum(int_limit(value) or 0 for value in tokens_by_model.values())
             if total > 0:
-                add_to_periods(periods, total, parse_timestamp(item.get("date")))
+                when = parse_timestamp(item.get("date"))
+                add_to_periods(periods, total, when)
+                day_key = str(item.get("date") or "").strip()
+                if not re.match(r"^\d{4}-\d{2}-\d{2}$", day_key):
+                    day_key = day_key_for_timestamp(when) or ""
+                if day_key:
+                    result["dailyTokens"][day_key] = result["dailyTokens"].get(day_key, 0) + total
         result["dailyModelTokensDays"] = len(daily_model_tokens)
         for key in ("today", "week", "month", "all"):
             if periods[key] > 0:
@@ -1373,31 +1473,60 @@ def claude_snapshot() -> Dict[str, Any]:
 
 
 def gemini_snapshot() -> Dict[str, Any]:
+    global _GEMINI_CACHE_KEY, _GEMINI_CACHE_VALUE, _GEMINI_CACHE_LOADED_AT
+
     result: Dict[str, Any] = {
         "status": "no_telemetry_yet",
         "source": str(GEMINI_TELEMETRY),
         "tokens": {},
         "models": {},
+        "dailyTokens": {},
         "events": 0,
     }
     if not GEMINI_TELEMETRY.exists():
         return result
 
-    tokens: Dict[str, int] = {}
-    models: Dict[str, Dict[str, int]] = {}
-    try:
-        text = GEMINI_TELEMETRY.read_text(encoding="utf-8", errors="replace")
-        tokens, models, events = parse_gemini_telemetry(text)
-    except Exception as exc:
-        result["status"] = "error"
-        result["error"] = str(exc)
+    stat = GEMINI_TELEMETRY.stat()
+    cache_key = (int(stat.st_size), int(stat.st_mtime_ns))
+    with _GEMINI_CACHE_LOCK:
+        cache_age = time.monotonic() - _GEMINI_CACHE_LOADED_AT
+        if _GEMINI_CACHE_VALUE is not None and (
+            _GEMINI_CACHE_KEY == cache_key or cache_age < GEMINI_CACHE_MIN_SECONDS
+        ):
+            return copy.deepcopy(_GEMINI_CACHE_VALUE)
+
+        tokens: Dict[str, int] = {}
+        models: Dict[str, Dict[str, int]] = {}
+        daily_tokens: Dict[str, int] = {}
+        try:
+            text = read_recent_gemini_telemetry(stat.st_size)
+            tokens, models, daily_tokens, events = parse_gemini_telemetry(text)
+        except Exception as exc:
+            result["status"] = "error"
+            result["error"] = str(exc)
+            return result
+
+        result["status"] = "ok" if events else "no_token_events_yet"
+        result["tokens"] = tokens
+        result["models"] = models
+        result["dailyTokens"] = daily_tokens
+        result["events"] = events
+        _GEMINI_CACHE_KEY = cache_key
+        _GEMINI_CACHE_VALUE = copy.deepcopy(result)
+        _GEMINI_CACHE_LOADED_AT = time.monotonic()
         return result
 
-    result["status"] = "ok" if events else "no_token_events_yet"
-    result["tokens"] = tokens
-    result["models"] = models
-    result["events"] = events
-    return result
+
+def read_recent_gemini_telemetry(file_size: int) -> str:
+    start = max(0, file_size - max(GEMINI_TELEMETRY_PARSE_BYTES, 1024 * 1024))
+    with GEMINI_TELEMETRY.open("rb") as fh:
+        fh.seek(start)
+        text = fh.read().decode("utf-8", errors="replace")
+    if start > 0:
+        first_object = text.find("{")
+        if first_object >= 0:
+            text = text[first_object:]
+    return text
 
 
 def iter_json_objects(text: str) -> Iterable[Any]:
@@ -1511,7 +1640,7 @@ def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tup
     return records
 
 
-def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]], int]:
+def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]], Dict[str, int], int]:
     records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime]]] = []
     for payload in iter_json_objects(text):
         records.extend(gemini_metric_records(payload, "gemini_cli.token.usage"))
@@ -1528,12 +1657,14 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
 
     tokens: Dict[str, int] = {}
     models: Dict[str, Dict[str, int]] = {}
+    daily_tokens: Dict[str, int] = {}
     periods = empty_periods()
     for token_key, model, amount, when in by_identity.values():
         tokens[token_key] = tokens.get(token_key, 0) + amount
         model_tokens = models.setdefault(model, {})
         model_tokens[token_key] = model_tokens.get(token_key, 0) + amount
         add_to_periods(periods, amount, when)
+        add_to_daily(daily_tokens, amount, when)
 
     total = sum(tokens.values())
     if total > 0:
@@ -1541,7 +1672,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
         for key, amount in periods.items():
             if amount > 0:
                 tokens[key] = amount
-    return tokens, models, len(by_identity)
+    return tokens, models, daily_tokens, len(by_identity)
 
 
 def executable_name(command: str) -> Optional[str]:
@@ -1688,7 +1819,9 @@ def build_snapshot() -> Dict[str, Any]:
             runtime_limits_by_provider.get(provider, empty_limits()),
         )
     snapshot = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
+        "connectorVersion": CONNECTOR_VERSION,
+        "capabilities": list(CONNECTOR_CAPABILITIES),
         "generatedAt": now_iso(),
         "activity": terminal_activity_snapshot(),
         "providers": providers,
@@ -1702,6 +1835,25 @@ def build_snapshot() -> Dict[str, Any]:
         fh.write("\n")
     tmp_path.replace(LATEST_SNAPSHOT)
     return snapshot
+
+
+def snapshot_for_http() -> Dict[str, Any]:
+    cached = read_json(LATEST_SNAPSHOT)
+    if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
+        snapshot = copy.deepcopy(cached)
+        snapshot["generatedAt"] = now_iso()
+        snapshot["activity"] = terminal_activity_snapshot()
+        return snapshot
+    return build_snapshot()
+
+
+def snapshot_refresh_loop(interval_seconds: float) -> None:
+    while True:
+        time.sleep(interval_seconds)
+        try:
+            build_snapshot()
+        except Exception as exc:
+            print(f"agentcatd snapshot refresh failed: {exc}", file=sys.stderr, flush=True)
 
 
 def concise_snapshot_text(snapshot: Dict[str, Any]) -> str:
@@ -1794,7 +1946,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/snapshot":
             try:
-                self.send_json(200, build_snapshot())
+                self.send_json(200, snapshot_for_http())
             except Exception as exc:
                 self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return
@@ -1821,6 +1973,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
     build_snapshot()
+    threading.Thread(target=snapshot_refresh_loop, args=(60.0,), daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
     print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
     try:
@@ -1886,6 +2039,25 @@ def command_setup_prompt(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_version(args: argparse.Namespace) -> int:
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "connectorVersion": CONNECTOR_VERSION,
+                    "schemaVersion": 2,
+                    "capabilities": list(CONNECTOR_CAPABILITIES),
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(CONNECTOR_VERSION)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentcat")
     subparsers = parser.add_subparsers(dest="command")
@@ -1922,6 +2094,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_prompt = subparsers.add_parser("setup-prompt")
     setup_prompt.set_defaults(func=command_setup_prompt)
+
+    version = subparsers.add_parser("version")
+    version.add_argument("--json", action="store_true")
+    version.set_defaults(func=command_version)
 
     return parser
 

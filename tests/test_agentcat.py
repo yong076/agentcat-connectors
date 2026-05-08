@@ -196,6 +196,25 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(fresh["quotas"][0]["remainingPercent"], 83.0)
         self.assertTrue(stale["stale"])
 
+    def test_live_limit_cache_keeps_error_for_backoff(self) -> None:
+        limits = agentcat.live_limit_error(RuntimeError("HTTP Error 429: Too Many Requests"), "usage-api")
+        agentcat.write_live_limits_cache("codex", limits)
+
+        cached = agentcat.cached_live_limits("codex", -1)
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["status"], "error")
+        self.assertIn("Too Many Requests", cached["error"])
+        self.assertFalse(cached.get("stale", False))
+
+    def test_snapshot_exposes_connector_metadata_and_capabilities(self) -> None:
+        snapshot = agentcat.build_snapshot()
+
+        self.assertEqual(snapshot["schemaVersion"], 2)
+        self.assertEqual(snapshot["connectorVersion"], agentcat.CONNECTOR_VERSION)
+        self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
+        self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
+
     def test_codex_runtime_limits_reads_latest_token_count_event(self) -> None:
         session_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "05" / "06"
         session_dir.mkdir(parents=True)
@@ -363,6 +382,10 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["shortWindowMinutes"], 300)
         self.assertEqual(limits["weeklyUsedPercent"], 10.0)
         self.assertEqual(limits["weeklyResetAt"], 1770000400)
+        self.assertEqual([quota["id"] for quota in limits["quotas"]], ["claude:five_hour", "claude:seven_day", "claude:session"])
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 96.0)
+        self.assertEqual(limits["quotas"][1]["remainingPercent"], 90.0)
+        self.assertEqual(limits["quotas"][2]["limit"], 1000000.0)
 
     def test_sanitize_payload_redacts_content_but_keeps_limit_metadata(self) -> None:
         sanitized = agentcat.sanitize_payload(
