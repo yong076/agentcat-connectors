@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import sqlite3
 import sys
@@ -24,6 +25,8 @@ import urllib.request
 
 HOME = Path(os.environ.get("HOME") or str(Path.home())).expanduser().resolve()
 AGENTCAT_HOME = Path(os.environ.get("AGENTCAT_HOME") or str(HOME / ".agentcat")).expanduser().resolve()
+IS_WINDOWS = os.name == "nt"
+CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
@@ -62,6 +65,7 @@ CONNECTOR_CAPABILITIES = (
     "hooks.claudeStatusline",
     "hooks.claudeHooks",
     "hooks.geminiTelemetry",
+    "activity.windowsProcessScan",
 )
 _GEMINI_CACHE_LOCK = threading.Lock()
 _GEMINI_CACHE_KEY: Optional[Tuple[int, int]] = None
@@ -112,6 +116,12 @@ IGNORED_EXECUTABLES = {
     "vim",
     "watch",
     "zsh",
+    "cmd.exe",
+    "conhost.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "python.exe",
+    "python3.exe",
 }
 
 SENSITIVE_KEY_PARTS = (
@@ -1675,13 +1685,24 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
     return tokens, models, daily_tokens, len(by_identity)
 
 
-def executable_name(command: str) -> Optional[str]:
+def command_parts(command: str) -> List[str]:
     text = command.strip()
     if not text:
+        return []
+    try:
+        parts = shlex.split(text, posix=not IS_WINDOWS)
+    except ValueError:
+        parts = text.split()
+    return [part.strip("\"'") for part in parts if part.strip("\"'")]
+
+
+def executable_name(command: str) -> Optional[str]:
+    parts = command_parts(command)
+    if not parts:
         return None
-    parts = text.split()
     first = parts[0]
-    if Path(first).name.lower() == "node" and len(parts) > 1:
+    executable = Path(first).name.lower()
+    if executable in {"node", "node.exe"} and len(parts) > 1:
         for part in parts[1:]:
             if part.startswith("-"):
                 continue
@@ -1692,20 +1713,26 @@ def executable_name(command: str) -> Optional[str]:
 
 def classify_process(command: str) -> Optional[str]:
     lower = command.lower()
-    if "/agent cat.app/" in lower or "/agentcatmac/" in lower or "agentcat-connectors/bin/agentcat" in lower:
+    normalized = lower.replace("\\", "/")
+    if (
+        "/agent cat.app/" in normalized
+        or "/agentcatmac/" in normalized
+        or "agentcat-connectors/bin/agentcat" in normalized
+        or "agent-cat-windows.exe" in normalized
+    ):
         return None
-    if "/applications/claude.app/contents/" in lower:
+    if "/applications/claude.app/contents/" in normalized:
         return None
 
     executable = executable_name(command)
     if not executable or executable in IGNORED_EXECUTABLES:
         return None
 
-    if executable == "codex" or "@openai/codex" in lower:
+    if executable in {"codex", "codex.exe", "codex.cmd"} or "@openai/codex" in normalized:
         return "codex"
-    if executable == "claude" or "@anthropic-ai/claude" in lower or "claude-code" in lower:
+    if executable in {"claude", "claude.exe", "claude.cmd"} or "@anthropic-ai/claude" in normalized or "claude-code" in normalized:
         return "claude"
-    if executable in {"gemini", "gemini-cli"} or "@google/gemini" in lower:
+    if executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli"} or "@google/gemini" in normalized:
         return "gemini"
     return None
 
@@ -1726,7 +1753,125 @@ def motion_stage(process_count: int, total_cpu: float, runnable_process_count: i
     return "walking"
 
 
+def terminal_activity_snapshot_windows() -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "status": "unknown",
+        "updatedAt": now_iso(),
+        "processCount": 0,
+        "totalCPUPercent": 0,
+        "motionStage": "sleeping",
+        "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0},
+        "processes": [],
+    }
+    script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine |
+  Where-Object {
+    $text = (($_.Name + ' ' + $_.CommandLine).ToLower())
+    $text -match '(^|[^a-z])(codex|claude|gemini)([^a-z]|$)'
+  } |
+  ForEach-Object {
+    [pscustomobject]@{
+      ProcessId = [uint32]$_.ProcessId
+      ParentProcessId = [uint32]$_.ParentProcessId
+      Name = $_.Name
+      CommandLine = $_.CommandLine
+      CpuPercent = 0
+    }
+  } |
+  ConvertTo-Json -Compress
+"""
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3.0,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+
+    if completed.returncode != 0:
+        result["status"] = "error"
+        result["error"] = completed.stderr.strip() or "PowerShell process scan failed"
+        return result
+
+    text = completed.stdout.strip()
+    if not text:
+        result.update(
+            {
+                "status": "ok",
+                "runnableProcessCount": 0,
+                "activityScore": 0,
+            }
+        )
+        return result
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+
+    items = parsed if isinstance(parsed, list) else [parsed] if isinstance(parsed, dict) else []
+    rows: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        command = str(item.get("CommandLine") or item.get("Name") or "")
+        provider = classify_process(command)
+        if provider is None:
+            continue
+        try:
+            pid = int(item.get("ProcessId") or 0)
+            parent_id = int(item.get("ParentProcessId") or 0)
+            cpu = float(item.get("CpuPercent") or 0)
+        except (TypeError, ValueError):
+            continue
+        rows.append(
+            {
+                "pid": pid,
+                "parentID": parent_id,
+                "kind": provider,
+                "cpuPercent": cpu,
+                "state": "running" if cpu > 0.1 else "sleeping",
+                "command": command[:180],
+            }
+        )
+
+    rows.sort(key=lambda row: (-float(row["cpuPercent"]), str(row["kind"])))
+    counts = {"codex": 0, "claude": 0, "gemini": 0}
+    for row in rows:
+        counts[str(row["kind"])] = counts.get(str(row["kind"]), 0) + 1
+    total_cpu = sum(float(row["cpuPercent"]) for row in rows)
+    runnable_process_count = sum(1 for row in rows if float(row.get("cpuPercent", 0)) > 0.1)
+    activity_score = total_cpu + float(runnable_process_count) * 3.0
+
+    result.update(
+        {
+            "status": "ok",
+            "processCount": len(rows),
+            "totalCPUPercent": total_cpu,
+            "runnableProcessCount": runnable_process_count,
+            "activityScore": activity_score,
+            "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
+            "countsByProvider": counts,
+            "processes": rows,
+        }
+    )
+    return result
+
+
 def terminal_activity_snapshot() -> Dict[str, Any]:
+    if IS_WINDOWS:
+        return terminal_activity_snapshot_windows()
+
     result: Dict[str, Any] = {
         "status": "unknown",
         "updatedAt": now_iso(),

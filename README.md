@@ -8,6 +8,14 @@ It installs a small local collector, keeps data under `~/.agentcat`, and patches
 
 ## Install
 
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.ps1 | iex
+```
+
+macOS/Linux:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.sh | bash
 ```
@@ -18,9 +26,15 @@ For a cloned checkout:
 ./install.sh
 ```
 
+On Windows from a cloned checkout:
+
+```powershell
+.\install.ps1
+```
+
 Then verify:
 
-```bash
+```powershell
 agentcat snapshot
 ```
 
@@ -32,8 +46,8 @@ agentcat setup-prompt
 
 ## What It Installs
 
-- `~/.local/bin/agentcat`: local collector CLI
-- `~/Library/LaunchAgents/com.trappist.agentcatd.plist`: local daemon on `127.0.0.1:8765`
+- `~/.local/bin/agentcat` or `%USERPROFILE%\.local\bin\agentcat.cmd`: local collector CLI
+- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` or Windows startup task `AgentCatD`: local daemon on `127.0.0.1:8765`
 - `~/.agentcat/events.sqlite`: local event store
 - `~/.agentcat/latest-snapshot.json`: latest normalized usage snapshot
 - timestamped backups under `~/.agentcat/backups/`

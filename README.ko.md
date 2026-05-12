@@ -8,6 +8,14 @@ Agent Cat Connectors는 Agent Cat 메뉴바 앱이 이 Mac에서 실행 중인 C
 
 ## 설치
 
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.ps1 | iex
+```
+
+macOS/Linux:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.sh | bash
 ```
@@ -18,9 +26,15 @@ curl -fsSL https://raw.githubusercontent.com/yong076/agentcat-connectors/main/in
 ./install.sh
 ```
 
+Windows에서 클론한 체크아웃을 실행할 때:
+
+```powershell
+.\install.ps1
+```
+
 설치 후 확인:
 
-```bash
+```powershell
 agentcat snapshot
 ```
 
@@ -32,8 +46,8 @@ agentcat setup-prompt
 
 ## 설치되는 항목
 
-- `~/.local/bin/agentcat`: 로컬 수집기 CLI
-- `~/Library/LaunchAgents/com.trappist.agentcatd.plist`: `127.0.0.1:8765`에서 동작하는 로컬 daemon
+- `~/.local/bin/agentcat` 또는 `%USERPROFILE%\.local\bin\agentcat.cmd`: 로컬 수집기 CLI
+- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` 또는 Windows 시작 작업 `AgentCatD`: `127.0.0.1:8765`에서 동작하는 로컬 daemon
 - `~/.agentcat/events.sqlite`: 로컬 이벤트 저장소
 - `~/.agentcat/latest-snapshot.json`: 최신 정규화 사용량 스냅샷
 - `~/.agentcat/backups/`: 설정 변경 전 timestamp 백업

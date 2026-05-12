@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -18,9 +19,21 @@ HOME = Path.home()
 AGENTCAT_HOME = HOME / ".agentcat"
 BACKUPS_DIR = AGENTCAT_HOME / "backups"
 LOCAL_BIN = HOME / ".local" / "bin"
-BIN_PATH = LOCAL_BIN / "agentcat"
+IS_WINDOWS = os.name == "nt"
+CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
+BIN_PATH = LOCAL_BIN / ("agentcat.cmd" if IS_WINDOWS else "agentcat")
 PLIST_PATH = HOME / "Library" / "LaunchAgents" / "com.trappist.agentcatd.plist"
 LABEL = "com.trappist.agentcatd"
+WINDOWS_TASK_NAME = "AgentCatD"
+WINDOWS_STARTUP_SCRIPT = (
+    Path(os.environ.get("APPDATA", HOME / "AppData" / "Roaming"))
+    / "Microsoft"
+    / "Windows"
+    / "Start Menu"
+    / "Programs"
+    / "Startup"
+    / "AgentCatD.vbs"
+)
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 CODEX_BEGIN = "# agentcat-connectors:begin"
 CODEX_END = "# agentcat-connectors:end"
@@ -35,14 +48,23 @@ def timestamp() -> str:
 
 
 def run(args: List[str], check: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+    kwargs: Dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "check": check,
+    }
+    if IS_WINDOWS:
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+    return subprocess.run(args, **kwargs)
 
 
 def mkdirs() -> None:
     AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
-    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not IS_WINDOWS:
+        PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     GEMINI_TELEMETRY.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -78,12 +100,54 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def ensure_windows_user_path() -> None:
+    if not IS_WINDOWS:
+        return
+    current_parts = [part.strip().lower() for part in os.environ.get("PATH", "").split(os.pathsep)]
+    if str(LOCAL_BIN).lower() in current_parts:
+        return
+    script = f"""
+$bin = {json.dumps(str(LOCAL_BIN))}
+$path = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ([string]::IsNullOrWhiteSpace($path)) {{
+  [Environment]::SetEnvironmentVariable('Path', $bin, 'User')
+}} else {{
+  $parts = $path -split ';' | Where-Object {{ $_ }}
+  if (($parts | ForEach-Object {{ $_.Trim().ToLowerInvariant() }}) -notcontains $bin.ToLowerInvariant()) {{
+    [Environment]::SetEnvironmentVariable('Path', ($path.TrimEnd(';') + ';' + $bin), 'User')
+  }}
+}}
+"""
+    result = run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+    if result.returncode == 0:
+        os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + str(LOCAL_BIN)
+        log(f"added {LOCAL_BIN} to the user PATH; open a new terminal if this shell cannot find agentcat")
+    else:
+        log(f"could not update user PATH automatically: {result.stderr.strip()}")
+
+
 def install_binary(repo_dir: Path, backup_dir: Path) -> None:
     src = repo_dir / "bin" / "agentcat"
     if not src.exists():
         raise FileNotFoundError(src)
     mode = src.stat().st_mode
     src.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    if IS_WINDOWS:
+        if BIN_PATH.exists() or BIN_PATH.is_symlink():
+            backup_path = backup(BIN_PATH, backup_dir)
+            BIN_PATH.unlink()
+            if backup_path:
+                log(f"backed up existing {BIN_PATH} to {backup_path}")
+        shim = (
+            "@echo off\r\n"
+            f'set "AGENTCAT_HOME={AGENTCAT_HOME}"\r\n'
+            f'"{Path(sys.executable)}" "{src}" %*\r\n'
+        )
+        BIN_PATH.write_text(shim, encoding="utf-8", newline="")
+        ensure_windows_user_path()
+        log(f"installed {BIN_PATH}")
+        return
 
     if BIN_PATH.exists() or BIN_PATH.is_symlink():
         if BIN_PATH.is_symlink() or BIN_PATH.resolve() == src.resolve():
@@ -132,13 +196,97 @@ def plist_text() -> str:
 """
 
 
+def daemon_health() -> bool:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8765/healthz", timeout=1.0) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+def start_windows_daemon() -> None:
+    if daemon_health():
+        log("agentcatd is already running")
+        return
+    stdout = (AGENTCAT_HOME / "agentcatd.out.log").open("ab")
+    stderr = (AGENTCAT_HOME / "agentcatd.err.log").open("ab")
+    subprocess.Popen(
+        [str(BIN_PATH), "daemon"],
+        cwd=str(HOME),
+        stdout=stdout,
+        stderr=stderr,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    log("started agentcatd")
+
+
+def stop_windows_daemon() -> None:
+    script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+Get-CimInstance Win32_Process |
+  Where-Object {
+    $line = [string]$_.CommandLine
+    $_.ProcessId -ne $PID -and
+      $line.ToLowerInvariant().Contains('agentcat') -and
+      $line.ToLowerInvariant().Contains('daemon')
+  } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+"""
+    run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+
+
+def load_windows_daemon() -> None:
+    task_command = f'cmd.exe /d /c ""{BIN_PATH}" daemon"'
+    result = run(
+        [
+            "schtasks.exe",
+            "/Create",
+            "/TN",
+            WINDOWS_TASK_NAME,
+            "/SC",
+            "ONLOGON",
+            "/TR",
+            task_command,
+            "/F",
+        ]
+    )
+    if result.returncode == 0:
+        log(f"registered Windows startup task {WINDOWS_TASK_NAME}")
+    else:
+        log(f"Windows startup task registration failed: {result.stderr.strip()}")
+        WINDOWS_STARTUP_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
+        WINDOWS_STARTUP_SCRIPT.write_text(
+            'Set shell = CreateObject("WScript.Shell")\r\n'
+            f'shell.Run """{BIN_PATH}"" daemon", 0, False\r\n',
+            encoding="utf-8",
+        )
+        log(f"registered Windows startup script {WINDOWS_STARTUP_SCRIPT}")
+    stop_windows_daemon()
+    start_windows_daemon()
+
+
+def unload_windows_daemon() -> None:
+    run(["schtasks.exe", "/End", "/TN", WINDOWS_TASK_NAME])
+    run(["schtasks.exe", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
+    stop_windows_daemon()
+    if WINDOWS_STARTUP_SCRIPT.exists():
+        WINDOWS_STARTUP_SCRIPT.unlink()
+        log(f"removed {WINDOWS_STARTUP_SCRIPT}")
+
+
 def unload_launch_agent() -> None:
+    if IS_WINDOWS:
+        unload_windows_daemon()
+        return
     uid = os.getuid()
     run(["launchctl", "bootout", f"gui/{uid}", str(PLIST_PATH)])
     run(["launchctl", "unload", str(PLIST_PATH)])
 
 
 def load_launch_agent() -> None:
+    if IS_WINDOWS:
+        load_windows_daemon()
+        return
     uid = os.getuid()
     unload_launch_agent()
     PLIST_PATH.write_text(plist_text(), encoding="utf-8")
@@ -154,6 +302,17 @@ def load_launch_agent() -> None:
         log(f"LaunchAgent load failed: {fallback.stderr.strip() or result.stderr.strip()}")
 
 
+def agentcat_shell_command(*args: str) -> str:
+    command = str(BIN_PATH)
+    if IS_WINDOWS:
+        command = f'"{command}"'
+    return " ".join([command, *args])
+
+
+def toml_string(value: Path | str) -> str:
+    return json.dumps(str(value))
+
+
 def ensure_claude_hook(settings: Dict[str, Any], event_name: str) -> None:
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -164,7 +323,7 @@ def ensure_claude_hook(settings: Dict[str, Any], event_name: str) -> None:
         entries = []
         hooks[event_name] = entries
 
-    command = f"{BIN_PATH} claude-hook --event {event_name}"
+    command = agentcat_shell_command("claude-hook", "--event", event_name)
     for entry in entries:
         if "agentcat" in json.dumps(entry):
             if command in json.dumps(entry):
@@ -199,7 +358,7 @@ def install_claude_settings(backup_dir: Path) -> None:
 
     settings["statusLine"] = {
         "type": "command",
-        "command": f"{BIN_PATH} claude-statusline",
+        "command": agentcat_shell_command("claude-statusline"),
     }
     for event_name in ("SessionStart", "UserPromptSubmit", "Stop"):
         ensure_claude_hook(settings, event_name)
@@ -256,7 +415,7 @@ def install_codex_config(backup_dir: Path) -> None:
         log("Codex notify already exists; skipped notify patch, local SQLite usage still works")
         return
 
-    block = f'{CODEX_BEGIN}\nnotify = ["{BIN_PATH}", "codex-notify"]\n{CODEX_END}\n'
+    block = f"{CODEX_BEGIN}\nnotify = [{toml_string(BIN_PATH)}, \"codex-notify\"]\n{CODEX_END}\n"
     new_text = text_without_block.rstrip() + "\n\n" + block
     path.write_text(new_text.lstrip(), encoding="utf-8")
     log("patched Codex notify hook")
@@ -349,12 +508,13 @@ def uninstall(repo_dir: Path, purge: bool = False) -> int:
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     unload_launch_agent()
-    if PLIST_PATH.exists():
+    if not IS_WINDOWS and PLIST_PATH.exists():
         backup(PLIST_PATH, backup_dir)
         PLIST_PATH.unlink()
         log(f"removed {PLIST_PATH}")
 
-    if BIN_PATH.is_symlink():
+    if BIN_PATH.exists() or BIN_PATH.is_symlink():
+        backup(BIN_PATH, backup_dir)
         BIN_PATH.unlink()
         log(f"removed {BIN_PATH}")
 
