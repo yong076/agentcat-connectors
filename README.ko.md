@@ -76,9 +76,11 @@ curl http://127.0.0.1:8765/healthz
 curl http://127.0.0.1:8765/v1/snapshot
 ```
 
-Agent Cat은 `~/.agentcat/latest-snapshot.json`을 읽거나 로컬 API를 호출할 수 있습니다. 스냅샷에는 provider별 사용량과 함께 `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, `activity.runnableProcessCount`, `activity.activityScore`, `activity.motionStage`가 들어 있습니다. 그래서 sandboxed Mac 빌드도 직접 process scan을 하지 않고 커넥터를 통해 활동 상태를 받을 수 있습니다.
+Agent Cat은 `~/.agentcat/latest-snapshot.json`을 읽거나 로컬 API를 호출할 수 있습니다. 스냅샷에는 provider별 사용량과 함께 `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, `activity.totalMemoryBytes`, `activity.memoryBytesByProvider`, `activity.runnableProcessCount`, `activity.activityScore`, `activity.motionStage`가 들어 있습니다. 그래서 sandboxed Mac 빌드도 직접 process scan을 하지 않고 커넥터를 통해 활동 상태를 받을 수 있습니다.
 
-`activity.motionStage`는 단순 에이전트 갯수가 아니라 현재 활동량으로 계산합니다. 커넥터는 `totalCPUPercent + runnableProcessCount * 3`을 활동 점수로 사용합니다. `jogging`은 2점부터, `running`은 8점부터, `sprinting`은 20점부터, `hyperSprinting`은 45점부터 시작합니다.
+`activity.motionStage`는 단순 에이전트 갯수가 아니라 현재 활동량으로 계산합니다. 커넥터는 `totalCPUPercent + runnableProcessCount * 4`를 활동 점수로 사용하고 앱과 같은 4단계만 내보냅니다. 에이전트 프로세스가 없으면 `sleeping`, 프로세스가 있지만 대부분 대기 중이면 `walking`, 7점부터 `running`, 22점부터 `sprinting`입니다.
+
+메모리 사용량은 `/bin/ps`에서 읽은 로컬 RSS 메모리입니다. 각 프로세스에는 `memoryBytes`, provider별 합계에는 `memoryBytesByProvider`가 들어갑니다. 프롬프트, 대화 본문, 모델 응답은 읽지 않습니다.
 
 ## 한도
 

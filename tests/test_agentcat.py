@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -212,6 +213,7 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertEqual(snapshot["schemaVersion"], 2)
         self.assertEqual(snapshot["connectorVersion"], agentcat.CONNECTOR_VERSION)
+        self.assertIn("activity.memory", snapshot["capabilities"])
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
 
@@ -353,11 +355,37 @@ class AgentCatConnectorTests(unittest.TestCase):
     def test_motion_stage_uses_granular_activity_thresholds(self) -> None:
         self.assertEqual(agentcat.motion_stage(0, 100, 10), "sleeping")
         self.assertEqual(agentcat.motion_stage(1, 0, 0), "walking")
-        self.assertEqual(agentcat.motion_stage(1, 2, 0), "jogging")
-        self.assertEqual(agentcat.motion_stage(1, 8, 0), "running")
-        self.assertEqual(agentcat.motion_stage(1, 20, 0), "sprinting")
-        self.assertEqual(agentcat.motion_stage(1, 45, 0), "hyperSprinting")
-        self.assertEqual(agentcat.motion_stage(1, 0, 15), "hyperSprinting")
+        self.assertEqual(agentcat.motion_stage(1, 6.9, 0), "walking")
+        self.assertEqual(agentcat.motion_stage(1, 7, 0), "running")
+        self.assertEqual(agentcat.motion_stage(1, 21.9, 0), "running")
+        self.assertEqual(agentcat.motion_stage(1, 22, 0), "sprinting")
+        self.assertEqual(agentcat.motion_stage(1, 0, 2), "running")
+        self.assertEqual(agentcat.motion_stage(1, 0, 6), "sprinting")
+
+    def test_terminal_activity_snapshot_reports_memory_usage(self) -> None:
+        completed = agentcat.subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout=(
+                "101 1 3.5 524288 R /opt/homebrew/bin/codex --model gpt-5.5\n"
+                "102 1 1.0 262144 S /opt/homebrew/bin/claude\n"
+                "103 1 0.5 131072 S /opt/homebrew/bin/gemini\n"
+            ),
+            stderr="",
+        )
+
+        with patch.object(agentcat.subprocess, "run", return_value=completed):
+            snapshot = agentcat.terminal_activity_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["totalMemoryBytes"], 939_524_096)
+        self.assertEqual(snapshot["memoryBytesByProvider"]["codex"], 536_870_912)
+        self.assertEqual(snapshot["memoryBytesByProvider"]["claude"], 268_435_456)
+        self.assertEqual(snapshot["memoryBytesByProvider"]["gemini"], 134_217_728)
+        self.assertEqual(snapshot["processes"][0]["memoryBytes"], 536_870_912)
+        self.assertEqual(snapshot["processes"][0]["rssKilobytes"], 524_288)
+        self.assertEqual(snapshot["processes"][0]["command"], "codex pid 101")
+        self.assertNotIn("gpt-5.5", snapshot["processes"][0]["command"])
 
     def test_claude_runtime_limits_reads_statusline_event(self) -> None:
         agentcat.store_event(
@@ -401,6 +429,16 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(sanitized["messages"], "[redacted]")
         self.assertEqual(sanitized["rate_limits"]["seven_day"]["used_percentage"], 10)
         self.assertEqual(sanitized["context_window"]["context_window_size"], 1000000)
+
+    def test_runtime_hooks_do_not_block_on_snapshot_refresh(self) -> None:
+        with patch.object(agentcat, "build_snapshot", side_effect=AssertionError("hook should not refresh snapshot")):
+            self.assertEqual(agentcat.command_codex_notify(agentcat.argparse.Namespace()), 0)
+            self.assertEqual(agentcat.command_claude_hook(agentcat.argparse.Namespace(event="Stop")), 0)
+            self.assertEqual(agentcat.command_gemini_hook(agentcat.argparse.Namespace(event="Stop")), 0)
+
+    def test_claude_statusline_does_not_block_on_snapshot_refresh(self) -> None:
+        with patch.object(agentcat, "build_snapshot", side_effect=AssertionError("statusline should not refresh snapshot")):
+            self.assertEqual(agentcat.command_claude_statusline(agentcat.argparse.Namespace()), 0)
 
     def test_setup_prompt_includes_install_skill_and_privacy_rules(self) -> None:
         prompt = agentcat.setup_prompt_text()

@@ -76,9 +76,11 @@ curl http://127.0.0.1:8765/healthz
 curl http://127.0.0.1:8765/v1/snapshot
 ```
 
-Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The snapshot includes usage plus `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, `activity.runnableProcessCount`, `activity.activityScore`, and `activity.motionStage` so sandboxed Mac builds can use the connector instead of direct process scanning.
+Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The snapshot includes usage plus `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, `activity.totalMemoryBytes`, `activity.memoryBytesByProvider`, `activity.runnableProcessCount`, `activity.activityScore`, and `activity.motionStage` so sandboxed Mac builds can use the connector instead of direct process scanning.
 
-`activity.motionStage` is based on current activity, not raw agent count. The connector uses `totalCPUPercent + runnableProcessCount * 3` as the activity score: `jogging` starts at 2, `running` at 8, `sprinting` at 20, and `hyperSprinting` at 45.
+`activity.motionStage` is based on current activity, not raw agent count. The connector uses `totalCPUPercent + runnableProcessCount * 4` as the activity score and emits the same four stages as the app: `sleeping` when no agent process is present, `walking` while processes are present but mostly waiting, `running` from 7 points, and `sprinting` from 22 points.
+
+Memory usage is local RSS memory from `/bin/ps`, exposed per process as `memoryBytes` and grouped by provider as `memoryBytesByProvider`. It does not inspect prompts, transcripts, or model responses.
 
 ## Limits
 

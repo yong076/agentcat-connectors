@@ -35,5 +35,6 @@ Use the local `agentcat` command instead of guessing provider usage.
 - Claude remaining quotas appear under `providers.claude.limits.quotas[]`, including 5-hour, 7-day, model, and monthly extra credit entries when the provider exposes them.
 - Gemini totals appear after Gemini CLI runs with local telemetry enabled.
 - Gemini remaining request quotas appear under `providers.gemini.limits.quotas[]` when Google-login Gemini CLI OAuth credentials can call Code Assist quota APIs.
+- Current CPU and memory usage come from `activity`. Memory is process RSS from `/bin/ps`, exposed as `activity.processes[].memoryBytes` and grouped as `activity.memoryBytesByProvider`.
 - Report exact provider quota/capacity only when the snapshot includes `remaining`, `limit`, or `remainingPercent`. Otherwise say unavailable.
 - Do not report prompt content. Agent Cat snapshots are intended to contain metadata only.
