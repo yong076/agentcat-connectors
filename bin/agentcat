@@ -5,6 +5,7 @@ import argparse
 import copy
 from contextlib import closing
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -47,7 +48,7 @@ GEMINI_TELEMETRY_PARSE_BYTES = int(os.environ.get("AGENTCAT_GEMINI_PARSE_BYTES",
 GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECONDS", "10"))
 LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.20.3")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.20.4")
 CONNECTOR_CAPABILITIES = (
     "snapshot.metadata",
     "activity.terminal",
@@ -924,7 +925,66 @@ def claude_quota_label(key: str) -> str:
         "extra_usage": "월별 크레딧",
         "monthly_limit": "월별 한도",
     }
-    return labels.get(key, key.replace("_", " "))
+    if key in labels:
+        return labels[key]
+    if key.startswith("seven_day_"):
+        return "Claude 모델 7일"
+    return "Claude 한도"
+
+
+def short_stable_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+def claude_quota_id(key: str) -> str:
+    known = {
+        "five_hour",
+        "seven_day",
+        "seven_day_sonnet",
+        "seven_day_opus",
+        "extra_usage",
+        "monthly_limit",
+    }
+    if key in known:
+        return f"claude:{key}"
+    if key.startswith("seven_day_"):
+        return f"claude:seven_day_model:{short_stable_hash(key)}"
+    return f"claude:quota:{short_stable_hash(key)}"
+
+
+def claude_quota_model(key: str) -> Optional[str]:
+    if key == "seven_day_sonnet":
+        return "sonnet"
+    if key == "seven_day_opus":
+        return "opus"
+    if key.startswith("seven_day_"):
+        return "unknown"
+    return None
+
+
+def sanitize_claude_cached_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
+    quotas = limits.get("quotas")
+    if not isinstance(quotas, list):
+        return limits
+
+    out = dict(limits)
+    sanitized: List[Dict[str, Any]] = []
+    for quota in quotas:
+        if not isinstance(quota, dict):
+            continue
+        item = dict(quota)
+        quota_id = str(item.get("id") or "")
+        if quota_id.startswith("claude:seven_day_") and not quota_id.startswith("claude:seven_day_model:"):
+            key = quota_id.removeprefix("claude:")
+            if key not in {"seven_day_sonnet", "seven_day_opus"}:
+                item["id"] = claude_quota_id(key)
+                item["label"] = claude_quota_label(key)
+                item["model"] = claude_quota_model(key)
+        sanitized.append(item)
+
+    sanitized.sort(key=claude_quota_sort_key)
+    out["quotas"] = sanitized
+    return out
 
 
 def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
@@ -936,7 +996,10 @@ def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
         "claude:seven_day_sonnet": 4,
         "claude:seven_day_opus": 5,
     }
-    return (order.get(str(quota.get("id")), 100), str(quota.get("id")))
+    quota_id = str(quota.get("id"))
+    if quota_id.startswith("claude:seven_day_model:"):
+        return (6, quota_id)
+    return (order.get(quota_id, 100), quota_id)
 
 
 def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "claude-oauth-usage-api") -> Dict[str, Any]:
@@ -959,7 +1022,7 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
                 used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
                 quotas.append(
                     quota_entry(
-                        f"claude:{key}",
+                        claude_quota_id(key),
                         claude_quota_label(key),
                         used_percent=used_percent,
                         used=used,
@@ -967,6 +1030,7 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
                         limit=limit,
                         unit=currency,
                         window="monthly",
+                        model=claude_quota_model(key),
                         source=source,
                     )
                 )
@@ -976,11 +1040,12 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
         if used is None:
             continue
         quota = quota_entry(
-            f"claude:{key}",
+            claude_quota_id(key),
             claude_quota_label(key),
             used_percent=used,
             reset_at=entry.get("resets_at"),
             window="5h" if key == "five_hour" else "7d" if key.startswith("seven_day") else None,
+            model=claude_quota_model(key),
             source=source,
         )
         quotas.append(quota)
@@ -1003,7 +1068,7 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
 def claude_live_limits() -> Dict[str, Any]:
     cached = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
-        return cached
+        return sanitize_claude_cached_limits(cached)
     token = read_claude_oauth_token()
     if not token:
         return empty_limits()

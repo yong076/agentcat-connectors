@@ -134,6 +134,7 @@ class AgentCatConnectorTests(unittest.TestCase):
                 "five_hour": {"utilization": 2.0, "resets_at": "2026-05-06T15:50:00Z"},
                 "seven_day": {"utilization": 17.0, "resets_at": "2026-05-08T07:00:00Z"},
                 "seven_day_sonnet": {"utilization": 5.0, "resets_at": "2026-05-08T07:00:00Z"},
+                "seven_day_omelette": {"utilization": 57.0, "resets_at": "2026-05-08T07:00:00Z"},
                 "extra_usage": {
                     "is_enabled": True,
                     "monthly_limit": 5000,
@@ -150,6 +151,27 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["quotas"][1]["remainingPercent"], 83.0)
         self.assertEqual(limits["quotas"][2]["remaining"], 3750.0)
         self.assertEqual(limits["quotas"][2]["remainingPercent"], 75.0)
+        self.assertEqual(limits["quotas"][4]["label"], "Claude 모델 7일")
+        self.assertEqual(limits["quotas"][4]["model"], "unknown")
+        self.assertNotIn("omelette", limits["quotas"][4]["id"])
+        self.assertNotIn("omelette", limits["quotas"][4]["label"])
+
+    def test_claude_cached_limits_sanitizes_unknown_internal_quota_names(self) -> None:
+        limits = agentcat.empty_limits(status="auto")
+        limits["quotas"] = [
+            {
+                "id": "claude:seven_day_omelette",
+                "label": "seven day omelette",
+                "remainingPercent": 43.0,
+                "usedPercent": 57.0,
+            }
+        ]
+
+        sanitized = agentcat.sanitize_claude_cached_limits(limits)
+
+        self.assertEqual(sanitized["quotas"][0]["label"], "Claude 모델 7일")
+        self.assertEqual(sanitized["quotas"][0]["model"], "unknown")
+        self.assertNotIn("omelette", sanitized["quotas"][0]["id"])
 
     def test_gemini_quota_api_payload_builds_model_remaining(self) -> None:
         limits = agentcat.gemini_limits_from_quota_response(
