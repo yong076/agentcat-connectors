@@ -2136,7 +2136,7 @@ https://github.com/yong076/agentcat-connectors/tree/main/skills/agentcat-usage
 Expected behavior:
 - Use `agentcat snapshot --json` as the source of truth for Codex, Claude Code, and Gemini CLI usage.
 - Codex should use local state plus the Agent Cat notify hook when configured.
-- Claude Code should use local stats plus Agent Cat statusLine/hooks when configured.
+- Claude Code should use local stats plus Agent Cat hooks when configured.
 - Gemini CLI should use local telemetry configured by Agent Cat.
 - Report exact provider quotas only when the snapshot exposes them. Otherwise say unavailable.
 - Never store or report prompt text, message content, transcripts, or conversation bodies.

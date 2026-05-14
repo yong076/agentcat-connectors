@@ -343,6 +343,14 @@ def ensure_claude_hook(settings: Dict[str, Any], event_name: str) -> None:
     )
 
 
+def remove_agentcat_status_line(settings: Dict[str, Any]) -> bool:
+    status_line = settings.get("statusLine")
+    if isinstance(status_line, dict) and "agentcat" in str(status_line.get("command", "")).lower():
+        settings.pop("statusLine", None)
+        return True
+    return False
+
+
 def install_claude_settings(backup_dir: Path) -> None:
     path = HOME / ".claude" / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -356,14 +364,14 @@ def install_claude_settings(backup_dir: Path) -> None:
         log(f"skipped Claude settings, invalid JSON: {exc}")
         return
 
-    settings["statusLine"] = {
-        "type": "command",
-        "command": agentcat_shell_command("claude-statusline"),
-    }
+    removed_status_line = remove_agentcat_status_line(settings)
     for event_name in ("SessionStart", "UserPromptSubmit", "Stop"):
         ensure_claude_hook(settings, event_name)
     write_json(path, settings)
-    log("patched Claude Code statusLine and hooks")
+    if removed_status_line:
+        log("removed Agent Cat Claude statusLine and patched hooks")
+    else:
+        log("patched Claude Code hooks")
 
 
 def install_gemini_settings(backup_dir: Path) -> None:
@@ -432,9 +440,7 @@ def remove_agentcat_claude_settings(backup_dir: Path) -> None:
         log(f"skipped Claude cleanup, invalid JSON: {exc}")
         return
 
-    status_line = settings.get("statusLine")
-    if isinstance(status_line, dict) and "agentcat" in str(status_line.get("command", "")):
-        settings.pop("statusLine", None)
+    remove_agentcat_status_line(settings)
 
     hooks = settings.get("hooks")
     if isinstance(hooks, dict):

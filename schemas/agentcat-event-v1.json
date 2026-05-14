@@ -11,7 +11,7 @@
     },
     "source": {
       "type": "string",
-      "examples": ["codex-notify", "claude-statusline", "claude-hook", "gemini-telemetry"]
+      "examples": ["codex-notify", "claude-hook", "gemini-telemetry"]
     },
     "eventType": {
       "type": "string"
@@ -39,4 +39,3 @@
   },
   "additionalProperties": true
 }
-
