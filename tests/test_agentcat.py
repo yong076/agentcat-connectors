@@ -234,7 +234,7 @@ class AgentCatConnectorTests(unittest.TestCase):
     def test_snapshot_exposes_connector_metadata_and_capabilities(self) -> None:
         snapshot = agentcat.build_snapshot()
 
-        self.assertEqual(snapshot["schemaVersion"], 2)
+        self.assertEqual(snapshot["schemaVersion"], 3)
         self.assertEqual(snapshot["connectorVersion"], agentcat.CONNECTOR_VERSION)
         self.assertIn("activity.memory", snapshot["capabilities"])
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
@@ -678,6 +678,271 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("agentcat snapshot --json", prompt)
         self.assertIn("skills/agentcat-usage", prompt)
         self.assertIn("Never store or report prompt text", prompt)
+
+
+class InsightsIntegrationTests(unittest.TestCase):
+    """Slice C — build_snapshot() includes insights, schema is v3."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.old_home = agentcat.HOME
+        self.old_agentcat_home = agentcat.AGENTCAT_HOME
+        self.old_events_db = agentcat.EVENTS_DB
+        self.old_latest = agentcat.LATEST_SNAPSHOT
+        agentcat.HOME = self.root
+        agentcat.AGENTCAT_HOME = self.root / ".agentcat"
+        agentcat.EVENTS_DB = agentcat.AGENTCAT_HOME / "events.sqlite"
+        agentcat.LATEST_SNAPSHOT = agentcat.AGENTCAT_HOME / "latest-snapshot.json"
+
+    def tearDown(self) -> None:
+        agentcat.HOME = self.old_home
+        agentcat.AGENTCAT_HOME = self.old_agentcat_home
+        agentcat.EVENTS_DB = self.old_events_db
+        agentcat.LATEST_SNAPSHOT = self.old_latest
+        self.tmp.cleanup()
+
+    def _stub_providers(self, providers_dict):
+        patches = []
+        for name, data in providers_dict.items():
+            p = patch.object(agentcat, f"{name}_snapshot", return_value=data)
+            patches.append(p)
+            p.start()
+        return patches
+
+    def _stop(self, patches):
+        for p in patches:
+            p.stop()
+
+    def test_build_snapshot_schema_version_is_3(self) -> None:
+        patches = self._stub_providers({
+            "codex": {"status": "ok", "tokens": {}, "models": {}},
+            "claude": {"status": "ok", "tokens": {}, "models": {}},
+            "gemini": {"status": "ok", "tokens": {}, "models": {}},
+            "opencode": {"status": "not_found"},
+            "copilot": {"status": "not_found"},
+        })
+        try:
+            with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
+                snap = agentcat.build_snapshot()
+            self.assertEqual(snap["schemaVersion"], 3)
+        finally:
+            self._stop(patches)
+
+    def test_build_snapshot_includes_insights_object(self) -> None:
+        patches = self._stub_providers({
+            "codex": {"status": "ok", "tokens": {}, "models": {}},
+            "claude": {
+                "status": "ok",
+                "tokens": {"inputTokens": 1_000_000},
+                "models": {"claude-opus-4-7": {"week": {
+                    "inputTokens": 1_000_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+            "gemini": {"status": "ok", "tokens": {}, "models": {}},
+            "opencode": {"status": "not_found"},
+            "copilot": {"status": "not_found"},
+        })
+        try:
+            with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
+                snap = agentcat.build_snapshot()
+            self.assertIn("insights", snap)
+            self.assertEqual(snap["insights"]["status"], "ok")
+            self.assertGreater(snap["insights"]["summary"]["total_tokens"], 0)
+            self.assertEqual(snap["insights"]["summary"]["top_provider"], "claude")
+        finally:
+            self._stop(patches)
+
+    def test_insights_status_error_caught_not_raised(self) -> None:
+        patches = self._stub_providers({
+            "codex": {"status": "ok", "tokens": {}, "models": {}},
+            "claude": {"status": "ok", "tokens": {}, "models": {}},
+            "gemini": {"status": "ok", "tokens": {}, "models": {}},
+            "opencode": {"status": "not_found"},
+            "copilot": {"status": "not_found"},
+        })
+        try:
+            with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}), \
+                 patch.object(agentcat, "derive_insights", side_effect=RuntimeError("kaboom")):
+                snap = agentcat.build_snapshot()
+            self.assertEqual(snap["insights"]["status"], "error")
+            self.assertIn("kaboom", snap["insights"]["error"])
+        finally:
+            self._stop(patches)
+
+
+class InsightsTests(unittest.TestCase):
+    """Slice B — derive_insights() port of Swift AgentInsights.derive()."""
+
+    def _snapshot(self, **providers) -> dict:
+        return {"providers": providers}
+
+    def test_handles_empty_snapshot(self) -> None:
+        result = agentcat.derive_insights(self._snapshot(), period="week")
+        self.assertEqual(result["summary"]["total_tokens"], 0)
+        self.assertEqual(result["summary"]["estimated_cost_usd"], 0.0)
+        self.assertEqual(result["providers"], [])
+        self.assertEqual(result["models"], [])
+        self.assertEqual(result["findings"], [])
+
+    def test_splits_cache_tokens_correctly(self) -> None:
+        # Q1 fix verification: when cache tokens dominate, cost is much
+        # lower than if we'd lumped them as input. Same model, same total
+        # token count → two scenarios.
+        s_all_input = self._snapshot(claude={
+            "tokens": {"inputTokens": 4_000_000},
+            "models": {
+                "claude-opus-4-7": {
+                    "week": {"inputTokens": 4_000_000, "outputTokens": 0,
+                              "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                }
+            },
+        })
+        s_mostly_cache = self._snapshot(claude={
+            "tokens": {"cacheReadInputTokens": 3_900_000, "inputTokens": 100_000},
+            "models": {
+                "claude-opus-4-7": {
+                    "week": {"inputTokens": 100_000, "outputTokens": 0,
+                              "cacheReadInputTokens": 3_900_000, "cacheCreationInputTokens": 0}
+                }
+            },
+        })
+        r1 = agentcat.derive_insights(s_all_input, period="week")
+        r2 = agentcat.derive_insights(s_mostly_cache, period="week")
+        # Same total tokens, but cache-heavy should be at least 5x cheaper.
+        self.assertGreater(r1["summary"]["estimated_cost_usd"], 0)
+        self.assertGreater(r2["summary"]["estimated_cost_usd"], 0)
+        self.assertGreater(
+            r1["summary"]["estimated_cost_usd"],
+            r2["summary"]["estimated_cost_usd"] * 5,
+        )
+
+    def test_emits_pricing_missing_for_unknown_model(self) -> None:
+        s = self._snapshot(unknown_provider={
+            "tokens": {"inputTokens": 1000},
+            "models": {
+                "my-totally-unknown-model": {
+                    "week": {"inputTokens": 1000, "outputTokens": 0,
+                              "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                }
+            },
+        })
+        r = agentcat.derive_insights(s, period="week")
+        finding_ids = [f["id"] for f in r["findings"]]
+        self.assertTrue(any(fid.startswith("pricing_missing:") for fid in finding_ids))
+
+    def test_sums_across_providers(self) -> None:
+        s = self._snapshot(
+            claude={
+                "tokens": {"inputTokens": 1_000_000},
+                "models": {"claude-opus-4-7": {"week": {
+                    "inputTokens": 1_000_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+            codex={
+                "tokens": {"inputTokens": 500_000},
+                "models": {"gpt-5": {"week": {
+                    "inputTokens": 500_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+        )
+        r = agentcat.derive_insights(s, period="week")
+        kinds = {p["kind"] for p in r["providers"]}
+        self.assertEqual(kinds, {"claude", "codex"})
+        self.assertEqual(r["summary"]["total_tokens"], 1_500_000)
+
+    def test_top_model_and_provider_picked(self) -> None:
+        s = self._snapshot(
+            small={
+                "tokens": {"inputTokens": 100_000},
+                "models": {"gpt-5-mini": {"week": {
+                    "inputTokens": 100_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+            big={
+                "tokens": {"inputTokens": 5_000_000},
+                "models": {"claude-opus-4-7": {"week": {
+                    "inputTokens": 5_000_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+        )
+        r = agentcat.derive_insights(s, period="week")
+        self.assertEqual(r["summary"]["top_provider"], "big")
+        self.assertEqual(r["summary"]["top_model"], "claude-opus-4-7")
+
+    def test_high_weekly_usage_finding(self) -> None:
+        s = self._snapshot(claude={
+            "tokens": {"inputTokens": 1000},
+            "models": {"claude-opus-4-7": {"week": {
+                "inputTokens": 1000, "outputTokens": 0,
+                "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            "limits": {"weeklyUsedPercent": 96},
+        })
+        r = agentcat.derive_insights(s, period="week")
+        high = [f for f in r["findings"] if f["id"].startswith("high_weekly_usage:")]
+        self.assertEqual(len(high), 1)
+        self.assertEqual(high[0]["severity"], "high")  # ≥95 = high
+
+
+class PricingTests(unittest.TestCase):
+    """Slice A — split-bucket pricing module."""
+
+    def test_known_model_returns_split_cost(self) -> None:
+        cost = agentcat.estimate_cost(
+            "claude-opus-4-7",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            cache_write_tokens=1_000_000,
+        )
+        self.assertIsInstance(cost, dict)
+        for k in ("input", "output", "cache_read", "cache_write", "total"):
+            self.assertIn(k, cost)
+        self.assertAlmostEqual(
+            cost["total"],
+            cost["input"] + cost["output"] + cost["cache_read"] + cost["cache_write"],
+            places=4,
+        )
+
+    def test_cache_read_is_cheaper_than_input(self) -> None:
+        cost = agentcat.estimate_cost(
+            "claude-opus-4-7",
+            input_tokens=1_000_000, output_tokens=0,
+            cache_read_tokens=1_000_000, cache_write_tokens=0,
+        )
+        # The Q1 fix: cache reads must price much cheaper than fresh input.
+        self.assertLess(cost["cache_read"], cost["input"])
+        self.assertLess(cost["cache_read"] * 5, cost["input"])
+
+    def test_unknown_model_returns_none(self) -> None:
+        cost = agentcat.estimate_cost(
+            "totally-made-up-model-99",
+            input_tokens=1_000_000, output_tokens=1_000_000,
+            cache_read_tokens=0, cache_write_tokens=0,
+        )
+        self.assertIsNone(cost)
+
+    def test_model_alias_normalization(self) -> None:
+        cost_a = agentcat.estimate_cost(
+            "claude-opus-4-7-20260101",
+            input_tokens=1_000_000, output_tokens=0,
+            cache_read_tokens=0, cache_write_tokens=0,
+        )
+        cost_b = agentcat.estimate_cost(
+            "claude-opus-4-7",
+            input_tokens=1_000_000, output_tokens=0,
+            cache_read_tokens=0, cache_write_tokens=0,
+        )
+        self.assertIsNotNone(cost_a)
+        self.assertEqual(cost_a["input"], cost_b["input"])
+
+    def test_zero_tokens_returns_zero_not_none(self) -> None:
+        cost = agentcat.estimate_cost(
+            "claude-opus-4-7",
+            input_tokens=0, output_tokens=0,
+            cache_read_tokens=0, cache_write_tokens=0,
+        )
+        self.assertEqual(cost["total"], 0.0)
 
 
 if __name__ == "__main__":

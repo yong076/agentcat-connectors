@@ -99,6 +99,256 @@ TOKEN_KEYS = {
     "tokensused": "totalTokens",
 }
 
+# --- Insights pricing (Slice A) ---
+# Bundled USD-per-1M-token prices, split into 4 buckets per model:
+#   input        — fresh prompt tokens
+#   output       — generated tokens
+#   cache_read   — tokens served from prompt cache (typically much cheaper)
+#   cache_write  — tokens written into prompt cache (≈ input or slightly more)
+#
+# Source: public provider pricing pages as of 2026-05. Estimates only —
+# never bill from these. Unknown models intentionally return None so the
+# caller emits a `pricing_missing` finding instead of silently guessing.
+MODEL_PRICING: Dict[str, Dict[str, float]] = {
+    # OpenAI / Codex
+    "gpt-5":         {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": 1.25},
+    "gpt-5-mini":    {"input": 0.25, "output": 2.0,  "cache_read": 0.025, "cache_write": 0.25},
+    "gpt-5.5":       {"input": 2.5,  "output": 15.0, "cache_read": 0.25,  "cache_write": 2.5},
+    "gpt-5.5-mini":  {"input": 0.3,  "output": 2.4,  "cache_read": 0.03,  "cache_write": 0.3},
+    "o3":            {"input": 4.0,  "output": 16.0, "cache_read": 0.4,   "cache_write": 4.0},
+    "o3-mini":       {"input": 0.55, "output": 2.2,  "cache_read": 0.055, "cache_write": 0.55},
+    "o4-mini":       {"input": 0.55, "output": 2.2,  "cache_read": 0.055, "cache_write": 0.55},
+    # Anthropic / Claude
+    "claude-opus-4-5":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    "claude-opus-4-6":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    "claude-opus-4-7":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
+    "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
+    "claude-haiku-4-5":  {"input": 0.8,  "output": 4.0,  "cache_read": 0.08, "cache_write": 1.0},
+    # Google / Gemini
+    "gemini-2.5-pro":   {"input": 1.25, "output": 5.0,  "cache_read": 0.31, "cache_write": 1.25},
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.6,  "cache_read": 0.04, "cache_write": 0.15},
+    "gemini-3-pro":     {"input": 2.5,  "output": 10.0, "cache_read": 0.62, "cache_write": 2.5},
+    "gemini-3-flash":   {"input": 0.2,  "output": 0.8,  "cache_read": 0.05, "cache_write": 0.2},
+}
+
+
+def _lookup_pricing(model: str) -> Optional[Dict[str, float]]:
+    """Resolve a model name to its pricing entry, tolerant of dated suffixes."""
+    if model in MODEL_PRICING:
+        return MODEL_PRICING[model]
+    normalized = model.lower()
+    if normalized in MODEL_PRICING:
+        return MODEL_PRICING[normalized]
+    trimmed = normalized.replace("-preview", "").replace("-latest", "")
+    if trimmed in MODEL_PRICING:
+        return MODEL_PRICING[trimmed]
+    # Strip trailing dated build id (e.g. -20251022)
+    m = re.match(r"^(.+?)-\d{6,}$", trimmed)
+    if m and m.group(1) in MODEL_PRICING:
+        return MODEL_PRICING[m.group(1)]
+    # Prefix match for variants like "claude-opus-4-7-1m"
+    for key in MODEL_PRICING:
+        if trimmed.startswith(key):
+            return MODEL_PRICING[key]
+    return None
+
+
+def estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+) -> Optional[Dict[str, float]]:
+    """Estimate USD cost for a model usage event, split by token bucket.
+
+    Returns {input, output, cache_read, cache_write, total} or None if the
+    model is not in MODEL_PRICING. Cost in each bucket = tokens / 1e6 * rate.
+    Negative or None token counts are coerced to 0.
+    """
+    pricing = _lookup_pricing(model)
+    if pricing is None:
+        return None
+    inp = max(0, int(input_tokens or 0))
+    out = max(0, int(output_tokens or 0))
+    cr = max(0, int(cache_read_tokens or 0))
+    cw = max(0, int(cache_write_tokens or 0))
+    cost_in = inp / 1_000_000.0 * pricing["input"]
+    cost_out = out / 1_000_000.0 * pricing["output"]
+    cost_cr = cr / 1_000_000.0 * pricing["cache_read"]
+    cost_cw = cw / 1_000_000.0 * pricing["cache_write"]
+    return {
+        "input": cost_in,
+        "output": cost_out,
+        "cache_read": cost_cr,
+        "cache_write": cost_cw,
+        "total": cost_in + cost_out + cost_cr + cost_cw,
+    }
+
+
+_FINDING_SEVERITY_ORDER = {"high": 0, "medium": 1, "info": 2}
+
+
+def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str, Any]:
+    """Pure port of Swift AgentInsights.derive() with split-bucket pricing.
+
+    Iterates snapshot.providers, sums per-bucket tokens per model, prices each
+    bucket separately via estimate_cost(), emits findings (pricing_missing,
+    provider_no_limits, high_weekly_usage), and returns the same shape the
+    Mac/Windows clients will decode.
+
+    period: "today" | "week" | "month" | "all"  — selects which bucket inside
+    each model entry to read (if absent, falls back to the top-level model dict).
+    """
+    providers = snapshot.get("providers") or {}
+
+    model_entries: list = []
+    provider_tokens: Dict[str, int] = {}
+    provider_cost: Dict[str, float] = {}
+    pricing_known = False
+    findings: list = []
+
+    total_input = 0
+    total_output = 0
+    total_cache_read = 0
+    total_cache_write = 0
+    any_input = any_output = any_cache_read = any_cache_write = False
+
+    for kind, provider in providers.items():
+        if not isinstance(provider, dict):
+            continue
+        if provider.get("status") == "not_found":
+            continue
+
+        ptokens = provider.get("tokens") or {}
+        if "inputTokens" in ptokens:
+            total_input += int(ptokens["inputTokens"] or 0); any_input = True
+        if "outputTokens" in ptokens:
+            total_output += int(ptokens["outputTokens"] or 0); any_output = True
+        if "cacheReadInputTokens" in ptokens:
+            total_cache_read += int(ptokens["cacheReadInputTokens"] or 0); any_cache_read = True
+        if "cacheCreationInputTokens" in ptokens:
+            total_cache_write += int(ptokens["cacheCreationInputTokens"] or 0); any_cache_write = True
+
+        models = provider.get("models") or {}
+        for model_name, model_data in models.items():
+            if not isinstance(model_data, dict):
+                continue
+            bucket = model_data.get(period) if period in model_data else model_data
+            if not isinstance(bucket, dict):
+                continue
+            i = int(bucket.get("inputTokens") or 0)
+            o = int(bucket.get("outputTokens") or 0)
+            cr = int(bucket.get("cacheReadInputTokens") or 0)
+            cw = int(bucket.get("cacheCreationInputTokens") or 0)
+            model_total = i + o + cr + cw
+            if model_total == 0:
+                continue
+
+            cost = estimate_cost(model_name, i, o, cr, cw)
+            if cost is None:
+                findings.append({
+                    "id": f"pricing_missing:{kind}:{model_name}",
+                    "severity": "info",
+                    "provider": kind,
+                    "title": "Pricing missing",
+                    "detail": f"No bundled price for {model_name}; cost shown as estimate-only",
+                })
+                cost_total = None
+            else:
+                cost_total = cost["total"]
+                provider_cost[kind] = provider_cost.get(kind, 0.0) + cost_total
+                pricing_known = True
+
+            provider_tokens[kind] = provider_tokens.get(kind, 0) + model_total
+            model_entries.append({
+                "name": model_name,
+                "provider": kind,
+                "tokens": model_total,
+                "estimated_cost_usd": cost_total,
+                "share_percent": 0.0,  # filled after totals known
+            })
+
+        # provider_no_limits finding
+        limits = provider.get("limits") or {}
+        has_quota = bool(limits.get("quotas")) or limits.get("weeklyTokens") is not None \
+                    or limits.get("monthlyTokens") is not None
+        if not has_quota and provider_tokens.get(kind, 0) > 0:
+            findings.append({
+                "id": f"provider_no_limits:{kind}",
+                "severity": "info",
+                "provider": kind,
+                "title": "Provider has no quota metadata",
+                "detail": f"{kind} reports usage but no quota limits; remaining capacity unknown",
+            })
+
+        # high_weekly_usage finding
+        used_pct = limits.get("weeklyUsedPercent")
+        if used_pct is not None:
+            try:
+                used_pct_f = float(used_pct)
+            except (TypeError, ValueError):
+                used_pct_f = None
+            if used_pct_f is not None and used_pct_f >= 80:
+                findings.append({
+                    "id": f"high_weekly_usage:{kind}",
+                    "severity": "high" if used_pct_f >= 95 else "medium",
+                    "provider": kind,
+                    "title": "High weekly usage",
+                    "detail": f"{kind} at {int(round(used_pct_f))}% of weekly limit",
+                })
+
+    # Normalize share %
+    total_tokens = sum(provider_tokens.values())
+    for entry in model_entries:
+        entry["share_percent"] = (entry["tokens"] / total_tokens * 100.0) if total_tokens > 0 else 0.0
+    model_entries.sort(key=lambda e: -e["tokens"])
+
+    # Provider summaries
+    provider_summaries = []
+    for kind in sorted(provider_tokens, key=lambda k: -provider_tokens[k]):
+        tokens = provider_tokens[kind]
+        if tokens == 0:
+            continue
+        provider_summaries.append({
+            "kind": kind,
+            "tokens": tokens,
+            "estimated_cost_usd": provider_cost.get(kind, 0.0),
+            "share_percent": (tokens / total_tokens * 100.0) if total_tokens > 0 else 0.0,
+        })
+
+    total_cost = sum(provider_cost.values())
+    top_provider = provider_summaries[0]["kind"] if provider_summaries else None
+    top_model = model_entries[0]["name"] if model_entries else None
+
+    cache_hit = None
+    if any_cache_read or any_input:
+        denom = total_cache_read + total_input
+        if denom > 0:
+            cache_hit = total_cache_read / denom * 100.0
+
+    findings.sort(key=lambda f: (_FINDING_SEVERITY_ORDER.get(f["severity"], 9), f["id"]))
+
+    return {
+        "summary": {
+            "total_tokens": total_tokens,
+            "estimated_cost_usd": total_cost,
+            "top_provider": top_provider,
+            "top_model": top_model,
+            "input_tokens": total_input if any_input else None,
+            "output_tokens": total_output if any_output else None,
+            "cache_read_tokens": total_cache_read if any_cache_read else None,
+            "cache_write_tokens": total_cache_write if any_cache_write else None,
+            "cache_hit_percent": cache_hit,
+        },
+        "providers": provider_summaries,
+        "models": model_entries,
+        "findings": findings,
+        "pricing_status": "ok" if pricing_known else "unknown",
+    }
+
+
 IGNORED_EXECUTABLES = {
     "awk",
     "bash",
@@ -2489,7 +2739,7 @@ def build_snapshot() -> Dict[str, Any]:
             runtime_limits_by_provider.get(provider, empty_limits()),
         )
     snapshot = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "connectorVersion": CONNECTOR_VERSION,
         "capabilities": list(CONNECTOR_CAPABILITIES),
         "generatedAt": now_iso(),
@@ -2499,6 +2749,14 @@ def build_snapshot() -> Dict[str, Any]:
             "latestByProvider": latest_by_provider,
         },
     }
+    # Slice C: embed pre-derived insights so clients (Mac/Windows) decode
+    # rather than re-derive. Failure here must NOT block the snapshot write —
+    # degrade to insights.status = error and let the client render fallback.
+    try:
+        derived = derive_insights(snapshot, period="week")
+        snapshot["insights"] = {"status": "ok", **derived}
+    except Exception as exc:
+        snapshot["insights"] = {"status": "error", "error": str(exc)}
     tmp_path = LATEST_SNAPSHOT.with_suffix(".json.tmp")
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(snapshot, fh, ensure_ascii=False, indent=2, sort_keys=True)
