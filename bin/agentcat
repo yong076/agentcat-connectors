@@ -50,13 +50,14 @@ LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_B
 LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
 LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.20.4")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.21.0")
 CONNECTOR_CAPABILITIES = (
     "snapshot.metadata",
     "activity.terminal",
     "activity.memory",
     "events.sqlite",
     "usage.dailyTokens",
+    "usage.hourlyTokens",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
     "limits.liveCache",
@@ -1687,6 +1688,7 @@ def empty_provider_usage(status: str = "not_found", source: Optional[str] = None
         "tokens": empty_periods(),
         "models": {},
         "dailyTokens": {},
+        "hourlyTokens": {},
     }
 
 
@@ -1711,11 +1713,34 @@ def day_key_for_timestamp(when: Optional[dt.datetime]) -> Optional[str]:
     return when.astimezone().date().isoformat()
 
 
+def hour_key_for_timestamp(when: Optional[dt.datetime]) -> Optional[str]:
+    """Hour-resolution bucket key.
+
+    Format ``YYYY-MM-DDTHH`` in the host's local timezone. Sortable as a
+    string so the Mac app can render a heatmap straight from the map
+    without re-parsing. Mirrors `day_key_for_timestamp` so the
+    add-to-bucket plumbing is symmetric.
+    """
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    local = when.astimezone()
+    return f"{local.date().isoformat()}T{local.hour:02d}"
+
+
 def add_to_daily(daily: Dict[str, int], amount: int, when: Optional[dt.datetime]) -> None:
     key = day_key_for_timestamp(when)
     if key is None:
         return
     daily[key] = daily.get(key, 0) + amount
+
+
+def add_to_hourly(hourly: Dict[str, int], amount: int, when: Optional[dt.datetime]) -> None:
+    key = hour_key_for_timestamp(when)
+    if key is None:
+        return
+    hourly[key] = hourly.get(key, 0) + amount
 
 
 def normalized_model_name(raw: Any) -> Optional[str]:
@@ -1759,6 +1784,7 @@ def add_usage_metrics(
     tokens = result.setdefault("tokens", empty_periods())
     models = result.setdefault("models", {})
     daily = result.setdefault("dailyTokens", {})
+    hourly = result.setdefault("hourlyTokens", {})
     model = normalized_model_name(model_raw) or "unknown"
     model_tokens = models.setdefault(model, {})
 
@@ -1773,6 +1799,7 @@ def add_usage_metrics(
     add_to_periods(tokens, total, when)
     add_to_periods(model_tokens, total, when)
     add_to_daily(daily, total, when)
+    add_to_hourly(hourly, total, when)
     return True
 
 
@@ -2121,6 +2148,7 @@ def codex_snapshot() -> Dict[str, Any]:
         "tokens": empty_periods(),
         "models": {},
         "dailyTokens": {},
+        "hourlyTokens": {},
     }
     if not paths:
         return result
@@ -2162,6 +2190,7 @@ def codex_snapshot() -> Dict[str, Any]:
         when = parse_timestamp(updated_raw)
         add_to_periods(result["tokens"], tokens, when)
         add_to_daily(result["dailyTokens"], tokens, when)
+        add_to_hourly(result["hourlyTokens"], tokens, when)
         model = normalized_model_name(model_raw)
         if model is None and rollout_raw:
             rollout_key = str(rollout_raw)
@@ -2188,6 +2217,12 @@ def claude_snapshot() -> Dict[str, Any]:
         "tokens": {},
         "models": {},
         "dailyTokens": {},
+        # Claude's stats-cache.json only carries daily granularity, so
+        # we cannot backfill historical hour buckets. The map stays
+        # empty here; live event hooks (claudeStatusline / claudeHooks)
+        # populate hourly buckets going forward via add_to_hourly when
+        # they fire.
+        "hourlyTokens": {},
     }
     if raw is None:
         return result
@@ -2252,6 +2287,7 @@ def gemini_snapshot() -> Dict[str, Any]:
         "tokens": {},
         "models": {},
         "dailyTokens": {},
+        "hourlyTokens": {},
         "events": 0,
     }
     if not GEMINI_TELEMETRY.exists():
@@ -2269,9 +2305,10 @@ def gemini_snapshot() -> Dict[str, Any]:
         tokens: Dict[str, int] = {}
         models: Dict[str, Dict[str, int]] = {}
         daily_tokens: Dict[str, int] = {}
+        hourly_tokens: Dict[str, int] = {}
         try:
             text = read_recent_gemini_telemetry(stat.st_size)
-            tokens, models, daily_tokens, events = parse_gemini_telemetry(text)
+            tokens, models, daily_tokens, hourly_tokens, events = parse_gemini_telemetry(text)
         except Exception as exc:
             result["status"] = "error"
             result["error"] = str(exc)
@@ -2281,6 +2318,7 @@ def gemini_snapshot() -> Dict[str, Any]:
         result["tokens"] = tokens
         result["models"] = models
         result["dailyTokens"] = daily_tokens
+        result["hourlyTokens"] = hourly_tokens
         result["events"] = events
         _GEMINI_CACHE_KEY = cache_key
         _GEMINI_CACHE_VALUE = copy.deepcopy(result)
@@ -2411,7 +2449,7 @@ def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tup
     return records
 
 
-def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]], Dict[str, int], int]:
+def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]], Dict[str, int], Dict[str, int], int]:
     records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime]]] = []
     for payload in iter_json_objects(text):
         records.extend(gemini_metric_records(payload, "gemini_cli.token.usage"))
@@ -2429,6 +2467,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
     tokens: Dict[str, int] = {}
     models: Dict[str, Dict[str, int]] = {}
     daily_tokens: Dict[str, int] = {}
+    hourly_tokens: Dict[str, int] = {}
     periods = empty_periods()
     for token_key, model, amount, when in by_identity.values():
         tokens[token_key] = tokens.get(token_key, 0) + amount
@@ -2437,6 +2476,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
         add_to_periods(model_tokens, amount, when)
         add_to_periods(periods, amount, when)
         add_to_daily(daily_tokens, amount, when)
+        add_to_hourly(hourly_tokens, amount, when)
 
     total = sum(tokens.values())
     if total > 0:
@@ -2444,7 +2484,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
         for key, amount in periods.items():
             if amount > 0:
                 tokens[key] = amount
-    return tokens, models, daily_tokens, len(by_identity)
+    return tokens, models, daily_tokens, hourly_tokens, len(by_identity)
 
 
 def command_parts(command: str) -> List[str]:
@@ -2739,7 +2779,7 @@ def build_snapshot() -> Dict[str, Any]:
             runtime_limits_by_provider.get(provider, empty_limits()),
         )
     snapshot = {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "connectorVersion": CONNECTOR_VERSION,
         "capabilities": list(CONNECTOR_CAPABILITIES),
         "generatedAt": now_iso(),

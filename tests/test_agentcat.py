@@ -234,11 +234,12 @@ class AgentCatConnectorTests(unittest.TestCase):
     def test_snapshot_exposes_connector_metadata_and_capabilities(self) -> None:
         snapshot = agentcat.build_snapshot()
 
-        self.assertEqual(snapshot["schemaVersion"], 3)
+        self.assertEqual(snapshot["schemaVersion"], 4)
         self.assertEqual(snapshot["connectorVersion"], agentcat.CONNECTOR_VERSION)
         self.assertIn("activity.memory", snapshot["capabilities"])
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
+        self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
 
     def test_codex_runtime_limits_reads_latest_token_count_event(self) -> None:
         session_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "05" / "06"
@@ -302,6 +303,16 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["week"], 30)
         self.assertEqual(snapshot["tokens"]["month"], 60)
         self.assertEqual(snapshot["tokens"]["all"], 100)
+
+        # PR-A: hourly buckets emitted next to dailyTokens. Sum of all
+        # buckets must match the all-time total.
+        hourly = snapshot.get("hourlyTokens", {})
+        self.assertIsInstance(hourly, dict)
+        self.assertGreater(len(hourly), 0)
+        self.assertEqual(sum(hourly.values()), 100)
+        # Keys are sortable YYYY-MM-DDTHH strings.
+        for key in hourly:
+            self.assertRegex(key, r"^\d{4}-\d{2}-\d{2}T\d{2}$")
 
     def test_codex_snapshot_infers_missing_model_from_rollout_metadata(self) -> None:
         codex_dir = agentcat.HOME / ".codex"
@@ -714,7 +725,7 @@ class InsightsIntegrationTests(unittest.TestCase):
         for p in patches:
             p.stop()
 
-    def test_build_snapshot_schema_version_is_3(self) -> None:
+    def test_build_snapshot_schema_version_is_4(self) -> None:
         patches = self._stub_providers({
             "codex": {"status": "ok", "tokens": {}, "models": {}},
             "claude": {"status": "ok", "tokens": {}, "models": {}},
@@ -725,7 +736,7 @@ class InsightsIntegrationTests(unittest.TestCase):
         try:
             with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
                 snap = agentcat.build_snapshot()
-            self.assertEqual(snap["schemaVersion"], 3)
+            self.assertEqual(snap["schemaVersion"], 4)
         finally:
             self._stop(patches)
 
