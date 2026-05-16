@@ -22,6 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
+import ssl
 
 
 HOME = Path(os.environ.get("HOME") or str(Path.home())).expanduser().resolve()
@@ -33,6 +34,7 @@ LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 LIVE_LIMITS_CACHE = AGENTCAT_HOME / "live-limits-cache.json"
+INSIGHTS_PLAN_FILE = AGENTCAT_HOME / "insights-plan.json"
 CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/codex/usage",
     "https://chatgpt.com/backend-api/wham/usage",
@@ -59,6 +61,25 @@ CONNECTOR_CAPABILITIES = (
     "usage.dailyTokens",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
+    "usage.codeburnProviderAdapters",
+    "usage.cursor.sqlite",
+    "usage.cursorAgent.transcripts",
+    "usage.qwen.localLogs",
+    "usage.pi.localLogs",
+    "usage.omp.localLogs",
+    "usage.clineFamily.localLogs",
+    "usage.kiro.localLogs",
+    "usage.goose.sqlite",
+    "usage.crush.sqlite",
+    "usage.droid.localLogs",
+    "usage.openclaw.localLogs",
+    "usage.antigravity.localRpc",
+    "usage.analytics.report",
+    "usage.analytics.insights",
+    "usage.analytics.models",
+    "usage.analytics.compare",
+    "usage.analytics.optimize",
+    "usage.analytics.planRoi",
     "limits.liveCache",
     "limits.errorBackoff",
     "limits.quotaFallbackOn429",
@@ -131,6 +152,28 @@ IGNORED_EXECUTABLES = {
     "python.exe",
     "python3.exe",
 }
+
+PROVIDER_KEYS = (
+    "codex",
+    "claude",
+    "gemini",
+    "opencode",
+    "copilot",
+    "antigravity",
+    "crush",
+    "cursor",
+    "cursor-agent",
+    "droid",
+    "goose",
+    "ibm-bob",
+    "kilo-code",
+    "kiro",
+    "openclaw",
+    "pi",
+    "omp",
+    "qwen",
+    "roo-code",
+)
 
 SENSITIVE_KEY_PARTS = (
     "prompt",
@@ -556,7 +599,7 @@ def merge_limits(configured: Dict[str, Any], detected: Dict[str, Any]) -> Dict[s
 
 
 def configured_limits() -> Dict[str, Dict[str, Any]]:
-    base = {provider: empty_limits() for provider in ("codex", "claude", "gemini")}
+    base = {provider: empty_limits() for provider in PROVIDER_KEYS}
     raw = read_json(LIMITS_FILE)
     if raw is None:
         return base
@@ -1430,13 +1473,19 @@ def empty_periods() -> Dict[str, int]:
     return {"today": 0, "week": 0, "month": 0, "all": 0}
 
 
-def empty_provider_usage(status: str = "not_found", source: Optional[str] = None) -> Dict[str, Any]:
+def empty_provider_usage(
+    status: str = "not_found",
+    source: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> Dict[str, Any]:
     return {
         "status": status,
         "source": source,
         "tokens": empty_periods(),
         "models": {},
         "dailyTokens": {},
+        "_provider": provider or "unknown",
+        "_usageCalls": [],
     }
 
 
@@ -1489,6 +1538,74 @@ TOKEN_TOTAL_PART_KEYS = {
 }
 
 
+MODEL_PRICING_PER_MILLION_USD = {
+    "gpt-5": 5.0,
+    "gpt-5-mini": 1.2,
+    "gpt-5.5": 6.0,
+    "gpt-5.5-mini": 1.5,
+    "o3": 8.0,
+    "o3-mini": 1.2,
+    "o4-mini": 1.6,
+    "claude-opus-4-5": 18.0,
+    "claude-opus-4-6": 18.0,
+    "claude-opus-4-7": 18.0,
+    "claude-sonnet-4-5": 5.0,
+    "claude-sonnet-4-6": 5.0,
+    "claude-haiku-4-5": 1.2,
+    "gemini-2.5-pro": 4.0,
+    "gemini-2.5-flash": 0.6,
+    "gemini-3-pro": 6.0,
+    "gemini-3-flash": 0.8,
+}
+
+MODEL_ALIASES = {
+    "cursor-auto": "claude-sonnet-4-5",
+    "cursor-agent-auto": "claude-sonnet-4-5",
+    "copilot-auto": "claude-sonnet-4-5",
+    "copilot-openai-auto": "gpt-5",
+    "copilot-anthropic-auto": "claude-sonnet-4-5",
+    "ibm-bob-auto": "claude-sonnet-4-5",
+    "kiro-auto": "claude-sonnet-4-5",
+    "cline-auto": "claude-sonnet-4-5",
+    "openclaw-auto": "claude-sonnet-4-5",
+    "qwen-auto": "claude-sonnet-4-5",
+    "droid-auto": "claude-sonnet-4-5",
+    "antigravity-auto": "gemini-3-pro",
+    "anthropic/claude-sonnet-4-6": "claude-sonnet-4-6",
+    "anthropic/claude-sonnet-4-5": "claude-sonnet-4-5",
+    "anthropic/claude-opus-4-7": "claude-opus-4-7",
+    "anthropic/claude-opus-4-6": "claude-opus-4-6",
+    "gpt-5.3-codex": "gpt-5",
+    "gpt-5.3": "gpt-5",
+    "gpt-5.4": "gpt-5.5",
+    "gpt-5.4-mini": "gpt-5.5-mini",
+    "gemini-3-pro-preview": "gemini-3-pro",
+    "gemini-3-flash-preview": "gemini-3-flash",
+    "gemini-3.1-pro": "gemini-3-pro",
+    "gemini-3.1-pro-preview": "gemini-3-pro",
+}
+
+CATEGORY_LABELS = {
+    "coding": "Coding",
+    "debugging": "Debugging",
+    "feature": "Feature Dev",
+    "refactoring": "Refactoring",
+    "testing": "Testing",
+    "exploration": "Exploration",
+    "planning": "Planning",
+    "delegation": "Delegation",
+    "git": "Git Ops",
+    "build/deploy": "Build/Deploy",
+    "conversation": "Conversation",
+    "brainstorming": "Brainstorming",
+    "general": "General",
+}
+
+EDIT_TOOLS = {"Edit", "Write", "FileEditTool", "FileWriteTool", "NotebookEdit", "cursor:edit"}
+READ_TOOLS = {"Read", "Grep", "Glob", "FileReadTool", "GrepTool", "GlobTool"}
+PLANNING_TOOLS = {"TaskCreate", "TaskUpdate", "TodoWrite", "EnterPlanMode", "ExitPlanMode"}
+
+
 def usage_token_total(metrics: Dict[str, int]) -> int:
     total = int(metrics.get("totalTokens") or 0)
     if total > 0:
@@ -1501,6 +1618,13 @@ def add_usage_metrics(
     model_raw: Any,
     metrics: Dict[str, int],
     when: Optional[dt.datetime],
+    *,
+    provider: Optional[str] = None,
+    project: Optional[str] = None,
+    session_id: Optional[str] = None,
+    source: Optional[str] = None,
+    tools: Optional[List[str]] = None,
+    bash_commands: Optional[List[str]] = None,
 ) -> bool:
     total = usage_token_total(metrics)
     if total <= 0:
@@ -1523,6 +1647,34 @@ def add_usage_metrics(
     add_to_periods(tokens, total, when)
     add_to_periods(model_tokens, total, when)
     add_to_daily(daily, total, when)
+    call_metrics = {
+        key: int(metrics.get(key) or 0)
+        for key in (
+            "inputTokens",
+            "outputTokens",
+            "cacheReadInputTokens",
+            "cacheCreationInputTokens",
+            "cachedInputTokens",
+            "reasoningTokens",
+            "thoughtTokens",
+            "toolTokens",
+        )
+        if int(metrics.get(key) or 0) > 0
+    }
+    call_metrics["totalTokens"] = total
+    result.setdefault("_usageCalls", []).append(
+        {
+            "provider": provider or result.get("_provider") or "unknown",
+            "project": project or result.get("_project") or provider or result.get("_provider") or "local",
+            "sessionId": session_id or result.get("_sessionId") or "",
+            "model": model,
+            "timestamp": when.isoformat().replace("+00:00", "Z") if when else "",
+            "source": source or result.get("source"),
+            "metrics": call_metrics,
+            "tools": list(tools or []),
+            "bashCommands": list(bash_commands or []),
+        }
+    )
     return True
 
 
@@ -1624,7 +1776,7 @@ def opencode_message_metrics(data: Dict[str, Any]) -> Dict[str, int]:
 
 def opencode_snapshot() -> Dict[str, Any]:
     data_dir = opencode_data_dir()
-    result = empty_provider_usage(source=str(data_dir))
+    result = empty_provider_usage(source=str(data_dir), provider="opencode")
     if not data_dir.exists():
         return result
 
@@ -1642,7 +1794,7 @@ def opencode_snapshot() -> Dict[str, Any]:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             rows = conn.execute(
                 """
-                select message.time_created, message.data
+                select message.time_created, message.data, message.session_id, session.directory, session.title
                 from message
                 left join session on session.id = message.session_id
                 where (session.time_archived is null or session.id is null)
@@ -1660,7 +1812,7 @@ def opencode_snapshot() -> Dict[str, Any]:
                 except Exception:
                     pass
 
-        for created_raw, data_raw in rows:
+        for created_raw, data_raw, session_id, directory, title in rows:
             try:
                 data = json.loads(data_raw.decode("utf-8", errors="replace") if isinstance(data_raw, bytes) else str(data_raw))
             except Exception:
@@ -1668,7 +1820,14 @@ def opencode_snapshot() -> Dict[str, Any]:
             if not isinstance(data, dict) or data.get("role") != "assistant":
                 continue
             metrics = opencode_message_metrics(data)
-            if add_usage_metrics(result, data.get("modelID"), metrics, parse_timestamp(created_raw)):
+            if add_usage_metrics(
+                result,
+                data.get("modelID"),
+                metrics,
+                parse_timestamp(created_raw),
+                project=str(title or Path(str(directory or "")).name or "opencode"),
+                session_id=str(session_id or ""),
+            ):
                 events += 1
 
     if events == 0 and errors:
@@ -1795,7 +1954,14 @@ def infer_copilot_transcript_model(events: List[Dict[str, Any]]) -> str:
 def char_token_estimate(text: Any) -> int:
     if not isinstance(text, str) or not text:
         return 0
-    return max(1, int((len(text) + 3) / 4))
+    return char_token_estimate_for_length(len(text))
+
+
+def char_token_estimate_for_length(length: Any) -> int:
+    amount = nonnegative_int(length) or 0
+    if amount <= 0:
+        return 0
+    return max(1, int((amount + 3) / 4))
 
 
 def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
@@ -1842,7 +2008,7 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
 def copilot_snapshot() -> Dict[str, Any]:
     legacy_files = recent_files(copilot_legacy_event_files())
     transcript_files = recent_files(copilot_vscode_transcript_files())
-    result = empty_provider_usage(source="~/.copilot/session-state, VS Code workspaceStorage")
+    result = empty_provider_usage(source="~/.copilot/session-state, VS Code workspaceStorage", provider="copilot")
     if not legacy_files and not transcript_files:
         return result
 
@@ -1861,6 +2027,783 @@ def copilot_snapshot() -> Dict[str, Any]:
     if events == 0:
         result["status"] = "no_token_events_yet"
     return result
+
+
+def safe_file_mtime(path: Path) -> Optional[dt.datetime]:
+    try:
+        return dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+    except OSError:
+        return None
+
+
+def recent_candidate_files(paths: Iterable[Path]) -> List[Path]:
+    return recent_files([path for path in paths if path.is_file()])
+
+
+def finish_local_usage_snapshot(result: Dict[str, Any], events: int, *, sources_seen: bool) -> Dict[str, Any]:
+    result["events"] = events
+    if events > 0:
+        result["status"] = "ok"
+    elif sources_seen:
+        result["status"] = "no_token_events_yet"
+    return result
+
+
+def vscode_global_storage_dirs(app_names: Iterable[str], extension_id: str) -> List[Path]:
+    dirs: List[Path] = []
+    for app_name in app_names:
+        if IS_WINDOWS:
+            dirs.append(HOME / "AppData" / "Roaming" / app_name / "User" / "globalStorage" / extension_id)
+        elif sys.platform == "darwin":
+            dirs.append(HOME / "Library" / "Application Support" / app_name / "User" / "globalStorage" / extension_id)
+        else:
+            dirs.append(HOME / ".config" / app_name / "User" / "globalStorage" / extension_id)
+    return dirs
+
+
+def extract_model_from_conversation_history(task_dir: Path, fallback_model: str) -> str:
+    raw = read_json(task_dir / "api_conversation_history.json")
+    if not isinstance(raw, list):
+        return fallback_model
+    model_re = re.compile(r"<model>([^<]+)</model>")
+    for item in raw:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                continue
+            match = model_re.search(block["text"])
+            if match:
+                model = match.group(1)
+                return model.split("/")[-1] if "/" in model else model
+    return fallback_model
+
+
+def parse_cline_task(task_dir: Path, provider: str, fallback_model: str, result: Dict[str, Any]) -> int:
+    raw = read_json(task_dir / "ui_messages.json")
+    if not isinstance(raw, list):
+        return 0
+    model = extract_model_from_conversation_history(task_dir, fallback_model)
+    events = 0
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "say" or item.get("say") != "api_req_started":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        metrics = {
+            "inputTokens": nonnegative_int(parsed.get("tokensIn")) or 0,
+            "outputTokens": nonnegative_int(parsed.get("tokensOut")) or 0,
+            "cacheReadInputTokens": nonnegative_int(parsed.get("cacheReads")) or 0,
+            "cacheCreationInputTokens": nonnegative_int(parsed.get("cacheWrites")) or 0,
+        }
+        when = parse_timestamp(item.get("ts")) or safe_file_mtime(task_dir / "ui_messages.json")
+        if add_usage_metrics(result, model, metrics, when, project=task_dir.parent.name, session_id=task_dir.name):
+            events += 1
+    return events
+
+
+def cline_family_snapshot(
+    provider: str,
+    extension_id: str,
+    fallback_model: str,
+    app_names: Iterable[str] = ("Code", "Code - Insiders"),
+    extra_base_dirs: Iterable[Path] = (),
+) -> Dict[str, Any]:
+    base_dirs = [*vscode_global_storage_dirs(app_names, extension_id), *extra_base_dirs]
+    result = empty_provider_usage(source=",".join(str(path) for path in base_dirs), provider=provider)
+    events = 0
+    sources_seen = False
+    for base_dir in base_dirs:
+        tasks_dir = base_dir / "tasks"
+        try:
+            task_dirs = [path for path in tasks_dir.iterdir() if path.is_dir()]
+        except OSError:
+            continue
+        for task_dir in recent_files(task_dirs):
+            if not (task_dir / "ui_messages.json").is_file():
+                continue
+            sources_seen = True
+            events += parse_cline_task(task_dir, provider, fallback_model, result)
+    return finish_local_usage_snapshot(result, events, sources_seen=sources_seen)
+
+
+def roo_code_snapshot() -> Dict[str, Any]:
+    return cline_family_snapshot("roo-code", "rooveterinaryinc.roo-cline", "cline-auto")
+
+
+def kilo_code_snapshot() -> Dict[str, Any]:
+    return cline_family_snapshot("kilo-code", "kilocode.kilo-code", "cline-auto")
+
+
+def ibm_bob_snapshot() -> Dict[str, Any]:
+    extra_dirs = []
+    if sys.platform == "darwin":
+        extra_dirs = [
+            HOME / "Library" / "Application Support" / "IBM Bob" / "User" / "globalStorage" / "ibm.bob-code",
+            HOME / "Library" / "Application Support" / "Bob-IDE" / "User" / "globalStorage" / "ibm.bob-code",
+        ]
+    elif IS_WINDOWS:
+        extra_dirs = [
+            HOME / "AppData" / "Roaming" / "IBM Bob" / "User" / "globalStorage" / "ibm.bob-code",
+            HOME / "AppData" / "Roaming" / "Bob-IDE" / "User" / "globalStorage" / "ibm.bob-code",
+        ]
+    else:
+        extra_dirs = [
+            HOME / ".config" / "IBM Bob" / "User" / "globalStorage" / "ibm.bob-code",
+            HOME / ".config" / "Bob-IDE" / "User" / "globalStorage" / "ibm.bob-code",
+        ]
+    return cline_family_snapshot("ibm-bob", "ibm.bob-code", "ibm-bob-auto", extra_base_dirs=extra_dirs)
+
+
+def qwen_project_dirs() -> List[Path]:
+    base = Path(os.environ.get("QWEN_DATA_DIR") or str(HOME / ".qwen" / "projects")).expanduser()
+    try:
+        return [path for path in base.iterdir() if path.is_dir()]
+    except OSError:
+        return []
+
+
+def qwen_snapshot() -> Dict[str, Any]:
+    source = Path(os.environ.get("QWEN_DATA_DIR") or str(HOME / ".qwen" / "projects")).expanduser()
+    result = empty_provider_usage(source=str(source), provider="qwen")
+    files: List[Path] = []
+    for project_dir in qwen_project_dirs():
+        chats = project_dir / "chats"
+        try:
+            files.extend(path for path in chats.iterdir() if path.is_file() and path.suffix == ".jsonl")
+        except OSError:
+            continue
+    files = recent_candidate_files(files)
+    events = 0
+    for path in files:
+        file_when = safe_file_mtime(path)
+        for entry in iter_jsonl_file(path):
+            if entry.get("type") != "assistant":
+                continue
+            usage = entry.get("usageMetadata")
+            if not isinstance(usage, dict):
+                continue
+            metrics = {
+                "inputTokens": nonnegative_int(usage.get("promptTokenCount")) or 0,
+                "outputTokens": nonnegative_int(usage.get("candidatesTokenCount")) or 0,
+                "reasoningTokens": nonnegative_int(usage.get("thoughtsTokenCount")) or 0,
+                "cacheReadInputTokens": nonnegative_int(usage.get("cachedContentTokenCount")) or 0,
+            }
+            if add_usage_metrics(
+                result,
+                entry.get("model") or "qwen-auto",
+                metrics,
+                parse_timestamp(entry.get("timestamp")) or file_when,
+                project=path.parent.parent.name,
+                session_id=str(entry.get("sessionId") or path.stem),
+            ):
+                events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
+def pi_like_snapshot(provider: str, base: Path, default_model: str = "gpt-5") -> Dict[str, Any]:
+    sessions_dir = base / "agent" / "sessions"
+    result = empty_provider_usage(source=str(sessions_dir), provider=provider)
+    files: List[Path] = []
+    try:
+        project_dirs = [path for path in sessions_dir.iterdir() if path.is_dir()]
+    except OSError:
+        project_dirs = []
+    for project_dir in project_dirs:
+        try:
+            files.extend(path for path in project_dir.iterdir() if path.is_file() and path.suffix == ".jsonl")
+        except OSError:
+            continue
+    files = recent_candidate_files(files)
+    events = 0
+    for path in files:
+        file_when = safe_file_mtime(path)
+        for entry in iter_jsonl_file(path):
+            if entry.get("type") != "message":
+                continue
+            message = entry.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            metrics = {
+                "inputTokens": nonnegative_int(usage.get("input")) or 0,
+                "outputTokens": nonnegative_int(usage.get("output")) or 0,
+                "cacheReadInputTokens": nonnegative_int(usage.get("cacheRead")) or 0,
+                "cacheCreationInputTokens": nonnegative_int(usage.get("cacheWrite")) or 0,
+            }
+            if add_usage_metrics(
+                result,
+                message.get("model") or default_model,
+                metrics,
+                parse_timestamp(entry.get("timestamp")) or file_when,
+                project=path.parent.name,
+                session_id=path.stem,
+            ):
+                events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
+def pi_snapshot() -> Dict[str, Any]:
+    return pi_like_snapshot("pi", HOME / ".pi")
+
+
+def omp_snapshot() -> Dict[str, Any]:
+    return pi_like_snapshot("omp", HOME / ".omp")
+
+
+def droid_session_files(factory_dir: Path) -> List[Path]:
+    sessions_dir = factory_dir / "sessions"
+    files: List[Path] = []
+    try:
+        project_dirs = [path for path in sessions_dir.iterdir() if path.is_dir()]
+    except OSError:
+        return files
+    for project_dir in project_dirs:
+        try:
+            files.extend(path for path in project_dir.iterdir() if path.is_file() and path.suffix == ".jsonl")
+        except OSError:
+            continue
+    return recent_candidate_files(files)
+
+
+def droid_snapshot() -> Dict[str, Any]:
+    factory_dir = Path(os.environ.get("FACTORY_DIR") or str(HOME / ".factory")).expanduser()
+    result = empty_provider_usage(source=str(factory_dir / "sessions"), provider="droid")
+    files = droid_session_files(factory_dir)
+    events = 0
+    for path in files:
+        settings = read_json(path.with_suffix(".settings.json"))
+        if not isinstance(settings, dict):
+            continue
+        usage = settings.get("tokenUsage")
+        if not isinstance(usage, dict):
+            continue
+        metrics = {
+            "inputTokens": nonnegative_int(usage.get("inputTokens")) or 0,
+            "outputTokens": nonnegative_int(usage.get("outputTokens")) or 0,
+            "cacheCreationInputTokens": nonnegative_int(usage.get("cacheCreationTokens")) or 0,
+            "cacheReadInputTokens": nonnegative_int(usage.get("cacheReadTokens")) or 0,
+            "reasoningTokens": nonnegative_int(usage.get("thinkingTokens")) or 0,
+        }
+        when = safe_file_mtime(path)
+        for entry in iter_jsonl_file(path):
+            if entry.get("type") == "session_start":
+                when = parse_timestamp(entry.get("timestamp")) or when
+                break
+        if add_usage_metrics(result, settings.get("model") or "droid-auto", metrics, when, project=path.parent.name, session_id=path.stem):
+            events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
+def openclaw_dirs() -> List[Path]:
+    return [
+        HOME / ".openclaw" / "agents",
+        HOME / ".clawdbot" / "agents",
+        HOME / ".moltbot" / "agents",
+        HOME / ".moldbot" / "agents",
+    ]
+
+
+def openclaw_session_files() -> List[Path]:
+    files: List[Path] = []
+    for agents_dir in openclaw_dirs():
+        try:
+            agent_dirs = [path for path in agents_dir.iterdir() if path.is_dir()]
+        except OSError:
+            continue
+        for agent_dir in agent_dirs:
+            sessions_dir = agent_dir / "sessions"
+            index = read_json(sessions_dir / "sessions.json")
+            if isinstance(index, dict):
+                for item in index.values():
+                    if not isinstance(item, dict):
+                        continue
+                    session_file = item.get("sessionFile")
+                    session_id = item.get("sessionId")
+                    if isinstance(session_file, str):
+                        files.append(Path(session_file).expanduser())
+                    elif isinstance(session_id, str):
+                        files.append(sessions_dir / f"{session_id}.jsonl")
+            try:
+                files.extend(path for path in sessions_dir.iterdir() if path.is_file() and path.suffix == ".jsonl")
+            except OSError:
+                continue
+    seen: Dict[str, Path] = {}
+    for path in files:
+        seen[str(path)] = path
+    return recent_candidate_files(seen.values())
+
+
+def openclaw_usage_metrics(usage: Dict[str, Any]) -> Dict[str, int]:
+    return {
+        "inputTokens": nonnegative_int(usage.get("input")) or 0,
+        "outputTokens": nonnegative_int(usage.get("output")) or 0,
+        "cacheReadInputTokens": nonnegative_int(usage.get("cacheRead")) or 0,
+        "cacheCreationInputTokens": nonnegative_int(usage.get("cacheWrite")) or 0,
+    }
+
+
+def openclaw_snapshot() -> Dict[str, Any]:
+    result = empty_provider_usage(source=",".join(str(path) for path in openclaw_dirs()), provider="openclaw")
+    files = openclaw_session_files()
+    events = 0
+    for path in files:
+        current_model = "openclaw-auto"
+        file_when = safe_file_mtime(path)
+        for entry in iter_jsonl_file(path):
+            if entry.get("type") == "model_change":
+                current_model = normalized_model_name(entry.get("modelId")) or current_model
+                continue
+            if entry.get("type") == "custom" and entry.get("customType") == "model-snapshot":
+                data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+                current_model = normalized_model_name(data.get("modelId")) or current_model
+                continue
+            if entry.get("type") != "message":
+                continue
+            message = entry.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            model = normalized_model_name(message.get("model")) or current_model
+            if add_usage_metrics(
+                result,
+                model,
+                openclaw_usage_metrics(usage),
+                parse_timestamp(entry.get("timestamp")) or file_when,
+                project=path.parent.parent.name if path.parent.name == "sessions" else path.parent.name,
+                session_id=path.stem,
+            ):
+                events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
+def goose_db_path() -> Path:
+    root = os.environ.get("GOOSE_PATH_ROOT")
+    if root:
+        return Path(root).expanduser() / "data" / "sessions" / "sessions.db"
+    if IS_WINDOWS:
+        return HOME / "AppData" / "Roaming" / "Block" / "goose" / "sessions" / "sessions.db"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg).expanduser() if xdg else HOME / ".local" / "share"
+    return base / "goose" / "sessions" / "sessions.db"
+
+
+def goose_snapshot() -> Dict[str, Any]:
+    db_path = goose_db_path()
+    result = empty_provider_usage(source=str(db_path), provider="goose")
+    if not db_path.is_file():
+        return result
+    events = 0
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+            rows = conn.execute(
+                """
+                select id, created_at, updated_at, accumulated_input_tokens,
+                       accumulated_output_tokens, model_config_json
+                from sessions
+                where coalesce(accumulated_input_tokens, 0) > 0
+                   or coalesce(accumulated_output_tokens, 0) > 0
+                order by updated_at desc
+                limit ?
+                """,
+                (LOCAL_PROVIDER_MAX_FILES,),
+            ).fetchall()
+            for session_id, created_at, updated_at, input_tokens, output_tokens, model_config_raw in rows:
+                model = "unknown"
+                if model_config_raw:
+                    try:
+                        model_config = json.loads(model_config_raw.decode("utf-8", errors="replace") if isinstance(model_config_raw, bytes) else str(model_config_raw))
+                        if isinstance(model_config, dict):
+                            model = normalized_model_name(model_config.get("model_name")) or model
+                    except Exception:
+                        pass
+                metrics = {
+                    "inputTokens": nonnegative_int(input_tokens) or 0,
+                    "outputTokens": nonnegative_int(output_tokens) or 0,
+                }
+                if add_usage_metrics(result, model, metrics, parse_timestamp(updated_at) or parse_timestamp(created_at), project="goose", session_id=str(session_id or "")):
+                    events += 1
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+    return finish_local_usage_snapshot(result, events, sources_seen=True)
+
+
+def crush_registry_path() -> Path:
+    explicit = os.environ.get("CRUSH_GLOBAL_DATA")
+    if explicit:
+        return Path(explicit).expanduser() / "projects.json"
+    if IS_WINDOWS:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data).expanduser() if local_app_data else HOME / "AppData" / "Local"
+        return base / "crush" / "projects.json"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg).expanduser() if xdg else HOME / ".local" / "share"
+    return base / "crush" / "projects.json"
+
+
+def crush_project_entries() -> List[Dict[str, str]]:
+    raw = read_json(crush_registry_path())
+    items: Iterable[Any]
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict) and not raw.get("_agentcat_error"):
+        items = raw.values()
+    else:
+        return []
+    out: List[Dict[str, str]] = []
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("path"), str) and isinstance(item.get("data_dir"), str):
+            out.append({"path": item["path"], "data_dir": item["data_dir"]})
+    return out
+
+
+def crush_snapshot() -> Dict[str, Any]:
+    registry = crush_registry_path()
+    result = empty_provider_usage(source=str(registry), provider="crush")
+    entries = crush_project_entries()
+    events = 0
+    saw_sources = False
+    for entry in entries[:LOCAL_PROVIDER_MAX_FILES]:
+        db_path = (Path(entry["path"]).expanduser() / entry["data_dir"] / "crush.db").resolve()
+        if not db_path.is_file():
+            continue
+        saw_sources = True
+        try:
+            with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+                rows = conn.execute(
+                    """
+                    select s.id, s.prompt_tokens, s.completion_tokens, s.created_at, s.updated_at,
+                           (select m.model from messages m
+                            where m.session_id = s.id and m.model is not null and m.model <> ''
+                            group by m.model order by count(*) desc limit 1) as model
+                    from sessions s
+                    where s.parent_session_id is null
+                      and (coalesce(s.prompt_tokens, 0) > 0 or coalesce(s.completion_tokens, 0) > 0)
+                    order by coalesce(s.updated_at, s.created_at) desc
+                    limit ?
+                    """,
+                    (LOCAL_PROVIDER_MAX_FILES,),
+                ).fetchall()
+                for session_id, input_tokens, output_tokens, created_at, updated_at, model in rows:
+                    when = parse_timestamp(updated_at) or parse_timestamp(created_at)
+                    if add_usage_metrics(
+                        result,
+                        normalized_model_name(model) or "unknown",
+                        {"inputTokens": nonnegative_int(input_tokens) or 0, "outputTokens": nonnegative_int(output_tokens) or 0},
+                        when,
+                        project=Path(entry["path"]).expanduser().name,
+                        session_id=str(session_id or ""),
+                    ):
+                        events += 1
+        except Exception as exc:
+            result.setdefault("warnings", []).append(f"{db_path.name}: {exc}")
+    return finish_local_usage_snapshot(result, events, sources_seen=saw_sources)
+
+
+def cursor_db_path() -> Path:
+    if IS_WINDOWS:
+        return HOME / "AppData" / "Roaming" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    if sys.platform == "darwin":
+        return HOME / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    return HOME / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+
+
+def cursor_snapshot() -> Dict[str, Any]:
+    db_path = cursor_db_path()
+    result = empty_provider_usage(source=str(db_path), provider="cursor")
+    if not db_path.is_file():
+        return result
+    events = 0
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+            rows = conn.execute(
+                """
+                select
+                  json_extract(value, '$.tokenCount.inputTokens') as input_tokens,
+                  json_extract(value, '$.tokenCount.outputTokens') as output_tokens,
+                  json_extract(value, '$.modelInfo.modelName') as model,
+                  json_extract(value, '$.createdAt') as created_at,
+                  length(json_extract(value, '$.text')) as text_length,
+                  json_extract(value, '$.type') as bubble_type
+                from cursorDiskKV
+                where key like 'bubbleId:%'
+                  and json_extract(value, '$.createdAt') is not null
+                order by rowid desc
+                limit ?
+                """,
+                (LOCAL_PROVIDER_MAX_FILES,),
+            ).fetchall()
+            for input_tokens, output_tokens, model, created_at, text_length, bubble_type in rows:
+                input_count = nonnegative_int(input_tokens) or 0
+                output_count = nonnegative_int(output_tokens) or 0
+                if input_count == 0 and output_count == 0:
+                    estimate = char_token_estimate_for_length(text_length)
+                    if bubble_type == 1:
+                        input_count = estimate
+                    else:
+                        output_count = estimate
+                if add_usage_metrics(
+                    result,
+                    normalized_model_name(model) or "cursor-auto",
+                    {"inputTokens": input_count, "outputTokens": output_count},
+                    parse_timestamp(created_at),
+                ):
+                    events += 1
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+    if events >= LOCAL_PROVIDER_MAX_FILES:
+        result["truncated"] = True
+    return finish_local_usage_snapshot(result, events, sources_seen=True)
+
+
+def cursor_agent_projects_dir() -> Path:
+    return HOME / ".cursor" / "projects"
+
+
+def cursor_agent_transcript_files() -> List[Path]:
+    root = cursor_agent_projects_dir()
+    files: List[Path] = []
+    try:
+        project_dirs = [path for path in root.iterdir() if path.is_dir()]
+    except OSError:
+        return files
+    for project_dir in project_dirs:
+        transcript_dir = project_dir / "agent-transcripts"
+        try:
+            entries = list(transcript_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_file() and entry.suffix in {".txt", ".jsonl"}:
+                files.append(entry)
+            elif entry.is_dir():
+                try:
+                    files.extend(path for path in entry.rglob("*") if path.is_file() and path.suffix in {".txt", ".jsonl"})
+                except OSError:
+                    continue
+    return recent_candidate_files(files)
+
+
+def cursor_agent_project_for_path(path: Path) -> str:
+    try:
+        rel = path.relative_to(cursor_agent_projects_dir())
+        return rel.parts[0] if rel.parts else "cursor-agent"
+    except ValueError:
+        return "cursor-agent"
+
+
+def cursor_agent_snapshot() -> Dict[str, Any]:
+    result = empty_provider_usage(source=str(cursor_agent_projects_dir()), provider="cursor-agent")
+    files = cursor_agent_transcript_files()
+    events = 0
+    for path in files:
+        text = read_text_limited(path)
+        if not text:
+            continue
+        when = safe_file_mtime(path)
+        if path.suffix == ".jsonl":
+            pending_input = 0
+            for entry in iter_jsonl_file(path):
+                role = entry.get("role")
+                message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+                content = message.get("content") if isinstance(message, dict) else None
+                if role == "user":
+                    if isinstance(content, list):
+                        pending_input = sum(char_token_estimate(block.get("text")) for block in content if isinstance(block, dict))
+                    continue
+                if role != "assistant" or not isinstance(content, list):
+                    continue
+                output_tokens = sum(char_token_estimate(block.get("text")) for block in content if isinstance(block, dict))
+                if add_usage_metrics(
+                    result,
+                    "cursor-agent-auto",
+                    {"inputTokens": pending_input, "outputTokens": output_tokens},
+                    when,
+                    project=cursor_agent_project_for_path(path),
+                    session_id=path.stem,
+                ):
+                    events += 1
+                pending_input = 0
+        else:
+            user_chunks = re.findall(r"(?im)^\s*user:\s*(.+)$", text)
+            assistant_chunks = re.findall(r"(?m)^\s*A:\s*(.+)$", text)
+            for index, assistant in enumerate(assistant_chunks):
+                user = user_chunks[index] if index < len(user_chunks) else ""
+                if add_usage_metrics(
+                    result,
+                    "cursor-agent-auto",
+                    {"inputTokens": char_token_estimate(user), "outputTokens": char_token_estimate(assistant)},
+                    when,
+                    project=cursor_agent_project_for_path(path),
+                    session_id=path.stem,
+                ):
+                    events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
+def kiro_agent_dir() -> Path:
+    if IS_WINDOWS:
+        return HOME / "AppData" / "Roaming" / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
+    if sys.platform == "darwin":
+        return HOME / "Library" / "Application Support" / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
+    return HOME / ".config" / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
+
+
+def kiro_snapshot() -> Dict[str, Any]:
+    agent_dir = kiro_agent_dir()
+    result = empty_provider_usage(source=str(agent_dir), provider="kiro")
+    files: List[Path] = []
+    try:
+        workspace_dirs = [path for path in agent_dir.iterdir() if path.is_dir() and len(path.name) == 32]
+    except OSError:
+        workspace_dirs = []
+    for workspace_dir in workspace_dirs:
+        try:
+            files.extend(path for path in workspace_dir.iterdir() if path.is_file() and path.suffix == ".chat")
+        except OSError:
+            continue
+    files = recent_candidate_files(files)
+    events = 0
+    for path in files:
+        raw = read_json(path)
+        if not isinstance(raw, dict):
+            continue
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        chat = raw.get("chat") if isinstance(raw.get("chat"), list) else []
+        model = normalized_model_name(metadata.get("modelId")) or "kiro-auto"
+        model = re.sub(r"(\d+)\.(\d+)", r"\1-\2", model)
+        user_text = ""
+        output_chars = 0
+        for message in chat:
+            if not isinstance(message, dict):
+                continue
+            content = str(message.get("content") or "")
+            if message.get("role") == "human" and not content.startswith("<identity>"):
+                user_text = content[:500]
+            elif message.get("role") == "bot":
+                output_chars += len(content)
+        metrics = {
+            "inputTokens": char_token_estimate(user_text),
+            "outputTokens": char_token_estimate_for_length(output_chars),
+        }
+        when = parse_timestamp(metadata.get("startTime")) or safe_file_mtime(path)
+        if add_usage_metrics(result, model, metrics, when, project=path.parent.name, session_id=path.stem):
+            events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
+def antigravity_conversations_dir() -> Path:
+    return HOME / ".gemini" / "antigravity" / "conversations"
+
+
+def antigravity_server_info() -> Optional[Tuple[int, str]]:
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-eo", "args"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception:
+        return None
+    for line in completed.stdout.splitlines():
+        if "language_server" not in line or "antigravity" not in line or "--https_server_port" not in line:
+            continue
+        port_match = re.search(r"--https_server_port\s+(\d+)", line)
+        csrf_match = re.search(r"--csrf_token\s+([0-9a-f-]{32,})", line)
+        if port_match and csrf_match:
+            return int(port_match.group(1)), csrf_match.group(1)
+    return None
+
+
+def antigravity_rpc(port: int, csrf_token: str, method: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/{method}",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+            "X-Codeium-Csrf-Token": csrf_token,
+        },
+    )
+    try:
+        context = ssl._create_unverified_context()
+        with urllib.request.urlopen(request, timeout=3, context=context) as response:
+            payload = json.loads(response.read(16 * 1024 * 1024).decode("utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def antigravity_snapshot() -> Dict[str, Any]:
+    conversations_dir = antigravity_conversations_dir()
+    result = empty_provider_usage(source=str(conversations_dir), provider="antigravity")
+    try:
+        files = recent_candidate_files(path for path in conversations_dir.iterdir() if path.suffix == ".pb")
+    except OSError:
+        return result
+    server = antigravity_server_info()
+    if server is None:
+        result["status"] = "waiting_for_live_server" if files else "not_found"
+        result["events"] = 0
+        return result
+    port, csrf = server
+    model_map: Dict[str, str] = {}
+    model_payload = antigravity_rpc(port, csrf, "GetAvailableModels", {})
+    models = (((model_payload or {}).get("response") or {}).get("models") if isinstance((model_payload or {}).get("response"), dict) else None)
+    if isinstance(models, dict):
+        for key, info in models.items():
+            if isinstance(info, dict) and isinstance(info.get("model"), str):
+                model_map[info["model"]] = str(key)
+    events = 0
+    for path in files:
+        cascade_id = path.stem
+        payload = antigravity_rpc(port, csrf, "GetCascadeTrajectoryGeneratorMetadata", {"cascadeId": cascade_id})
+        metadata = payload.get("generatorMetadata") if isinstance(payload, dict) else None
+        if not isinstance(metadata, list):
+            continue
+        for item in metadata:
+            if not isinstance(item, dict):
+                continue
+            chat_model = item.get("chatModel") if isinstance(item.get("chatModel"), dict) else {}
+            usage = chat_model.get("usage") if isinstance(chat_model, dict) and isinstance(chat_model.get("usage"), dict) else None
+            if not usage:
+                continue
+            raw_model = normalized_model_name(usage.get("model")) or "antigravity-auto"
+            model = model_map.get(raw_model, raw_model)
+            metrics = {
+                "inputTokens": nonnegative_int(usage.get("inputTokens")) or 0,
+                "outputTokens": nonnegative_int(usage.get("responseOutputTokens")) or nonnegative_int(usage.get("outputTokens")) or 0,
+                "reasoningTokens": nonnegative_int(usage.get("thinkingOutputTokens")) or 0,
+            }
+            start_metadata = chat_model.get("chatStartMetadata") if isinstance(chat_model.get("chatStartMetadata"), dict) else {}
+            when = parse_timestamp(start_metadata.get("createdAt")) or safe_file_mtime(path)
+            if add_usage_metrics(result, model, metrics, when, project=path.stem, session_id=path.stem):
+                events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
 
 
 def codex_snapshot() -> Dict[str, Any]:
@@ -2235,6 +3178,12 @@ def classify_process(command: str) -> Optional[str]:
         return None
     if "/applications/claude.app/contents/" in normalized:
         return None
+    if "/cursor.app/contents/" in normalized:
+        return None
+    if "/kiro.app/contents/" in normalized:
+        return None
+    if "/antigravity.app/contents/" in normalized and "language_server" not in normalized:
+        return None
 
     executable = executable_name(command)
     if not executable or executable in IGNORED_EXECUTABLES:
@@ -2246,6 +3195,38 @@ def classify_process(command: str) -> Optional[str]:
         return "claude"
     if executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli"} or "@google/gemini" in normalized:
         return "gemini"
+    if executable in {"opencode", "opencode.exe", "opencode.cmd"} or "opencode" in normalized:
+        return "opencode"
+    if executable in {"qwen", "qwen.exe", "qwen.cmd", "qwen-code", "qwen-code.exe"} or "qwen-code" in normalized:
+        return "qwen"
+    if executable in {"cursor-agent", "cursor-agent.exe", "cursor-agent.cmd"}:
+        return "cursor-agent"
+    if executable in {"cursor", "cursor.exe", "cursor.cmd"}:
+        return "cursor"
+    if executable in {"kiro", "kiro.exe", "kiro.cmd"}:
+        return "kiro"
+    if executable in {"goose", "goose.exe", "goose.cmd"}:
+        return "goose"
+    if executable in {"crush", "crush.exe", "crush.cmd"}:
+        return "crush"
+    if executable in {"droid", "droid.exe", "droid.cmd"} or "/.factory/" in normalized:
+        return "droid"
+    if executable in {"pi", "pi.exe", "pi.cmd"} or "/.pi/" in normalized:
+        return "pi"
+    if executable in {"omp", "omp.exe", "omp.cmd"} or "/.omp/" in normalized:
+        return "omp"
+    if executable in {"openclaw", "openclaw.exe", "openclaw.cmd", "claw", "claw.exe"}:
+        return "openclaw"
+    if executable in {"roo", "roo-code", "roo-code.exe"} or "roo-cline" in normalized:
+        return "roo-code"
+    if executable in {"kilo", "kilo-code", "kilo-code.exe"} or "kilo-code" in normalized:
+        return "kilo-code"
+    if executable in {"antigravity", "antigravity.exe"} or ("antigravity" in normalized and "language_server" in normalized):
+        return "antigravity"
+    if executable in {"copilot", "copilot.exe", "copilot.cmd"} or "copilot-chat" in normalized:
+        return "copilot"
+    if executable in {"bob", "bob-code", "ibm-bob"} or "bob-code" in normalized:
+        return "ibm-bob"
     return None
 
 
@@ -2272,15 +3253,16 @@ def terminal_activity_snapshot_windows() -> Dict[str, Any]:
         "processCount": 0,
         "totalCPUPercent": 0,
         "motionStage": "sleeping",
-        "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0},
+        "countsByProvider": {provider: 0 for provider in PROVIDER_KEYS},
         "processes": [],
     }
+    provider_regex = "(codex|claude|gemini|opencode|qwen|cursor-agent|cursor|kiro|goose|crush|droid|openclaw|copilot|roo-code|kilo-code|antigravity|ibm-bob)"
     script = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine |
   Where-Object {
     $text = (($_.Name + ' ' + $_.CommandLine).ToLower())
-    $text -match '(^|[^a-z])(codex|claude|gemini)([^a-z]|$)'
+    $text -match '(^|[^a-z])__PROVIDER_REGEX__([^a-z]|$)'
   } |
   ForEach-Object {
     [pscustomobject]@{
@@ -2292,7 +3274,7 @@ Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLi
     }
   } |
   ConvertTo-Json -Compress
-"""
+""".replace("__PROVIDER_REGEX__", provider_regex)
     try:
         completed = subprocess.run(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
@@ -2358,7 +3340,7 @@ Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLi
         )
 
     rows.sort(key=lambda row: (-float(row["cpuPercent"]), str(row["kind"])))
-    counts = {"codex": 0, "claude": 0, "gemini": 0}
+    counts = {provider: 0 for provider in PROVIDER_KEYS}
     for row in rows:
         counts[str(row["kind"])] = counts.get(str(row["kind"]), 0) + 1
     total_cpu = sum(float(row["cpuPercent"]) for row in rows)
@@ -2391,8 +3373,8 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
         "totalCPUPercent": 0,
         "totalMemoryBytes": 0,
         "motionStage": "sleeping",
-        "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0},
-        "memoryBytesByProvider": {"codex": 0, "claude": 0, "gemini": 0},
+        "countsByProvider": {provider: 0 for provider in PROVIDER_KEYS},
+        "memoryBytesByProvider": {provider: 0 for provider in PROVIDER_KEYS},
         "processes": [],
     }
     try:
@@ -2441,8 +3423,8 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
         )
 
     rows.sort(key=lambda row: (-float(row["cpuPercent"]), str(row["kind"])))
-    counts = {"codex": 0, "claude": 0, "gemini": 0}
-    memory_by_provider = {"codex": 0, "claude": 0, "gemini": 0}
+    counts = {provider: 0 for provider in PROVIDER_KEYS}
+    memory_by_provider = {provider: 0 for provider in PROVIDER_KEYS}
     for row in rows:
         counts[str(row["kind"])] = counts.get(str(row["kind"]), 0) + 1
         memory_by_provider[str(row["kind"])] = memory_by_provider.get(str(row["kind"]), 0) + int(row.get("memoryBytes") or 0)
@@ -2468,12 +3450,11 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
     return result
 
 
-def build_snapshot() -> Dict[str, Any]:
-    ensure_dirs()
-    try:
-        latest_by_provider: Dict[str, Any] = latest_events_by_provider()
-    except Exception as exc:
-        latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
+def public_provider_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in data.items() if not str(key).startswith("_")}
+
+
+def collect_provider_snapshots() -> Dict[str, Dict[str, Any]]:
     limits_by_provider = configured_limits()
     runtime_limits_by_provider = runtime_limits()
     providers = {
@@ -2482,12 +3463,39 @@ def build_snapshot() -> Dict[str, Any]:
         "gemini": gemini_snapshot(),
         "opencode": opencode_snapshot(),
         "copilot": copilot_snapshot(),
+        "antigravity": antigravity_snapshot(),
+        "crush": crush_snapshot(),
+        "cursor": cursor_snapshot(),
+        "cursor-agent": cursor_agent_snapshot(),
+        "droid": droid_snapshot(),
+        "goose": goose_snapshot(),
+        "ibm-bob": ibm_bob_snapshot(),
+        "kilo-code": kilo_code_snapshot(),
+        "kiro": kiro_snapshot(),
+        "openclaw": openclaw_snapshot(),
+        "pi": pi_snapshot(),
+        "omp": omp_snapshot(),
+        "qwen": qwen_snapshot(),
+        "roo-code": roo_code_snapshot(),
     }
     for provider, data in providers.items():
         data["limits"] = merge_limits(
             limits_by_provider.get(provider, empty_limits()),
             runtime_limits_by_provider.get(provider, empty_limits()),
         )
+    return providers
+
+
+def build_snapshot() -> Dict[str, Any]:
+    ensure_dirs()
+    try:
+        latest_by_provider: Dict[str, Any] = latest_events_by_provider()
+    except Exception as exc:
+        latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
+    providers = {
+        provider: public_provider_payload(data)
+        for provider, data in collect_provider_snapshots().items()
+    }
     snapshot = {
         "schemaVersion": 2,
         "connectorVersion": CONNECTOR_VERSION,
@@ -2668,6 +3676,668 @@ def run_daemon(args: argparse.Namespace) -> int:
     return 0
 
 
+PERIOD_ALIASES = {
+    "today": "today",
+    "day": "today",
+    "7d": "week",
+    "week": "week",
+    "30d": "month",
+    "month": "month",
+    "all": "all",
+    "lifetime": "all",
+}
+
+
+def normalize_analytics_period(raw: Optional[str]) -> str:
+    period = PERIOD_ALIASES.get(str(raw or "week").strip().lower())
+    if not period:
+        raise ValueError(f"unsupported period: {raw}")
+    return period
+
+
+def analytics_period_label(period: str) -> str:
+    return {"today": "Today", "week": "7 Days", "month": "30 Days", "all": "All"}[period]
+
+
+def timestamp_matches_period(raw: Any, period: str) -> bool:
+    if period == "all":
+        return True
+    when = parse_timestamp(raw)
+    if when is None:
+        return False
+    now = dt.datetime.now(dt.timezone.utc)
+    if period == "today":
+        return when.date() == now.date()
+    if period == "week":
+        return when >= now - dt.timedelta(days=7)
+    if period == "month":
+        return when >= now - dt.timedelta(days=30)
+    return True
+
+
+def canonical_model_name(model: Any) -> str:
+    name = normalized_model_name(model) or "unknown"
+    normalized = name.lower().replace("@latest", "")
+    normalized = re.sub(r"@\d+$", "", normalized)
+    normalized = re.sub(r"-\d{6,}$", "", normalized)
+    normalized = normalized.replace("-preview", "")
+    normalized = MODEL_ALIASES.get(normalized, normalized)
+    if "/" in normalized and normalized not in MODEL_PRICING_PER_MILLION_USD:
+        stripped = normalized.split("/")[-1]
+        normalized = MODEL_ALIASES.get(stripped, stripped)
+    return normalized
+
+
+def model_price_per_million(model: Any) -> Optional[float]:
+    canonical = canonical_model_name(model)
+    if canonical in MODEL_PRICING_PER_MILLION_USD:
+        return MODEL_PRICING_PER_MILLION_USD[canonical]
+    for key in sorted(MODEL_PRICING_PER_MILLION_USD, key=len, reverse=True):
+        if canonical == key or canonical.startswith(key + "-"):
+            return MODEL_PRICING_PER_MILLION_USD[key]
+    return None
+
+
+def metrics_total(metrics: Dict[str, Any]) -> int:
+    total = int(metrics.get("totalTokens") or 0)
+    if total > 0:
+        return total
+    return sum(int(metrics.get(key) or 0) for key in TOKEN_TOTAL_PART_KEYS)
+
+
+def estimate_cost_usd(model: Any, metrics: Dict[str, Any]) -> Optional[float]:
+    price = model_price_per_million(model)
+    if price is None:
+        return None
+    return metrics_total(metrics) / 1_000_000.0 * price
+
+
+def round_money(value: float) -> float:
+    return round(value + 0.0000000001, 6)
+
+
+def safe_project_label(raw: Any, fallback: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        return fallback
+    text = raw.strip()
+    if "/" in text or "\\" in text:
+        text = Path(text).name or fallback
+    text = re.sub(r"\s+", " ", text)
+    return text[:80] or fallback
+
+
+def classify_analytics_tools(tools: Iterable[Any]) -> Tuple[str, bool, int]:
+    names = {str(tool) for tool in tools if str(tool)}
+    has_edits = any(name in EDIT_TOOLS for name in names)
+    has_reads = any(name in READ_TOOLS for name in names)
+    if names & PLANNING_TOOLS:
+        return "planning", has_edits, 0
+    if "Agent" in names:
+        return "delegation", has_edits, 0
+    if has_edits:
+        return "coding", True, 0
+    if has_reads:
+        return "exploration", False, 0
+    if "Bash" in names or "BashTool" in names:
+        return "coding", False, 0
+    return "general", False, 0
+
+
+def provider_period_total(data: Dict[str, Any], period: str) -> int:
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    return int(tokens.get(period) or tokens.get("totalTokens") or tokens.get("all") or 0)
+
+
+def model_period_total(data: Dict[str, Any], period: str) -> int:
+    return int(data.get(period) or data.get("totalTokens") or data.get("all") or 0)
+
+
+def scale_model_metrics(model_data: Dict[str, Any], period_total: int) -> Dict[str, int]:
+    all_total = int(model_data.get("totalTokens") or model_data.get("all") or period_total or 0)
+    ratio = 1.0 if all_total <= 0 else min(1.0, period_total / all_total)
+    metrics: Dict[str, int] = {}
+    for key in TOKEN_TOTAL_PART_KEYS:
+        amount = int(model_data.get(key) or 0)
+        if amount > 0:
+            metrics[key] = int(round(amount * ratio))
+    metrics["totalTokens"] = period_total
+    return metrics
+
+
+def calls_from_provider_snapshot(provider: str, data: Dict[str, Any], period: str) -> List[Dict[str, Any]]:
+    private_calls = data.get("_usageCalls")
+    calls: List[Dict[str, Any]] = []
+    if isinstance(private_calls, list) and private_calls:
+        for call in private_calls:
+            if not isinstance(call, dict) or not timestamp_matches_period(call.get("timestamp"), period):
+                continue
+            metrics = call.get("metrics") if isinstance(call.get("metrics"), dict) else {}
+            total = metrics_total(metrics)
+            if total <= 0:
+                continue
+            model = normalized_model_name(call.get("model")) or "unknown"
+            tools = call.get("tools") if isinstance(call.get("tools"), list) else []
+            category, has_edits, retries = classify_analytics_tools(tools)
+            cost = estimate_cost_usd(model, metrics)
+            calls.append(
+                {
+                    "provider": provider,
+                    "project": safe_project_label(call.get("project"), provider),
+                    "sessionId": str(call.get("sessionId") or f"{provider}:{model}"),
+                    "model": model,
+                    "timestamp": str(call.get("timestamp") or ""),
+                    "metrics": {
+                        key: int(value or 0)
+                        for key, value in metrics.items()
+                        if isinstance(value, (int, float))
+                    },
+                    "costUSD": cost,
+                    "pricingKnown": cost is not None,
+                    "category": category,
+                    "hasEdits": has_edits,
+                    "retries": retries,
+                    "tools": [str(tool) for tool in tools],
+                }
+            )
+        return calls
+
+    models = data.get("models") if isinstance(data.get("models"), dict) else {}
+    for model, model_data in models.items():
+        if not isinstance(model_data, dict):
+            continue
+        total = model_period_total(model_data, period)
+        if total <= 0:
+            continue
+        metrics = scale_model_metrics(model_data, total)
+        cost = estimate_cost_usd(model, metrics)
+        calls.append(
+            {
+                "provider": provider,
+                "project": provider,
+                "sessionId": f"{provider}:{model}",
+                "model": str(model),
+                "timestamp": "",
+                "metrics": metrics,
+                "costUSD": cost,
+                "pricingKnown": cost is not None,
+                "category": "general",
+                "hasEdits": False,
+                "retries": 0,
+                "tools": [],
+                "synthetic": True,
+            }
+        )
+    if not calls:
+        total = provider_period_total(data, period)
+        if total > 0:
+            calls.append(
+                {
+                    "provider": provider,
+                    "project": provider,
+                    "sessionId": provider,
+                    "model": "unknown",
+                    "timestamp": "",
+                    "metrics": {"totalTokens": total},
+                    "costUSD": None,
+                    "pricingKnown": False,
+                    "category": "general",
+                    "hasEdits": False,
+                    "retries": 0,
+                    "tools": [],
+                    "synthetic": True,
+                }
+            )
+    return calls
+
+
+def project_filter_match(project: str, include: Optional[List[str]], exclude: Optional[List[str]]) -> bool:
+    text = project.lower()
+    if include and not any(item.lower() in text for item in include):
+        return False
+    if exclude and any(item.lower() in text for item in exclude):
+        return False
+    return True
+
+
+def collect_usage_calls(
+    provider_snapshots: Dict[str, Dict[str, Any]],
+    period: str,
+    provider_filter: str = "all",
+    project_include: Optional[List[str]] = None,
+    project_exclude: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    calls: List[Dict[str, Any]] = []
+    for provider, data in provider_snapshots.items():
+        if provider_filter != "all" and provider != provider_filter:
+            continue
+        for call in calls_from_provider_snapshot(provider, data, period):
+            if project_filter_match(str(call.get("project") or ""), project_include, project_exclude):
+                calls.append(call)
+    return calls
+
+
+def add_metrics(acc: Dict[str, int], metrics: Dict[str, Any]) -> None:
+    for key in (
+        "inputTokens",
+        "outputTokens",
+        "cacheReadInputTokens",
+        "cacheCreationInputTokens",
+        "cachedInputTokens",
+        "reasoningTokens",
+        "thoughtTokens",
+        "toolTokens",
+        "totalTokens",
+    ):
+        value = int(metrics.get(key) or 0)
+        if value > 0:
+            acc[key] = acc.get(key, 0) + value
+
+
+def build_report_from_calls(
+    calls: List[Dict[str, Any]],
+    provider_snapshots: Dict[str, Dict[str, Any]],
+    period: str,
+) -> Dict[str, Any]:
+    provider_rows: Dict[str, Dict[str, Any]] = {}
+    model_rows: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    project_rows: Dict[str, Dict[str, Any]] = {}
+    activity_rows: Dict[str, Dict[str, Any]] = {}
+    totals: Dict[str, int] = {}
+    known_cost = 0.0
+    unknown_cost_tokens = 0
+
+    for call in calls:
+        provider = str(call["provider"])
+        model = str(call["model"])
+        project = str(call["project"])
+        metrics = call.get("metrics") if isinstance(call.get("metrics"), dict) else {}
+        total_tokens = metrics_total(metrics)
+        cost = call.get("costUSD") if isinstance(call.get("costUSD"), (int, float)) else None
+        if cost is None:
+            unknown_cost_tokens += total_tokens
+            cost_value = 0.0
+        else:
+            cost_value = float(cost)
+            known_cost += cost_value
+        add_metrics(totals, metrics)
+
+        p = provider_rows.setdefault(provider, {"provider": provider, "tokens": 0, "estimatedCostUSD": 0.0, "calls": 0, "pricingKnown": True})
+        p["tokens"] += total_tokens
+        p["estimatedCostUSD"] += cost_value
+        p["calls"] += 1
+        p["pricingKnown"] = bool(p["pricingKnown"] and cost is not None)
+
+        mk = (provider, model)
+        m = model_rows.setdefault(
+            mk,
+            {
+                "provider": provider,
+                "model": model,
+                "canonicalModel": canonical_model_name(model),
+                "tokens": 0,
+                "estimatedCostUSD": 0.0,
+                "calls": 0,
+                "pricingKnown": True,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "cacheReadTokens": 0,
+                "cacheWriteTokens": 0,
+                "editTurns": 0,
+                "oneShotTurns": 0,
+                "retries": 0,
+            },
+        )
+        m["tokens"] += total_tokens
+        m["estimatedCostUSD"] += cost_value
+        m["calls"] += 1
+        m["pricingKnown"] = bool(m["pricingKnown"] and cost is not None)
+        m["inputTokens"] += int(metrics.get("inputTokens") or 0)
+        m["outputTokens"] += int(metrics.get("outputTokens") or 0) + int(metrics.get("reasoningTokens") or 0)
+        m["cacheReadTokens"] += int(metrics.get("cacheReadInputTokens") or 0) + int(metrics.get("cachedInputTokens") or 0)
+        m["cacheWriteTokens"] += int(metrics.get("cacheCreationInputTokens") or 0)
+        if call.get("hasEdits"):
+            m["editTurns"] += 1
+            if int(call.get("retries") or 0) == 0:
+                m["oneShotTurns"] += 1
+            m["retries"] += int(call.get("retries") or 0)
+
+        pr = project_rows.setdefault(project, {"project": project, "tokens": 0, "estimatedCostUSD": 0.0, "calls": 0, "providers": set(), "sessions": set()})
+        pr["tokens"] += total_tokens
+        pr["estimatedCostUSD"] += cost_value
+        pr["calls"] += 1
+        pr["providers"].add(provider)
+        pr["sessions"].add(str(call.get("sessionId") or ""))
+
+        category = str(call.get("category") or "general")
+        a = activity_rows.setdefault(category, {"category": category, "label": CATEGORY_LABELS.get(category, category), "tokens": 0, "estimatedCostUSD": 0.0, "turns": 0, "editTurns": 0, "oneShotTurns": 0, "retries": 0})
+        a["tokens"] += total_tokens
+        a["estimatedCostUSD"] += cost_value
+        a["turns"] += 1
+        if call.get("hasEdits"):
+            a["editTurns"] += 1
+            if int(call.get("retries") or 0) == 0:
+                a["oneShotTurns"] += 1
+            a["retries"] += int(call.get("retries") or 0)
+
+    total_cost = round_money(known_cost)
+    total_tokens = int(totals.get("totalTokens") or 0)
+
+    providers = sorted(provider_rows.values(), key=lambda row: row["estimatedCostUSD"], reverse=True)
+    for row in providers:
+        row["estimatedCostUSD"] = round_money(float(row["estimatedCostUSD"]))
+        row["sharePercent"] = round((row["tokens"] / total_tokens) * 100, 1) if total_tokens > 0 else 0.0
+        limits = provider_snapshots.get(row["provider"], {}).get("limits")
+        row["limitsStatus"] = limits.get("status") if isinstance(limits, dict) else "not_configured"
+
+    models = sorted(model_rows.values(), key=lambda row: (row["estimatedCostUSD"], row["tokens"]), reverse=True)
+    for row in models:
+        row["estimatedCostUSD"] = round_money(float(row["estimatedCostUSD"]))
+        row["sharePercent"] = round((row["tokens"] / total_tokens) * 100, 1) if total_tokens > 0 else 0.0
+        row["oneShotRate"] = round((row["oneShotTurns"] / row["editTurns"]) * 100, 1) if row["editTurns"] else None
+        row["retriesPerEdit"] = round(row["retries"] / row["editTurns"], 1) if row["editTurns"] else None
+        row["costPerEditUSD"] = round_money(row["estimatedCostUSD"] / row["editTurns"]) if row["editTurns"] else None
+
+    projects = []
+    for row in project_rows.values():
+        projects.append(
+            {
+                "project": row["project"],
+                "tokens": row["tokens"],
+                "estimatedCostUSD": round_money(float(row["estimatedCostUSD"])),
+                "calls": row["calls"],
+                "sessions": len([s for s in row["sessions"] if s]),
+                "providers": sorted(row["providers"]),
+                "sharePercent": round((row["tokens"] / total_tokens) * 100, 1) if total_tokens > 0 else 0.0,
+            }
+        )
+    projects.sort(key=lambda row: (row["estimatedCostUSD"], row["tokens"]), reverse=True)
+
+    activities = sorted(activity_rows.values(), key=lambda row: (row["estimatedCostUSD"], row["tokens"]), reverse=True)
+    for row in activities:
+        row["estimatedCostUSD"] = round_money(float(row["estimatedCostUSD"]))
+        row["oneShotRate"] = round((row["oneShotTurns"] / row["editTurns"]) * 100, 1) if row["editTurns"] else None
+
+    return {
+        "generatedAt": now_iso(),
+        "period": period,
+        "periodLabel": analytics_period_label(period),
+        "currency": "USD",
+        "privacy": {
+            "localOnly": True,
+            "promptTextIncluded": False,
+            "transcriptIncluded": False,
+            "fullPathsIncluded": False,
+        },
+        "overview": {
+            "tokens": total_tokens,
+            "estimatedCostUSD": total_cost,
+            "pricingKnown": unknown_cost_tokens == 0,
+            "unknownCostTokens": unknown_cost_tokens,
+            "calls": len(calls),
+            "providers": len(providers),
+            "models": len(models),
+            "projects": len(projects),
+            "inputTokens": int(totals.get("inputTokens") or 0),
+            "outputTokens": int(totals.get("outputTokens") or 0) + int(totals.get("reasoningTokens") or 0),
+            "cacheReadTokens": int(totals.get("cacheReadInputTokens") or 0) + int(totals.get("cachedInputTokens") or 0),
+            "cacheWriteTokens": int(totals.get("cacheCreationInputTokens") or 0),
+        },
+        "providers": providers,
+        "projects": projects,
+        "models": models,
+        "activities": activities,
+        "findings": [],
+    }
+
+
+def build_optimize_findings(report: Dict[str, Any], provider_snapshots: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    for model in report.get("models", []):
+        if not isinstance(model, dict):
+            continue
+        if not model.get("pricingKnown") and int(model.get("tokens") or 0) > 0:
+            findings.append(
+                {
+                    "id": f"pricing_missing:{model.get('provider')}:{model.get('model')}",
+                    "title": "Missing model price",
+                    "detail": f"No local price for {model.get('model')}; estimated cost skips those tokens.",
+                    "severity": "info",
+                    "impact": "low",
+                    "provider": model.get("provider"),
+                    "model": model.get("model"),
+                    "tokensAffected": int(model.get("tokens") or 0),
+                    "estimatedSavingsUSD": 0.0,
+                    "localOnly": True,
+                }
+            )
+        input_like = int(model.get("inputTokens") or 0) + int(model.get("cacheReadTokens") or 0) + int(model.get("cacheWriteTokens") or 0)
+        output = int(model.get("outputTokens") or 0)
+        if input_like >= 50_000 and output > 0 and input_like / output >= 25:
+            tokens_saved = max(0, input_like - output * 12)
+            savings = estimate_cost_usd(model.get("model"), {"totalTokens": tokens_saved}) or 0.0
+            findings.append(
+                {
+                    "id": f"context_bloat:{model.get('provider')}:{model.get('model')}",
+                    "title": "High context-to-output ratio",
+                    "detail": "Input and cached context are much larger than generated output for this model.",
+                    "severity": "medium",
+                    "impact": "medium",
+                    "provider": model.get("provider"),
+                    "model": model.get("model"),
+                    "tokensSaved": tokens_saved,
+                    "estimatedSavingsUSD": round_money(savings),
+                    "localOnly": True,
+                }
+            )
+        cache_write = int(model.get("cacheWriteTokens") or 0)
+        if cache_write >= 250_000 and cache_write > int(model.get("inputTokens") or 0):
+            tokens_saved = int(cache_write * 0.25)
+            savings = estimate_cost_usd(model.get("model"), {"totalTokens": tokens_saved}) or 0.0
+            findings.append(
+                {
+                    "id": f"cache_bloat:{model.get('provider')}:{model.get('model')}",
+                    "title": "Large cache creation volume",
+                    "detail": "Cache write tokens are high relative to fresh input. Reusing shorter context can reduce spend.",
+                    "severity": "medium",
+                    "impact": "medium",
+                    "provider": model.get("provider"),
+                    "model": model.get("model"),
+                    "tokensSaved": tokens_saved,
+                    "estimatedSavingsUSD": round_money(savings),
+                    "localOnly": True,
+                }
+            )
+
+    provider_usage = {row.get("provider"): row for row in report.get("providers", []) if isinstance(row, dict)}
+    for provider, row in provider_usage.items():
+        data = provider_snapshots.get(str(provider), {})
+        limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
+        if row.get("tokens", 0) > 0 and limits.get("status") in {None, "not_configured"}:
+            findings.append(
+                {
+                    "id": f"provider_no_limits:{provider}",
+                    "title": "Provider quota unavailable",
+                    "detail": "Usage exists, but the connector has no quota or plan signal for this provider.",
+                    "severity": "info",
+                    "impact": "low",
+                    "provider": provider,
+                    "estimatedSavingsUSD": 0.0,
+                    "localOnly": True,
+                }
+            )
+        for key in ("weeklyUsedPercent", "shortUsedPercent"):
+            pct = limits.get(key)
+            if isinstance(pct, (int, float)) and pct >= 80:
+                findings.append(
+                    {
+                        "id": f"high_usage:{provider}:{key}",
+                        "title": "Quota usage is high",
+                        "detail": f"{provider} {key} is at {round(float(pct), 1)}%.",
+                        "severity": "high" if pct >= 95 else "medium",
+                        "impact": "high" if pct >= 95 else "medium",
+                        "provider": provider,
+                        "estimatedSavingsUSD": 0.0,
+                        "localOnly": True,
+                    }
+                )
+
+    severity_rank = {"high": 3, "medium": 2, "low": 1, "info": 0}
+    findings.sort(key=lambda f: (severity_rank.get(str(f.get("severity")), 0), float(f.get("estimatedSavingsUSD") or 0)), reverse=True)
+    return findings[:20]
+
+
+def build_analytics_report(
+    period_raw: Optional[str] = None,
+    provider_filter: str = "all",
+    project_include: Optional[List[str]] = None,
+    project_exclude: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    ensure_dirs()
+    period = normalize_analytics_period(period_raw)
+    provider_snapshots = collect_provider_snapshots()
+    calls = collect_usage_calls(provider_snapshots, period, provider_filter, project_include, project_exclude)
+    report = build_report_from_calls(calls, provider_snapshots, period)
+    report["findings"] = build_optimize_findings(report, provider_snapshots)
+    return report
+
+
+def compare_values(a: Optional[float], b: Optional[float], higher_is_better: bool) -> str:
+    if a is None or b is None:
+        return "none"
+    if a == b:
+        return "tie"
+    if higher_is_better:
+        return "a" if a > b else "b"
+    return "a" if a < b else "b"
+
+
+def merged_model_rows(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for row in report.get("models", []):
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("model") or "")
+        if name not in by_name:
+            by_name[name] = copy.deepcopy(row)
+            continue
+        current = by_name[name]
+        for key in ("tokens", "estimatedCostUSD", "calls", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "editTurns", "oneShotTurns", "retries"):
+            current[key] = current.get(key, 0) + row.get(key, 0)
+        current["pricingKnown"] = bool(current.get("pricingKnown") and row.get("pricingKnown"))
+    return by_name
+
+
+def build_compare_report(report: Dict[str, Any], model_a: Optional[str], model_b: Optional[str]) -> Dict[str, Any]:
+    by_name = merged_model_rows(report)
+    ranked = sorted(by_name.values(), key=lambda row: (row.get("estimatedCostUSD", 0), row.get("tokens", 0)), reverse=True)
+    if not model_a and ranked:
+        model_a = str(ranked[0].get("model"))
+    if not model_b and len(ranked) > 1:
+        model_b = str(ranked[1].get("model"))
+    a = by_name.get(str(model_a)) if model_a else None
+    b = by_name.get(str(model_b)) if model_b else None
+    if not a or not b:
+        return {
+            "generatedAt": now_iso(),
+            "period": report.get("period"),
+            "status": "not_enough_models",
+            "models": [row.get("model") for row in ranked[:5]],
+            "comparison": [],
+        }
+
+    def pct(num: float, den: float) -> Optional[float]:
+        return round((num / den) * 100, 1) if den else None
+
+    metrics = [
+        ("Performance", "One-shot rate", pct(a.get("oneShotTurns", 0), a.get("editTurns", 0)), pct(b.get("oneShotTurns", 0), b.get("editTurns", 0)), "percent", True),
+        ("Performance", "Retry rate", (a.get("retries", 0) / a.get("editTurns", 0)) if a.get("editTurns", 0) else None, (b.get("retries", 0) / b.get("editTurns", 0)) if b.get("editTurns", 0) else None, "decimal", False),
+        ("Efficiency", "Cost / call", (a.get("estimatedCostUSD", 0) / a.get("calls", 0)) if a.get("calls", 0) else None, (b.get("estimatedCostUSD", 0) / b.get("calls", 0)) if b.get("calls", 0) else None, "cost", False),
+        ("Efficiency", "Cost / edit", (a.get("estimatedCostUSD", 0) / a.get("editTurns", 0)) if a.get("editTurns", 0) else None, (b.get("estimatedCostUSD", 0) / b.get("editTurns", 0)) if b.get("editTurns", 0) else None, "cost", False),
+        ("Efficiency", "Output tok / call", (a.get("outputTokens", 0) / a.get("calls", 0)) if a.get("calls", 0) else None, (b.get("outputTokens", 0) / b.get("calls", 0)) if b.get("calls", 0) else None, "number", False),
+        ("Efficiency", "Cache hit rate", pct(a.get("cacheReadTokens", 0), a.get("inputTokens", 0) + a.get("cacheReadTokens", 0)), pct(b.get("cacheReadTokens", 0), b.get("inputTokens", 0) + b.get("cacheReadTokens", 0)), "percent", True),
+    ]
+    return {
+        "generatedAt": now_iso(),
+        "period": report.get("period"),
+        "status": "ok",
+        "modelA": a,
+        "modelB": b,
+        "comparison": [
+            {
+                "section": section,
+                "label": label,
+                "valueA": round(value_a, 6) if isinstance(value_a, float) else value_a,
+                "valueB": round(value_b, 6) if isinstance(value_b, float) else value_b,
+                "format": fmt,
+                "winner": compare_values(value_a, value_b, higher_is_better),
+            }
+            for section, label, value_a, value_b, fmt, higher_is_better in metrics
+        ],
+    }
+
+
+def read_insights_plan() -> Optional[Dict[str, Any]]:
+    raw = read_json(INSIGHTS_PLAN_FILE)
+    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+        return None
+    monthly = raw.get("monthlyUsd")
+    if not isinstance(monthly, (int, float)) or monthly <= 0:
+        return None
+    return raw
+
+
+def write_insights_plan(plan: Dict[str, Any]) -> None:
+    ensure_dirs()
+    tmp = INSIGHTS_PLAN_FILE.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(plan, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    tmp.replace(INSIGHTS_PLAN_FILE)
+
+
+def reset_insights_plan() -> None:
+    try:
+        INSIGHTS_PLAN_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def build_plan_report(plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    active_plan = plan or read_insights_plan()
+    if not active_plan:
+        return {"generatedAt": now_iso(), "status": "not_configured", "plan": None}
+    provider = str(active_plan.get("provider") or "all")
+    report = build_analytics_report("month", provider)
+    spent = float(report.get("overview", {}).get("estimatedCostUSD") or 0.0)
+    budget = float(active_plan.get("monthlyUsd") or 0.0)
+    percent = (spent / budget) * 100 if budget > 0 else 0.0
+    today = dt.datetime.now().date()
+    reset_day = max(1, min(28, int(active_plan.get("resetDay") or 1)))
+    if today.day >= reset_day:
+        next_reset = dt.date(today.year + (1 if today.month == 12 else 0), 1 if today.month == 12 else today.month + 1, reset_day)
+    else:
+        next_reset = dt.date(today.year, today.month, reset_day)
+    days_until_reset = max(0, (next_reset - today).days)
+    median_daily = spent / 30.0 if spent > 0 else 0.0
+    projected = spent + median_daily * days_until_reset
+    return {
+        "generatedAt": now_iso(),
+        "status": "ok",
+        "plan": active_plan,
+        "provider": provider,
+        "spentApiEquivalentUsd": round_money(spent),
+        "budgetUsd": round_money(budget),
+        "percentUsed": round(percent, 1),
+        "usageStatus": "over" if percent > 100 else ("near" if percent >= 80 else "under"),
+        "projectedMonthEndUsd": round_money(projected),
+        "daysUntilReset": days_until_reset,
+        "roi": {
+            "apiEquivalentMinusPlanUsd": round_money(projected - budget),
+            "planMinusApiEquivalentUsd": round_money(budget - projected),
+        },
+    }
+
+
 def command_snapshot(args: argparse.Namespace) -> int:
     snapshot = build_snapshot()
     if args.json:
@@ -2675,6 +4345,104 @@ def command_snapshot(args: argparse.Namespace) -> int:
     else:
         print(concise_snapshot_text(snapshot))
     return 0
+
+
+def print_json_or_text(payload: Dict[str, Any], as_json: bool, text: str) -> int:
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(text)
+    return 0
+
+
+def command_report(args: argparse.Namespace) -> int:
+    report = build_analytics_report(args.period, args.provider, args.project, args.exclude)
+    text = (
+        f"Agent Cat report · {report['periodLabel']}\n"
+        f"- tokens: {report['overview']['tokens']:,}\n"
+        f"- estimated cost: ${report['overview']['estimatedCostUSD']:.4f}\n"
+        f"- providers: {report['overview']['providers']}, models: {report['overview']['models']}, projects: {report['overview']['projects']}\n"
+        f"- findings: {len(report.get('findings', []))}"
+    )
+    return print_json_or_text(report, args.json, text)
+
+
+def command_insights(args: argparse.Namespace) -> int:
+    return command_report(args)
+
+
+def command_models(args: argparse.Namespace) -> int:
+    report = build_analytics_report(args.period, args.provider, args.project, args.exclude)
+    payload = {
+        "generatedAt": report["generatedAt"],
+        "period": report["period"],
+        "periodLabel": report["periodLabel"],
+        "currency": report["currency"],
+        "models": report["models"],
+    }
+    text = "\n".join(
+        [f"Agent Cat models · {report['periodLabel']}"]
+        + [
+            f"- {row['provider']} {row['model']}: {row['tokens']:,} tokens, ${row['estimatedCostUSD']:.4f}"
+            for row in report["models"][:10]
+        ]
+    )
+    return print_json_or_text(payload, args.json, text)
+
+
+def command_compare(args: argparse.Namespace) -> int:
+    report = build_analytics_report(args.period, args.provider, args.project, args.exclude)
+    payload = build_compare_report(report, args.model_a, args.model_b)
+    if payload.get("status") != "ok":
+        text = "Not enough model usage to compare."
+    else:
+        text = f"Comparing {payload['modelA']['model']} vs {payload['modelB']['model']}"
+    return print_json_or_text(payload, args.json, text)
+
+
+def command_optimize(args: argparse.Namespace) -> int:
+    report = build_analytics_report(args.period, args.provider, args.project, args.exclude)
+    findings = report.get("findings", [])
+    savings = sum(float(item.get("estimatedSavingsUSD") or 0.0) for item in findings if isinstance(item, dict))
+    payload = {
+        "generatedAt": report["generatedAt"],
+        "period": report["period"],
+        "periodLabel": report["periodLabel"],
+        "findingCount": len(findings),
+        "estimatedSavingsUSD": round_money(savings),
+        "findings": findings,
+        "overview": report["overview"],
+    }
+    text = f"Agent Cat optimize · {len(findings)} findings · ~${payload['estimatedSavingsUSD']:.4f} possible savings"
+    return print_json_or_text(payload, args.json, text)
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    action = args.action or "show"
+    if action == "reset":
+        reset_insights_plan()
+        payload = {"generatedAt": now_iso(), "status": "reset"}
+        return print_json_or_text(payload, args.json, "Agent Cat plan reset.")
+    if action == "set":
+        if args.monthly_usd is None or args.monthly_usd <= 0:
+            raise SystemExit("agentcat plan set requires --monthly-usd > 0")
+        plan = {
+            "id": args.id or "custom",
+            "monthlyUsd": float(args.monthly_usd),
+            "provider": args.provider,
+            "resetDay": max(1, min(28, int(args.reset_day))),
+            "setAt": now_iso(),
+        }
+        write_insights_plan(plan)
+        payload = build_plan_report(plan)
+        return print_json_or_text(payload, args.json, f"Agent Cat plan set: ${plan['monthlyUsd']:.2f}/month")
+    payload = build_plan_report()
+    status = payload.get("status")
+    if status == "ok":
+        text = f"Agent Cat plan · {payload['percentUsed']}% used · projected ${payload['projectedMonthEndUsd']:.4f}"
+    else:
+        text = "Agent Cat plan is not configured."
+    return print_json_or_text(payload, args.json, text)
 
 
 def command_event(args: argparse.Namespace) -> int:
@@ -2749,6 +4517,57 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot = subparsers.add_parser("snapshot")
     snapshot.add_argument("--json", action="store_true")
     snapshot.set_defaults(func=command_snapshot)
+
+    report = subparsers.add_parser("report")
+    report.add_argument("--json", action="store_true")
+    report.add_argument("--period", default="week")
+    report.add_argument("--provider", default="all", choices=("all",) + PROVIDER_KEYS)
+    report.add_argument("--project", action="append")
+    report.add_argument("--exclude", action="append")
+    report.set_defaults(func=command_report)
+
+    insights = subparsers.add_parser("insights")
+    insights.add_argument("--json", action="store_true")
+    insights.add_argument("--period", default="week")
+    insights.add_argument("--provider", default="all", choices=("all",) + PROVIDER_KEYS)
+    insights.add_argument("--project", action="append")
+    insights.add_argument("--exclude", action="append")
+    insights.set_defaults(func=command_insights)
+
+    models = subparsers.add_parser("models")
+    models.add_argument("--json", action="store_true")
+    models.add_argument("--period", default="week")
+    models.add_argument("--provider", default="all", choices=("all",) + PROVIDER_KEYS)
+    models.add_argument("--project", action="append")
+    models.add_argument("--exclude", action="append")
+    models.set_defaults(func=command_models)
+
+    compare = subparsers.add_parser("compare")
+    compare.add_argument("model_a", nargs="?")
+    compare.add_argument("model_b", nargs="?")
+    compare.add_argument("--json", action="store_true")
+    compare.add_argument("--period", default="week")
+    compare.add_argument("--provider", default="all", choices=("all",) + PROVIDER_KEYS)
+    compare.add_argument("--project", action="append")
+    compare.add_argument("--exclude", action="append")
+    compare.set_defaults(func=command_compare)
+
+    optimize = subparsers.add_parser("optimize")
+    optimize.add_argument("--json", action="store_true")
+    optimize.add_argument("--period", default="week")
+    optimize.add_argument("--provider", default="all", choices=("all",) + PROVIDER_KEYS)
+    optimize.add_argument("--project", action="append")
+    optimize.add_argument("--exclude", action="append")
+    optimize.set_defaults(func=command_optimize)
+
+    plan = subparsers.add_parser("plan")
+    plan.add_argument("action", nargs="?", choices=("show", "set", "reset"))
+    plan.add_argument("id", nargs="?")
+    plan.add_argument("--json", action="store_true")
+    plan.add_argument("--monthly-usd", type=float)
+    plan.add_argument("--provider", default="all", choices=("all", "claude", "codex", "cursor"))
+    plan.add_argument("--reset-day", default=1, type=int)
+    plan.set_defaults(func=command_plan)
 
     event = subparsers.add_parser("event")
     event.add_argument("--provider", required=True)

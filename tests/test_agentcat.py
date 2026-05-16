@@ -29,6 +29,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             "LIMITS_FILE": agentcat.LIMITS_FILE,
             "GEMINI_TELEMETRY": agentcat.GEMINI_TELEMETRY,
             "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
+            "INSIGHTS_PLAN_FILE": agentcat.INSIGHTS_PLAN_FILE,
         }
 
         home = self.root / "home"
@@ -42,6 +43,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat.LIMITS_FILE = agentcat_home / "limits.json"
         agentcat.GEMINI_TELEMETRY = agentcat_home / "gemini" / "telemetry.log"
         agentcat.LIVE_LIMITS_CACHE = agentcat_home / "live-limits-cache.json"
+        agentcat.INSIGHTS_PLAN_FILE = agentcat_home / "insights-plan.json"
 
     def tearDown(self) -> None:
         for name, value in self.old_paths.items():
@@ -569,6 +571,221 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertGreater(snapshot["models"]["copilot-openai-auto"]["inputTokens"], 0)
         self.assertGreater(snapshot["models"]["copilot-openai-auto"]["week"], 0)
 
+    def test_qwen_snapshot_reads_local_jsonl_usage(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        chat_dir = agentcat.HOME / ".qwen" / "projects" / "proj-1" / "chats"
+        chat_dir.mkdir(parents=True)
+        (chat_dir / "chat.jsonl").write_text(
+            json.dumps(
+                {
+                    "uuid": "assistant-1",
+                    "sessionId": "session-1",
+                    "timestamp": now,
+                    "type": "assistant",
+                    "model": "qwen3-coder-plus",
+                    "usageMetadata": {
+                        "promptTokenCount": 100,
+                        "candidatesTokenCount": 40,
+                        "thoughtsTokenCount": 10,
+                        "cachedContentTokenCount": 5,
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.qwen_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 155)
+        self.assertEqual(snapshot["models"]["qwen3-coder-plus"]["cacheReadInputTokens"], 5)
+        self.assertEqual(snapshot["models"]["qwen3-coder-plus"]["week"], 155)
+
+    def test_pi_snapshot_reads_agent_session_usage(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        session_dir = agentcat.HOME / ".pi" / "agent" / "sessions" / "project"
+        session_dir.mkdir(parents=True)
+        (session_dir / "session.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "session", "id": "session-1"}),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "timestamp": now,
+                            "message": {
+                                "role": "assistant",
+                                "model": "gpt-5",
+                                "usage": {
+                                    "input": 120,
+                                    "output": 35,
+                                    "cacheRead": 12,
+                                    "cacheWrite": 4,
+                                },
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.pi_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 171)
+        self.assertEqual(snapshot["models"]["gpt-5"]["cacheCreationInputTokens"], 4)
+
+    def test_cline_family_snapshot_reads_vscode_task_usage(self) -> None:
+        task_dir = (
+            agentcat.vscode_global_storage_dirs(["Code"], "rooveterinaryinc.roo-cline")[0]
+            / "tasks"
+            / "task-1"
+        )
+        task_dir.mkdir(parents=True)
+        (task_dir / "api_conversation_history.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "role": "user",
+                        "content": [{"text": "<model>anthropic/claude-sonnet-4-6</model>"}],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (task_dir / "ui_messages.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "say",
+                        "say": "api_req_started",
+                        "ts": int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000),
+                        "text": json.dumps(
+                            {
+                                "tokensIn": 200,
+                                "tokensOut": 50,
+                                "cacheReads": 20,
+                                "cacheWrites": 10,
+                            }
+                        ),
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.roo_code_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 280)
+        self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["cacheReadInputTokens"], 20)
+
+    def test_build_snapshot_includes_codeburn_provider_keys(self) -> None:
+        with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok", "processes": []}):
+            snapshot = agentcat.build_snapshot()
+
+        self.assertEqual(sorted(snapshot["providers"].keys()), sorted(agentcat.PROVIDER_KEYS))
+        self.assertIn("usage.codeburnProviderAdapters", snapshot["capabilities"])
+        self.assertIn("usage.analytics.report", snapshot["capabilities"])
+        self.assertIn("usage.analytics.insights", snapshot["capabilities"])
+        self.assertNotIn("_usageCalls", snapshot["providers"]["qwen"])
+
+    def sample_analytics_snapshots(self) -> dict:
+        codex_limits = agentcat.empty_limits()
+        codex_limits["status"] = "ok"
+        qwen_limits = agentcat.empty_limits()
+        return {
+            "codex": {
+                "status": "ok",
+                "tokens": {"today": 0, "week": 1000, "month": 1000, "all": 1000},
+                "models": {
+                    "gpt-5": {
+                        "week": 1000,
+                        "all": 1000,
+                        "totalTokens": 1000,
+                        "inputTokens": 600,
+                        "outputTokens": 400,
+                    }
+                },
+                "dailyTokens": {},
+                "limits": codex_limits,
+            },
+            "qwen": {
+                "status": "ok",
+                "tokens": {"today": 0, "week": 2000, "month": 2000, "all": 2000},
+                "models": {
+                    "unknown-qwen-model": {
+                        "week": 2000,
+                        "all": 2000,
+                        "totalTokens": 2000,
+                        "inputTokens": 1900,
+                        "outputTokens": 100,
+                    }
+                },
+                "dailyTokens": {},
+                "limits": qwen_limits,
+            },
+        }
+
+    def test_analytics_report_builds_model_provider_and_project_breakdowns(self) -> None:
+        with patch.object(agentcat, "collect_provider_snapshots", return_value=self.sample_analytics_snapshots()):
+            report = agentcat.build_analytics_report("week")
+
+        self.assertEqual(report["overview"]["tokens"], 3000)
+        self.assertEqual(report["overview"]["providers"], 2)
+        self.assertEqual(report["overview"]["projects"], 2)
+        self.assertEqual(report["providers"][0]["provider"], "codex")
+        self.assertEqual(report["models"][0]["model"], "gpt-5")
+        self.assertFalse(report["overview"]["pricingKnown"])
+        self.assertTrue(any(f["id"].startswith("pricing_missing:qwen") for f in report["findings"]))
+
+    def test_compare_report_compares_two_models(self) -> None:
+        snapshots = self.sample_analytics_snapshots()
+        snapshots["claude"] = {
+            "status": "ok",
+            "tokens": {"today": 0, "week": 1000, "month": 1000, "all": 1000},
+            "models": {
+                "claude-sonnet-4-6": {
+                    "week": 1000,
+                    "all": 1000,
+                    "totalTokens": 1000,
+                    "inputTokens": 500,
+                    "outputTokens": 500,
+                }
+            },
+            "dailyTokens": {},
+            "limits": agentcat.empty_limits(status="ok"),
+        }
+        with patch.object(agentcat, "collect_provider_snapshots", return_value=snapshots):
+            report = agentcat.build_analytics_report("week")
+
+        compare = agentcat.build_compare_report(report, "gpt-5", "claude-sonnet-4-6")
+
+        self.assertEqual(compare["status"], "ok")
+        self.assertEqual(compare["modelA"]["model"], "gpt-5")
+        self.assertTrue(any(row["label"] == "Cost / call" for row in compare["comparison"]))
+
+    def test_plan_report_computes_roi_from_month_usage(self) -> None:
+        with patch.object(agentcat, "collect_provider_snapshots", return_value=self.sample_analytics_snapshots()):
+            plan = {
+                "id": "custom",
+                "monthlyUsd": 20.0,
+                "provider": "all",
+                "resetDay": 1,
+                "setAt": agentcat.now_iso(),
+            }
+            report = agentcat.build_plan_report(plan)
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["budgetUsd"], 20.0)
+        self.assertIn("roi", report)
+
     def test_classify_gemini_node_wrapper_processes(self) -> None:
         self.assertEqual(
             agentcat.classify_process("node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"),
@@ -580,6 +797,10 @@ class AgentCatConnectorTests(unittest.TestCase):
             ),
             "gemini",
         )
+        self.assertEqual(agentcat.classify_process("/opt/homebrew/bin/qwen-code"), "qwen")
+        self.assertEqual(agentcat.classify_process("/opt/homebrew/bin/opencode run"), "opencode")
+        self.assertIsNone(agentcat.classify_process("/Applications/Cursor.app/Contents/MacOS/Cursor"))
+        self.assertEqual(agentcat.classify_process("/tmp/antigravity/language_server --https_server_port 123"), "antigravity")
 
     def test_motion_stage_uses_granular_activity_thresholds(self) -> None:
         self.assertEqual(agentcat.motion_stage(0, 100, 10), "sleeping")
