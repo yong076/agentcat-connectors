@@ -58,6 +58,7 @@ CONNECTOR_CAPABILITIES = (
     "events.sqlite",
     "usage.dailyTokens",
     "usage.hourlyTokens",
+    "usage.breakdown",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
     "limits.liveCache",
@@ -1689,7 +1690,72 @@ def empty_provider_usage(status: str = "not_found", source: Optional[str] = None
         "models": {},
         "dailyTokens": {},
         "hourlyTokens": {},
+        # Per-provider event-type breakdown (chat / tools / mcp / shell).
+        # `status: not_available` means the provider's data source does
+        # not expose the necessary information yet — the UI hides the
+        # breakdown panel rather than rendering misleading zeros.
+        "breakdown": empty_breakdown(),
     }
+
+
+SHELL_TOOL_NAMES = {
+    "bash",
+    "shell",
+    "exec",
+    "execute_command",
+    "run_terminal_cmd",
+    "shell_exec",
+    "terminal",
+    "run",
+}
+
+
+def classify_tool_name(name: str) -> str:
+    """Classify a tool name as 'mcp', 'shell', or 'tool'.
+
+    MCP tools use the `mcp__server__name` convention across Claude
+    Code, Cursor, and most clients shipping the MCP spec. Shell tools
+    are matched against a small known-name set rather than fuzzy
+    substring so we don't accidentally bucket `bash_completion` or
+    similar utility tool names.
+    """
+    if not name:
+        return "tool"
+    lower = name.lower()
+    if lower.startswith("mcp__") or lower.startswith("mcp_") or lower.startswith("mcp:"):
+        return "mcp"
+    if lower in SHELL_TOOL_NAMES:
+        return "shell"
+    return "tool"
+
+
+def empty_breakdown() -> Dict[str, Any]:
+    return {
+        "status": "not_available",
+        "chat": 0,
+        "tools": 0,
+        "mcp": 0,
+        "shell": 0,
+    }
+
+
+def update_breakdown(
+    breakdown: Dict[str, Any],
+    *,
+    chat: int = 0,
+    tools: Iterable[str] = (),
+) -> None:
+    """Bump per-category counts. Switching `status` to `ok` the moment
+    any signal lands so the UI can render a real card."""
+    if chat:
+        breakdown["chat"] = int(breakdown.get("chat", 0)) + chat
+        breakdown["status"] = "ok"
+    for tool_name in tools:
+        category = classify_tool_name(str(tool_name))
+        breakdown["tools"] = int(breakdown.get("tools", 0)) + 1
+        if category in ("mcp", "shell"):
+            breakdown[category] = int(breakdown.get(category, 0)) + 1
+        breakdown["status"] = "ok"
 
 
 def add_to_periods(periods: Dict[str, int], amount: int, when: Optional[dt.datetime]) -> None:
@@ -1947,6 +2013,18 @@ def opencode_snapshot() -> Dict[str, Any]:
             metrics = opencode_message_metrics(data)
             if add_usage_metrics(result, data.get("modelID"), metrics, parse_timestamp(created_raw)):
                 events += 1
+            # PR-C: feed event-type breakdown so the Tools/MCP/Shell
+            # panels stop being placeholders for opencode users.
+            tool_requests = data.get("toolRequests")
+            tool_names: List[str] = []
+            if isinstance(tool_requests, list):
+                for tool in tool_requests:
+                    if not isinstance(tool, dict):
+                        continue
+                    name = tool.get("toolName") or tool.get("name") or tool.get("tool")
+                    if name:
+                        tool_names.append(str(name))
+            update_breakdown(result["breakdown"], chat=1, tools=tool_names)
 
     if events == 0 and errors:
         result["status"] = "error"
@@ -2112,6 +2190,17 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
         }
         if add_usage_metrics(result, model, metrics, parse_timestamp(event.get("timestamp")) or file_when):
             parsed += 1
+        # PR-C: copilot transcript carries the same toolRequests shape
+        # opencode does — feed the breakdown counters.
+        tool_names: List[str] = []
+        if isinstance(tool_requests, list):
+            for tool in tool_requests:
+                if not isinstance(tool, dict):
+                    continue
+                name = tool.get("toolName") or tool.get("name") or tool.get("tool")
+                if name:
+                    tool_names.append(str(name))
+        update_breakdown(result["breakdown"], chat=1, tools=tool_names)
         pending_input_tokens = 0
     return parsed
 
@@ -2149,6 +2238,7 @@ def codex_snapshot() -> Dict[str, Any]:
         "models": {},
         "dailyTokens": {},
         "hourlyTokens": {},
+        "breakdown": empty_breakdown(),
     }
     if not paths:
         return result
@@ -2205,6 +2295,14 @@ def codex_snapshot() -> Dict[str, Any]:
     result["status"] = "ok"
     result["threads"] = len(rows)
     result["models"] = models
+    # Codex SQLite gives us per-thread token totals but not per-tool
+    # call records, so the breakdown only reports chat (= thread count).
+    # Tools/MCP/Shell stay zero with status='ok' so the UI knows the
+    # provider opted in to breakdown even though tool-level granularity
+    # is unavailable.
+    if rows:
+        result["breakdown"]["chat"] = len(rows)
+        result["breakdown"]["status"] = "ok"
     return result
 
 
@@ -2223,6 +2321,10 @@ def claude_snapshot() -> Dict[str, Any]:
         # populate hourly buckets going forward via add_to_hourly when
         # they fire.
         "hourlyTokens": {},
+        # stats-cache.json doesn't expose tool-level records either, so
+        # breakdown stays not_available until claudeHooks ingestion
+        # lands. The UI hides the panel when status is not_available.
+        "breakdown": empty_breakdown(),
     }
     if raw is None:
         return result
@@ -2289,6 +2391,11 @@ def gemini_snapshot() -> Dict[str, Any]:
         "dailyTokens": {},
         "hourlyTokens": {},
         "events": 0,
+        # Gemini telemetry carries tool/MCP call records under
+        # `gemini_cli.tool.call`; parse_gemini_telemetry could grow a
+        # second pass for those. For now mark not_available so the
+        # client doesn't render zeros that imply zero tools were used.
+        "breakdown": empty_breakdown(),
     }
     if not GEMINI_TELEMETRY.exists():
         return result
