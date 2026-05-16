@@ -46,6 +46,8 @@ GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"const OAUTH_CLIENT_ID = '([^']+)';")
 GEMINI_TELEMETRY_PARSE_BYTES = int(os.environ.get("AGENTCAT_GEMINI_PARSE_BYTES", str(64 * 1024 * 1024)))
 GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECONDS", "10"))
+LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_BYTES", str(16 * 1024 * 1024)))
+LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
 LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
 CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.20.4")
@@ -55,6 +57,8 @@ CONNECTOR_CAPABILITIES = (
     "activity.memory",
     "events.sqlite",
     "usage.dailyTokens",
+    "usage.opencode.sqlite",
+    "usage.copilot.localLogs",
     "limits.liveCache",
     "limits.errorBackoff",
     "limits.quotaFallbackOn429",
@@ -84,6 +88,8 @@ TOKEN_KEYS = {
     "output_token_count": "outputTokens",
     "cached_content_token_count": "cacheReadInputTokens",
     "thoughts_token_count": "thoughtTokens",
+    "reasoning_tokens": "reasoningTokens",
+    "reasoningtokens": "reasoningTokens",
     "tool_token_count": "toolTokens",
     "total_token_count": "totalTokens",
     "total_input_tokens": "inputTokens",
@@ -336,6 +342,21 @@ def int_limit(raw: Any) -> Optional[int]:
     else:
         return None
     return value if value > 0 else None
+
+
+def nonnegative_int(raw: Any) -> Optional[int]:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        value = int(raw)
+    elif isinstance(raw, str):
+        text = raw.strip().replace(",", "").replace("_", "")
+        if not text.isdigit():
+            return None
+        value = int(text)
+    else:
+        return None
+    return value if value >= 0 else None
 
 
 def float_percent(raw: Any) -> Optional[float]:
@@ -957,8 +978,6 @@ def claude_quota_model(key: str) -> Optional[str]:
         return "sonnet"
     if key == "seven_day_opus":
         return "opus"
-    if key.startswith("seven_day_"):
-        return "unknown"
     return None
 
 
@@ -980,6 +999,8 @@ def sanitize_claude_cached_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
                 item["id"] = claude_quota_id(key)
                 item["label"] = claude_quota_label(key)
                 item["model"] = claude_quota_model(key)
+        if isinstance(item.get("model"), str) and item["model"].strip().lower() in {"unknown", "null", "none", ""}:
+            item["model"] = None
         sanitized.append(item)
 
     sanitized.sort(key=claude_quota_sort_key)
@@ -1409,17 +1430,27 @@ def empty_periods() -> Dict[str, int]:
     return {"today": 0, "week": 0, "month": 0, "all": 0}
 
 
+def empty_provider_usage(status: str = "not_found", source: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "source": source,
+        "tokens": empty_periods(),
+        "models": {},
+        "dailyTokens": {},
+    }
+
+
 def add_to_periods(periods: Dict[str, int], amount: int, when: Optional[dt.datetime]) -> None:
-    periods["all"] += amount
+    periods["all"] = periods.get("all", 0) + amount
     if when is None:
         return
     now = dt.datetime.now(dt.timezone.utc)
     if when.date() == now.date():
-        periods["today"] += amount
+        periods["today"] = periods.get("today", 0) + amount
     if when >= now - dt.timedelta(days=7):
-        periods["week"] += amount
+        periods["week"] = periods.get("week", 0) + amount
     if when >= now - dt.timedelta(days=30):
-        periods["month"] += amount
+        periods["month"] = periods.get("month", 0) + amount
 
 
 def day_key_for_timestamp(when: Optional[dt.datetime]) -> Optional[str]:
@@ -1435,6 +1466,401 @@ def add_to_daily(daily: Dict[str, int], amount: int, when: Optional[dt.datetime]
     if key is None:
         return
     daily[key] = daily.get(key, 0) + amount
+
+
+def normalized_model_name(raw: Any) -> Optional[str]:
+    if raw is None or isinstance(raw, bool):
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() in {"unknown", "null", "none"}:
+        return None
+    return text
+
+
+TOKEN_TOTAL_PART_KEYS = {
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+    "cachedInputTokens",
+    "reasoningTokens",
+    "thoughtTokens",
+    "toolTokens",
+}
+
+
+def usage_token_total(metrics: Dict[str, int]) -> int:
+    total = int(metrics.get("totalTokens") or 0)
+    if total > 0:
+        return total
+    return sum(int(metrics.get(key) or 0) for key in TOKEN_TOTAL_PART_KEYS)
+
+
+def add_usage_metrics(
+    result: Dict[str, Any],
+    model_raw: Any,
+    metrics: Dict[str, int],
+    when: Optional[dt.datetime],
+) -> bool:
+    total = usage_token_total(metrics)
+    if total <= 0:
+        return False
+
+    tokens = result.setdefault("tokens", empty_periods())
+    models = result.setdefault("models", {})
+    daily = result.setdefault("dailyTokens", {})
+    model = normalized_model_name(model_raw) or "unknown"
+    model_tokens = models.setdefault(model, {})
+
+    for key, amount in metrics.items():
+        if amount <= 0 or key == "totalTokens":
+            continue
+        tokens[key] = tokens.get(key, 0) + amount
+        model_tokens[key] = model_tokens.get(key, 0) + amount
+
+    tokens["totalTokens"] = tokens.get("totalTokens", 0) + total
+    model_tokens["totalTokens"] = model_tokens.get("totalTokens", 0) + total
+    add_to_periods(tokens, total, when)
+    add_to_periods(model_tokens, total, when)
+    add_to_daily(daily, total, when)
+    return True
+
+
+def nested_dict_value(value: Any, path: Iterable[str]) -> Optional[Any]:
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def codex_model_from_rollout(raw_path: Any) -> Optional[str]:
+    if not raw_path:
+        return None
+    path = Path(str(raw_path)).expanduser()
+    if not path.is_absolute():
+        path = HOME / path
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for index, line in enumerate(fh):
+                if index >= 1000:
+                    break
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                payload = item.get("payload")
+                candidates = [
+                    item.get("model"),
+                    nested_dict_value(payload, ["model"]),
+                    nested_dict_value(payload, ["collaboration_mode", "settings", "model"]),
+                    nested_dict_value(payload, ["settings", "model"]),
+                    nested_dict_value(payload, ["metadata", "model"]),
+                    nested_dict_value(payload, ["session", "model"]),
+                    nested_dict_value(payload, ["info", "model"]),
+                ]
+                for candidate in candidates:
+                    model = normalized_model_name(candidate)
+                    if model:
+                        return model
+    except OSError:
+        return None
+    return None
+
+
+def read_text_limited(path: Path, max_bytes: int = LOCAL_PROVIDER_PARSE_BYTES) -> Optional[str]:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(max(0, size - max_bytes))
+                data = fh.read()
+                newline = data.find(b"\n")
+                if newline >= 0:
+                    data = data[newline + 1 :]
+            else:
+                data = fh.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def iter_jsonl_file(path: Path) -> Iterable[Dict[str, Any]]:
+    text = read_text_limited(path)
+    if text is None:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            yield payload
+
+
+def opencode_data_dir() -> Path:
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg).expanduser() if xdg else HOME / ".local" / "share"
+    return base / "opencode"
+
+
+def opencode_message_metrics(data: Dict[str, Any]) -> Dict[str, int]:
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+    return {
+        "inputTokens": nonnegative_int(tokens.get("input")) or 0,
+        "outputTokens": nonnegative_int(tokens.get("output")) or 0,
+        "reasoningTokens": nonnegative_int(tokens.get("reasoning")) or 0,
+        "cacheReadInputTokens": nonnegative_int(cache.get("read")) or 0,
+        "cacheCreationInputTokens": nonnegative_int(cache.get("write")) or 0,
+    }
+
+
+def opencode_snapshot() -> Dict[str, Any]:
+    data_dir = opencode_data_dir()
+    result = empty_provider_usage(source=str(data_dir))
+    if not data_dir.exists():
+        return result
+
+    db_paths = sorted(path for path in data_dir.glob("opencode*.db") if path.is_file())
+    if not db_paths:
+        return result
+
+    result["status"] = "ok"
+    result["source"] = ",".join(str(path) for path in db_paths)
+    events = 0
+    errors: List[str] = []
+    for db_path in db_paths:
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            rows = conn.execute(
+                """
+                select message.time_created, message.data
+                from message
+                left join session on session.id = message.session_id
+                where (session.time_archived is null or session.id is null)
+                  and (session.parent_id is null or session.id is null)
+                order by message.time_created asc
+                """
+            ).fetchall()
+        except Exception as exc:
+            errors.append(f"{db_path.name}: {exc}")
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        for created_raw, data_raw in rows:
+            try:
+                data = json.loads(data_raw.decode("utf-8", errors="replace") if isinstance(data_raw, bytes) else str(data_raw))
+            except Exception:
+                continue
+            if not isinstance(data, dict) or data.get("role") != "assistant":
+                continue
+            metrics = opencode_message_metrics(data)
+            if add_usage_metrics(result, data.get("modelID"), metrics, parse_timestamp(created_raw)):
+                events += 1
+
+    if events == 0 and errors:
+        result["status"] = "error"
+        result["error"] = "; ".join(errors[:3])
+    elif errors:
+        result["warnings"] = errors[:3]
+    result["events"] = events
+    return result
+
+
+def copilot_workspace_storage_dirs() -> List[Path]:
+    if IS_WINDOWS:
+        return [
+            HOME / "AppData" / "Roaming" / "Code" / "User" / "workspaceStorage",
+            HOME / "AppData" / "Roaming" / "Code - Insiders" / "User" / "workspaceStorage",
+        ]
+    if sys.platform == "darwin":
+        return [
+            HOME / "Library" / "Application Support" / "Code" / "User" / "workspaceStorage",
+            HOME / "Library" / "Application Support" / "Code - Insiders" / "User" / "workspaceStorage",
+        ]
+    return [
+        HOME / ".config" / "Code" / "User" / "workspaceStorage",
+        HOME / ".config" / "Code - Insiders" / "User" / "workspaceStorage",
+        HOME / ".vscode-server" / "data" / "User" / "workspaceStorage",
+    ]
+
+
+def copilot_legacy_event_files() -> List[Path]:
+    root = HOME / ".copilot" / "session-state"
+    try:
+        return [
+            path / "events.jsonl"
+            for path in root.iterdir()
+            if path.is_dir() and (path / "events.jsonl").is_file()
+        ]
+    except OSError:
+        return []
+
+
+def copilot_vscode_transcript_files() -> List[Path]:
+    out: List[Path] = []
+    for workspace_root in copilot_workspace_storage_dirs():
+        try:
+            workspace_dirs = list(workspace_root.iterdir())
+        except OSError:
+            continue
+        for workspace_dir in workspace_dirs:
+            transcripts = workspace_dir / "GitHub.copilot-chat" / "transcripts"
+            try:
+                out.extend(path for path in transcripts.iterdir() if path.is_file() and path.suffix == ".jsonl")
+            except OSError:
+                continue
+    return out
+
+
+def recent_files(paths: List[Path]) -> List[Path]:
+    def mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(paths, key=mtime, reverse=True)[: max(1, LOCAL_PROVIDER_MAX_FILES)]
+
+
+def copilot_legacy_model(event: Dict[str, Any], current_model: Optional[str]) -> Optional[str]:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    model = normalized_model_name(data.get("model"))
+    if model:
+        return model
+    if event.get("type") == "session.model_change":
+        return normalized_model_name(data.get("newModel")) or current_model
+    return current_model
+
+
+def parse_copilot_legacy_file(path: Path, result: Dict[str, Any]) -> int:
+    current_model: Optional[str] = None
+    events = 0
+    try:
+        file_when = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+    except OSError:
+        file_when = None
+    for event in iter_jsonl_file(path):
+        current_model = copilot_legacy_model(event, current_model)
+        if event.get("type") != "assistant.message":
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        output_tokens = nonnegative_int(data.get("outputTokens")) or 0
+        if output_tokens <= 0 or not current_model:
+            continue
+        metrics = {"outputTokens": output_tokens}
+        if add_usage_metrics(result, current_model, metrics, parse_timestamp(event.get("timestamp")) or file_when):
+            events += 1
+    return events
+
+
+def infer_copilot_transcript_model(events: List[Dict[str, Any]]) -> str:
+    counts: Dict[str, int] = {}
+    for event in events:
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        model = normalized_model_name(data.get("model"))
+        if model:
+            counts[model] = counts.get(model, 0) + 100
+        if event.get("type") != "assistant.message":
+            continue
+        tool_requests = data.get("toolRequests")
+        if not isinstance(tool_requests, list):
+            continue
+        for tool in tool_requests:
+            if not isinstance(tool, dict):
+                continue
+            tool_call_id = str(tool.get("toolCallId") or "")
+            if tool_call_id.startswith(("toolu_bdrk_", "toolu_vrtx_", "tooluse_", "toolu_")):
+                counts["copilot-anthropic-auto"] = counts.get("copilot-anthropic-auto", 0) + 1
+            elif tool_call_id.startswith("call_"):
+                counts["copilot-openai-auto"] = counts.get("copilot-openai-auto", 0) + 1
+    if counts:
+        return sorted(counts.items(), key=lambda item: item[1], reverse=True)[0][0]
+    return "copilot-auto"
+
+
+def char_token_estimate(text: Any) -> int:
+    if not isinstance(text, str) or not text:
+        return 0
+    return max(1, int((len(text) + 3) / 4))
+
+
+def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
+    events = list(iter_jsonl_file(path))
+    if not events:
+        return 0
+    first = events[0]
+    first_data = first.get("data") if isinstance(first.get("data"), dict) else {}
+    if first.get("type") != "session.start" or first_data.get("producer") != "copilot-agent":
+        return 0
+
+    model = infer_copilot_transcript_model(events)
+    try:
+        file_when = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+    except OSError:
+        file_when = None
+    pending_input_tokens = 0
+    parsed = 0
+    for event in events:
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        if event.get("type") == "user.message":
+            pending_input_tokens = char_token_estimate(data.get("content"))
+            continue
+        if event.get("type") != "assistant.message":
+            continue
+        content_tokens = nonnegative_int(data.get("outputTokens"))
+        if content_tokens is None:
+            content_tokens = char_token_estimate(data.get("content"))
+        reasoning_tokens = char_token_estimate(data.get("reasoningText"))
+        tool_requests = data.get("toolRequests")
+        if content_tokens <= 0 and reasoning_tokens <= 0 and not isinstance(tool_requests, list):
+            continue
+        metrics = {
+            "inputTokens": pending_input_tokens,
+            "outputTokens": content_tokens,
+            "reasoningTokens": reasoning_tokens,
+        }
+        if add_usage_metrics(result, model, metrics, parse_timestamp(event.get("timestamp")) or file_when):
+            parsed += 1
+        pending_input_tokens = 0
+    return parsed
+
+
+def copilot_snapshot() -> Dict[str, Any]:
+    legacy_files = recent_files(copilot_legacy_event_files())
+    transcript_files = recent_files(copilot_vscode_transcript_files())
+    result = empty_provider_usage(source="~/.copilot/session-state, VS Code workspaceStorage")
+    if not legacy_files and not transcript_files:
+        return result
+
+    result["status"] = "ok"
+    events = 0
+    for path in legacy_files:
+        events += parse_copilot_legacy_file(path, result)
+    for path in transcript_files:
+        events += parse_copilot_transcript_file(path, result)
+    result["events"] = events
+    result["sources"] = {
+        "legacyFiles": len(legacy_files),
+        "transcriptFiles": len(transcript_files),
+        "parseMaxFiles": LOCAL_PROVIDER_MAX_FILES,
+    }
+    if events == 0:
+        result["status"] = "no_token_events_yet"
+    return result
 
 
 def codex_snapshot() -> Dict[str, Any]:
@@ -1460,7 +1886,10 @@ def codex_snapshot() -> Dict[str, Any]:
             return result
         model_col = "model" if "model" in columns else "null"
         updated_col = "updated_at" if "updated_at" in columns else ("created_at" if "created_at" in columns else "null")
-        rows = conn.execute(f"select tokens_used, {model_col}, {updated_col} from threads where tokens_used is not null").fetchall()
+        rollout_col = "rollout_path" if "rollout_path" in columns else "null"
+        rows = conn.execute(
+            f"select tokens_used, {model_col}, {updated_col}, {rollout_col} from threads where tokens_used is not null"
+        ).fetchall()
     except Exception as exc:
         result["status"] = "error"
         result["error"] = str(exc)
@@ -1472,7 +1901,8 @@ def codex_snapshot() -> Dict[str, Any]:
             pass
 
     models: Dict[str, Dict[str, int]] = {}
-    for tokens_raw, model_raw, updated_raw in rows:
+    rollout_model_cache: Dict[str, Optional[str]] = {}
+    for tokens_raw, model_raw, updated_raw, rollout_raw in rows:
         try:
             tokens = int(tokens_raw or 0)
         except (TypeError, ValueError):
@@ -1482,7 +1912,14 @@ def codex_snapshot() -> Dict[str, Any]:
         when = parse_timestamp(updated_raw)
         add_to_periods(result["tokens"], tokens, when)
         add_to_daily(result["dailyTokens"], tokens, when)
-        model = str(model_raw or "unknown")
+        model = normalized_model_name(model_raw)
+        if model is None and rollout_raw:
+            rollout_key = str(rollout_raw)
+            if rollout_key not in rollout_model_cache:
+                rollout_model_cache[rollout_key] = codex_model_from_rollout(rollout_raw)
+            model = rollout_model_cache[rollout_key]
+        if model is None:
+            model = "unknown"
         model_periods = models.setdefault(model, empty_periods())
         add_to_periods(model_periods, tokens, when)
 
@@ -1527,9 +1964,17 @@ def claude_snapshot() -> Dict[str, Any]:
             tokens_by_model = item.get("tokensByModel")
             if not isinstance(tokens_by_model, dict):
                 continue
-            total = sum(int_limit(value) or 0 for value in tokens_by_model.values())
+            when = parse_timestamp(item.get("date"))
+            total = 0
+            for model_raw, value in tokens_by_model.items():
+                amount = int_limit(value) or 0
+                if amount <= 0:
+                    continue
+                total += amount
+                model = normalized_model_name(model_raw) or "unknown"
+                model_periods = result["models"].setdefault(model, {})
+                add_to_periods(model_periods, amount, when)
             if total > 0:
-                when = parse_timestamp(item.get("date"))
                 add_to_periods(periods, total, when)
                 day_key = str(item.get("date") or "").strip()
                 if not re.match(r"^\d{4}-\d{2}-\d{2}$", day_key):
@@ -1739,6 +2184,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
         tokens[token_key] = tokens.get(token_key, 0) + amount
         model_tokens = models.setdefault(model, {})
         model_tokens[token_key] = model_tokens.get(token_key, 0) + amount
+        add_to_periods(model_tokens, amount, when)
         add_to_periods(periods, amount, when)
         add_to_daily(daily_tokens, amount, when)
 
@@ -2034,6 +2480,8 @@ def build_snapshot() -> Dict[str, Any]:
         "codex": codex_snapshot(),
         "claude": claude_snapshot(),
         "gemini": gemini_snapshot(),
+        "opencode": opencode_snapshot(),
+        "copilot": copilot_snapshot(),
     }
     for provider, data in providers.items():
         data["limits"] = merge_limits(
@@ -2149,22 +2597,35 @@ class AgentCatHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
+    def write_response_body(self, body: bytes) -> bool:
+        try:
+            self.wfile.write(body)
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+
     def send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        self.write_response_body(body)
 
     def do_GET(self) -> None:
         if self.path == "/healthz":
             body = b"ok\n"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            self.write_response_body(body)
             return
         if self.path == "/v1/snapshot":
             try:
