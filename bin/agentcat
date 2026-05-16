@@ -59,6 +59,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.dailyTokens",
     "usage.hourlyTokens",
     "usage.breakdown",
+    "usage.projects",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
     "limits.liveCache",
@@ -1695,7 +1696,31 @@ def empty_provider_usage(status: str = "not_found", source: Optional[str] = None
         # not expose the necessary information yet — the UI hides the
         # breakdown panel rather than rendering misleading zeros.
         "breakdown": empty_breakdown(),
+        # Per-project rollup. Same status semantics as breakdown: when
+        # `not_available`, the UI hides the per-project section.
+        "projects": empty_projects(),
     }
+
+
+def empty_projects() -> Dict[str, Any]:
+    return {
+        "status": "not_available",
+        "items": [],
+    }
+
+
+def display_project_name(path: str) -> str:
+    """Friendly leaf name for a project path.
+
+    Strips trailing slashes and returns the last meaningful directory
+    component. Falls back to the input when the path doesn't have a
+    folder name (e.g. just `/`).
+    """
+    text = (path or "").rstrip("/\\")
+    if not text:
+        return ""
+    leaf = Path(text).name
+    return leaf or text
 
 
 SHELL_TOOL_NAMES = {
@@ -1979,13 +2004,24 @@ def opencode_snapshot() -> Dict[str, Any]:
     result["source"] = ",".join(str(path) for path in db_paths)
     events = 0
     errors: List[str] = []
+    project_tokens: Dict[str, int] = {}
+    project_last: Dict[str, dt.datetime] = {}
     for db_path in db_paths:
         conn: Optional[sqlite3.Connection] = None
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            session_columns = {row[1] for row in conn.execute("pragma table_info(session)").fetchall()}
+            # Session schemas across opencode releases have used `path`,
+            # `cwd`, and `working_directory`. Try each — first hit wins.
+            path_col: Optional[str] = None
+            for candidate in ("path", "cwd", "working_directory"):
+                if candidate in session_columns:
+                    path_col = candidate
+                    break
+            select_path = f"session.{path_col}" if path_col else "''"
             rows = conn.execute(
-                """
-                select message.time_created, message.data
+                f"""
+                select message.time_created, message.data, {select_path}
                 from message
                 left join session on session.id = message.session_id
                 where (session.time_archived is null or session.id is null)
@@ -2003,7 +2039,7 @@ def opencode_snapshot() -> Dict[str, Any]:
                 except Exception:
                     pass
 
-        for created_raw, data_raw in rows:
+        for created_raw, data_raw, project_raw in rows:
             try:
                 data = json.loads(data_raw.decode("utf-8", errors="replace") if isinstance(data_raw, bytes) else str(data_raw))
             except Exception:
@@ -2011,8 +2047,18 @@ def opencode_snapshot() -> Dict[str, Any]:
             if not isinstance(data, dict) or data.get("role") != "assistant":
                 continue
             metrics = opencode_message_metrics(data)
-            if add_usage_metrics(result, data.get("modelID"), metrics, parse_timestamp(created_raw)):
+            when = parse_timestamp(created_raw)
+            if add_usage_metrics(result, data.get("modelID"), metrics, when):
                 events += 1
+            project_path = str(project_raw or "").strip()
+            if project_path:
+                total = usage_token_total(metrics)
+                if total > 0:
+                    project_tokens[project_path] = project_tokens.get(project_path, 0) + total
+                if when is not None:
+                    current = project_last.get(project_path)
+                    if current is None or when > current:
+                        project_last[project_path] = when
             # PR-C: feed event-type breakdown so the Tools/MCP/Shell
             # panels stop being placeholders for opencode users.
             tool_requests = data.get("toolRequests")
@@ -2032,6 +2078,19 @@ def opencode_snapshot() -> Dict[str, Any]:
     elif errors:
         result["warnings"] = errors[:3]
     result["events"] = events
+    if project_tokens:
+        items = []
+        for project_path, tokens in project_tokens.items():
+            last_active = project_last.get(project_path)
+            items.append({
+                "id": project_path,
+                "path": project_path,
+                "name": display_project_name(project_path),
+                "tokens": tokens,
+                "lastActive": last_active.isoformat().replace("+00:00", "Z") if last_active else None,
+            })
+        items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
+        result["projects"] = {"status": "ok", "items": items[:20]}
     return result
 
 
@@ -2205,6 +2264,46 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
     return parsed
 
 
+def copilot_workspace_folder(workspace_dir: Path) -> Optional[str]:
+    """Resolve a VS Code workspaceStorage subdirectory to the on-disk
+    folder it represents. Reads `workspace.json` which carries the
+    `folder` URI; returns the local path or None if it can't decode."""
+    try:
+        payload = json.loads((workspace_dir / "workspace.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    folder = payload.get("folder") if isinstance(payload, dict) else None
+    if not isinstance(folder, str):
+        return None
+    if folder.startswith("file://"):
+        try:
+            return urllib.parse.unquote(urllib.parse.urlparse(folder).path)
+        except Exception:
+            return None
+    return folder
+
+
+def copilot_project_for_path(path: Path) -> Optional[str]:
+    """Map a copilot legacy events.jsonl or VS Code transcript file
+    back to its project folder, or None if it can't be determined."""
+    candidate = path
+    for _ in range(6):
+        parent = candidate.parent
+        # `~/.copilot/session-state/<workspace_hash>/events.jsonl` — the
+        # hash directory is the parent of events.jsonl.
+        if candidate.name == "events.jsonl":
+            return parent.name or None
+        # VS Code transcripts live in workspaceStorage/<hash>/GitHub.copilot-chat/transcripts/<file>
+        if parent.name == "transcripts" and parent.parent.name == "GitHub.copilot-chat":
+            workspace_dir = parent.parent.parent
+            folder = copilot_workspace_folder(workspace_dir)
+            return folder or workspace_dir.name
+        candidate = parent
+        if candidate == candidate.parent:
+            break
+    return None
+
+
 def copilot_snapshot() -> Dict[str, Any]:
     legacy_files = recent_files(copilot_legacy_event_files())
     transcript_files = recent_files(copilot_vscode_transcript_files())
@@ -2214,11 +2313,35 @@ def copilot_snapshot() -> Dict[str, Any]:
 
     result["status"] = "ok"
     events = 0
+    project_totals: Dict[str, int] = {}
     for path in legacy_files:
+        before = int(result["tokens"].get("totalTokens") or 0)
         events += parse_copilot_legacy_file(path, result)
+        after = int(result["tokens"].get("totalTokens") or 0)
+        project = copilot_project_for_path(path)
+        if project and after > before:
+            project_totals[project] = project_totals.get(project, 0) + (after - before)
     for path in transcript_files:
+        before = int(result["tokens"].get("totalTokens") or 0)
         events += parse_copilot_transcript_file(path, result)
+        after = int(result["tokens"].get("totalTokens") or 0)
+        project = copilot_project_for_path(path)
+        if project and after > before:
+            project_totals[project] = project_totals.get(project, 0) + (after - before)
     result["events"] = events
+    if project_totals:
+        items = [
+            {
+                "id": project,
+                "path": project,
+                "name": display_project_name(project),
+                "tokens": tokens,
+                "lastActive": None,
+            }
+            for project, tokens in project_totals.items()
+        ]
+        items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
+        result["projects"] = {"status": "ok", "items": items[:20]}
     result["sources"] = {
         "legacyFiles": len(legacy_files),
         "transcriptFiles": len(transcript_files),
