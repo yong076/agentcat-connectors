@@ -3186,6 +3186,14 @@ def classify_process(command: str) -> Optional[str]:
         return None
     if "/applications/claude.app/contents/" in normalized:
         return None
+    if (
+        "/windowsapps/openai.codex_" in normalized
+        and "/app/codex.exe" in normalized
+        and "/app/resources/codex.exe" not in normalized
+    ):
+        return None
+    if "/.vscode/extensions/openai.chatgpt-" in normalized:
+        return None
 
     executable = executable_name(command)
     if not executable or executable in IGNORED_EXECUTABLES:
