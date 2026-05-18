@@ -1,9 +1,11 @@
 import importlib.util
+import io
 import datetime as dt
 import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
@@ -240,6 +242,16 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
         self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
+
+    def test_version_json_matches_snapshot_schema_version(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(agentcat.command_version(agentcat.argparse.Namespace(json=True)), 0)
+        payload = json.loads(buf.getvalue())
+
+        self.assertEqual(payload["connectorVersion"], agentcat.CONNECTOR_VERSION)
+        self.assertEqual(payload["schemaVersion"], agentcat.SCHEMA_VERSION)
+        self.assertEqual(payload["schemaVersion"], 4)
 
     def test_codex_runtime_limits_reads_latest_token_count_event(self) -> None:
         session_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "05" / "06"
