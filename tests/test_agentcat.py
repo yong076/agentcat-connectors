@@ -1,9 +1,11 @@
 import importlib.util
+import io
 import datetime as dt
 import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
@@ -152,7 +154,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["quotas"][2]["remaining"], 3750.0)
         self.assertEqual(limits["quotas"][2]["remainingPercent"], 75.0)
         self.assertEqual(limits["quotas"][4]["label"], "Claude 모델 7일")
-        self.assertEqual(limits["quotas"][4]["model"], "unknown")
+        self.assertIsNone(limits["quotas"][4]["model"])
         self.assertNotIn("omelette", limits["quotas"][4]["id"])
         self.assertNotIn("omelette", limits["quotas"][4]["label"])
 
@@ -162,6 +164,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             {
                 "id": "claude:seven_day_omelette",
                 "label": "seven day omelette",
+                "model": "unknown",
                 "remainingPercent": 43.0,
                 "usedPercent": 57.0,
             }
@@ -170,7 +173,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         sanitized = agentcat.sanitize_claude_cached_limits(limits)
 
         self.assertEqual(sanitized["quotas"][0]["label"], "Claude 모델 7일")
-        self.assertEqual(sanitized["quotas"][0]["model"], "unknown")
+        self.assertIsNone(sanitized["quotas"][0]["model"])
         self.assertNotIn("omelette", sanitized["quotas"][0]["id"])
 
     def test_gemini_quota_api_payload_builds_model_remaining(self) -> None:
@@ -233,11 +236,22 @@ class AgentCatConnectorTests(unittest.TestCase):
     def test_snapshot_exposes_connector_metadata_and_capabilities(self) -> None:
         snapshot = agentcat.build_snapshot()
 
-        self.assertEqual(snapshot["schemaVersion"], 2)
+        self.assertEqual(snapshot["schemaVersion"], 4)
         self.assertEqual(snapshot["connectorVersion"], agentcat.CONNECTOR_VERSION)
         self.assertIn("activity.memory", snapshot["capabilities"])
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
+        self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
+
+    def test_version_json_matches_snapshot_schema_version(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(agentcat.command_version(agentcat.argparse.Namespace(json=True)), 0)
+        payload = json.loads(buf.getvalue())
+
+        self.assertEqual(payload["connectorVersion"], agentcat.CONNECTOR_VERSION)
+        self.assertEqual(payload["schemaVersion"], agentcat.SCHEMA_VERSION)
+        self.assertEqual(payload["schemaVersion"], 4)
 
     def test_codex_runtime_limits_reads_latest_token_count_event(self) -> None:
         session_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "05" / "06"
@@ -302,6 +316,90 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["month"], 60)
         self.assertEqual(snapshot["tokens"]["all"], 100)
 
+        # PR-A: hourly buckets emitted next to dailyTokens. Sum of all
+        # buckets must match the all-time total.
+        hourly = snapshot.get("hourlyTokens", {})
+        self.assertIsInstance(hourly, dict)
+        self.assertGreater(len(hourly), 0)
+        self.assertEqual(sum(hourly.values()), 100)
+        # Keys are sortable YYYY-MM-DDTHH strings.
+        for key in hourly:
+            self.assertRegex(key, r"^\d{4}-\d{2}-\d{2}T\d{2}$")
+
+    def test_codex_snapshot_infers_missing_model_from_rollout_metadata(self) -> None:
+        codex_dir = agentcat.HOME / ".codex"
+        codex_dir.mkdir(parents=True)
+        sessions_dir = codex_dir / "sessions" / "2026" / "05" / "15"
+        sessions_dir.mkdir(parents=True)
+        rollout_path = sessions_dir / "rollout-test.jsonl"
+        rollout_path.write_text(
+            json.dumps({"type": "session_meta", "payload": {"model_provider": "openai"}}) + "\n"
+            + json.dumps(
+                {
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.4",
+                        "collaboration_mode": {"settings": {"model": "gpt-5.4"}},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        db_path = codex_dir / "state_test.sqlite"
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "create table threads(tokens_used integer, model text, updated_at integer, rollout_path text)"
+            )
+            conn.execute(
+                "insert into threads(tokens_used, model, updated_at, rollout_path) values (?, ?, ?, ?)",
+                (42, None, now, str(rollout_path)),
+            )
+            conn.commit()
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["models"]["gpt-5.4"]["all"], 42)
+        self.assertNotIn("unknown", snapshot["models"])
+
+    def test_claude_snapshot_adds_periods_to_daily_model_tokens(self) -> None:
+        claude_dir = agentcat.HOME / ".claude"
+        claude_dir.mkdir(parents=True)
+        today = dt.datetime.now(dt.timezone.utc).date()
+        old = today - dt.timedelta(days=45)
+        stats = {
+            "dailyModelTokens": [
+                {
+                    "date": today.isoformat(),
+                    "tokensByModel": {
+                        "claude-sonnet-4-6": 100,
+                        "unknown": 9,
+                    },
+                },
+                {
+                    "date": old.isoformat(),
+                    "tokensByModel": {
+                        "claude-sonnet-4-6": 50,
+                    },
+                },
+            ]
+        }
+        (claude_dir / "stats-cache.json").write_text(json.dumps(stats), encoding="utf-8")
+
+        snapshot = agentcat.claude_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["today"], 109)
+        self.assertEqual(snapshot["tokens"]["week"], 109)
+        self.assertEqual(snapshot["tokens"]["all"], 159)
+        self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["today"], 100)
+        self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["week"], 100)
+        self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["all"], 150)
+        self.assertEqual(snapshot["models"]["unknown"]["week"], 9)
+
     def test_gemini_snapshot_reads_otel_token_metrics(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
         now = dt.datetime.now(dt.timezone.utc)
@@ -361,6 +459,138 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["month"], 450)
         self.assertEqual(snapshot["tokens"]["all"], 450)
         self.assertEqual(snapshot["models"]["gemini-test"]["inputTokens"], 125)
+        self.assertEqual(snapshot["models"]["gemini-test"]["today"], 450)
+        self.assertEqual(snapshot["models"]["gemini-test"]["week"], 450)
+        self.assertEqual(snapshot["models"]["gemini-test"]["month"], 450)
+        self.assertEqual(snapshot["models"]["gemini-test"]["all"], 450)
+
+    def test_opencode_snapshot_reads_sqlite_message_tokens(self) -> None:
+        data_home = agentcat.HOME / ".local" / "share"
+        opencode_dir = data_home / "opencode"
+        opencode_dir.mkdir(parents=True)
+        db_path = opencode_dir / "opencode.db"
+        now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                create table session (
+                  id text primary key,
+                  parent_id text,
+                  directory text,
+                  title text,
+                  time_archived integer
+                )
+                """
+            )
+            conn.execute(
+                "create table message (id text primary key, session_id text, time_created integer, data text)"
+            )
+            conn.execute(
+                "insert into session(id, parent_id, directory, title, time_archived) values (?, ?, ?, ?, ?)",
+                ("session-1", None, "/tmp/project", "Project", None),
+            )
+            conn.execute(
+                "insert into message(id, session_id, time_created, data) values (?, ?, ?, ?)",
+                (
+                    "message-1",
+                    "session-1",
+                    now_ms,
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "modelID": "anthropic/claude-sonnet-4-6",
+                            "tokens": {
+                                "input": 100,
+                                "output": 25,
+                                "reasoning": 5,
+                                "cache": {"read": 20, "write": 10},
+                            },
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+
+        with patch.dict(agentcat.os.environ, {"XDG_DATA_HOME": str(data_home)}):
+            snapshot = agentcat.opencode_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 160)
+        self.assertEqual(snapshot["tokens"]["week"], 160)
+        self.assertEqual(snapshot["models"]["anthropic/claude-sonnet-4-6"]["inputTokens"], 100)
+        self.assertEqual(snapshot["models"]["anthropic/claude-sonnet-4-6"]["week"], 160)
+
+    def test_copilot_snapshot_reads_legacy_and_vscode_transcript_tokens(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        legacy_dir = agentcat.HOME / ".copilot" / "session-state" / "legacy-session"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "events.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session.model_change",
+                            "timestamp": now,
+                            "data": {"newModel": "gpt-4.1"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant.message",
+                            "timestamp": now,
+                            "data": {"messageId": "assistant-1", "outputTokens": 75},
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        transcript_dir = (
+            agentcat.HOME
+            / "Library"
+            / "Application Support"
+            / "Code"
+            / "User"
+            / "workspaceStorage"
+            / "workspace-1"
+            / "GitHub.copilot-chat"
+            / "transcripts"
+        )
+        transcript_dir.mkdir(parents=True)
+        (transcript_dir / "transcript.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "session.start", "timestamp": now, "data": {"sessionId": "session-2", "producer": "copilot-agent"}}),
+                    json.dumps({"type": "user.message", "timestamp": now, "data": {"content": "abcd" * 10}}),
+                    json.dumps(
+                        {
+                            "type": "assistant.message",
+                            "timestamp": now,
+                            "data": {
+                                "messageId": "assistant-2",
+                                "content": "done",
+                                "reasoningText": "thinking",
+                                "toolRequests": [{"toolCallId": "call_abc", "name": "read_file"}],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.copilot_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 2)
+        self.assertEqual(snapshot["models"]["gpt-4.1"]["outputTokens"], 75)
+        self.assertEqual(snapshot["models"]["gpt-4.1"]["week"], 75)
+        self.assertGreater(snapshot["models"]["copilot-openai-auto"]["inputTokens"], 0)
+        self.assertGreater(snapshot["models"]["copilot-openai-auto"]["week"], 0)
 
     def test_classify_gemini_node_wrapper_processes(self) -> None:
         self.assertEqual(
@@ -471,6 +701,271 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("agentcat snapshot --json", prompt)
         self.assertIn("skills/agentcat-usage", prompt)
         self.assertIn("Never store or report prompt text", prompt)
+
+
+class InsightsIntegrationTests(unittest.TestCase):
+    """Slice C — build_snapshot() includes insights, schema is v3."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.old_home = agentcat.HOME
+        self.old_agentcat_home = agentcat.AGENTCAT_HOME
+        self.old_events_db = agentcat.EVENTS_DB
+        self.old_latest = agentcat.LATEST_SNAPSHOT
+        agentcat.HOME = self.root
+        agentcat.AGENTCAT_HOME = self.root / ".agentcat"
+        agentcat.EVENTS_DB = agentcat.AGENTCAT_HOME / "events.sqlite"
+        agentcat.LATEST_SNAPSHOT = agentcat.AGENTCAT_HOME / "latest-snapshot.json"
+
+    def tearDown(self) -> None:
+        agentcat.HOME = self.old_home
+        agentcat.AGENTCAT_HOME = self.old_agentcat_home
+        agentcat.EVENTS_DB = self.old_events_db
+        agentcat.LATEST_SNAPSHOT = self.old_latest
+        self.tmp.cleanup()
+
+    def _stub_providers(self, providers_dict):
+        patches = []
+        for name, data in providers_dict.items():
+            p = patch.object(agentcat, f"{name}_snapshot", return_value=data)
+            patches.append(p)
+            p.start()
+        return patches
+
+    def _stop(self, patches):
+        for p in patches:
+            p.stop()
+
+    def test_build_snapshot_schema_version_is_4(self) -> None:
+        patches = self._stub_providers({
+            "codex": {"status": "ok", "tokens": {}, "models": {}},
+            "claude": {"status": "ok", "tokens": {}, "models": {}},
+            "gemini": {"status": "ok", "tokens": {}, "models": {}},
+            "opencode": {"status": "not_found"},
+            "copilot": {"status": "not_found"},
+        })
+        try:
+            with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
+                snap = agentcat.build_snapshot()
+            self.assertEqual(snap["schemaVersion"], 4)
+        finally:
+            self._stop(patches)
+
+    def test_build_snapshot_includes_insights_object(self) -> None:
+        patches = self._stub_providers({
+            "codex": {"status": "ok", "tokens": {}, "models": {}},
+            "claude": {
+                "status": "ok",
+                "tokens": {"inputTokens": 1_000_000},
+                "models": {"claude-opus-4-7": {"week": {
+                    "inputTokens": 1_000_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+            "gemini": {"status": "ok", "tokens": {}, "models": {}},
+            "opencode": {"status": "not_found"},
+            "copilot": {"status": "not_found"},
+        })
+        try:
+            with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
+                snap = agentcat.build_snapshot()
+            self.assertIn("insights", snap)
+            self.assertEqual(snap["insights"]["status"], "ok")
+            self.assertGreater(snap["insights"]["summary"]["total_tokens"], 0)
+            self.assertEqual(snap["insights"]["summary"]["top_provider"], "claude")
+        finally:
+            self._stop(patches)
+
+    def test_insights_status_error_caught_not_raised(self) -> None:
+        patches = self._stub_providers({
+            "codex": {"status": "ok", "tokens": {}, "models": {}},
+            "claude": {"status": "ok", "tokens": {}, "models": {}},
+            "gemini": {"status": "ok", "tokens": {}, "models": {}},
+            "opencode": {"status": "not_found"},
+            "copilot": {"status": "not_found"},
+        })
+        try:
+            with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}), \
+                 patch.object(agentcat, "derive_insights", side_effect=RuntimeError("kaboom")):
+                snap = agentcat.build_snapshot()
+            self.assertEqual(snap["insights"]["status"], "error")
+            self.assertIn("kaboom", snap["insights"]["error"])
+        finally:
+            self._stop(patches)
+
+
+class InsightsTests(unittest.TestCase):
+    """Slice B — derive_insights() port of Swift AgentInsights.derive()."""
+
+    def _snapshot(self, **providers) -> dict:
+        return {"providers": providers}
+
+    def test_handles_empty_snapshot(self) -> None:
+        result = agentcat.derive_insights(self._snapshot(), period="week")
+        self.assertEqual(result["summary"]["total_tokens"], 0)
+        self.assertEqual(result["summary"]["estimated_cost_usd"], 0.0)
+        self.assertEqual(result["providers"], [])
+        self.assertEqual(result["models"], [])
+        self.assertEqual(result["findings"], [])
+
+    def test_splits_cache_tokens_correctly(self) -> None:
+        # Q1 fix verification: when cache tokens dominate, cost is much
+        # lower than if we'd lumped them as input. Same model, same total
+        # token count → two scenarios.
+        s_all_input = self._snapshot(claude={
+            "tokens": {"inputTokens": 4_000_000},
+            "models": {
+                "claude-opus-4-7": {
+                    "week": {"inputTokens": 4_000_000, "outputTokens": 0,
+                              "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                }
+            },
+        })
+        s_mostly_cache = self._snapshot(claude={
+            "tokens": {"cacheReadInputTokens": 3_900_000, "inputTokens": 100_000},
+            "models": {
+                "claude-opus-4-7": {
+                    "week": {"inputTokens": 100_000, "outputTokens": 0,
+                              "cacheReadInputTokens": 3_900_000, "cacheCreationInputTokens": 0}
+                }
+            },
+        })
+        r1 = agentcat.derive_insights(s_all_input, period="week")
+        r2 = agentcat.derive_insights(s_mostly_cache, period="week")
+        # Same total tokens, but cache-heavy should be at least 5x cheaper.
+        self.assertGreater(r1["summary"]["estimated_cost_usd"], 0)
+        self.assertGreater(r2["summary"]["estimated_cost_usd"], 0)
+        self.assertGreater(
+            r1["summary"]["estimated_cost_usd"],
+            r2["summary"]["estimated_cost_usd"] * 5,
+        )
+
+    def test_emits_pricing_missing_for_unknown_model(self) -> None:
+        s = self._snapshot(unknown_provider={
+            "tokens": {"inputTokens": 1000},
+            "models": {
+                "my-totally-unknown-model": {
+                    "week": {"inputTokens": 1000, "outputTokens": 0,
+                              "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                }
+            },
+        })
+        r = agentcat.derive_insights(s, period="week")
+        finding_ids = [f["id"] for f in r["findings"]]
+        self.assertTrue(any(fid.startswith("pricing_missing:") for fid in finding_ids))
+
+    def test_sums_across_providers(self) -> None:
+        s = self._snapshot(
+            claude={
+                "tokens": {"inputTokens": 1_000_000},
+                "models": {"claude-opus-4-7": {"week": {
+                    "inputTokens": 1_000_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+            codex={
+                "tokens": {"inputTokens": 500_000},
+                "models": {"gpt-5": {"week": {
+                    "inputTokens": 500_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+        )
+        r = agentcat.derive_insights(s, period="week")
+        kinds = {p["kind"] for p in r["providers"]}
+        self.assertEqual(kinds, {"claude", "codex"})
+        self.assertEqual(r["summary"]["total_tokens"], 1_500_000)
+
+    def test_top_model_and_provider_picked(self) -> None:
+        s = self._snapshot(
+            small={
+                "tokens": {"inputTokens": 100_000},
+                "models": {"gpt-5-mini": {"week": {
+                    "inputTokens": 100_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+            big={
+                "tokens": {"inputTokens": 5_000_000},
+                "models": {"claude-opus-4-7": {"week": {
+                    "inputTokens": 5_000_000, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            },
+        )
+        r = agentcat.derive_insights(s, period="week")
+        self.assertEqual(r["summary"]["top_provider"], "big")
+        self.assertEqual(r["summary"]["top_model"], "claude-opus-4-7")
+
+    def test_high_weekly_usage_finding(self) -> None:
+        s = self._snapshot(claude={
+            "tokens": {"inputTokens": 1000},
+            "models": {"claude-opus-4-7": {"week": {
+                "inputTokens": 1000, "outputTokens": 0,
+                "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}},
+            "limits": {"weeklyUsedPercent": 96},
+        })
+        r = agentcat.derive_insights(s, period="week")
+        high = [f for f in r["findings"] if f["id"].startswith("high_weekly_usage:")]
+        self.assertEqual(len(high), 1)
+        self.assertEqual(high[0]["severity"], "high")  # ≥95 = high
+
+
+class PricingTests(unittest.TestCase):
+    """Slice A — split-bucket pricing module."""
+
+    def test_known_model_returns_split_cost(self) -> None:
+        cost = agentcat.estimate_cost(
+            "claude-opus-4-7",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            cache_write_tokens=1_000_000,
+        )
+        self.assertIsInstance(cost, dict)
+        for k in ("input", "output", "cache_read", "cache_write", "total"):
+            self.assertIn(k, cost)
+        self.assertAlmostEqual(
+            cost["total"],
+            cost["input"] + cost["output"] + cost["cache_read"] + cost["cache_write"],
+            places=4,
+        )
+
+    def test_cache_read_is_cheaper_than_input(self) -> None:
+        cost = agentcat.estimate_cost(
+            "claude-opus-4-7",
+            input_tokens=1_000_000, output_tokens=0,
+            cache_read_tokens=1_000_000, cache_write_tokens=0,
+        )
+        # The Q1 fix: cache reads must price much cheaper than fresh input.
+        self.assertLess(cost["cache_read"], cost["input"])
+        self.assertLess(cost["cache_read"] * 5, cost["input"])
+
+    def test_unknown_model_returns_none(self) -> None:
+        cost = agentcat.estimate_cost(
+            "totally-made-up-model-99",
+            input_tokens=1_000_000, output_tokens=1_000_000,
+            cache_read_tokens=0, cache_write_tokens=0,
+        )
+        self.assertIsNone(cost)
+
+    def test_model_alias_normalization(self) -> None:
+        cost_a = agentcat.estimate_cost(
+            "claude-opus-4-7-20260101",
+            input_tokens=1_000_000, output_tokens=0,
+            cache_read_tokens=0, cache_write_tokens=0,
+        )
+        cost_b = agentcat.estimate_cost(
+            "claude-opus-4-7",
+            input_tokens=1_000_000, output_tokens=0,
+            cache_read_tokens=0, cache_write_tokens=0,
+        )
+        self.assertIsNotNone(cost_a)
+        self.assertEqual(cost_a["input"], cost_b["input"])
+
+    def test_zero_tokens_returns_zero_not_none(self) -> None:
+        cost = agentcat.estimate_cost(
+            "claude-opus-4-7",
+            input_tokens=0, output_tokens=0,
+            cache_read_tokens=0, cache_write_tokens=0,
+        )
+        self.assertEqual(cost["total"], 0.0)
 
 
 if __name__ == "__main__":
