@@ -629,6 +629,13 @@ class AgentCatConnectorTests(unittest.TestCase):
             )
         )
 
+    def test_classify_ignores_codex_desktop_stdio_app_servers(self) -> None:
+        self.assertIsNone(
+            agentcat.classify_process(
+                r'"C:\Users\me\AppData\Local\OpenAI\Codex\bin\76ac88818493fc45\codex.exe" app-server --listen stdio://'
+            )
+        )
+
     def test_windows_activity_ignores_codex_desktop_helper_processes(self) -> None:
         completed = agentcat.subprocess.CompletedProcess(
             args=["powershell.exe"],
@@ -661,6 +668,13 @@ class AgentCatConnectorTests(unittest.TestCase):
                         "ParentProcessId": 14196,
                         "Name": "codex.exe",
                         "CommandLine": r"c:\Users\me\.vscode\extensions\openai.chatgpt-26.513.21555-win32-x64\bin\windows-x86_64\codex.exe app-server --analytics-default-enabled",
+                        "CpuPercent": 0,
+                    },
+                    {
+                        "ProcessId": 23020,
+                        "ParentProcessId": 21436,
+                        "Name": "codex.exe",
+                        "CommandLine": r'"C:\Users\me\AppData\Local\OpenAI\Codex\bin\76ac88818493fc45\codex.exe" app-server --listen stdio://',
                         "CpuPercent": 0,
                     },
                 ]

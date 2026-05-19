@@ -3192,6 +3192,12 @@ def classify_process(command: str) -> Optional[str]:
         and "/app/resources/codex.exe" not in normalized
     ):
         return None
+    if (
+        "/appdata/local/openai/codex/bin/" in normalized
+        and "codex.exe" in normalized
+        and "app-server --listen stdio://" in normalized
+    ):
+        return None
     if "/.vscode/extensions/openai.chatgpt-" in normalized:
         return None
 
