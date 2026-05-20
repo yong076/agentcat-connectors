@@ -60,7 +60,7 @@ CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.1")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.2")
 SCHEMA_VERSION = 4
 CONNECTOR_CAPABILITIES = (
     "snapshot.metadata",
@@ -204,6 +204,73 @@ def estimate_cost(
 _FINDING_SEVERITY_ORDER = {"high": 0, "medium": 1, "info": 2}
 
 
+def _insight_int(raw: Any) -> int:
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, (int, float)):
+        return max(0, int(raw))
+    if isinstance(raw, str):
+        try:
+            return max(0, int(float(raw.replace(",", "").strip())))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _scaled_token_class(amount: int, period_total: int, all_total: int) -> int:
+    if amount <= 0 or period_total <= 0:
+        return 0
+    if all_total <= 0 or period_total >= all_total:
+        return amount
+    return max(0, int(round(amount * (period_total / all_total))))
+
+
+def insight_model_period_bucket(model_data: Dict[str, Any], period: str) -> Optional[Tuple[Dict[str, int], int]]:
+    """Return per-class model tokens plus total for an insights period.
+
+    Older model stats store `week`/`today` as nested token-class dicts. Gemini,
+    Codex, OpenCode, and Copilot snapshots store the same period as an integer
+    total next to top-level token classes. Treat both as first-class inputs so
+    providers are not dropped from the pre-derived insights object.
+    """
+    raw_bucket = model_data.get(period)
+    token_keys = (
+        "inputTokens",
+        "outputTokens",
+        "cacheReadInputTokens",
+        "cacheCreationInputTokens",
+    )
+    extra_token_keys = ("thoughtTokens", "toolTokens", "reasoningTokens")
+
+    if isinstance(raw_bucket, dict):
+        bucket = {key: _insight_int(raw_bucket.get(key)) for key in token_keys}
+        extra_total = sum(_insight_int(raw_bucket.get(key)) for key in extra_token_keys)
+        explicit_total = _insight_int(raw_bucket.get("totalTokens"))
+        total = explicit_total or sum(bucket.values()) + extra_total
+        return bucket, total
+
+    if raw_bucket is not None:
+        period_total = _insight_int(raw_bucket)
+        if period_total <= 0:
+            return None
+        all_total = _insight_int(model_data.get("all")) or sum(
+            _insight_int(model_data.get(key)) for key in (*token_keys, *extra_token_keys)
+        )
+        bucket = {
+            key: _scaled_token_class(_insight_int(model_data.get(key)), period_total, all_total)
+            for key in token_keys
+        }
+        return bucket, period_total
+
+    bucket = {key: _insight_int(model_data.get(key)) for key in token_keys}
+    extra_total = sum(_insight_int(model_data.get(key)) for key in extra_token_keys)
+    explicit_total = _insight_int(model_data.get("totalTokens"))
+    total = explicit_total or sum(bucket.values()) + extra_total
+    if total <= 0:
+        return None
+    return bucket, total
+
+
 def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str, Any]:
     """Pure port of Swift AgentInsights.derive() with split-bucket pricing.
 
@@ -249,14 +316,14 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
         for model_name, model_data in models.items():
             if not isinstance(model_data, dict):
                 continue
-            bucket = model_data.get(period) if period in model_data else model_data
-            if not isinstance(bucket, dict):
+            period_bucket = insight_model_period_bucket(model_data, period)
+            if period_bucket is None:
                 continue
+            bucket, model_total = period_bucket
             i = int(bucket.get("inputTokens") or 0)
             o = int(bucket.get("outputTokens") or 0)
             cr = int(bucket.get("cacheReadInputTokens") or 0)
             cw = int(bucket.get("cacheCreationInputTokens") or 0)
-            model_total = i + o + cr + cw
             if model_total == 0:
                 continue
 
@@ -1679,17 +1746,49 @@ def gemini_limits_from_quota_response(
                 )
             )
 
-    quotas.sort(key=lambda q: (0 if "pro" in str(q.get("model")).lower() else 1, str(q.get("label"))))
-    limits["quotas"] = quotas
+    limits["quotas"] = sorted_gemini_quotas(quotas)
     if not quotas:
         limits["status"] = "not_configured"
     return limits
 
 
+def sorted_gemini_quotas(quotas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if len(quotas) > 3:
+        return sorted(quotas, key=gemini_quota_compact_sort_key)
+    return sorted(quotas, key=lambda q: (0 if "pro" in str(q.get("model")).lower() else 1, str(q.get("label"))))
+
+
+def normalize_gemini_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
+    quotas = limits.get("quotas")
+    if not isinstance(quotas, list):
+        return limits
+    out = dict(limits)
+    out["quotas"] = sorted_gemini_quotas([q for q in quotas if isinstance(q, dict)])
+    return out
+
+
+def gemini_quota_remaining_percent(quota: Dict[str, Any]) -> float:
+    remaining = float_value(quota.get("remainingPercent"))
+    if remaining is not None:
+        return remaining
+    used = float_value(quota.get("usedPercent"))
+    if used is not None:
+        return min(max(100.0 - used, 0.0), 100.0)
+    return float("inf")
+
+
+def gemini_quota_compact_sort_key(quota: Dict[str, Any]) -> Tuple[float, int, str]:
+    return (
+        gemini_quota_remaining_percent(quota),
+        int_limit(quota.get("resetAt")) or 2**31 - 1,
+        str(quota.get("label") or quota.get("id") or ""),
+    )
+
+
 def gemini_live_limits() -> Dict[str, Any]:
     cached = cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
-        return cached
+        return normalize_gemini_limits(cached)
     auth_type = read_gemini_auth_type()
     if auth_type != "oauth-personal":
         return empty_limits()
@@ -1720,6 +1819,7 @@ def gemini_live_limits() -> Dict[str, Any]:
     except Exception as exc:
         stale = cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
         if stale:
+            stale = normalize_gemini_limits(stale)
             stale["liveError"] = str(exc)
             return stale
         limits = live_limit_error(exc, GEMINI_CODE_ASSIST_URL)

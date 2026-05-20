@@ -211,6 +211,57 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["quotas"][0]["remainingPercent"], 100.0)
         self.assertAlmostEqual(limits["quotas"][1]["usedPercent"], 1.6)
 
+    def test_gemini_quota_prioritizes_constrained_models_for_compact_ui(self) -> None:
+        limits = agentcat.gemini_limits_from_quota_response(
+            {
+                "buckets": [
+                    {
+                        "modelId": "gemini-3-pro-preview",
+                        "remainingFraction": 1,
+                        "resetTime": "2026-05-07T11:19:25Z",
+                        "tokenType": "REQUESTS",
+                    },
+                    {
+                        "modelId": "gemini-3.1-pro-preview",
+                        "remainingFraction": 1,
+                        "resetTime": "2026-05-07T11:19:25Z",
+                        "tokenType": "REQUESTS",
+                    },
+                    {
+                        "modelId": "gemini-3-flash-preview",
+                        "remainingFraction": 0.953,
+                        "resetTime": "2026-05-07T06:00:00Z",
+                        "tokenType": "REQUESTS",
+                    },
+                    {
+                        "modelId": "gemini-3.1-flash-lite",
+                        "remainingFraction": 0.9925,
+                        "resetTime": "2026-05-07T05:00:00Z",
+                        "tokenType": "REQUESTS",
+                    },
+                ]
+            },
+            {"paidTier": {"name": "Gemini Code Assist in Google One AI Pro"}},
+        )
+
+        self.assertEqual(limits["quotas"][0]["model"], "gemini-3-flash-preview")
+        self.assertAlmostEqual(limits["quotas"][0]["usedPercent"], 4.7)
+        self.assertEqual(limits["quotas"][1]["model"], "gemini-3.1-flash-lite")
+
+    def test_gemini_cached_limits_are_reprioritized_for_compact_ui(self) -> None:
+        cached = agentcat.empty_limits(status="auto")
+        cached["quotas"] = [
+            {"id": "gemini:pro", "label": "Gemini Pro", "model": "gemini-3-pro-preview", "remainingPercent": 100},
+            {"id": "gemini:pro2", "label": "Gemini 3.1 Pro", "model": "gemini-3.1-pro-preview", "remainingPercent": 100},
+            {"id": "gemini:flash", "label": "Gemini 3 Flash", "model": "gemini-3-flash-preview", "remainingPercent": 95.3},
+            {"id": "gemini:lite", "label": "Gemini 3.1 Flash Lite", "model": "gemini-3.1-flash-lite", "remainingPercent": 99.25},
+        ]
+
+        normalized = agentcat.normalize_gemini_limits(cached)
+
+        self.assertEqual(normalized["quotas"][0]["model"], "gemini-3-flash-preview")
+        self.assertEqual(normalized["quotas"][1]["model"], "gemini-3.1-flash-lite")
+
     def test_live_limit_cache_returns_stale_limits_when_allowed(self) -> None:
         limits = agentcat.empty_limits(status="auto")
         limits["quotas"] = [
@@ -1084,6 +1135,42 @@ class InsightsTests(unittest.TestCase):
         kinds = {p["kind"] for p in r["providers"]}
         self.assertEqual(kinds, {"claude", "codex"})
         self.assertEqual(r["summary"]["total_tokens"], 1_500_000)
+
+    def test_includes_integer_period_model_buckets(self) -> None:
+        s = self._snapshot(
+            gemini={
+                "tokens": {"inputTokens": 2_000_000, "cacheReadInputTokens": 1_000_000},
+                "models": {
+                    "gemini-3-flash-preview": {
+                        "inputTokens": 2_000_000,
+                        "cacheReadInputTokens": 1_000_000,
+                        "outputTokens": 10_000,
+                        "thoughtTokens": 5_000,
+                        "week": 3_015_000,
+                        "all": 3_015_000,
+                    }
+                },
+                "limits": {
+                    "quotas": [
+                        {
+                            "id": "gemini:gemini-3-flash-preview",
+                            "remainingPercent": 95.3,
+                            "usedPercent": 4.7,
+                        }
+                    ]
+                },
+            }
+        )
+
+        r = agentcat.derive_insights(s, period="week")
+
+        self.assertEqual(r["providers"][0]["kind"], "gemini")
+        self.assertEqual(r["providers"][0]["tokens"], 3_015_000)
+        self.assertEqual(r["models"][0]["name"], "gemini-3-flash-preview")
+        self.assertEqual(r["models"][0]["tokens"], 3_015_000)
+        self.assertEqual(r["summary"]["top_provider"], "gemini")
+        self.assertEqual(r["summary"]["top_model"], "gemini-3-flash-preview")
+        self.assertEqual(r["pricing_status"], "ok")
 
     def test_top_model_and_provider_picked(self) -> None:
         s = self._snapshot(
