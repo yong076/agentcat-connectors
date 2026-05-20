@@ -30,7 +30,11 @@ class AgentCatConnectorTests(unittest.TestCase):
             "LATEST_SNAPSHOT": agentcat.LATEST_SNAPSHOT,
             "LIMITS_FILE": agentcat.LIMITS_FILE,
             "GEMINI_TELEMETRY": agentcat.GEMINI_TELEMETRY,
+            "GEMINI_USAGE_CACHE": agentcat.GEMINI_USAGE_CACHE,
             "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
+            "_GEMINI_CACHE_KEY": agentcat._GEMINI_CACHE_KEY,
+            "_GEMINI_CACHE_VALUE": agentcat._GEMINI_CACHE_VALUE,
+            "_GEMINI_CACHE_LOADED_AT": agentcat._GEMINI_CACHE_LOADED_AT,
         }
 
         home = self.root / "home"
@@ -43,7 +47,11 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat.LATEST_SNAPSHOT = agentcat_home / "latest-snapshot.json"
         agentcat.LIMITS_FILE = agentcat_home / "limits.json"
         agentcat.GEMINI_TELEMETRY = agentcat_home / "gemini" / "telemetry.log"
+        agentcat.GEMINI_USAGE_CACHE = agentcat_home / "gemini-usage-cache.json"
         agentcat.LIVE_LIMITS_CACHE = agentcat_home / "live-limits-cache.json"
+        agentcat._GEMINI_CACHE_KEY = None
+        agentcat._GEMINI_CACHE_VALUE = None
+        agentcat._GEMINI_CACHE_LOADED_AT = 0.0
 
     def tearDown(self) -> None:
         for name, value in self.old_paths.items():
@@ -464,6 +472,130 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["models"]["gemini-test"]["month"], 450)
         self.assertEqual(snapshot["models"]["gemini-test"]["all"], 450)
 
+    def test_gemini_snapshot_distributes_cumulative_counter_deltas_by_day(self) -> None:
+        agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
+        today = dt.datetime.now(dt.timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+        yesterday = today - dt.timedelta(days=1)
+        start_time = [int(yesterday.timestamp()), 0]
+
+        def payload(value: int, end: dt.datetime) -> dict:
+            return {
+                "scopeMetrics": [
+                    {
+                        "metrics": [
+                            {
+                                "descriptor": {"name": "gemini_cli.token.usage"},
+                                "dataPoints": [
+                                    {
+                                        "attributes": {
+                                            "model": "gemini-test",
+                                            "session.id": "session-a",
+                                            "type": "input",
+                                        },
+                                        "startTime": start_time,
+                                        "endTime": [int(end.timestamp()), 0],
+                                        "value": {"sum": value},
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+
+        agentcat.GEMINI_TELEMETRY.write_text(
+            json.dumps(payload(100, yesterday), indent=2)
+            + "\n"
+            + json.dumps(payload(150, today), indent=2),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.gemini_snapshot()
+        today_key = agentcat.day_key_for_timestamp(today)
+        yesterday_key = agentcat.day_key_for_timestamp(yesterday)
+
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 150)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 150)
+        self.assertEqual(snapshot["dailyTokens"][yesterday_key], 100)
+        self.assertEqual(snapshot["dailyTokens"][today_key], 50)
+        self.assertEqual(snapshot["models"]["gemini-test"]["all"], 150)
+        self.assertEqual(snapshot["events"], 2)
+
+    def test_gemini_snapshot_indexes_full_log_across_stream_chunks(self) -> None:
+        agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
+        today = dt.datetime.now(dt.timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+        old_day = today - dt.timedelta(days=9)
+
+        def payload(session: str, value: int, when: dt.datetime) -> dict:
+            return {
+                "scopeMetrics": [
+                    {
+                        "metrics": [
+                            {
+                                "descriptor": {"name": "gemini_cli.token.usage"},
+                                "dataPoints": [
+                                    {
+                                        "attributes": {
+                                            "model": "gemini-test",
+                                            "session.id": session,
+                                            "type": "input",
+                                        },
+                                        "startTime": [int(when.timestamp()), 0],
+                                        "endTime": "[Circular]",
+                                        "value": value,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+
+        agentcat.GEMINI_TELEMETRY.write_text(
+            json.dumps(payload("old", 90, old_day), indent=2)
+            + "\n"
+            + (" " * 512)
+            + "\n"
+            + json.dumps(payload("today", 10, today), indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(agentcat, "GEMINI_TELEMETRY_STREAM_CHUNK_BYTES", 128):
+            snapshot = agentcat.gemini_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["all"], 100)
+        self.assertEqual(snapshot["tokens"]["today"], 10)
+        self.assertEqual(snapshot["dailyTokens"][agentcat.day_key_for_timestamp(old_day)], 90)
+        self.assertEqual(snapshot["dailyTokens"][agentcat.day_key_for_timestamp(today)], 10)
+        self.assertEqual(snapshot["cache"]["source"], "full-log-index")
+        self.assertTrue(agentcat.GEMINI_USAGE_CACHE.exists())
+        cached = json.loads(agentcat.GEMINI_USAGE_CACHE.read_text(encoding="utf-8"))
+        self.assertEqual(cached["offset"], agentcat.GEMINI_TELEMETRY.stat().st_size)
+
+    def test_gemini_usage_cache_clamps_overlarge_offset_for_same_file_size(self) -> None:
+        agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
+        agentcat.GEMINI_TELEMETRY.write_text("{}\n", encoding="utf-8")
+        stat = agentcat.GEMINI_TELEMETRY.stat()
+        agentcat.GEMINI_USAGE_CACHE.write_text(
+            json.dumps(
+                {
+                    "version": agentcat.GEMINI_USAGE_CACHE_VERSION,
+                    "source": str(agentcat.GEMINI_TELEMETRY),
+                    "offset": stat.st_size + 100,
+                    "size": stat.st_size,
+                    "tokenClasses": {"inputTokens": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        state = agentcat.load_gemini_usage_state(stat)
+
+        self.assertEqual(state["offset"], stat.st_size)
+        self.assertEqual(state["tokenClasses"]["inputTokens"], 1)
+
     def test_opencode_snapshot_reads_sqlite_message_tokens(self) -> None:
         data_home = agentcat.HOME / ".local" / "share"
         opencode_dir = data_home / "opencode"
@@ -638,6 +770,85 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["processes"][0]["rssKilobytes"], 524_288)
         self.assertEqual(snapshot["processes"][0]["command"], "codex pid 101")
         self.assertNotIn("gpt-5.5", snapshot["processes"][0]["command"])
+
+    def test_windows_activity_prefers_pwsh_and_configured_timeout(self) -> None:
+        (agentcat.AGENTCAT_HOME / "settings.json").write_text(
+            json.dumps({"windowsProcessScanTimeoutSeconds": 8}),
+            encoding="utf-8",
+        )
+        completed = agentcat.subprocess.CompletedProcess(
+            args=["pwsh.exe"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "ProcessId": 301,
+                    "ParentProcessId": 1,
+                    "Name": "node.exe",
+                    "CommandLine": "node C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@google\\gemini-cli\\index.js",
+                    "CpuPercent": 0,
+                    "WorkingSetSize": 12_345_678,
+                }
+            ),
+            stderr="",
+        )
+        run_calls = []
+
+        def which(name):
+            return "C:\\Program Files\\PowerShell\\7\\pwsh.exe" if name == "pwsh.exe" else None
+
+        def run(*args, **kwargs):
+            run_calls.append((args, kwargs))
+            return completed
+
+        with patch.object(agentcat.shutil, "which", side_effect=which), patch.object(
+            agentcat.subprocess, "run", side_effect=run
+        ):
+            snapshot = agentcat.terminal_activity_snapshot_windows()
+
+        command = run_calls[0][0][0]
+        kwargs = run_calls[0][1]
+        self.assertEqual(command[0], "C:\\Program Files\\PowerShell\\7\\pwsh.exe")
+        self.assertEqual(kwargs["timeout"], 8.0)
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["scanSource"], "powershell")
+        self.assertEqual(snapshot["countsByProvider"]["gemini"], 1)
+        self.assertEqual(snapshot["totalMemoryBytes"], 12_345_678)
+        self.assertEqual(snapshot["memoryBytesByProvider"]["gemini"], 12_345_678)
+        self.assertEqual(snapshot["processes"][0]["command"], "gemini pid 301")
+        self.assertNotIn("@google", snapshot["processes"][0]["command"])
+
+    def test_windows_activity_falls_back_to_tasklist_when_powershell_times_out(self) -> None:
+        tasklist = agentcat.subprocess.CompletedProcess(
+            args=["tasklist.exe"],
+            returncode=0,
+            stdout=(
+                '"codex.exe","101","Console","1","12,345 K"\n'
+                '"claude.exe","102","Console","1","9,000 K"\n'
+                '"gemini.exe","103","Console","1","8,000 K"\n'
+            ),
+            stderr="",
+        )
+        run_calls = []
+
+        def run(args, **kwargs):
+            run_calls.append((args, kwargs))
+            if args[0] == "powershell.exe":
+                raise agentcat.subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return tasklist
+
+        with patch.object(agentcat.shutil, "which", return_value=None), patch.object(
+            agentcat.subprocess, "run", side_effect=run
+        ):
+            snapshot = agentcat.terminal_activity_snapshot_windows()
+
+        self.assertEqual(run_calls[0][0][0], "powershell.exe")
+        self.assertEqual(run_calls[1][0][0], "tasklist.exe")
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["scanSource"], "tasklist")
+        self.assertIn("PowerShell scan failed", snapshot["scanWarning"])
+        self.assertEqual(snapshot["processCount"], 3)
+        self.assertEqual(snapshot["countsByProvider"], {"codex": 1, "claude": 1, "gemini": 1})
+        self.assertEqual(snapshot["totalMemoryBytes"], 30_049_280)
 
     def test_claude_runtime_limits_reads_statusline_event(self) -> None:
         agentcat.store_event(

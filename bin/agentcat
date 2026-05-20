@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 from contextlib import closing
 import logging
 import datetime as dt
@@ -33,6 +34,7 @@ EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
+GEMINI_USAGE_CACHE = AGENTCAT_HOME / "gemini-usage-cache.json"
 LIVE_LIMITS_CACHE = AGENTCAT_HOME / "live-limits-cache.json"
 CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/codex/usage",
@@ -46,6 +48,8 @@ GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"const OAUTH_CLIENT_ID = '([^']+)';")
 GEMINI_TELEMETRY_PARSE_BYTES = int(os.environ.get("AGENTCAT_GEMINI_PARSE_BYTES", str(64 * 1024 * 1024)))
+GEMINI_TELEMETRY_STREAM_CHUNK_BYTES = int(os.environ.get("AGENTCAT_GEMINI_STREAM_CHUNK_BYTES", str(4 * 1024 * 1024)))
+GEMINI_USAGE_CACHE_VERSION = 1
 GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECONDS", "10"))
 LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_BYTES", str(16 * 1024 * 1024)))
 LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
@@ -448,6 +452,60 @@ def now_iso() -> str:
 def ensure_dirs() -> None:
     AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
     GEMINI_TELEMETRY.parent.mkdir(parents=True, exist_ok=True)
+
+
+def agentcat_settings() -> Dict[str, Any]:
+    path = AGENTCAT_HOME / "settings.json"
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
+    for path in paths:
+        current: Any = settings
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if current is not None:
+            return current
+    return None
+
+
+def positive_float(raw: Any) -> Optional[float]:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not value > 0:
+        return None
+    return value
+
+
+def windows_process_scan_timeout_seconds() -> float:
+    env_value = positive_float(os.environ.get("AGENTCAT_WINDOWS_PROCESS_SCAN_TIMEOUT_SECONDS"))
+    if env_value is not None:
+        return min(max(env_value, 1.0), 30.0)
+
+    settings = agentcat_settings()
+    configured = positive_float(
+        settings_value(
+            settings,
+            ("windowsProcessScanTimeoutSeconds",),
+            ("processScanTimeoutSeconds",),
+            ("windows", "processScanTimeoutSeconds"),
+        )
+    )
+    if configured is not None:
+        return min(max(configured, 1.0), 30.0)
+    return 3.0
 
 
 def read_stdin_payload() -> Any:
@@ -2945,6 +3003,7 @@ def gemini_snapshot() -> Dict[str, Any]:
         "dailyTokens": {},
         "hourlyTokens": {},
         "events": 0,
+        "cache": {"source": "none"},
         # Gemini telemetry carries tool/MCP call records under
         # `gemini_cli.tool.call`; parse_gemini_telemetry could grow a
         # second pass for those. For now mark not_available so the
@@ -2963,24 +3022,23 @@ def gemini_snapshot() -> Dict[str, Any]:
         ):
             return copy.deepcopy(_GEMINI_CACHE_VALUE)
 
-        tokens: Dict[str, int] = {}
-        models: Dict[str, Dict[str, int]] = {}
-        daily_tokens: Dict[str, int] = {}
-        hourly_tokens: Dict[str, int] = {}
         try:
-            text = read_recent_gemini_telemetry(stat.st_size)
-            tokens, models, daily_tokens, hourly_tokens, events = parse_gemini_telemetry(text)
+            state = load_gemini_usage_state(stat)
+            state = scan_gemini_telemetry_state(state, stat)
+            save_gemini_usage_state(state)
+            usage = gemini_usage_result_from_state(state)
         except Exception as exc:
             result["status"] = "error"
             result["error"] = str(exc)
             return result
 
-        result["status"] = "ok" if events else "no_token_events_yet"
-        result["tokens"] = tokens
-        result["models"] = models
-        result["dailyTokens"] = daily_tokens
-        result["hourlyTokens"] = hourly_tokens
-        result["events"] = events
+        result["status"] = "ok" if usage["events"] else "no_token_events_yet"
+        result["tokens"] = usage["tokens"]
+        result["models"] = usage["models"]
+        result["dailyTokens"] = usage["dailyTokens"]
+        result["hourlyTokens"] = usage["hourlyTokens"]
+        result["events"] = usage["events"]
+        result["cache"] = usage["cache"]
         _GEMINI_CACHE_KEY = cache_key
         _GEMINI_CACHE_VALUE = copy.deepcopy(result)
         _GEMINI_CACHE_LOADED_AT = time.monotonic()
@@ -3056,6 +3114,30 @@ def timestamp_from_otel(raw: Any) -> Optional[dt.datetime]:
             return dt.datetime.fromtimestamp(seconds + nanos / 1_000_000_000, dt.timezone.utc)
         except Exception:
             return None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        value = float(raw)
+        if value > 10_000_000_000_000:
+            value = value / 1_000_000_000.0
+        return parse_timestamp(value)
+    if isinstance(raw, str) and raw.strip().isdigit():
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            return None
+        if value > 10_000_000_000_000:
+            value = value / 1_000_000_000.0
+        return parse_timestamp(value)
+    if isinstance(raw, dict):
+        seconds = raw.get("seconds") or raw.get("secondsSinceEpoch")
+        nanos = raw.get("nanos") or raw.get("nanoseconds") or 0
+        if seconds is not None:
+            try:
+                return dt.datetime.fromtimestamp(
+                    float(seconds) + float(nanos or 0) / 1_000_000_000,
+                    dt.timezone.utc,
+                )
+            except Exception:
+                return None
     return parse_timestamp(raw)
 
 
@@ -3074,8 +3156,16 @@ def gemini_token_key(raw: Any) -> Optional[str]:
     return None
 
 
-def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime]]]:
-    records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime]]] = []
+def freeze_identity_value(raw: Any) -> Any:
+    if isinstance(raw, list):
+        return tuple(freeze_identity_value(item) for item in raw)
+    if isinstance(raw, dict):
+        return tuple(sorted((str(key), freeze_identity_value(value)) for key, value in raw.items()))
+    return raw
+
+
+def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime], Optional[dt.datetime]]]:
+    records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime], Optional[dt.datetime]]] = []
     if not isinstance(payload, dict):
         return records
 
@@ -3098,20 +3188,29 @@ def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tup
                 amount = metric_value(point.get("value"))
                 if token_key is None or amount is None:
                     continue
-                when = timestamp_from_otel(point.get("endTime")) or timestamp_from_otel(point.get("startTime"))
+                start_raw = point.get("startTime") if point.get("startTime") is not None else point.get("startTimeUnixNano")
+                end_raw = (
+                    point.get("endTime")
+                    if point.get("endTime") is not None
+                    else point.get("endTimeUnixNano")
+                    if point.get("endTimeUnixNano") is not None
+                    else point.get("timeUnixNano")
+                )
+                start_when = timestamp_from_otel(start_raw)
+                when = timestamp_from_otel(end_raw) or start_when
                 identity = (
                     preferred_metric,
                     attributes.get("session.id"),
                     model,
                     token_key,
-                    tuple(point.get("startTime") or []),
+                    freeze_identity_value(start_raw),
                 )
-                records.append((identity, token_key, model, amount, when))
+                records.append((identity, token_key, model, amount, when, start_when))
     return records
 
 
 def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]], Dict[str, int], Dict[str, int], int]:
-    records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime]]] = []
+    records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime], Optional[dt.datetime]]] = []
     for payload in iter_json_objects(text):
         records.extend(gemini_metric_records(payload, "gemini_cli.token.usage"))
 
@@ -3119,25 +3218,47 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
         for payload in iter_json_objects(text):
             records.extend(gemini_metric_records(payload, "gen_ai.client.token.usage"))
 
-    by_identity: Dict[Tuple[Any, ...], Tuple[str, str, int, Optional[dt.datetime]]] = {}
-    for identity, token_key, model, amount, when in records:
-        current = by_identity.get(identity)
-        if current is None or amount > current[2]:
-            by_identity[identity] = (token_key, model, amount, when)
+    by_identity: Dict[Tuple[Any, ...], List[Tuple[str, str, int, Optional[dt.datetime], Optional[dt.datetime]]]] = {}
+    for identity, token_key, model, amount, when, start_when in records:
+        by_identity.setdefault(identity, []).append((token_key, model, amount, when, start_when))
 
     tokens: Dict[str, int] = {}
     models: Dict[str, Dict[str, int]] = {}
     daily_tokens: Dict[str, int] = {}
     hourly_tokens: Dict[str, int] = {}
     periods = empty_periods()
-    for token_key, model, amount, when in by_identity.values():
-        tokens[token_key] = tokens.get(token_key, 0) + amount
-        model_tokens = models.setdefault(model, {})
-        model_tokens[token_key] = model_tokens.get(token_key, 0) + amount
-        add_to_periods(model_tokens, amount, when)
-        add_to_periods(periods, amount, when)
-        add_to_daily(daily_tokens, amount, when)
-        add_to_hourly(hourly_tokens, amount, when)
+    events = 0
+    for group in by_identity.values():
+        group.sort(
+            key=lambda item: (
+                (item[3] or item[4] or dt.datetime.fromtimestamp(0, dt.timezone.utc)).timestamp(),
+                item[2],
+            )
+        )
+        previous_amount: Optional[int] = None
+        for token_key, model, amount, when, start_when in group:
+            if previous_amount is None:
+                delta = amount
+                bucket_when = start_when if start_when and when and start_when.date() != when.date() else (when or start_when)
+            elif amount >= previous_amount:
+                delta = amount - previous_amount
+                bucket_when = when or start_when
+            else:
+                # Counter reset within the same session identity.
+                delta = amount
+                bucket_when = when or start_when
+            previous_amount = amount
+            if delta <= 0:
+                continue
+
+            events += 1
+            tokens[token_key] = tokens.get(token_key, 0) + delta
+            model_tokens = models.setdefault(model, {})
+            model_tokens[token_key] = model_tokens.get(token_key, 0) + delta
+            add_to_periods(model_tokens, delta, bucket_when)
+            add_to_periods(periods, delta, bucket_when)
+            add_to_daily(daily_tokens, delta, bucket_when)
+            add_to_hourly(hourly_tokens, delta, bucket_when)
 
     total = sum(tokens.values())
     if total > 0:
@@ -3145,7 +3266,284 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
         for key, amount in periods.items():
             if amount > 0:
                 tokens[key] = amount
-    return tokens, models, daily_tokens, hourly_tokens, len(by_identity)
+    return tokens, models, daily_tokens, hourly_tokens, events
+
+
+def empty_gemini_usage_state() -> Dict[str, Any]:
+    return {
+        "version": GEMINI_USAGE_CACHE_VERSION,
+        "source": str(GEMINI_TELEMETRY),
+        "offset": 0,
+        "size": 0,
+        "mtimeNs": 0,
+        "tokenClasses": {},
+        "models": {},
+        "modelDailyTokens": {},
+        "dailyTokens": {},
+        "hourlyTokens": {},
+        "events": 0,
+        "identities": {},
+    }
+
+
+def load_gemini_usage_state(stat: os.stat_result) -> Dict[str, Any]:
+    try:
+        raw = json.loads(GEMINI_USAGE_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        return empty_gemini_usage_state()
+    if not isinstance(raw, dict):
+        return empty_gemini_usage_state()
+    if raw.get("version") != GEMINI_USAGE_CACHE_VERSION:
+        return empty_gemini_usage_state()
+    if raw.get("source") != str(GEMINI_TELEMETRY):
+        return empty_gemini_usage_state()
+    offset = int_limit(raw.get("offset")) or 0
+    if offset < 0:
+        return empty_gemini_usage_state()
+    if offset > stat.st_size:
+        cached_size = int_limit(raw.get("size")) or 0
+        if cached_size == stat.st_size:
+            raw["offset"] = int(stat.st_size)
+        else:
+            return empty_gemini_usage_state()
+    return raw
+
+
+def save_gemini_usage_state(state: Dict[str, Any]) -> None:
+    ensure_dirs()
+    tmp = GEMINI_USAGE_CACHE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(GEMINI_USAGE_CACHE)
+
+
+def gemini_identity_key(identity: Tuple[Any, ...]) -> str:
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def add_gemini_delta_to_state(
+    state: Dict[str, Any],
+    *,
+    token_key: str,
+    model: str,
+    amount: int,
+    when: Optional[dt.datetime],
+) -> None:
+    token_classes = state.setdefault("tokenClasses", {})
+    token_classes[token_key] = int(token_classes.get(token_key) or 0) + amount
+
+    models = state.setdefault("models", {})
+    model_tokens = models.setdefault(model, {})
+    model_tokens[token_key] = int(model_tokens.get(token_key) or 0) + amount
+
+    day_key = day_key_for_timestamp(when)
+    if day_key:
+        daily_tokens = state.setdefault("dailyTokens", {})
+        daily_tokens[day_key] = int(daily_tokens.get(day_key) or 0) + amount
+        model_daily = state.setdefault("modelDailyTokens", {}).setdefault(model, {})
+        model_daily[day_key] = int(model_daily.get(day_key) or 0) + amount
+
+    hour_key = hour_key_for_timestamp(when)
+    if hour_key:
+        hourly_tokens = state.setdefault("hourlyTokens", {})
+        hourly_tokens[hour_key] = int(hourly_tokens.get(hour_key) or 0) + amount
+
+    state["events"] = int(state.get("events") or 0) + 1
+
+
+def apply_gemini_records_to_state(
+    state: Dict[str, Any],
+    records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime], Optional[dt.datetime]]],
+) -> None:
+    by_identity: Dict[Tuple[Any, ...], List[Tuple[str, str, int, Optional[dt.datetime], Optional[dt.datetime]]]] = {}
+    for identity, token_key, model, amount, when, start_when in records:
+        by_identity.setdefault(identity, []).append((token_key, model, amount, when, start_when))
+
+    identities = state.setdefault("identities", {})
+    for identity, group in by_identity.items():
+        identity_key = gemini_identity_key(identity)
+        last = identities.get(identity_key) if isinstance(identities.get(identity_key), dict) else {}
+        previous_amount = int_limit(last.get("amount")) if isinstance(last, dict) else None
+        group.sort(
+            key=lambda item: (
+                (item[3] or item[4] or dt.datetime.fromtimestamp(0, dt.timezone.utc)).timestamp(),
+                item[2],
+            )
+        )
+        for token_key, model, amount, when, start_when in group:
+            if previous_amount is None:
+                delta = amount
+                bucket_when = start_when if start_when and when and start_when.date() != when.date() else (when or start_when)
+            elif amount >= previous_amount:
+                delta = amount - previous_amount
+                bucket_when = when or start_when
+            else:
+                delta = amount
+                bucket_when = when or start_when
+            previous_amount = amount
+            if delta <= 0:
+                continue
+            add_gemini_delta_to_state(
+                state,
+                token_key=token_key,
+                model=model,
+                amount=delta,
+                when=bucket_when,
+            )
+        if previous_amount is not None:
+            identities[identity_key] = {"amount": previous_amount}
+
+
+def iter_gemini_telemetry_payloads(offset: int = 0) -> Iterable[Tuple[Any, int]]:
+    decoder = json.JSONDecoder()
+    buffer = ""
+    buffer_start = offset
+    chunk_size = max(GEMINI_TELEMETRY_STREAM_CHUNK_BYTES, 1024 * 1024)
+    with GEMINI_TELEMETRY.open("rb") as fh:
+        fh.seek(offset)
+        while True:
+            chunk = fh.read(chunk_size)
+            eof = not chunk
+            if chunk:
+                buffer += chunk.decode("utf-8", errors="replace")
+
+            index = 0
+            while True:
+                while index < len(buffer) and buffer[index].isspace():
+                    index += 1
+                if index >= len(buffer):
+                    buffer_start += len(buffer.encode("utf-8"))
+                    buffer = ""
+                    break
+                if buffer[index] != "{":
+                    next_object = buffer.find("{", index + 1)
+                    if next_object < 0:
+                        if eof:
+                            buffer_start += len(buffer.encode("utf-8"))
+                            buffer = ""
+                        elif index > 0:
+                            buffer_start += len(buffer[:index].encode("utf-8"))
+                            buffer = buffer[index:]
+                        break
+                    index = next_object
+                try:
+                    payload, end = decoder.raw_decode(buffer, index)
+                except json.JSONDecodeError:
+                    if index > 0:
+                        buffer_start += len(buffer[:index].encode("utf-8"))
+                        buffer = buffer[index:]
+                    break
+                end_offset = buffer_start + len(buffer[:end].encode("utf-8"))
+                yield payload, end_offset
+                index = end
+                if index >= 1024 * 1024:
+                    buffer_start += len(buffer[:index].encode("utf-8"))
+                    buffer = buffer[index:]
+                    index = 0
+
+            if eof:
+                break
+
+
+def gemini_remaining_bytes_are_whitespace(offset: int, file_size: int) -> bool:
+    if offset >= file_size:
+        return True
+    remaining = file_size - offset
+    if remaining > max(GEMINI_TELEMETRY_STREAM_CHUNK_BYTES, 1024 * 1024):
+        return False
+    with GEMINI_TELEMETRY.open("rb") as fh:
+        fh.seek(offset)
+        return not fh.read(remaining).strip()
+
+
+def scan_gemini_telemetry_state(state: Dict[str, Any], stat: os.stat_result) -> Dict[str, Any]:
+    offset = int_limit(state.get("offset")) or 0
+    if offset < 0 or offset > stat.st_size:
+        state = empty_gemini_usage_state()
+        offset = 0
+
+    last_offset = offset
+    for payload, end_offset in iter_gemini_telemetry_payloads(offset):
+        records = gemini_metric_records(payload, "gemini_cli.token.usage")
+        if not records:
+            records = gemini_metric_records(payload, "gen_ai.client.token.usage")
+        if records:
+            apply_gemini_records_to_state(state, records)
+        last_offset = max(last_offset, end_offset)
+
+    if gemini_remaining_bytes_are_whitespace(last_offset, int(stat.st_size)):
+        last_offset = int(stat.st_size)
+
+    state["source"] = str(GEMINI_TELEMETRY)
+    state["offset"] = min(last_offset, int(stat.st_size))
+    state["size"] = int(stat.st_size)
+    state["mtimeNs"] = int(stat.st_mtime_ns)
+    return state
+
+
+def int_map(raw: Any) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        amount = int_limit(value)
+        if amount is not None:
+            out[str(key)] = amount
+    return out
+
+
+def periods_from_daily_tokens(daily_tokens: Dict[str, int]) -> Dict[str, int]:
+    periods = empty_periods()
+    for day, amount in daily_tokens.items():
+        if amount <= 0:
+            continue
+        when = parse_timestamp(f"{day}T12:00:00Z") or parse_timestamp(day)
+        add_to_periods(periods, amount, when)
+    return periods
+
+
+def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    token_classes = int_map(state.get("tokenClasses"))
+    daily_tokens = int_map(state.get("dailyTokens"))
+    hourly_tokens = int_map(state.get("hourlyTokens"))
+
+    tokens = dict(token_classes)
+    total = sum(token_classes.values())
+    if total > 0:
+        tokens["totalTokens"] = total
+        periods = periods_from_daily_tokens(daily_tokens)
+        periods["all"] = total
+        for key, amount in periods.items():
+            if amount > 0:
+                tokens[key] = amount
+
+    models: Dict[str, Dict[str, int]] = {}
+    raw_models = state.get("models") if isinstance(state.get("models"), dict) else {}
+    raw_model_daily = state.get("modelDailyTokens") if isinstance(state.get("modelDailyTokens"), dict) else {}
+    for model, raw_model_tokens in raw_models.items():
+        model_tokens = int_map(raw_model_tokens)
+        model_total = sum(model_tokens.values())
+        if model_total <= 0:
+            continue
+        model_daily = int_map(raw_model_daily.get(model)) if isinstance(raw_model_daily, dict) else {}
+        periods = periods_from_daily_tokens(model_daily)
+        periods["all"] = model_total
+        for key, amount in periods.items():
+            if amount > 0:
+                model_tokens[key] = amount
+        models[str(model)] = model_tokens
+
+    return {
+        "tokens": tokens,
+        "models": models,
+        "dailyTokens": daily_tokens,
+        "hourlyTokens": hourly_tokens,
+        "events": int(state.get("events") or 0),
+        "cache": {
+            "source": "full-log-index",
+            "offset": int(state.get("offset") or 0),
+            "size": int(state.get("size") or 0),
+        },
+    }
 
 
 def command_parts(command: str) -> List[str]:
@@ -3216,19 +3614,125 @@ def motion_stage(process_count: int, total_cpu: float, runnable_process_count: i
     return "walking"
 
 
-def terminal_activity_snapshot_windows() -> Dict[str, Any]:
-    result: Dict[str, Any] = {
+def empty_windows_activity_result() -> Dict[str, Any]:
+    return {
         "status": "unknown",
         "updatedAt": now_iso(),
         "processCount": 0,
         "totalCPUPercent": 0,
+        "totalMemoryBytes": 0,
         "motionStage": "sleeping",
         "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0},
+        "memoryBytesByProvider": {"codex": 0, "claude": 0, "gemini": 0},
         "processes": [],
     }
+
+
+def windows_powershell_command() -> List[str]:
+    for executable in ("pwsh.exe", "pwsh", "powershell.exe", "powershell"):
+        found = shutil.which(executable)
+        if found:
+            return [found, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+    return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
+
+def windows_activity_from_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    scan_source: str,
+    scan_warning: Optional[str] = None,
+) -> Dict[str, Any]:
+    rows.sort(key=lambda row: (-float(row["cpuPercent"]), str(row["kind"])))
+    counts = {"codex": 0, "claude": 0, "gemini": 0}
+    memory_by_provider = {"codex": 0, "claude": 0, "gemini": 0}
+    for row in rows:
+        provider = str(row["kind"])
+        counts[provider] = counts.get(provider, 0) + 1
+        memory_by_provider[provider] = memory_by_provider.get(provider, 0) + int(row.get("memoryBytes") or 0)
+    total_cpu = sum(float(row["cpuPercent"]) for row in rows)
+    total_memory = sum(int(row.get("memoryBytes") or 0) for row in rows)
+    runnable_process_count = sum(1 for row in rows if float(row.get("cpuPercent", 0)) > 0.1)
+    activity_score = total_cpu + float(runnable_process_count) * 3.0
+
+    result = empty_windows_activity_result()
+    result.update(
+        {
+            "status": "ok",
+            "processCount": len(rows),
+            "totalCPUPercent": total_cpu,
+            "totalMemoryBytes": total_memory,
+            "runnableProcessCount": runnable_process_count,
+            "activityScore": activity_score,
+            "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
+            "countsByProvider": counts,
+            "memoryBytesByProvider": memory_by_provider,
+            "processes": rows,
+            "scanSource": scan_source,
+        }
+    )
+    if scan_warning:
+        result["scanWarning"] = scan_warning[:240]
+    return result
+
+
+def terminal_activity_snapshot_windows_tasklist(scan_warning: Optional[str] = None) -> Dict[str, Any]:
+    result = empty_windows_activity_result()
+    try:
+        completed = subprocess.run(
+            ["tasklist.exe", "/FO", "CSV", "/NH"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=min(windows_process_scan_timeout_seconds(), 10.0),
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+
+    if completed.returncode != 0:
+        result["status"] = "error"
+        result["error"] = completed.stderr.strip() or "tasklist process scan failed"
+        return result
+
+    rows: List[Dict[str, Any]] = []
+    for item in csv.reader(completed.stdout.splitlines()):
+        if len(item) < 2:
+            continue
+        image_name = item[0]
+        provider = classify_process(image_name)
+        if provider is None:
+            continue
+        try:
+            pid = int(item[1])
+        except (TypeError, ValueError):
+            continue
+        memory_kb = 0
+        if len(item) >= 5:
+            digits = re.sub(r"[^0-9]", "", item[4])
+            memory_kb = int(digits or 0)
+        rows.append(
+            {
+                "pid": pid,
+                "parentID": 0,
+                "kind": provider,
+                "cpuPercent": 0,
+                "rssKilobytes": memory_kb,
+                "memoryBytes": memory_kb * 1024,
+                "state": "unknown",
+                "command": safe_activity_command(provider, pid),
+            }
+        )
+    return windows_activity_from_rows(rows, scan_source="tasklist", scan_warning=scan_warning)
+
+
+def terminal_activity_snapshot_windows() -> Dict[str, Any]:
+    result = empty_windows_activity_result()
     script = r"""
 $ErrorActionPreference = 'SilentlyContinue'
-Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine |
+Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,WorkingSetSize |
   Where-Object {
     $text = (($_.Name + ' ' + $_.CommandLine).ToLower())
     $text -match '(^|[^a-z])(codex|claude|gemini)([^a-z]|$)'
@@ -3240,40 +3744,42 @@ Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLi
       Name = $_.Name
       CommandLine = $_.CommandLine
       CpuPercent = 0
+      WorkingSetSize = [int64]$_.WorkingSetSize
     }
   } |
   ConvertTo-Json -Compress
 """
     try:
         completed = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            windows_powershell_command() + [script],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=3.0,
+            timeout=windows_process_scan_timeout_seconds(),
             creationflags=CREATE_NO_WINDOW,
         )
     except Exception as exc:
+        fallback = terminal_activity_snapshot_windows_tasklist(scan_warning=f"PowerShell scan failed: {exc}")
+        if fallback.get("status") == "ok":
+            return fallback
         result["status"] = "error"
         result["error"] = str(exc)
         return result
 
     if completed.returncode != 0:
+        fallback = terminal_activity_snapshot_windows_tasklist(
+            scan_warning=completed.stderr.strip() or "PowerShell process scan failed"
+        )
+        if fallback.get("status") == "ok":
+            return fallback
         result["status"] = "error"
         result["error"] = completed.stderr.strip() or "PowerShell process scan failed"
         return result
 
     text = completed.stdout.strip()
     if not text:
-        result.update(
-            {
-                "status": "ok",
-                "runnableProcessCount": 0,
-                "activityScore": 0,
-            }
-        )
-        return result
+        return windows_activity_from_rows([], scan_source="powershell")
 
     try:
         parsed = json.loads(text)
@@ -3295,6 +3801,7 @@ Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLi
             pid = int(item.get("ProcessId") or 0)
             parent_id = int(item.get("ParentProcessId") or 0)
             cpu = float(item.get("CpuPercent") or 0)
+            memory_bytes = int(item.get("WorkingSetSize") or 0)
         except (TypeError, ValueError):
             continue
         rows.append(
@@ -3303,32 +3810,14 @@ Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLi
                 "parentID": parent_id,
                 "kind": provider,
                 "cpuPercent": cpu,
+                "rssKilobytes": max(memory_bytes, 0) // 1024,
+                "memoryBytes": max(memory_bytes, 0),
                 "state": "running" if cpu > 0.1 else "sleeping",
-                "command": command[:180],
+                "command": safe_activity_command(provider, pid),
             }
         )
 
-    rows.sort(key=lambda row: (-float(row["cpuPercent"]), str(row["kind"])))
-    counts = {"codex": 0, "claude": 0, "gemini": 0}
-    for row in rows:
-        counts[str(row["kind"])] = counts.get(str(row["kind"]), 0) + 1
-    total_cpu = sum(float(row["cpuPercent"]) for row in rows)
-    runnable_process_count = sum(1 for row in rows if float(row.get("cpuPercent", 0)) > 0.1)
-    activity_score = total_cpu + float(runnable_process_count) * 3.0
-
-    result.update(
-        {
-            "status": "ok",
-            "processCount": len(rows),
-            "totalCPUPercent": total_cpu,
-            "runnableProcessCount": runnable_process_count,
-            "activityScore": activity_score,
-            "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
-            "countsByProvider": counts,
-            "processes": rows,
-        }
-    )
-    return result
+    return windows_activity_from_rows(rows, scan_source="powershell")
 
 
 def terminal_activity_snapshot() -> Dict[str, Any]:
