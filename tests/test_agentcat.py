@@ -926,6 +926,92 @@ class AgentCatConnectorTests(unittest.TestCase):
             "gemini",
         )
 
+    def test_classify_ignores_codex_desktop_electron_helpers_on_windows(self) -> None:
+        self.assertIsNone(
+            agentcat.classify_process(
+                r'"C:\Program Files\WindowsApps\OpenAI.Codex_26.513.4821.0_x64__2p2nqsd0c76g0\app\Codex.exe"'
+            )
+        )
+        self.assertIsNone(
+            agentcat.classify_process(
+                r'"C:\Program Files\WindowsApps\OpenAI.Codex_26.513.4821.0_x64__2p2nqsd0c76g0\app\Codex.exe" --type=renderer --user-data-dir="C:\Users\me\AppData\Roaming\Codex"'
+            )
+        )
+        self.assertEqual(
+            agentcat.classify_process(
+                r'"C:\Program Files\WindowsApps\OpenAI.Codex_26.513.4821.0_x64__2p2nqsd0c76g0\app\resources\codex.exe" app-server --analytics-default-enabled'
+            ),
+            "codex",
+        )
+
+    def test_classify_ignores_vscode_chatgpt_extension_codex_server(self) -> None:
+        self.assertIsNone(
+            agentcat.classify_process(
+                r"c:\Users\me\.vscode\extensions\openai.chatgpt-26.513.21555-win32-x64\bin\windows-x86_64\codex.exe app-server --analytics-default-enabled"
+            )
+        )
+
+    def test_classify_ignores_codex_desktop_stdio_app_servers(self) -> None:
+        self.assertIsNone(
+            agentcat.classify_process(
+                r'"C:\Users\me\AppData\Local\OpenAI\Codex\bin\76ac88818493fc45\codex.exe" app-server --listen stdio://'
+            )
+        )
+
+    def test_windows_activity_ignores_codex_desktop_helper_processes(self) -> None:
+        completed = agentcat.subprocess.CompletedProcess(
+            args=["powershell.exe"],
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "ProcessId": 6036,
+                        "ParentProcessId": 14000,
+                        "Name": "Codex.exe",
+                        "CommandLine": r'"C:\Program Files\WindowsApps\OpenAI.Codex_26.513.4821.0_x64__2p2nqsd0c76g0\app\Codex.exe"',
+                        "CpuPercent": 0,
+                    },
+                    {
+                        "ProcessId": 8044,
+                        "ParentProcessId": 6036,
+                        "Name": "Codex.exe",
+                        "CommandLine": r'"C:\Program Files\WindowsApps\OpenAI.Codex_26.513.4821.0_x64__2p2nqsd0c76g0\app\Codex.exe" --type=renderer',
+                        "CpuPercent": 0,
+                    },
+                    {
+                        "ProcessId": 13496,
+                        "ParentProcessId": 6036,
+                        "Name": "codex.exe",
+                        "CommandLine": r'"C:\Program Files\WindowsApps\OpenAI.Codex_26.513.4821.0_x64__2p2nqsd0c76g0\app\resources\codex.exe" app-server --analytics-default-enabled',
+                        "CpuPercent": 0,
+                    },
+                    {
+                        "ProcessId": 38772,
+                        "ParentProcessId": 14196,
+                        "Name": "codex.exe",
+                        "CommandLine": r"c:\Users\me\.vscode\extensions\openai.chatgpt-26.513.21555-win32-x64\bin\windows-x86_64\codex.exe app-server --analytics-default-enabled",
+                        "CpuPercent": 0,
+                    },
+                    {
+                        "ProcessId": 23020,
+                        "ParentProcessId": 21436,
+                        "Name": "codex.exe",
+                        "CommandLine": r'"C:\Users\me\AppData\Local\OpenAI\Codex\bin\76ac88818493fc45\codex.exe" app-server --listen stdio://',
+                        "CpuPercent": 0,
+                    },
+                ]
+            ),
+            stderr="",
+        )
+
+        with patch.object(agentcat.subprocess, "run", return_value=completed):
+            snapshot = agentcat.terminal_activity_snapshot_windows()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["processCount"], 1)
+        self.assertEqual(snapshot["countsByProvider"]["codex"], 1)
+        self.assertEqual(snapshot["processes"][0]["pid"], 13496)
+
     def test_motion_stage_uses_granular_activity_thresholds(self) -> None:
         self.assertEqual(agentcat.motion_stage(0, 100, 10), "sleeping")
         self.assertEqual(agentcat.motion_stage(1, 0, 0), "walking")
