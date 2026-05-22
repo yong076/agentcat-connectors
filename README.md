@@ -82,6 +82,14 @@ Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The
 
 Memory usage is local RSS memory from `/bin/ps`, exposed per process as `memoryBytes` and grouped by provider as `memoryBytesByProvider`. It does not inspect prompts, transcripts, or model responses.
 
+On Windows, Agent Cat prefers PowerShell 7 (`pwsh`) when available, tries a fast `Get-Process` scan first, and only falls back to richer command-line scanning or `tasklist` when needed. Slow corporate environments can raise the scan timeout in `~/.agentcat/settings.json`:
+
+```json
+{
+  "windowsProcessScanTimeoutSeconds": 8
+}
+```
+
 ## Limits
 
 Agent Cat reports remaining quota when a provider exposes it through the same local auth state used by its CLI:

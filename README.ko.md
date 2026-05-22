@@ -82,6 +82,14 @@ Agent Cat은 `~/.agentcat/latest-snapshot.json`을 읽거나 로컬 API를 호�
 
 메모리 사용량은 `/bin/ps`에서 읽은 로컬 RSS 메모리입니다. 각 프로세스에는 `memoryBytes`, provider별 합계에는 `memoryBytesByProvider`가 들어갑니다. 프롬프트, 대화 본문, 모델 응답은 읽지 않습니다.
 
+Windows에서는 가능한 경우 PowerShell 7(`pwsh`)을 우선 사용하고, 빠른 `Get-Process` 스캔을 먼저 시도한 뒤 필요할 때만 command-line 스캔이나 `tasklist`로 fallback합니다. 회사 PC처럼 PowerShell 기동이 느린 환경에서는 `~/.agentcat/settings.json`에서 스캔 타임아웃을 늘릴 수 있습니다.
+
+```json
+{
+  "windowsProcessScanTimeoutSeconds": 8
+}
+```
+
 ## 한도
 
 Agent Cat은 각 CLI가 이미 로그인에 쓰는 로컬 인증 상태로 provider가 노출하는 남은 quota를 읽습니다.

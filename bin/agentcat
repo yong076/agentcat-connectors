@@ -61,7 +61,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 2
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.4")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.5")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -3822,14 +3822,18 @@ def executable_name(command: str) -> Optional[str]:
     if not parts:
         return None
     first = parts[0]
-    executable = Path(first).name.lower()
+
+    def basename(value: str) -> str:
+        return Path(value.replace("\\", "/")).name.lower()
+
+    executable = basename(first)
     if executable in {"node", "node.exe"} and len(parts) > 1:
         for part in parts[1:]:
             if part.startswith("-"):
                 continue
             first = part
             break
-    return Path(first).name.lower()
+    return basename(first)
 
 
 def classify_process(command: str) -> Optional[str]:
@@ -3992,22 +3996,44 @@ def terminal_activity_snapshot_windows() -> Dict[str, Any]:
     result = empty_windows_activity_result()
     script = r"""
 $ErrorActionPreference = 'SilentlyContinue'
-Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,WorkingSetSize |
+$rows = @(
+Get-Process |
   Where-Object {
-    $text = (($_.Name + ' ' + $_.CommandLine).ToLower())
+    $text = (($_.ProcessName + ' ' + $_.Path).ToLower())
     $text -match '(^|[^a-z])(codex|claude|gemini)([^a-z]|$)'
   } |
   ForEach-Object {
     [pscustomobject]@{
-      ProcessId = [uint32]$_.ProcessId
-      ParentProcessId = [uint32]$_.ParentProcessId
-      Name = $_.Name
-      CommandLine = $_.CommandLine
+      ProcessId = [uint32]$_.Id
+      ParentProcessId = 0
+      Name = $_.ProcessName
+      Path = $_.Path
+      CommandLine = $_.Path
       CpuPercent = 0
-      WorkingSetSize = [int64]$_.WorkingSetSize
+      WorkingSetSize = [int64]$_.WorkingSet64
     }
-  } |
-  ConvertTo-Json -Compress
+  }
+)
+if (-not $rows) {
+  $rows = @(
+  Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,WorkingSetSize |
+    Where-Object {
+      $text = (($_.Name + ' ' + $_.CommandLine).ToLower())
+      $text -match '(^|[^a-z])(codex|claude|gemini)([^a-z]|$)'
+    } |
+    ForEach-Object {
+      [pscustomobject]@{
+        ProcessId = [uint32]$_.ProcessId
+        ParentProcessId = [uint32]$_.ParentProcessId
+        Name = $_.Name
+        CommandLine = $_.CommandLine
+        CpuPercent = 0
+        WorkingSetSize = [int64]$_.WorkingSetSize
+      }
+    }
+  )
+}
+$rows | ConvertTo-Json -Compress
 """
     try:
         completed = subprocess.run(
@@ -4039,7 +4065,7 @@ Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLi
 
     text = completed.stdout.strip()
     if not text:
-        return windows_activity_from_rows([], scan_source="powershell")
+        return windows_activity_from_rows([], scan_source="powershell-get-process")
 
     try:
         parsed = json.loads(text)
@@ -4053,7 +4079,12 @@ Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLi
     for item in items:
         if not isinstance(item, dict):
             continue
-        command = str(item.get("CommandLine") or item.get("Name") or "")
+        if item.get("CommandLine"):
+            command = str(item.get("CommandLine"))
+        elif item.get("Path"):
+            command = json.dumps(str(item.get("Path")))
+        else:
+            command = str(item.get("Name") or "")
         provider = classify_process(command)
         if provider is None:
             continue
@@ -4077,7 +4108,7 @@ Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLi
             }
         )
 
-    return windows_activity_from_rows(rows, scan_source="powershell")
+    return windows_activity_from_rows(rows, scan_source="powershell-get-process")
 
 
 def terminal_activity_snapshot() -> Dict[str, Any]:
