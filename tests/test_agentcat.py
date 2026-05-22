@@ -1060,9 +1060,9 @@ class AgentCatConnectorTests(unittest.TestCase):
             stdout=json.dumps(
                 {
                     "ProcessId": 301,
-                    "ParentProcessId": 1,
-                    "Name": "node.exe",
-                    "CommandLine": "node C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@google\\gemini-cli\\index.js",
+                    "ParentProcessId": 0,
+                    "Name": "claude",
+                    "Path": "C:\\Users\\me\\AppData\\Local\\Programs\\Claude\\claude.exe",
                     "CpuPercent": 0,
                     "WorkingSetSize": 12_345_678,
                 }
@@ -1086,14 +1086,42 @@ class AgentCatConnectorTests(unittest.TestCase):
         command = run_calls[0][0][0]
         kwargs = run_calls[0][1]
         self.assertEqual(command[0], "C:\\Program Files\\PowerShell\\7\\pwsh.exe")
+        self.assertIn("Get-Process", command[-1])
+        self.assertLess(command[-1].index("Get-Process"), command[-1].index("Get-CimInstance Win32_Process"))
         self.assertEqual(kwargs["timeout"], 8.0)
         self.assertEqual(snapshot["status"], "ok")
-        self.assertEqual(snapshot["scanSource"], "powershell")
-        self.assertEqual(snapshot["countsByProvider"]["gemini"], 1)
+        self.assertEqual(snapshot["scanSource"], "powershell-get-process")
+        self.assertEqual(snapshot["countsByProvider"]["claude"], 1)
         self.assertEqual(snapshot["totalMemoryBytes"], 12_345_678)
-        self.assertEqual(snapshot["memoryBytesByProvider"]["gemini"], 12_345_678)
-        self.assertEqual(snapshot["processes"][0]["command"], "gemini pid 301")
-        self.assertNotIn("@google", snapshot["processes"][0]["command"])
+        self.assertEqual(snapshot["memoryBytesByProvider"]["claude"], 12_345_678)
+        self.assertEqual(snapshot["processes"][0]["command"], "claude pid 301")
+        self.assertNotIn("Claude", snapshot["processes"][0]["command"])
+
+    def test_windows_activity_keeps_commandline_wrapper_detection(self) -> None:
+        completed = agentcat.subprocess.CompletedProcess(
+            args=["pwsh.exe"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "ProcessId": 302,
+                    "ParentProcessId": 1,
+                    "Name": "node.exe",
+                    "CommandLine": "node C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@google\\gemini-cli\\index.js",
+                    "CpuPercent": 0,
+                    "WorkingSetSize": 10_000_000,
+                }
+            ),
+            stderr="",
+        )
+
+        with patch.object(agentcat.shutil, "which", return_value="pwsh.exe"), patch.object(
+            agentcat.subprocess, "run", return_value=completed
+        ):
+            snapshot = agentcat.terminal_activity_snapshot_windows()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["countsByProvider"]["gemini"], 1)
+        self.assertEqual(snapshot["memoryBytesByProvider"]["gemini"], 10_000_000)
 
     def test_windows_activity_falls_back_to_tasklist_when_powershell_times_out(self) -> None:
         tasklist = agentcat.subprocess.CompletedProcess(
