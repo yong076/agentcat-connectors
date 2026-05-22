@@ -32,6 +32,8 @@ class AgentCatConnectorTests(unittest.TestCase):
             "GEMINI_TELEMETRY": agentcat.GEMINI_TELEMETRY,
             "GEMINI_USAGE_CACHE": agentcat.GEMINI_USAGE_CACHE,
             "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
+            "JOURNAL_CURSOR_FILE": agentcat.JOURNAL_CURSOR_FILE,
+            "CLAUDE_PROJECTS_DIR": agentcat.CLAUDE_PROJECTS_DIR,
             "_GEMINI_CACHE_KEY": agentcat._GEMINI_CACHE_KEY,
             "_GEMINI_CACHE_VALUE": agentcat._GEMINI_CACHE_VALUE,
             "_GEMINI_CACHE_LOADED_AT": agentcat._GEMINI_CACHE_LOADED_AT,
@@ -49,6 +51,8 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat.GEMINI_TELEMETRY = agentcat_home / "gemini" / "telemetry.log"
         agentcat.GEMINI_USAGE_CACHE = agentcat_home / "gemini-usage-cache.json"
         agentcat.LIVE_LIMITS_CACHE = agentcat_home / "live-limits-cache.json"
+        agentcat.JOURNAL_CURSOR_FILE = agentcat_home / "jsonl-cursor.json"
+        agentcat.CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
         agentcat._GEMINI_CACHE_KEY = None
         agentcat._GEMINI_CACHE_VALUE = None
         agentcat._GEMINI_CACHE_LOADED_AT = 0.0
@@ -302,6 +306,26 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
         self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
 
+    def test_http_snapshot_preserves_cached_provider_generated_at(self) -> None:
+        agentcat.LATEST_SNAPSHOT.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 4,
+                    "generatedAt": "2026-05-01T00:00:00Z",
+                    "providers": {"claude": {"status": "ok"}},
+                    "activity": {"status": "old"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
+            snapshot = agentcat.snapshot_for_http()
+
+        self.assertEqual(snapshot["generatedAt"], "2026-05-01T00:00:00Z")
+        self.assertIn("servedAt", snapshot)
+        self.assertEqual(snapshot["activity"], {"status": "ok"})
+
     def test_version_json_matches_snapshot_schema_version(self) -> None:
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -458,6 +482,85 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["week"], 100)
         self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["all"], 150)
         self.assertEqual(snapshot["models"]["unknown"]["week"], 9)
+
+    def test_claude_snapshot_prefers_jsonl_usage_over_stale_stats_cache(self) -> None:
+        claude_dir = agentcat.HOME / ".claude"
+        claude_dir.mkdir(parents=True)
+        project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"
+        project_dir.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        old = now - dt.timedelta(days=40)
+        (claude_dir / "stats-cache.json").write_text(
+            json.dumps(
+                {
+                    "dailyModelTokens": [
+                        {
+                            "date": old.date().isoformat(),
+                            "tokensByModel": {"claude-sonnet-4-6": 999},
+                        }
+                    ],
+                    "modelUsage": {
+                        "claude-sonnet-4-6": {
+                            "inputTokens": 999,
+                            "outputTokens": 999,
+                            "totalTokens": 1998,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (project_dir / "session.jsonl").write_text(
+            json.dumps(
+                {
+                    "timestamp": now.isoformat().replace("+00:00", "Z"),
+                    "cwd": str(agentcat.HOME / "repo"),
+                    "message": {
+                        "model": "claude-sonnet-4-6",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 2,
+                            "cache_read_input_tokens": 3,
+                            "cache_creation": {
+                                "ephemeral_1h_input_tokens": 4,
+                                "ephemeral_5m_input_tokens": 5,
+                            },
+                        },
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        agentcat.JOURNAL_CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
+        agentcat.JOURNAL_CURSOR_FILE.write_text(
+            json.dumps({"offsets": {str(project_dir / "session.jsonl"): 999999}, "totals": {}}),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 1)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 2)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 3)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 9)
+        self.assertEqual(snapshot["tokens"]["today"], 15)
+        self.assertEqual(snapshot["tokens"]["week"], 15)
+        self.assertEqual(snapshot["tokens"]["month"], 15)
+        self.assertEqual(snapshot["tokens"]["all"], 15)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 15)
+        self.assertEqual(snapshot["dailyTokens"][now.astimezone().date().isoformat()], 15)
+        self.assertEqual(sum(snapshot["hourlyTokens"].values()), 15)
+        model = snapshot["models"]["claude-sonnet-4-6"]
+        self.assertEqual(model["inputTokens"], 1)
+        self.assertEqual(model["outputTokens"], 2)
+        self.assertEqual(model["cacheReadInputTokens"], 3)
+        self.assertEqual(model["cacheCreationInputTokens"], 9)
+        self.assertEqual(model["today"], 15)
+        self.assertEqual(model["week"], 15)
+        self.assertEqual(model["all"], 15)
+        self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 15)
 
     def test_gemini_snapshot_reads_otel_token_metrics(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)

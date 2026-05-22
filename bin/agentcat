@@ -57,10 +57,11 @@ LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_S
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
+CLAUDE_JOURNAL_CURSOR_VERSION = 2
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.2")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.3")
 SCHEMA_VERSION = 4
 CONNECTOR_CAPABILITIES = (
     "snapshot.metadata",
@@ -225,7 +226,12 @@ def _scaled_token_class(amount: int, period_total: int, all_total: int) -> int:
     return max(0, int(round(amount * (period_total / all_total))))
 
 
-def insight_model_period_bucket(model_data: Dict[str, Any], period: str) -> Optional[Tuple[Dict[str, int], int]]:
+def insight_model_period_bucket(
+    model_data: Dict[str, Any],
+    period: str,
+    *,
+    allow_lifetime_fallback: bool = True,
+) -> Optional[Tuple[Dict[str, int], int]]:
     """Return per-class model tokens plus total for an insights period.
 
     Older model stats store `week`/`today` as nested token-class dicts. Gemini,
@@ -261,6 +267,9 @@ def insight_model_period_bucket(model_data: Dict[str, Any], period: str) -> Opti
             for key in token_keys
         }
         return bucket, period_total
+
+    if not allow_lifetime_fallback:
+        return None
 
     bucket = {key: _insight_int(model_data.get(key)) for key in token_keys}
     extra_total = sum(_insight_int(model_data.get(key)) for key in extra_token_keys)
@@ -316,7 +325,11 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
         for model_name, model_data in models.items():
             if not isinstance(model_data, dict):
                 continue
-            period_bucket = insight_model_period_bucket(model_data, period)
+            period_bucket = insight_model_period_bucket(
+                model_data,
+                period,
+                allow_lifetime_fallback=(period == "all"),
+            )
             if period_bucket is None:
                 continue
             bucket, model_total = period_bucket
@@ -2780,27 +2793,60 @@ def _empty_journal_projects() -> Dict[str, Dict[str, Any]]:
     return {}
 
 
+def _empty_journal_daily_tokens() -> Dict[str, int]:
+    return {}
+
+
+def _empty_journal_hourly_tokens() -> Dict[str, int]:
+    return {}
+
+
+def _empty_journal_models() -> Dict[str, Dict[str, int]]:
+    return {}
+
+
 def load_journal_cursor() -> Dict[str, Any]:
     raw = read_json(JOURNAL_CURSOR_FILE)
     if not isinstance(raw, dict):
         return {
+            "version": CLAUDE_JOURNAL_CURSOR_VERSION,
             "offsets": {},
             "totals": _empty_journal_totals(),
             "projects": _empty_journal_projects(),
+            "dailyTokens": _empty_journal_daily_tokens(),
+            "hourlyTokens": _empty_journal_hourly_tokens(),
+            "models": _empty_journal_models(),
             "projects_needs_rebuild": False,
+            "usage_needs_rebuild": False,
             "totals_as_of": None,
         }
     has_projects = isinstance(raw.get("projects"), dict)
+    has_daily = isinstance(raw.get("dailyTokens"), dict)
+    has_hourly = isinstance(raw.get("hourlyTokens"), dict)
+    has_models = isinstance(raw.get("models"), dict)
+    has_current_version = raw.get("version") == CLAUDE_JOURNAL_CURSOR_VERSION
     offsets = raw.get("offsets") or {}
     totals = raw.get("totals") or {}
     projects = raw.get("projects") if has_projects else _empty_journal_projects()
+    daily_tokens = raw.get("dailyTokens") if has_daily else _empty_journal_daily_tokens()
+    hourly_tokens = raw.get("hourlyTokens") if has_hourly else _empty_journal_hourly_tokens()
+    models = raw.get("models") if has_models else _empty_journal_models()
     for k in _JOURNAL_PERIOD_KEYS:
         totals.setdefault(k, 0)
     return {
+        "version": CLAUDE_JOURNAL_CURSOR_VERSION,
         "offsets": {str(p): int(v) for p, v in offsets.items() if isinstance(v, (int, float))},
         "totals": totals,
         "projects": projects,
+        "dailyTokens": {str(k): int(v) for k, v in daily_tokens.items() if isinstance(v, (int, float))},
+        "hourlyTokens": {str(k): int(v) for k, v in hourly_tokens.items() if isinstance(v, (int, float))},
+        "models": {
+            str(model): {str(k): int(v) for k, v in values.items() if isinstance(v, (int, float))}
+            for model, values in models.items()
+            if isinstance(values, dict)
+        },
         "projects_needs_rebuild": not has_projects,
+        "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_current_version),
         "totals_as_of": raw.get("totals_as_of"),
     }
 
@@ -2855,33 +2901,54 @@ def parse_claude_usage_line(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _apply_record_to_totals(
     totals: Dict[str, int],
     rec: Dict[str, Any],
-    now_local: "dt.date",
+    now: "dt.datetime",
     projects: Optional[Dict[str, Dict[str, Any]]] = None,
+    daily_tokens: Optional[Dict[str, int]] = None,
+    hourly_tokens: Optional[Dict[str, int]] = None,
+    models: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> None:
     ts: Optional["dt.datetime"] = rec.get("timestamp")
+    if ts is not None and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    now_local = now.astimezone().date()
     rec_date = ts.astimezone().date() if ts else None
     fields = (
-        ("input", "input"), ("output", "output"), ("cache_read", "cacheRead"),
-        ("cache_write_1h", "cacheWrite_1h"), ("cache_write_5m", "cacheWrite_5m"),
+        ("input", "input", "inputTokens"),
+        ("output", "output", "outputTokens"),
+        ("cache_read", "cacheRead", "cacheReadInputTokens"),
+        ("cache_write_1h", "cacheWrite_1h", "cacheCreationInputTokens"),
+        ("cache_write_5m", "cacheWrite_5m", "cacheCreationInputTokens"),
     )
     project_total = 0
-    for rec_key, tok_key in fields:
+    model = normalized_model_name(rec.get("model")) or "unknown"
+    model_tokens = models.setdefault(model, {}) if models is not None else None
+    for rec_key, tok_key, model_key in fields:
         amount = rec.get(rec_key) or 0
         if amount <= 0:
             continue
         project_total += amount
         totals[f"all_{tok_key}"] = totals.get(f"all_{tok_key}", 0) + amount
-        if rec_date is None:
+        if model_tokens is not None:
+            model_tokens[model_key] = model_tokens.get(model_key, 0) + amount
+        if ts is None or rec_date is None:
             continue
-        delta = (now_local - rec_date).days
-        if delta == 0:
+        if rec_date == now_local:
             totals[f"today_{tok_key}"] = totals.get(f"today_{tok_key}", 0) + amount
-        if delta < 7:
+        if ts >= now - dt.timedelta(days=7):
             totals[f"week_{tok_key}"] = totals.get(f"week_{tok_key}", 0) + amount
-        if delta < 30:
+        if ts >= now - dt.timedelta(days=30):
             totals[f"month_{tok_key}"] = totals.get(f"month_{tok_key}", 0) + amount
+    if project_total <= 0:
+        return
+    if daily_tokens is not None:
+        add_to_daily(daily_tokens, project_total, ts)
+    if hourly_tokens is not None:
+        add_to_hourly(hourly_tokens, project_total, ts)
+    if model_tokens is not None:
+        model_tokens["totalTokens"] = model_tokens.get("totalTokens", 0) + project_total
+        add_to_periods(model_tokens, project_total, ts)
     cwd = str(rec.get("cwd") or "").strip()
-    if projects is not None and cwd and project_total > 0:
+    if projects is not None and cwd:
         project = projects.setdefault(cwd, {"tokens": 0, "last_active": None})
         project["tokens"] = int(project.get("tokens") or 0) + project_total
         if ts is not None:
@@ -2891,7 +2958,7 @@ def _apply_record_to_totals(
                 project["last_active"] = ts.isoformat().replace("+00:00", "Z")
 
 
-def rebuild_claude_journal_projects(now_local: "dt.date") -> Dict[str, Dict[str, Any]]:
+def rebuild_claude_journal_projects(now: "dt.datetime") -> Dict[str, Dict[str, Any]]:
     projects: Dict[str, Dict[str, Any]] = {}
     if not CLAUDE_PROJECTS_DIR.is_dir():
         return projects
@@ -2909,7 +2976,7 @@ def rebuild_claude_journal_projects(now_local: "dt.date") -> Dict[str, Dict[str,
                         continue
                     rec = parse_claude_usage_line(obj)
                     if rec:
-                        _apply_record_to_totals(scratch_totals, rec, now_local, projects)
+                        _apply_record_to_totals(scratch_totals, rec, now, projects)
         except OSError as exc:
             logging.warning("rebuild_claude_journal_projects: cannot read %s: %s", str(path), exc)
             continue
@@ -2926,20 +2993,30 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         try:
             prev_date = dt.datetime.fromisoformat(totals_as_of_str).astimezone().date()
             if prev_date != now_local:
-                for k in list(cursor["totals"]):
-                    if k.startswith("today_"):
-                        cursor["totals"][k] = 0
+                cursor["usage_needs_rebuild"] = True
         except Exception:
             pass
     offsets: Dict[str, int] = cursor.setdefault("offsets", {})
     totals: Dict[str, int] = cursor.setdefault("totals", _empty_journal_totals())
     projects: Dict[str, Dict[str, Any]] = cursor.setdefault("projects", _empty_journal_projects())
+    daily_tokens: Dict[str, int] = cursor.setdefault("dailyTokens", _empty_journal_daily_tokens())
+    hourly_tokens: Dict[str, int] = cursor.setdefault("hourlyTokens", _empty_journal_hourly_tokens())
+    models: Dict[str, Dict[str, int]] = cursor.setdefault("models", _empty_journal_models())
+    if cursor.pop("usage_needs_rebuild", False):
+        offsets.clear()
+        totals.clear()
+        totals.update(_empty_journal_totals())
+        projects.clear()
+        daily_tokens.clear()
+        hourly_tokens.clear()
+        models.clear()
+        cursor["projects_needs_rebuild"] = False
     if cursor.pop("projects_needs_rebuild", False):
         # Existing cursors predate per-project attribution. Rebuild only
         # project totals from JSONL so historical project usage appears
         # without disturbing global totals or byte offsets.
         projects.clear()
-        projects.update(rebuild_claude_journal_projects(now_local))
+        projects.update(rebuild_claude_journal_projects(now_utc))
     for path in sorted(CLAUDE_PROJECTS_DIR.rglob("*.jsonl")):
         path_str = str(path)
         try:
@@ -2968,7 +3045,15 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                         continue
                     rec = parse_claude_usage_line(obj)
                     if rec:
-                        _apply_record_to_totals(totals, rec, now_local, projects)
+                        _apply_record_to_totals(
+                            totals,
+                            rec,
+                            now_utc,
+                            projects,
+                            daily_tokens,
+                            hourly_tokens,
+                            models,
+                        )
                         lines_parsed += 1
         except OSError as exc:
             logging.warning("scan_claude_journal: cannot read %s: %s", path_str, exc)
@@ -2977,6 +3062,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
                       path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
     cursor["totals_as_of"] = now_utc.isoformat()
+    cursor["version"] = CLAUDE_JOURNAL_CURSOR_VERSION
     return cursor
 
 
@@ -2984,11 +3070,41 @@ def _merge_journal_totals(tokens: Dict[str, int], cursor_totals: Dict[str, int])
     for k, v in cursor_totals.items():
         if v > 0:
             tokens[k] = tokens.get(k, 0) + v
+    all_input = cursor_totals.get("all_input", 0)
+    all_output = cursor_totals.get("all_output", 0)
+    all_cache_read = cursor_totals.get("all_cacheRead", 0)
+    all_cache_write = cursor_totals.get("all_cacheWrite_1h", 0) + cursor_totals.get("all_cacheWrite_5m", 0)
+    if all_input > 0:
+        tokens["inputTokens"] = tokens.get("inputTokens", 0) + all_input
+    if all_output > 0:
+        tokens["outputTokens"] = tokens.get("outputTokens", 0) + all_output
+    if all_cache_read > 0:
+        tokens["cacheReadInputTokens"] = tokens.get("cacheReadInputTokens", 0) + all_cache_read
+    if all_cache_write > 0:
+        tokens["cacheCreationInputTokens"] = tokens.get("cacheCreationInputTokens", 0) + all_cache_write
     for period in ("today", "week", "month", "all"):
         lumped = sum(cursor_totals.get(f"{period}_{cls}", 0)
                      for cls in ("input", "output", "cacheRead", "cacheWrite_1h", "cacheWrite_5m"))
         if lumped > 0:
             tokens[period] = lumped
+    if tokens.get("all", 0) > 0:
+        tokens["totalTokens"] = tokens["all"]
+
+
+def _merge_journal_buckets(target: Dict[str, int], source: Dict[str, int]) -> None:
+    for key, amount in source.items():
+        if amount > 0:
+            target[key] = max(target.get(key, 0), amount)
+
+
+def _merge_journal_models(target: Dict[str, Dict[str, int]], source: Dict[str, Dict[str, int]]) -> None:
+    for model, values in source.items():
+        if not isinstance(values, dict):
+            continue
+        model_tokens = target.setdefault(model, {})
+        for key, amount in values.items():
+            if amount > 0:
+                model_tokens[key] = max(model_tokens.get(key, 0), amount)
 
 
 def _journal_projects_snapshot(projects: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -3037,6 +3153,9 @@ def claude_snapshot() -> Dict[str, Any]:
         _merge_journal_totals(result["tokens"], cursor["totals"])
         if result["status"] == "not_found" and any(cursor["totals"].values()):
             result["status"] = "ok"
+    _merge_journal_buckets(result["dailyTokens"], cursor.get("dailyTokens") or {})
+    _merge_journal_buckets(result["hourlyTokens"], cursor.get("hourlyTokens") or {})
+    _merge_journal_models(result["models"], cursor.get("models") or {})
     if cursor.get("projects"):
         result["projects"] = _journal_projects_snapshot(cursor["projects"])
 
@@ -3050,13 +3169,17 @@ def claude_snapshot() -> Dict[str, Any]:
     model_usage = raw.get("modelUsage") if isinstance(raw, dict) else None
     if isinstance(model_usage, dict):
         for model, payload in model_usage.items():
-            result["models"].setdefault(str(model), extract_tokens(payload))
+            model_tokens = result["models"].setdefault(str(model), {})
+            for key, amount in extract_tokens(payload).items():
+                if amount > 0:
+                    model_tokens.setdefault(key, amount)
 
     daily_model_tokens = raw.get("dailyModelTokens") if isinstance(raw, dict) else None
     if isinstance(daily_model_tokens, dict):
         result["dailyModelTokensDays"] = len(daily_model_tokens)
     elif isinstance(daily_model_tokens, list):
         periods = empty_periods()
+        model_periods_from_stats: Dict[str, Dict[str, int]] = {}
         for item in daily_model_tokens:
             if not isinstance(item, dict):
                 continue
@@ -3071,7 +3194,7 @@ def claude_snapshot() -> Dict[str, Any]:
                     continue
                 total += amount
                 model = normalized_model_name(model_raw) or "unknown"
-                model_periods = result["models"].setdefault(model, {})
+                model_periods = model_periods_from_stats.setdefault(model, empty_periods())
                 add_to_periods(model_periods, amount, when)
             if total > 0:
                 add_to_periods(periods, total, when)
@@ -3079,10 +3202,15 @@ def claude_snapshot() -> Dict[str, Any]:
                 if not re.match(r"^\d{4}-\d{2}-\d{2}$", day_key):
                     day_key = day_key_for_timestamp(when) or ""
                 if day_key:
-                    result["dailyTokens"][day_key] = result["dailyTokens"].get(day_key, 0) + total
+                    result["dailyTokens"][day_key] = max(result["dailyTokens"].get(day_key, 0), total)
         result["dailyModelTokensDays"] = len(daily_model_tokens)
+        for model, stats_periods in model_periods_from_stats.items():
+            model_periods = result["models"].setdefault(model, {})
+            for key, amount in stats_periods.items():
+                if amount > 0:
+                    model_periods.setdefault(key, amount)
         for key in ("today", "week", "month", "all"):
-            if periods[key] > 0:
+            if periods[key] > 0 and result["tokens"].get(key, 0) <= 0:
                 result["tokens"][key] = periods[key]
     daily_activity = raw.get("dailyActivity") if isinstance(raw, dict) else None
     if isinstance(daily_activity, dict):
@@ -4059,7 +4187,7 @@ def snapshot_for_http() -> Dict[str, Any]:
     cached = read_json(LATEST_SNAPSHOT)
     if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
         snapshot = copy.deepcopy(cached)
-        snapshot["generatedAt"] = now_iso()
+        snapshot["servedAt"] = now_iso()
         snapshot["activity"] = terminal_activity_snapshot()
         return snapshot
     return build_snapshot()
