@@ -5,7 +5,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
@@ -427,7 +427,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             (30, "gpt-test", (now - dt.timedelta(days=20)).isoformat()),
             (40, "gpt-test", (now - dt.timedelta(days=45)).isoformat()),
         ]
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             conn.execute("create table threads(tokens_used integer, model text, updated_at text)")
             conn.executemany("insert into threads(tokens_used, model, updated_at) values (?, ?, ?)", rows)
             conn.commit()
@@ -473,7 +473,7 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         db_path = codex_dir / "state_test.sqlite"
         now = int(dt.datetime.now(dt.timezone.utc).timestamp())
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             conn.execute(
                 "create table threads(tokens_used integer, model text, updated_at integer, rollout_path text)"
             )
@@ -797,7 +797,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         opencode_dir.mkdir(parents=True)
         db_path = opencode_dir / "opencode.db"
         now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             conn.execute(
                 """
                 create table session (
@@ -876,12 +876,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         )
 
         transcript_dir = (
-            agentcat.HOME
-            / "Library"
-            / "Application Support"
-            / "Code"
-            / "User"
-            / "workspaceStorage"
+            agentcat.copilot_workspace_storage_dirs()[0]
             / "workspace-1"
             / "GitHub.copilot-chat"
             / "transcripts"
@@ -953,7 +948,9 @@ class AgentCatConnectorTests(unittest.TestCase):
             stderr="",
         )
 
-        with patch.object(agentcat.subprocess, "run", return_value=completed):
+        with patch.object(agentcat, "IS_WINDOWS", False), patch.object(
+            agentcat.subprocess, "run", return_value=completed
+        ):
             snapshot = agentcat.terminal_activity_snapshot()
 
         self.assertEqual(snapshot["status"], "ok")
