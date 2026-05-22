@@ -3164,14 +3164,18 @@ def executable_name(command: str) -> Optional[str]:
     if not parts:
         return None
     first = parts[0]
-    executable = Path(first).name.lower()
+
+    def basename(value: str) -> str:
+        return Path(value.replace("\\", "/")).name.lower()
+
+    executable = basename(first)
     if executable in {"node", "node.exe"} and len(parts) > 1:
         for part in parts[1:]:
             if part.startswith("-"):
                 continue
             first = part
             break
-    return Path(first).name.lower()
+    return basename(first)
 
 
 def classify_process(command: str) -> Optional[str]:
