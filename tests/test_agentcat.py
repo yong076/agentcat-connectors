@@ -301,10 +301,50 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertEqual(snapshot["schemaVersion"], 4)
         self.assertEqual(snapshot["connectorVersion"], agentcat.CONNECTOR_VERSION)
+        self.assertIn("update", snapshot)
         self.assertIn("activity.memory", snapshot["capabilities"])
+        self.assertIn("connector.autoUpdate", snapshot["capabilities"])
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
         self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
+
+    def test_connector_version_parser_and_comparison(self) -> None:
+        text = 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.10")'
+
+        self.assertEqual(agentcat.parse_connector_version_from_text(text), "26.22.10")
+        self.assertTrue(agentcat.is_newer_connector_version("26.22.10", "26.22.9"))
+        self.assertFalse(agentcat.is_newer_connector_version("26.22.9", "26.22.10"))
+
+    def test_auto_update_check_starts_installer_for_new_managed_version(self) -> None:
+        install_dir = (agentcat.AGENTCAT_HOME / "connectors").resolve()
+        proc = type("Proc", (), {"pid": 12345})()
+
+        with patch.dict(agentcat.os.environ, {
+            "AGENTCAT_AUTO_UPDATE": "1",
+            "AGENTCAT_CONNECTOR_VERSION": "",
+            "AGENTCAT_CONNECTORS_DIR": str(install_dir),
+        }), \
+                patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
+                patch.object(agentcat, "fetch_remote_connector_version", return_value="99.0.0"), \
+                patch.object(agentcat, "start_auto_update_install", return_value=proc) as starter:
+            state = agentcat.check_auto_update_once(apply_update=True)
+
+        self.assertEqual(state["status"], "update_started")
+        self.assertEqual(state["remoteVersion"], "99.0.0")
+        self.assertEqual(state["installPid"], 12345)
+        starter.assert_called_once_with("99.0.0")
+
+    def test_auto_update_check_does_not_update_from_dev_checkout(self) -> None:
+        with patch.dict(agentcat.os.environ, {
+            "AGENTCAT_AUTO_UPDATE": "1",
+            "AGENTCAT_CONNECTOR_VERSION": "",
+            "AGENTCAT_CONNECTORS_DIR": str(agentcat.AGENTCAT_HOME / "connectors"),
+        }), \
+                patch.object(agentcat, "current_connector_repo_dir", return_value=self.root / "dev"):
+            state = agentcat.check_auto_update_once(apply_update=True)
+
+        self.assertEqual(state["status"], "disabled")
+        self.assertIn("outside managed install", state["reason"])
 
     def test_http_snapshot_preserves_cached_provider_generated_at(self) -> None:
         agentcat.LATEST_SNAPSHOT.write_text(
@@ -324,6 +364,7 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertEqual(snapshot["generatedAt"], "2026-05-01T00:00:00Z")
         self.assertIn("servedAt", snapshot)
+        self.assertIn("update", snapshot)
         self.assertEqual(snapshot["activity"], {"status": "ok"})
 
     def test_version_json_matches_snapshot_schema_version(self) -> None:
