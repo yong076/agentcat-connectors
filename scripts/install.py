@@ -9,7 +9,6 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -126,6 +125,21 @@ if ([string]::IsNullOrWhiteSpace($path)) {{
         log(f"could not update user PATH automatically: {result.stderr.strip()}")
 
 
+def _windows_shim_path(target: Path) -> str:
+    """Render `target` as a path string suitable for embedding inside a
+    Windows `.cmd` shim. Paths under the user's HOME are rewritten to use
+    `%USERPROFILE%` so the shim body stays ASCII even when the username
+    contains non-ASCII characters. See the encoding comment in
+    `install_binary` for the underlying cmd.exe codepage issue.
+    """
+    try:
+        rel = target.relative_to(HOME)
+    except ValueError:
+        return str(target)
+    rel_str = str(rel).replace("/", "\\")
+    return "%USERPROFILE%\\" + rel_str if rel_str else "%USERPROFILE%"
+
+
 def install_binary(repo_dir: Path, backup_dir: Path) -> None:
     src = repo_dir / "bin" / "agentcat"
     if not src.exists():
@@ -139,11 +153,25 @@ def install_binary(repo_dir: Path, backup_dir: Path) -> None:
             BIN_PATH.unlink()
             if backup_path:
                 log(f"backed up existing {BIN_PATH} to {backup_path}")
-        shim = (
-            "@echo off\r\n"
-            f'set "AGENTCAT_HOME={AGENTCAT_HOME}"\r\n'
-            f'"{Path(sys.executable)}" "{src}" %*\r\n'
-        )
+        # cmd.exe parses .cmd files using the active OEM codepage (e.g. CP949
+        # on Korean Windows). Baking an absolute path with non-ASCII characters
+        # (Korean/Japanese/Chinese username) into the shim makes cmd mis-decode
+        # the bytes and pass Python a mojibake path it can't open
+        # ([Errno 22] Invalid argument). Resolve paths at runtime via
+        # %USERPROFILE% so the shim body stays ASCII regardless of username.
+        script_ref = _windows_shim_path(src)
+        home_ref = _windows_shim_path(AGENTCAT_HOME)
+        shim = "\r\n".join([
+            "@echo off",
+            f'set "AGENTCAT_HOME={home_ref}"',
+            'where py >nul 2>nul',
+            'if %ERRORLEVEL% EQU 0 (',
+            f'  py -3 "{script_ref}" %*',
+            ') else (',
+            f'  python "{script_ref}" %*',
+            ')',
+            "",
+        ])
         BIN_PATH.write_text(shim, encoding="utf-8", newline="")
         ensure_windows_user_path()
         log(f"installed {BIN_PATH}")
