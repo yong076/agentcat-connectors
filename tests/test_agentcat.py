@@ -603,6 +603,60 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(model["all"], 15)
         self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 15)
 
+    def test_claude_snapshot_deduplicates_repeated_request_usage(self) -> None:
+        project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"
+        project_dir.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        base_event = {
+            "timestamp": now.isoformat().replace("+00:00", "Z"),
+            "cwd": str(agentcat.HOME / "repo"),
+            "requestId": "req_1",
+            "uuid": "line_1",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-opus-4-7",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 40,
+                        "ephemeral_5m_input_tokens": 50,
+                    },
+                },
+            },
+        }
+        repeated = dict(base_event)
+        repeated["uuid"] = "line_2"
+        smaller_repeat = json.loads(json.dumps(base_event))
+        smaller_repeat["uuid"] = "line_3"
+        smaller_repeat["message"]["usage"]["cache_read_input_tokens"] = 5
+        distinct = json.loads(json.dumps(base_event))
+        distinct["requestId"] = "req_2"
+        distinct["uuid"] = "line_4"
+        distinct["message"]["id"] = "msg_2"
+        distinct["message"]["usage"] = {
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 3,
+            "cache_creation_input_tokens": 4,
+        }
+        (project_dir / "session.jsonl").write_text(
+            "\n".join(json.dumps(item) for item in [base_event, repeated, smaller_repeat, distinct]) + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 11)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 22)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 33)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 94)
+        self.assertEqual(snapshot["tokens"]["all"], 160)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 160)
+        self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 160)
+        self.assertEqual(snapshot["models"]["claude-opus-4-7"]["all"], 160)
+
     def test_gemini_snapshot_reads_otel_token_metrics(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
         now = dt.datetime.now(dt.timezone.utc)
