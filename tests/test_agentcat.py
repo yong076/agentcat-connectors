@@ -603,6 +603,121 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(model["all"], 15)
         self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 15)
 
+    def test_claude_snapshot_deduplicates_repeated_request_usage(self) -> None:
+        project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"
+        project_dir.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        base_event = {
+            "timestamp": now.isoformat().replace("+00:00", "Z"),
+            "cwd": str(agentcat.HOME / "repo"),
+            "requestId": "req_1",
+            "uuid": "line_1",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-opus-4-7",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 40,
+                        "ephemeral_5m_input_tokens": 50,
+                    },
+                },
+            },
+        }
+        repeated = dict(base_event)
+        repeated["uuid"] = "line_2"
+        smaller_repeat = json.loads(json.dumps(base_event))
+        smaller_repeat["uuid"] = "line_3"
+        smaller_repeat["message"]["usage"]["cache_read_input_tokens"] = 5
+        distinct = json.loads(json.dumps(base_event))
+        distinct["requestId"] = "req_2"
+        distinct["uuid"] = "line_4"
+        distinct["message"]["id"] = "msg_2"
+        distinct["message"]["usage"] = {
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 3,
+            "cache_creation_input_tokens": 4,
+        }
+        (project_dir / "session.jsonl").write_text(
+            "\n".join(json.dumps(item) for item in [base_event, repeated, smaller_repeat, distinct]) + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 11)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 22)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 33)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 94)
+        self.assertEqual(snapshot["tokens"]["all"], 160)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 160)
+        self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 160)
+        self.assertEqual(snapshot["models"]["claude-opus-4-7"]["all"], 160)
+
+    def test_claude_snapshot_rebuilds_legacy_cursor_for_dedupe_records(self) -> None:
+        project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"
+        project_dir.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        event = {
+            "timestamp": now.isoformat().replace("+00:00", "Z"),
+            "cwd": str(agentcat.HOME / "repo"),
+            "requestId": "req_legacy",
+            "uuid": "line_1",
+            "message": {
+                "id": "msg_legacy",
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 11,
+                    "cache_read_input_tokens": 13,
+                    "cache_creation_input_tokens": 17,
+                },
+            },
+        }
+        duplicate = json.loads(json.dumps(event))
+        duplicate["uuid"] = "line_2"
+        session_path = project_dir / "session.jsonl"
+        session_path.write_text(
+            "\n".join(json.dumps(item) for item in [event, duplicate]) + "\n",
+            encoding="utf-8",
+        )
+        agentcat.JOURNAL_CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
+        agentcat.JOURNAL_CURSOR_FILE.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "offsets": {str(session_path): session_path.stat().st_size},
+                    "totals": {
+                        "all_input": 7000,
+                        "all_output": 11000,
+                        "all_cacheRead": 13000,
+                        "all_cacheWrite_1h": 17000,
+                    },
+                    "projects": {str(agentcat.HOME / "repo"): {"tokens": 48000}},
+                    "dailyTokens": {now.astimezone().date().isoformat(): 48000},
+                    "hourlyTokens": {},
+                    "models": {"claude-sonnet-4-6": {"all": 48000, "totalTokens": 48000}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+        rebuilt_cursor = json.loads(agentcat.JOURNAL_CURSOR_FILE.read_text(encoding="utf-8"))
+
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 7)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 11)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 13)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 17)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 48)
+        self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 48)
+        self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["all"], 48)
+        self.assertEqual(rebuilt_cursor["version"], agentcat.CLAUDE_JOURNAL_CURSOR_VERSION)
+        self.assertIn("request:req_legacy", rebuilt_cursor["usageRecords"])
+
     def test_gemini_snapshot_reads_otel_token_metrics(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
         now = dt.datetime.now(dt.timezone.utc)

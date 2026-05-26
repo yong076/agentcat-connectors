@@ -57,7 +57,7 @@ LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_S
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
-CLAUDE_JOURNAL_CURSOR_VERSION = 2
+CLAUDE_JOURNAL_CURSOR_VERSION = 3
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
@@ -2848,6 +2848,7 @@ def load_journal_cursor() -> Dict[str, Any]:
             "dailyTokens": _empty_journal_daily_tokens(),
             "hourlyTokens": _empty_journal_hourly_tokens(),
             "models": _empty_journal_models(),
+            "usageRecords": {},
             "projects_needs_rebuild": False,
             "usage_needs_rebuild": False,
             "totals_as_of": None,
@@ -2856,6 +2857,7 @@ def load_journal_cursor() -> Dict[str, Any]:
     has_daily = isinstance(raw.get("dailyTokens"), dict)
     has_hourly = isinstance(raw.get("hourlyTokens"), dict)
     has_models = isinstance(raw.get("models"), dict)
+    has_usage_records = isinstance(raw.get("usageRecords"), dict)
     has_current_version = raw.get("version") == CLAUDE_JOURNAL_CURSOR_VERSION
     offsets = raw.get("offsets") or {}
     totals = raw.get("totals") or {}
@@ -2863,6 +2865,7 @@ def load_journal_cursor() -> Dict[str, Any]:
     daily_tokens = raw.get("dailyTokens") if has_daily else _empty_journal_daily_tokens()
     hourly_tokens = raw.get("hourlyTokens") if has_hourly else _empty_journal_hourly_tokens()
     models = raw.get("models") if has_models else _empty_journal_models()
+    usage_records = raw.get("usageRecords") if has_usage_records else {}
     for k in _JOURNAL_PERIOD_KEYS:
         totals.setdefault(k, 0)
     return {
@@ -2877,8 +2880,13 @@ def load_journal_cursor() -> Dict[str, Any]:
             for model, values in models.items()
             if isinstance(values, dict)
         },
+        "usageRecords": {
+            str(key): value
+            for key, value in usage_records.items()
+            if isinstance(value, dict)
+        },
         "projects_needs_rebuild": not has_projects,
-        "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_current_version),
+        "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_usage_records and has_current_version),
         "totals_as_of": raw.get("totals_as_of"),
     }
 
@@ -2915,6 +2923,8 @@ def parse_claude_usage_line(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if isinstance(cache_creation, dict):
         cache_write_1h = nonnegative_int(cache_creation.get("ephemeral_1h_input_tokens")) or 0
         cache_write_5m = nonnegative_int(cache_creation.get("ephemeral_5m_input_tokens")) or 0
+        if cache_write_1h == 0 and cache_write_5m == 0:
+            cache_write_1h = nonnegative_int(usage.get("cache_creation_input_tokens")) or 0
     else:
         total_write = nonnegative_int(usage.get("cache_creation_input_tokens")) or 0
         cache_write_1h, cache_write_5m = total_write, 0
@@ -2922,11 +2932,59 @@ def parse_claude_usage_line(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     ts = parse_timestamp(obj.get("timestamp"))
     return {
+        "dedupeKey": claude_usage_dedupe_key(obj, msg),
         "timestamp": ts,
         "model": str(msg.get("model") or "unknown"),
         "cwd": str(obj.get("cwd") or ""),
         "input": inp, "output": out, "cache_read": cache_read,
         "cache_write_1h": cache_write_1h, "cache_write_5m": cache_write_5m,
+    }
+
+
+def claude_usage_dedupe_key(obj: Dict[str, Any], msg: Dict[str, Any]) -> Optional[str]:
+    request_id = obj.get("requestId") or obj.get("request_id")
+    if isinstance(request_id, str) and request_id:
+        return f"request:{request_id}"
+    message_id = msg.get("id")
+    if isinstance(message_id, str) and message_id:
+        return f"message:{message_id}"
+    return None
+
+
+def claude_record_total(rec: Dict[str, Any]) -> int:
+    return sum(
+        int(rec.get(key) or 0)
+        for key in ("input", "output", "cache_read", "cache_write_1h", "cache_write_5m")
+    )
+
+
+def claude_record_for_cursor(rec: Dict[str, Any]) -> Dict[str, Any]:
+    timestamp = rec.get("timestamp")
+    return {
+        "timestamp": timestamp.isoformat() if isinstance(timestamp, dt.datetime) else None,
+        "model": rec.get("model"),
+        "cwd": rec.get("cwd"),
+        "input": int(rec.get("input") or 0),
+        "output": int(rec.get("output") or 0),
+        "cache_read": int(rec.get("cache_read") or 0),
+        "cache_write_1h": int(rec.get("cache_write_1h") or 0),
+        "cache_write_5m": int(rec.get("cache_write_5m") or 0),
+    }
+
+
+def claude_record_from_cursor(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    timestamp = parse_timestamp(raw.get("timestamp"))
+    return {
+        "timestamp": timestamp,
+        "model": str(raw.get("model") or "unknown"),
+        "cwd": str(raw.get("cwd") or ""),
+        "input": int_limit(raw.get("input")) or 0,
+        "output": int_limit(raw.get("output")) or 0,
+        "cache_read": int_limit(raw.get("cache_read")) or 0,
+        "cache_write_1h": int_limit(raw.get("cache_write_1h")) or 0,
+        "cache_write_5m": int_limit(raw.get("cache_write_5m")) or 0,
     }
 
 
@@ -2938,6 +2996,7 @@ def _apply_record_to_totals(
     daily_tokens: Optional[Dict[str, int]] = None,
     hourly_tokens: Optional[Dict[str, int]] = None,
     models: Optional[Dict[str, Dict[str, int]]] = None,
+    sign: int = 1,
 ) -> None:
     ts: Optional["dt.datetime"] = rec.get("timestamp")
     if ts is not None and ts.tzinfo is None:
@@ -2955,9 +3014,10 @@ def _apply_record_to_totals(
     model = normalized_model_name(rec.get("model")) or "unknown"
     model_tokens = models.setdefault(model, {}) if models is not None else None
     for rec_key, tok_key, model_key in fields:
-        amount = rec.get(rec_key) or 0
-        if amount <= 0:
+        raw_amount = rec.get(rec_key) or 0
+        if raw_amount <= 0:
             continue
+        amount = int(raw_amount) * sign
         project_total += amount
         totals[f"all_{tok_key}"] = totals.get(f"all_{tok_key}", 0) + amount
         if model_tokens is not None:
@@ -2970,7 +3030,7 @@ def _apply_record_to_totals(
             totals[f"week_{tok_key}"] = totals.get(f"week_{tok_key}", 0) + amount
         if ts >= now - dt.timedelta(days=30):
             totals[f"month_{tok_key}"] = totals.get(f"month_{tok_key}", 0) + amount
-    if project_total <= 0:
+    if project_total == 0:
         return
     if daily_tokens is not None:
         add_to_daily(daily_tokens, project_total, ts)
@@ -3034,6 +3094,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     daily_tokens: Dict[str, int] = cursor.setdefault("dailyTokens", _empty_journal_daily_tokens())
     hourly_tokens: Dict[str, int] = cursor.setdefault("hourlyTokens", _empty_journal_hourly_tokens())
     models: Dict[str, Dict[str, int]] = cursor.setdefault("models", _empty_journal_models())
+    usage_records: Dict[str, Dict[str, Any]] = cursor.setdefault("usageRecords", {})
     if cursor.pop("usage_needs_rebuild", False):
         offsets.clear()
         totals.clear()
@@ -3042,6 +3103,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         daily_tokens.clear()
         hourly_tokens.clear()
         models.clear()
+        usage_records.clear()
         cursor["projects_needs_rebuild"] = False
     if cursor.pop("projects_needs_rebuild", False):
         # Existing cursors predate per-project attribution. Rebuild only
@@ -3077,6 +3139,23 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                         continue
                     rec = parse_claude_usage_line(obj)
                     if rec:
+                        dedupe_key = rec.get("dedupeKey")
+                        if isinstance(dedupe_key, str) and dedupe_key:
+                            previous = claude_record_from_cursor(usage_records.get(dedupe_key))
+                            if previous is not None:
+                                if claude_record_total(rec) <= claude_record_total(previous):
+                                    continue
+                                _apply_record_to_totals(
+                                    totals,
+                                    previous,
+                                    now_utc,
+                                    projects,
+                                    daily_tokens,
+                                    hourly_tokens,
+                                    models,
+                                    sign=-1,
+                                )
+                            usage_records[dedupe_key] = claude_record_for_cursor(rec)
                         _apply_record_to_totals(
                             totals,
                             rec,
@@ -3753,11 +3832,25 @@ def int_map(raw: Any) -> Dict[str, int]:
 
 def periods_from_daily_tokens(daily_tokens: Dict[str, int]) -> Dict[str, int]:
     periods = empty_periods()
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    today_utc = now_utc.date()
+    today_local = now_utc.astimezone().date()
     for day, amount in daily_tokens.items():
         if amount <= 0:
             continue
-        when = parse_timestamp(f"{day}T12:00:00Z") or parse_timestamp(day)
-        add_to_periods(periods, amount, when)
+        periods["all"] = periods.get("all", 0) + amount
+        try:
+            day_date = dt.date.fromisoformat(str(day)[:10])
+        except ValueError:
+            when = parse_timestamp(f"{day}T12:00:00Z") or parse_timestamp(day)
+            add_to_periods(periods, amount, when)
+            continue
+        if day_date in {today_utc, today_local}:
+            periods["today"] = periods.get("today", 0) + amount
+        if day_date >= today_utc - dt.timedelta(days=7) or day_date >= today_local - dt.timedelta(days=7):
+            periods["week"] = periods.get("week", 0) + amount
+        if day_date >= today_utc - dt.timedelta(days=30) or day_date >= today_local - dt.timedelta(days=30):
+            periods["month"] = periods.get("month", 0) + amount
     return periods
 
 
