@@ -31,6 +31,9 @@ class AgentCatConnectorTests(unittest.TestCase):
             "LIMITS_FILE": agentcat.LIMITS_FILE,
             "GEMINI_TELEMETRY": agentcat.GEMINI_TELEMETRY,
             "GEMINI_USAGE_CACHE": agentcat.GEMINI_USAGE_CACHE,
+            "ANTIGRAVITY_CLI_DIR": agentcat.ANTIGRAVITY_CLI_DIR,
+            "ANTIGRAVITY_TELEMETRY": agentcat.ANTIGRAVITY_TELEMETRY,
+            "ANTIGRAVITY_USAGE_CACHE": agentcat.ANTIGRAVITY_USAGE_CACHE,
             "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
             "JOURNAL_CURSOR_FILE": agentcat.JOURNAL_CURSOR_FILE,
             "CLAUDE_PROJECTS_DIR": agentcat.CLAUDE_PROJECTS_DIR,
@@ -50,6 +53,9 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat.LIMITS_FILE = agentcat_home / "limits.json"
         agentcat.GEMINI_TELEMETRY = agentcat_home / "gemini" / "telemetry.log"
         agentcat.GEMINI_USAGE_CACHE = agentcat_home / "gemini-usage-cache.json"
+        agentcat.ANTIGRAVITY_CLI_DIR = home / ".gemini" / "antigravity-cli"
+        agentcat.ANTIGRAVITY_TELEMETRY = agentcat_home / "gemini" / "antigravity-telemetry.log"
+        agentcat.ANTIGRAVITY_USAGE_CACHE = agentcat_home / "antigravity-usage-cache.json"
         agentcat.LIVE_LIMITS_CACHE = agentcat_home / "live-limits-cache.json"
         agentcat.JOURNAL_CURSOR_FILE = agentcat_home / "jsonl-cursor.json"
         agentcat.CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
@@ -782,6 +788,59 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["models"]["gemini-test"]["month"], 450)
         self.assertEqual(snapshot["models"]["gemini-test"]["all"], 450)
 
+    def test_gemini_snapshot_merges_antigravity_cli_telemetry(self) -> None:
+        agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+
+        def payload(session: str, model: str, token_type: str, value: int) -> dict:
+            return {
+                "scopeMetrics": [
+                    {
+                        "metrics": [
+                            {
+                                "descriptor": {"name": "gemini_cli.token.usage"},
+                                "dataPoints": [
+                                    {
+                                        "attributes": {
+                                            "model": model,
+                                            "session.id": session,
+                                            "type": token_type,
+                                        },
+                                        "startTime": [int(now.timestamp()), 0],
+                                        "endTime": "[Circular]",
+                                        "value": {"sum": value},
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+
+        agentcat.GEMINI_TELEMETRY.write_text(
+            json.dumps(payload("gemini-session", "gemini-test", "input", 100)),
+            encoding="utf-8",
+        )
+        agentcat.ANTIGRAVITY_TELEMETRY.write_text(
+            json.dumps(payload("antigravity-session", "gemini-test", "output", 50)),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.gemini_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["canonicalProvider"], "google")
+        self.assertEqual(snapshot["events"], 2)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 100)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 50)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 150)
+        self.assertEqual(snapshot["models"]["gemini-test"]["all"], 150)
+        self.assertEqual(snapshot["cache"]["source"], "multi-source-full-log-index")
+        self.assertEqual(snapshot["sources"]["geminiCli"]["tokens"], 100)
+        self.assertEqual(snapshot["sources"]["antigravityCli"]["tokens"], 50)
+        self.assertTrue(agentcat.GEMINI_USAGE_CACHE.exists())
+        self.assertTrue(agentcat.ANTIGRAVITY_USAGE_CACHE.exists())
+
     def test_gemini_snapshot_distributes_cumulative_counter_deltas_by_day(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
         today = dt.datetime.now(dt.timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
@@ -1041,6 +1100,24 @@ class AgentCatConnectorTests(unittest.TestCase):
             "gemini",
         )
 
+    def test_classify_antigravity_cli_processes_as_gemini(self) -> None:
+        self.assertEqual(
+            agentcat.classify_process("agy --print hello"),
+            "gemini",
+        )
+        self.assertEqual(
+            agentcat.classify_process("/Users/me/.local/bin/agy --prompt hello"),
+            "gemini",
+        )
+        self.assertEqual(
+            agentcat.classify_process(r'"C:\Users\me\.local\bin\agy.exe" --print hello'),
+            "gemini",
+        )
+        self.assertEqual(
+            agentcat.classify_process("/Applications/Antigravity.app/Contents/MacOS/antigravity"),
+            "gemini",
+        )
+
     def test_classify_ignores_codex_desktop_electron_helpers_on_windows(self) -> None:
         self.assertIsNone(
             agentcat.classify_process(
@@ -1246,6 +1323,7 @@ class AgentCatConnectorTests(unittest.TestCase):
                 '"codex.exe","101","Console","1","12,345 K"\n'
                 '"claude.exe","102","Console","1","9,000 K"\n'
                 '"gemini.exe","103","Console","1","8,000 K"\n'
+                '"agy.exe","104","Console","1","7,000 K"\n'
             ),
             stderr="",
         )
@@ -1267,9 +1345,9 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "ok")
         self.assertEqual(snapshot["scanSource"], "tasklist")
         self.assertIn("PowerShell scan failed", snapshot["scanWarning"])
-        self.assertEqual(snapshot["processCount"], 3)
-        self.assertEqual(snapshot["countsByProvider"], {"codex": 1, "claude": 1, "gemini": 1})
-        self.assertEqual(snapshot["totalMemoryBytes"], 30_049_280)
+        self.assertEqual(snapshot["processCount"], 4)
+        self.assertEqual(snapshot["countsByProvider"], {"codex": 1, "claude": 1, "gemini": 2})
+        self.assertEqual(snapshot["totalMemoryBytes"], 37_217_280)
 
     def test_claude_runtime_limits_reads_statusline_event(self) -> None:
         agentcat.store_event(

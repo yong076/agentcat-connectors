@@ -34,6 +34,7 @@ WINDOWS_STARTUP_SCRIPT = (
     / "AgentCatD.vbs"
 )
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
+ANTIGRAVITY_TELEMETRY = AGENTCAT_HOME / "gemini" / "antigravity-telemetry.log"
 CODEX_BEGIN = "# agentcat-connectors:begin"
 CODEX_END = "# agentcat-connectors:end"
 
@@ -402,17 +403,16 @@ def install_claude_settings(backup_dir: Path) -> None:
         log("patched Claude Code hooks")
 
 
-def install_gemini_settings(backup_dir: Path) -> None:
-    path = HOME / ".gemini" / "settings.json"
+def install_google_cli_settings(backup_dir: Path, *, path: Path, telemetry_path: Path, label: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         backup_path = backup(path, backup_dir)
         if backup_path:
-            log(f"backed up Gemini settings to {backup_path}")
+            log(f"backed up {label} settings to {backup_path}")
     try:
         settings = read_json(path)
     except Exception as exc:
-        log(f"skipped Gemini settings, invalid JSON: {exc}")
+        log(f"skipped {label} settings, invalid JSON: {exc}")
         return
 
     telemetry = settings.get("telemetry")
@@ -422,13 +422,28 @@ def install_gemini_settings(backup_dir: Path) -> None:
         {
             "enabled": True,
             "target": "local",
-            "outfile": str(GEMINI_TELEMETRY),
+            "outfile": str(telemetry_path),
             "logPrompts": False,
         }
     )
     settings["telemetry"] = telemetry
     write_json(path, settings)
-    log("enabled Gemini local telemetry")
+    log(f"enabled {label} local telemetry")
+
+
+def install_gemini_settings(backup_dir: Path) -> None:
+    install_google_cli_settings(
+        backup_dir,
+        path=HOME / ".gemini" / "settings.json",
+        telemetry_path=GEMINI_TELEMETRY,
+        label="Gemini",
+    )
+    install_google_cli_settings(
+        backup_dir,
+        path=HOME / ".gemini" / "antigravity-cli" / "settings.json",
+        telemetry_path=ANTIGRAVITY_TELEMETRY,
+        label="Antigravity CLI",
+    )
 
 
 def remove_managed_block(text: str) -> str:
@@ -486,21 +501,33 @@ def remove_agentcat_claude_settings(backup_dir: Path) -> None:
     log("removed Agent Cat Claude settings")
 
 
-def remove_agentcat_gemini_settings(backup_dir: Path) -> None:
-    path = HOME / ".gemini" / "settings.json"
+def remove_agentcat_google_cli_settings(backup_dir: Path, *, path: Path, label: str) -> None:
     if not path.exists():
         return
     backup(path, backup_dir)
     try:
         settings = read_json(path)
     except Exception as exc:
-        log(f"skipped Gemini cleanup, invalid JSON: {exc}")
+        log(f"skipped {label} cleanup, invalid JSON: {exc}")
         return
     telemetry = settings.get("telemetry")
     if isinstance(telemetry, dict) and str(telemetry.get("outfile", "")).startswith(str(AGENTCAT_HOME)):
         settings.pop("telemetry", None)
         write_json(path, settings)
-        log("removed Agent Cat Gemini telemetry settings")
+        log(f"removed Agent Cat {label} telemetry settings")
+
+
+def remove_agentcat_gemini_settings(backup_dir: Path) -> None:
+    remove_agentcat_google_cli_settings(
+        backup_dir,
+        path=HOME / ".gemini" / "settings.json",
+        label="Gemini",
+    )
+    remove_agentcat_google_cli_settings(
+        backup_dir,
+        path=HOME / ".gemini" / "antigravity-cli" / "settings.json",
+        label="Antigravity CLI",
+    )
 
 
 def remove_agentcat_codex_config(backup_dir: Path) -> None:

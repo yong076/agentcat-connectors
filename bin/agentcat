@@ -35,6 +35,9 @@ LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 GEMINI_USAGE_CACHE = AGENTCAT_HOME / "gemini-usage-cache.json"
+ANTIGRAVITY_CLI_DIR = HOME / ".gemini" / "antigravity-cli"
+ANTIGRAVITY_TELEMETRY = AGENTCAT_HOME / "gemini" / "antigravity-telemetry.log"
+ANTIGRAVITY_USAGE_CACHE = AGENTCAT_HOME / "antigravity-usage-cache.json"
 LIVE_LIMITS_CACHE = AGENTCAT_HOME / "live-limits-cache.json"
 CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/codex/usage",
@@ -3331,12 +3334,93 @@ def claude_snapshot() -> Dict[str, Any]:
     return result
 
 
+def gemini_source_descriptors() -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": "geminiCli",
+            "displayName": "Gemini CLI",
+            "telemetry": GEMINI_TELEMETRY,
+            "cache": GEMINI_USAGE_CACHE,
+            "settings": HOME / ".gemini" / "settings.json",
+            "installed": bool(shutil.which("gemini") or (HOME / ".gemini").exists() or GEMINI_TELEMETRY.exists()),
+        },
+        {
+            "id": "antigravityCli",
+            "displayName": "Antigravity CLI",
+            "telemetry": ANTIGRAVITY_TELEMETRY,
+            "cache": ANTIGRAVITY_USAGE_CACHE,
+            "settings": ANTIGRAVITY_CLI_DIR / "settings.json",
+            "installed": bool(shutil.which("agy") or shutil.which("antigravity") or ANTIGRAVITY_CLI_DIR.exists() or ANTIGRAVITY_TELEMETRY.exists()),
+        },
+    ]
+
+
+def gemini_source_status(source: Dict[str, Any], usage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    telemetry_path = Path(source["telemetry"])
+    settings_path = Path(source["settings"])
+    tokens = int((usage or {}).get("tokens", {}).get("totalTokens") or 0) if usage else 0
+    telemetry_configured = False
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            telemetry = settings.get("telemetry") if isinstance(settings, dict) else None
+            telemetry_configured = isinstance(telemetry, dict) and str(telemetry.get("outfile") or "") == str(telemetry_path)
+        except Exception:
+            telemetry_configured = False
+    return {
+        "displayName": source["displayName"],
+        "installed": bool(source.get("installed")),
+        "status": "ok" if tokens > 0 else "no_token_events_yet" if telemetry_path.exists() else "no_telemetry_yet",
+        "telemetryConfigured": telemetry_configured,
+        "source": str(telemetry_path),
+        "settings": str(settings_path),
+        "cache": str(source["cache"]),
+        "tokens": tokens,
+        "events": int((usage or {}).get("events") or 0) if usage else 0,
+    }
+
+
+def merge_token_maps(target: Dict[str, int], source: Any) -> None:
+    if not isinstance(source, dict):
+        return
+    for key, value in int_map(source).items():
+        target[key] = int(target.get(key) or 0) + value
+
+
+def merge_gemini_usage(usages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(usages) == 1:
+        return copy.deepcopy(usages[0])
+    merged = {
+        "tokens": {},
+        "models": {},
+        "dailyTokens": {},
+        "hourlyTokens": {},
+        "events": 0,
+        "cache": {"source": "multi-source-full-log-index", "sources": []},
+    }
+    for usage in usages:
+        merge_token_maps(merged["tokens"], usage.get("tokens", {}))
+        merge_token_maps(merged["dailyTokens"], usage.get("dailyTokens", {}))
+        merge_token_maps(merged["hourlyTokens"], usage.get("hourlyTokens", {}))
+        merged["events"] += int(usage.get("events") or 0)
+        for model, raw_tokens in (usage.get("models") or {}).items():
+            model_tokens = merged["models"].setdefault(str(model), {})
+            merge_token_maps(model_tokens, raw_tokens)
+        merged["cache"]["sources"].append(usage.get("cache", {"source": "unknown"}))
+    return merged
+
+
 def gemini_snapshot() -> Dict[str, Any]:
     global _GEMINI_CACHE_KEY, _GEMINI_CACHE_VALUE, _GEMINI_CACHE_LOADED_AT
 
+    sources = gemini_source_descriptors()
     result: Dict[str, Any] = {
         "status": "no_telemetry_yet",
-        "source": str(GEMINI_TELEMETRY),
+        "source": ", ".join(str(source["telemetry"]) for source in sources),
+        "canonicalProvider": "google",
+        "providerLabel": "Gemini",
+        "displayName": "Gemini",
+        "sources": {str(source["id"]): gemini_source_status(source) for source in sources},
         "tokens": {},
         "models": {},
         "dailyTokens": {},
@@ -3349,11 +3433,12 @@ def gemini_snapshot() -> Dict[str, Any]:
         # client doesn't render zeros that imply zero tools were used.
         "breakdown": empty_breakdown(),
     }
-    if not GEMINI_TELEMETRY.exists():
+    existing_sources = [source for source in sources if Path(source["telemetry"]).exists()]
+    if not existing_sources:
         return result
 
-    stat = GEMINI_TELEMETRY.stat()
-    cache_key = (int(stat.st_size), int(stat.st_mtime_ns))
+    stats = [(source["id"], Path(source["telemetry"]).stat()) for source in existing_sources]
+    cache_key = tuple((str(source_id), int(stat.st_size), int(stat.st_mtime_ns)) for source_id, stat in stats)
     with _GEMINI_CACHE_LOCK:
         cache_age = time.monotonic() - _GEMINI_CACHE_LOADED_AT
         if _GEMINI_CACHE_VALUE is not None and (
@@ -3362,16 +3447,27 @@ def gemini_snapshot() -> Dict[str, Any]:
             return copy.deepcopy(_GEMINI_CACHE_VALUE)
 
         try:
-            state = load_gemini_usage_state(stat)
-            state = scan_gemini_telemetry_state(state, stat)
-            save_gemini_usage_state(state)
-            usage = gemini_usage_result_from_state(state)
+            usages = []
+            source_statuses = {}
+            for source in existing_sources:
+                telemetry_path = Path(source["telemetry"])
+                cache_path = Path(source["cache"])
+                stat = telemetry_path.stat()
+                state = load_gemini_usage_state(stat, telemetry_path=telemetry_path, cache_path=cache_path)
+                state = scan_gemini_telemetry_state(state, stat, telemetry_path=telemetry_path)
+                save_gemini_usage_state(state, cache_path=cache_path)
+                usage = gemini_usage_result_from_state(state)
+                usages.append(usage)
+                source_statuses[str(source["id"])] = gemini_source_status(source, usage)
+            usage = merge_gemini_usage(usages)
         except Exception as exc:
             result["status"] = "error"
             result["error"] = str(exc)
             return result
 
         result["status"] = "ok" if usage["events"] else "no_token_events_yet"
+        for source_id, source_status in source_statuses.items():
+            result["sources"][source_id] = source_status
         result["tokens"] = usage["tokens"]
         result["models"] = usage["models"]
         result["dailyTokens"] = usage["dailyTokens"]
@@ -3384,9 +3480,10 @@ def gemini_snapshot() -> Dict[str, Any]:
         return result
 
 
-def read_recent_gemini_telemetry(file_size: int) -> str:
+def read_recent_gemini_telemetry(file_size: int, telemetry_path: Optional[Path] = None) -> str:
+    telemetry_path = telemetry_path or GEMINI_TELEMETRY
     start = max(0, file_size - max(GEMINI_TELEMETRY_PARSE_BYTES, 1024 * 1024))
-    with GEMINI_TELEMETRY.open("rb") as fh:
+    with telemetry_path.open("rb") as fh:
         fh.seek(start)
         text = fh.read().decode("utf-8", errors="replace")
     if start > 0:
@@ -3608,10 +3705,11 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
     return tokens, models, daily_tokens, hourly_tokens, events
 
 
-def empty_gemini_usage_state() -> Dict[str, Any]:
+def empty_gemini_usage_state(telemetry_path: Optional[Path] = None) -> Dict[str, Any]:
+    telemetry_path = telemetry_path or GEMINI_TELEMETRY
     return {
         "version": GEMINI_USAGE_CACHE_VERSION,
-        "source": str(GEMINI_TELEMETRY),
+        "source": str(telemetry_path),
         "offset": 0,
         "size": 0,
         "mtimeNs": 0,
@@ -3625,34 +3723,43 @@ def empty_gemini_usage_state() -> Dict[str, Any]:
     }
 
 
-def load_gemini_usage_state(stat: os.stat_result) -> Dict[str, Any]:
+def load_gemini_usage_state(
+    stat: os.stat_result,
+    *,
+    telemetry_path: Optional[Path] = None,
+    cache_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    telemetry_path = telemetry_path or GEMINI_TELEMETRY
+    cache_path = cache_path or GEMINI_USAGE_CACHE
     try:
-        raw = json.loads(GEMINI_USAGE_CACHE.read_text(encoding="utf-8"))
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
     except Exception:
-        return empty_gemini_usage_state()
+        return empty_gemini_usage_state(telemetry_path)
     if not isinstance(raw, dict):
-        return empty_gemini_usage_state()
+        return empty_gemini_usage_state(telemetry_path)
     if raw.get("version") != GEMINI_USAGE_CACHE_VERSION:
-        return empty_gemini_usage_state()
-    if raw.get("source") != str(GEMINI_TELEMETRY):
-        return empty_gemini_usage_state()
+        return empty_gemini_usage_state(telemetry_path)
+    if raw.get("source") != str(telemetry_path):
+        return empty_gemini_usage_state(telemetry_path)
     offset = int_limit(raw.get("offset")) or 0
     if offset < 0:
-        return empty_gemini_usage_state()
+        return empty_gemini_usage_state(telemetry_path)
     if offset > stat.st_size:
         cached_size = int_limit(raw.get("size")) or 0
         if cached_size == stat.st_size:
             raw["offset"] = int(stat.st_size)
         else:
-            return empty_gemini_usage_state()
+            return empty_gemini_usage_state(telemetry_path)
     return raw
 
 
-def save_gemini_usage_state(state: Dict[str, Any]) -> None:
+def save_gemini_usage_state(state: Dict[str, Any], cache_path: Optional[Path] = None) -> None:
+    cache_path = cache_path or GEMINI_USAGE_CACHE
     ensure_dirs()
-    tmp = GEMINI_USAGE_CACHE.with_suffix(".json.tmp")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-    tmp.replace(GEMINI_USAGE_CACHE)
+    tmp.replace(cache_path)
 
 
 def gemini_identity_key(identity: Tuple[Any, ...]) -> str:
@@ -3732,12 +3839,13 @@ def apply_gemini_records_to_state(
             identities[identity_key] = {"amount": previous_amount}
 
 
-def iter_gemini_telemetry_payloads(offset: int = 0) -> Iterable[Tuple[Any, int]]:
+def iter_gemini_telemetry_payloads(offset: int = 0, telemetry_path: Optional[Path] = None) -> Iterable[Tuple[Any, int]]:
+    telemetry_path = telemetry_path or GEMINI_TELEMETRY
     decoder = json.JSONDecoder()
     buffer = ""
     buffer_start = offset
     chunk_size = max(GEMINI_TELEMETRY_STREAM_CHUNK_BYTES, 1024 * 1024)
-    with GEMINI_TELEMETRY.open("rb") as fh:
+    with telemetry_path.open("rb") as fh:
         fh.seek(offset)
         while True:
             chunk = fh.read(chunk_size)
@@ -3783,25 +3891,32 @@ def iter_gemini_telemetry_payloads(offset: int = 0) -> Iterable[Tuple[Any, int]]
                 break
 
 
-def gemini_remaining_bytes_are_whitespace(offset: int, file_size: int) -> bool:
+def gemini_remaining_bytes_are_whitespace(offset: int, file_size: int, telemetry_path: Optional[Path] = None) -> bool:
+    telemetry_path = telemetry_path or GEMINI_TELEMETRY
     if offset >= file_size:
         return True
     remaining = file_size - offset
     if remaining > max(GEMINI_TELEMETRY_STREAM_CHUNK_BYTES, 1024 * 1024):
         return False
-    with GEMINI_TELEMETRY.open("rb") as fh:
+    with telemetry_path.open("rb") as fh:
         fh.seek(offset)
         return not fh.read(remaining).strip()
 
 
-def scan_gemini_telemetry_state(state: Dict[str, Any], stat: os.stat_result) -> Dict[str, Any]:
+def scan_gemini_telemetry_state(
+    state: Dict[str, Any],
+    stat: os.stat_result,
+    *,
+    telemetry_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    telemetry_path = telemetry_path or GEMINI_TELEMETRY
     offset = int_limit(state.get("offset")) or 0
     if offset < 0 or offset > stat.st_size:
-        state = empty_gemini_usage_state()
+        state = empty_gemini_usage_state(telemetry_path)
         offset = 0
 
     last_offset = offset
-    for payload, end_offset in iter_gemini_telemetry_payloads(offset):
+    for payload, end_offset in iter_gemini_telemetry_payloads(offset, telemetry_path=telemetry_path):
         records = gemini_metric_records(payload, "gemini_cli.token.usage")
         if not records:
             records = gemini_metric_records(payload, "gen_ai.client.token.usage")
@@ -3809,10 +3924,10 @@ def scan_gemini_telemetry_state(state: Dict[str, Any], stat: os.stat_result) -> 
             apply_gemini_records_to_state(state, records)
         last_offset = max(last_offset, end_offset)
 
-    if gemini_remaining_bytes_are_whitespace(last_offset, int(stat.st_size)):
+    if gemini_remaining_bytes_are_whitespace(last_offset, int(stat.st_size), telemetry_path=telemetry_path):
         last_offset = int(stat.st_size)
 
-    state["source"] = str(GEMINI_TELEMETRY)
+    state["source"] = str(telemetry_path)
     state["offset"] = min(last_offset, int(stat.st_size))
     state["size"] = int(stat.st_size)
     state["mtimeNs"] = int(stat.st_mtime_ns)
@@ -3964,7 +4079,12 @@ def classify_process(command: str) -> Optional[str]:
         return "codex"
     if executable in {"claude", "claude.exe", "claude.cmd"} or "@anthropic-ai/claude" in normalized or "claude-code" in normalized:
         return "claude"
-    if executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli"} or "@google/gemini" in normalized:
+    if (
+        executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli", "agy", "agy.exe", "antigravity", "antigravity.exe", "antigravity-cli"}
+        or "@google/gemini" in normalized
+        or "/.gemini/antigravity-cli/" in normalized
+        or "com.google.antigravity" in normalized
+    ):
         return "gemini"
     return None
 
@@ -4107,7 +4227,7 @@ $rows = @(
 Get-Process |
   Where-Object {
     $text = (($_.ProcessName + ' ' + $_.Path).ToLower())
-    $text -match '(^|[^a-z])(codex|claude|gemini)([^a-z]|$)'
+    $text -match '(^|[^a-z])(codex|claude|gemini|agy|antigravity)([^a-z]|$)'
   } |
   ForEach-Object {
     [pscustomobject]@{
@@ -4126,7 +4246,7 @@ if (-not $rows) {
   Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,WorkingSetSize |
     Where-Object {
       $text = (($_.Name + ' ' + $_.CommandLine).ToLower())
-      $text -match '(^|[^a-z])(codex|claude|gemini)([^a-z]|$)'
+      $text -match '(^|[^a-z])(codex|claude|gemini|agy|antigravity)([^a-z]|$)'
     } |
     ForEach-Object {
       [pscustomobject]@{
