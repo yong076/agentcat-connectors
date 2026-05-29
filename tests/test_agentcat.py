@@ -1314,6 +1314,144 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(sanitized["rate_limits"]["seven_day"]["used_percentage"], 10)
         self.assertEqual(sanitized["context_window"]["context_window_size"], 1000000)
 
+    def test_claude_hook_records_ultrathink_mode_without_prompt_text(self) -> None:
+        payload = {
+            "session_id": "session-1",
+            "prompt": "please ultrathink about this private code",
+            "cwd": "/private/project",
+        }
+
+        with patch.object(agentcat.sys, "stdin", io.StringIO(json.dumps(payload))):
+            self.assertEqual(agentcat.command_claude_hook(agentcat.argparse.Namespace(event="UserPromptSubmit")), 0)
+
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
+            stored_json = conn.execute("select payload_json from events").fetchone()[0]
+        stored = json.loads(stored_json)
+
+        self.assertEqual(stored["prompt"], "[redacted]")
+        self.assertEqual(stored["cwd"], "[redacted]")
+        self.assertEqual(stored["agentcatRuntimeMode"]["mode"], "ultrathink")
+        self.assertEqual(stored["agentcatRuntimeMode"]["confidence"], "exact")
+        self.assertEqual(stored["agentcatRuntimeMode"]["privacy"], "prompt_text_discarded")
+        self.assertNotIn("private code", stored_json)
+
+        modes = agentcat.runtime_modes_snapshot()
+        self.assertEqual(len(modes), 1)
+        self.assertEqual(modes[0]["provider"], "claude")
+        self.assertEqual(modes[0]["mode"], "ultrathink")
+        self.assertEqual(modes[0]["confidence"], "exact")
+
+    def test_claude_hook_records_ultracode_mode_without_prompt_text(self) -> None:
+        payload = {
+            "session_id": "session-1",
+            "prompt": "please run ultra-code on this private code",
+            "cwd": "/private/project",
+        }
+
+        with patch.object(agentcat.sys, "stdin", io.StringIO(json.dumps(payload))):
+            self.assertEqual(agentcat.command_claude_hook(agentcat.argparse.Namespace(event="UserPromptSubmit")), 0)
+
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
+            stored_json = conn.execute("select payload_json from events").fetchone()[0]
+        stored = json.loads(stored_json)
+
+        self.assertEqual(stored["prompt"], "[redacted]")
+        self.assertEqual(stored["cwd"], "[redacted]")
+        self.assertEqual(stored["agentcatRuntimeMode"]["mode"], "ultracode")
+        self.assertEqual(stored["agentcatRuntimeMode"]["privacy"], "prompt_text_discarded")
+        self.assertNotIn("private code", stored_json)
+
+    def test_claude_hook_records_nested_effort_level(self) -> None:
+        payload = {
+            "session_id": "session-1",
+            "effort": {"level": "xhigh"},
+        }
+
+        with patch.object(agentcat.sys, "stdin", io.StringIO(json.dumps(payload))):
+            self.assertEqual(agentcat.command_claude_hook(agentcat.argparse.Namespace(event="SessionStart")), 0)
+
+        modes = agentcat.runtime_modes_snapshot()
+        self.assertEqual(modes[0]["provider"], "claude")
+        self.assertEqual(modes[0]["mode"], "effort_xhigh")
+        self.assertEqual(modes[0]["privacy"], "metadata_only")
+
+    def test_codex_notify_records_xhigh_runtime_mode(self) -> None:
+        payload = {
+            "model": "gpt-5.5",
+            "model_reasoning_effort": "xhigh",
+        }
+
+        with patch.object(agentcat.sys, "stdin", io.StringIO(json.dumps(payload))):
+            self.assertEqual(agentcat.command_codex_notify(agentcat.argparse.Namespace()), 0)
+
+        modes = agentcat.runtime_modes_snapshot()
+        self.assertEqual(modes[0]["provider"], "codex")
+        self.assertEqual(modes[0]["mode"], "effort_xhigh")
+        self.assertEqual(modes[0]["source"], "codex-notify")
+        self.assertEqual(modes[0]["privacy"], "metadata_only")
+
+    def test_codex_config_runtime_mode_requires_active_codex_process(self) -> None:
+        codex_dir = agentcat.HOME / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "config.toml").write_text('model_reasoning_effort = "xhigh"\n', encoding="utf-8")
+
+        self.assertEqual(agentcat.runtime_modes_snapshot(active_providers=[]), [])
+
+        modes = agentcat.runtime_modes_snapshot(active_providers=["codex"])
+        self.assertEqual(modes[0]["provider"], "codex")
+        self.assertEqual(modes[0]["mode"], "effort_xhigh")
+        self.assertEqual(modes[0]["confidence"], "config_default")
+        self.assertEqual(modes[0]["source"], "codex-config")
+
+    def test_claude_stop_hook_clears_runtime_mode(self) -> None:
+        with patch.object(agentcat.sys, "stdin", io.StringIO(json.dumps({"prompt": "ultrathink"}))):
+            agentcat.command_claude_hook(agentcat.argparse.Namespace(event="UserPromptSubmit"))
+        self.assertEqual(agentcat.runtime_modes_snapshot()[0]["mode"], "ultrathink")
+
+        with patch.object(agentcat.sys, "stdin", io.StringIO("{}")):
+            agentcat.command_claude_hook(agentcat.argparse.Namespace(event="Stop"))
+
+        self.assertEqual(agentcat.runtime_modes_snapshot(), [])
+
+    def test_terminal_activity_snapshot_includes_runtime_modes(self) -> None:
+        with patch.object(agentcat.sys, "stdin", io.StringIO(json.dumps({"prompt": "ultrathink"}))):
+            agentcat.command_claude_hook(agentcat.argparse.Namespace(event="UserPromptSubmit"))
+
+        completed = agentcat.subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout="102 1 1.0 262144 S /opt/homebrew/bin/claude\n",
+            stderr="",
+        )
+
+        with patch.object(agentcat, "IS_WINDOWS", False), patch.object(
+            agentcat.subprocess, "run", return_value=completed
+        ):
+            snapshot = agentcat.terminal_activity_snapshot()
+
+        self.assertEqual(snapshot["runtimeModes"][0]["mode"], "ultrathink")
+        self.assertEqual(snapshot["runtimeModes"][0]["privacy"], "prompt_text_discarded")
+
+    def test_terminal_activity_snapshot_includes_codex_config_runtime_mode_when_active(self) -> None:
+        codex_dir = agentcat.HOME / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "config.toml").write_text('model_reasoning_effort = "xhigh"\n', encoding="utf-8")
+        completed = agentcat.subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout="102 1 1.0 262144 R /opt/homebrew/bin/codex\n",
+            stderr="",
+        )
+
+        with patch.object(agentcat, "IS_WINDOWS", False), patch.object(
+            agentcat.subprocess, "run", return_value=completed
+        ):
+            snapshot = agentcat.terminal_activity_snapshot()
+
+        self.assertEqual(snapshot["runtimeModes"][0]["provider"], "codex")
+        self.assertEqual(snapshot["runtimeModes"][0]["mode"], "effort_xhigh")
+        self.assertEqual(snapshot["runtimeModes"][0]["confidence"], "config_default")
+
     def test_runtime_hooks_do_not_block_on_snapshot_refresh(self) -> None:
         with patch.object(agentcat, "build_snapshot", side_effect=AssertionError("hook should not refresh snapshot")):
             self.assertEqual(agentcat.command_codex_notify(agentcat.argparse.Namespace()), 0)

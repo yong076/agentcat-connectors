@@ -82,6 +82,8 @@ Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The
 
 Memory usage is local RSS memory from `/bin/ps`, exposed per process as `memoryBytes` and grouped by provider as `memoryBytesByProvider`. It does not inspect prompts, transcripts, or model responses.
 
+`activity.runtimeModes` is an optional local-only signal for high-effort agent sessions. Claude Code `UserPromptSubmit` hooks detect `ultrathink` / `ultracode` in memory, discard the prompt text, and persist only a short-lived flag such as `mode=ultrathink`, `confidence=exact`, and `privacy=prompt_text_discarded`. Metadata-only effort signals such as `effort.level=xhigh` and Codex `model_reasoning_effort=xhigh` are normalized as `mode=effort_xhigh` without reading prompts or transcripts. Claude `Stop` hooks clear the flag. No prompt text, file paths, transcripts, or conversation bodies are persisted.
+
 On Windows, Agent Cat prefers PowerShell 7 (`pwsh`) when available, tries a fast `Get-Process` scan first, and only falls back to richer command-line scanning or `tasklist` when needed. Slow corporate environments can raise the scan timeout in `~/.agentcat/settings.json`:
 
 ```json
