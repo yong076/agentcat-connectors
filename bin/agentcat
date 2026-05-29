@@ -61,7 +61,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.6")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.7")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -83,6 +83,7 @@ CONNECTOR_CAPABILITIES = (
     "connector.autoUpdate",
     "activity.terminal",
     "activity.memory",
+    "activity.runtimeModes",
     "events.sqlite",
     "usage.dailyTokens",
     "usage.hourlyTokens",
@@ -532,13 +533,49 @@ SENSITIVE_KEY_PARTS = (
     "prompt",
     "completion",
     "content",
+    "cwd",
+    "directory",
+    "file_path",
+    "filepath",
     "message",
     "messages",
+    "path",
+    "repo",
     "transcript",
     "conversation",
     "input_text",
     "output_text",
+    "workspace",
 )
+
+RUNTIME_MODE_TTL_SECONDS = int(os.environ.get("AGENTCAT_RUNTIME_MODE_TTL_SECONDS", "1800"))
+RUNTIME_MODE_KEYWORD_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bultra[\s_-]*think\b|\bultrathink\b", re.IGNORECASE), "ultrathink"),
+    (re.compile(r"\bultra[\s_-]*code\b|\bultracode\b", re.IGNORECASE), "ultracode"),
+)
+RUNTIME_MODE_PROMPT_KEYS = {
+    "prompt",
+    "user_prompt",
+    "userprompt",
+    "input_text",
+    "inputtext",
+}
+RUNTIME_MODE_EFFORT_KEYS = {
+    "effort",
+    "effort_level",
+    "effortlevel",
+    "model_reasoning_effort",
+    "modelreasoningeffort",
+    "reasoning_effort",
+    "reasoningeffort",
+    "thinking_effort",
+    "thinkingeffort",
+}
+RUNTIME_MODE_EFFORT_VALUE_KEYS = {
+    "level",
+    "name",
+    "value",
+}
 
 
 def now_iso() -> str:
@@ -680,6 +717,296 @@ def extract_tokens(value: Any) -> Dict[str, int]:
         if partial_total:
             totals["totalTokens"] = partial_total
     return totals
+
+
+def parse_iso_timestamp(value: Any) -> Optional[dt.datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def runtime_mode_expires_at(ts: int, ttl_seconds: int = RUNTIME_MODE_TTL_SECONDS) -> str:
+    return dt.datetime.fromtimestamp(ts + max(1, ttl_seconds), dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def prompt_strings_for_runtime_mode(value: Any, sensitive_parent: bool = False, depth: int = 0) -> Iterable[str]:
+    if depth > 8:
+        return []
+    if isinstance(value, dict):
+        out: List[str] = []
+        for key, child in value.items():
+            key_norm = normalized_key(key)
+            is_prompt_field = sensitive_parent or key_norm in RUNTIME_MODE_PROMPT_KEYS or "prompt" in key_norm
+            out.extend(prompt_strings_for_runtime_mode(child, is_prompt_field, depth + 1))
+        return out
+    if isinstance(value, list):
+        out: List[str] = []
+        for child in value[:50]:
+            out.extend(prompt_strings_for_runtime_mode(child, sensitive_parent, depth + 1))
+        return out
+    if sensitive_parent and isinstance(value, str):
+        return [value]
+    return []
+
+
+def runtime_keyword_mode(value: Any) -> Optional[str]:
+    for text in prompt_strings_for_runtime_mode(value):
+        for pattern, mode in RUNTIME_MODE_KEYWORD_PATTERNS:
+            if pattern.search(text) is not None:
+                return mode
+    return None
+
+
+def normalize_runtime_effort(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_")
+        return normalized or None
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if normalized_key(key) in RUNTIME_MODE_EFFORT_VALUE_KEYS:
+                normalized = normalize_runtime_effort(child)
+                if normalized:
+                    return normalized
+    return None
+
+
+def find_runtime_effort(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_norm = normalized_key(key)
+            if key_norm in RUNTIME_MODE_EFFORT_KEYS:
+                normalized = normalize_runtime_effort(child)
+                if normalized:
+                    return normalized
+        for child in value.values():
+            found = find_runtime_effort(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value[:50]:
+            found = find_runtime_effort(child)
+            if found:
+                return found
+    return None
+
+
+def runtime_mode_from_effort(effort: Optional[str]) -> Optional[str]:
+    if effort in {"xhigh", "ultra", "ultra_high", "highest"}:
+        return "effort_xhigh"
+    if effort == "high":
+        return "effort_high"
+    return None
+
+
+def runtime_mode_event(
+    *,
+    provider: str,
+    mode: str,
+    confidence: str,
+    source: str,
+    detected_from: str,
+    privacy: str,
+    ts: Optional[int] = None,
+    ttl_seconds: int = RUNTIME_MODE_TTL_SECONDS,
+) -> Dict[str, Any]:
+    detected_at = int(ts or time.time())
+    return {
+        "mode": mode,
+        "provider": provider,
+        "confidence": confidence,
+        "source": source,
+        "detectedFrom": detected_from,
+        "privacy": privacy,
+        "detectedAt": dt.datetime.fromtimestamp(detected_at, dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "expiresAt": runtime_mode_expires_at(detected_at, ttl_seconds),
+    }
+
+
+def claude_runtime_mode_event(event_type: Optional[str], payload: Any, ts: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    event_norm = normalized_key(event_type or "")
+    detected_at = int(ts or time.time())
+    if event_norm in {"stop", "subagentstop"}:
+        return {
+            "mode": "clear",
+            "provider": "claude",
+            "confidence": "exact",
+            "source": "claude-hook",
+            "detectedFrom": "stop_hook",
+            "detectedAt": dt.datetime.fromtimestamp(detected_at, dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "expiresAt": dt.datetime.fromtimestamp(detected_at, dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+
+    if event_norm not in {"userpromptsubmit", "sessionstart"}:
+        return None
+
+    effort = find_runtime_effort(payload)
+    mode: Optional[str] = None
+    confidence: Optional[str] = None
+    detected_from: Optional[str] = None
+
+    keyword_mode = runtime_keyword_mode(payload)
+    if keyword_mode:
+        mode = keyword_mode
+        confidence = "exact"
+        detected_from = "prompt_keyword"
+    else:
+        mode = runtime_mode_from_effort(effort)
+        confidence = "exact"
+        detected_from = "effort_setting"
+
+    if not mode or not confidence or not detected_from:
+        return None
+
+    return runtime_mode_event(
+        provider="claude",
+        mode=mode,
+        confidence=confidence,
+        source="claude-hook",
+        detected_from=detected_from,
+        privacy="prompt_text_discarded" if detected_from == "prompt_keyword" else "metadata_only",
+        ts=detected_at,
+    )
+
+
+def codex_runtime_mode_event(payload: Any, ts: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    mode = runtime_mode_from_effort(find_runtime_effort(payload))
+    if not mode:
+        return None
+    return runtime_mode_event(
+        provider="codex",
+        mode=mode,
+        confidence="exact",
+        source="codex-notify",
+        detected_from="effort_setting",
+        privacy="metadata_only",
+        ts=ts,
+    )
+
+
+def codex_notify_storage_payload(payload: Any, runtime_mode: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    stored = copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    if "raw" in stored:
+        stored["raw"] = "[redacted]"
+    if runtime_mode:
+        stored["agentcatRuntimeMode"] = runtime_mode
+    return stored
+
+
+def claude_hook_storage_payload(payload: Any, runtime_mode: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    stored = copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    # Invalid JSON falls back to {"raw": "..."} in read_stdin_payload. For
+    # Claude hooks that can be prompt text, so never persist it.
+    if "raw" in stored:
+        stored["raw"] = "[redacted]"
+    if runtime_mode:
+        stored["agentcatRuntimeMode"] = runtime_mode
+    return stored
+
+
+def codex_config_reasoning_effort() -> Optional[str]:
+    path = HOME / ".codex" / "config.toml"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            # Only read the global default. Project/profile sections can have
+            # different semantics and should not color every Codex session.
+            return None
+        match = re.match(r"model_reasoning_effort\s*=\s*['\"]?([A-Za-z0-9_-]+)['\"]?", line)
+        if match:
+            return normalize_runtime_effort(match.group(1))
+    return None
+
+
+def codex_config_runtime_mode(active_providers: Iterable[str], ts: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    if "codex" not in {str(provider) for provider in active_providers}:
+        return None
+    mode = runtime_mode_from_effort(codex_config_reasoning_effort())
+    if not mode:
+        return None
+    return runtime_mode_event(
+        provider="codex",
+        mode=mode,
+        confidence="config_default",
+        source="codex-config",
+        detected_from="model_reasoning_effort",
+        privacy="metadata_only",
+        ts=ts,
+        ttl_seconds=180,
+    )
+
+
+def runtime_modes_snapshot(
+    now: Optional[dt.datetime] = None,
+    active_providers: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    init_db()
+    current = now or dt.datetime.now(dt.timezone.utc)
+    rows: List[Tuple[Any, ...]]
+    with closing(sqlite3.connect(EVENTS_DB)) as conn:
+        rows = conn.execute(
+            "select ts, provider, source, event_type, payload_json from events order by ts desc, id desc limit 300"
+        ).fetchall()
+
+    modes: List[Dict[str, Any]] = []
+    seen_providers: set[str] = set()
+    for ts, provider, source, event_type, payload_json in rows:
+        provider_s = str(provider)
+        if provider_s in seen_providers:
+            continue
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_mode = payload.get("agentcatRuntimeMode")
+        if not isinstance(raw_mode, dict):
+            continue
+        seen_providers.add(provider_s)
+
+        mode = str(raw_mode.get("mode") or "")
+        if not mode or mode == "clear":
+            continue
+        expires_at = parse_iso_timestamp(raw_mode.get("expiresAt"))
+        if expires_at is None or expires_at <= current:
+            continue
+
+        modes.append(
+            {
+                "provider": provider_s,
+                "mode": mode,
+                "confidence": str(raw_mode.get("confidence") or "inferred"),
+                "source": str(raw_mode.get("source") or source or "event"),
+                "detectedFrom": str(raw_mode.get("detectedFrom") or "event"),
+                "detectedAt": str(raw_mode.get("detectedAt") or dt.datetime.fromtimestamp(int(ts), dt.timezone.utc).isoformat().replace("+00:00", "Z")),
+                "expiresAt": raw_mode["expiresAt"],
+                "privacy": str(raw_mode.get("privacy") or "metadata_only"),
+            }
+        )
+    existing_providers = {str(mode.get("provider") or "") for mode in modes}
+    if active_providers is not None and "codex" not in existing_providers:
+        fallback = codex_config_runtime_mode(active_providers, ts=int(current.timestamp()))
+        if fallback:
+            modes.append(fallback)
+
+    modes.sort(key=lambda item: (item["confidence"] != "exact", item["provider"], item["mode"]))
+    return modes
+
+
+def safe_runtime_modes_snapshot(active_providers: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
+    try:
+        return runtime_modes_snapshot(active_providers=active_providers)
+    except Exception:
+        return []
 
 
 def find_first_key(value: Any, keys: Iterable[str]) -> Optional[Any]:
@@ -3993,6 +4320,7 @@ def empty_windows_activity_result() -> Dict[str, Any]:
         "totalCPUPercent": 0,
         "totalMemoryBytes": 0,
         "motionStage": "sleeping",
+        "runtimeModes": safe_runtime_modes_snapshot(),
         "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0},
         "memoryBytesByProvider": {"codex": 0, "claude": 0, "gemini": 0},
         "processes": [],
@@ -4035,6 +4363,9 @@ def windows_activity_from_rows(
             "runnableProcessCount": runnable_process_count,
             "activityScore": activity_score,
             "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
+            "runtimeModes": safe_runtime_modes_snapshot(
+                active_providers=[provider for provider, count in counts.items() if count > 0]
+            ),
             "countsByProvider": counts,
             "memoryBytesByProvider": memory_by_provider,
             "processes": rows,
@@ -4239,6 +4570,7 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
         "totalCPUPercent": 0,
         "totalMemoryBytes": 0,
         "motionStage": "sleeping",
+        "runtimeModes": safe_runtime_modes_snapshot(),
         "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0},
         "memoryBytesByProvider": {"codex": 0, "claude": 0, "gemini": 0},
         "processes": [],
@@ -4308,6 +4640,9 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
             "runnableProcessCount": runnable_process_count,
             "activityScore": activity_score,
             "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
+            "runtimeModes": safe_runtime_modes_snapshot(
+                active_providers=[provider for provider, count in counts.items() if count > 0]
+            ),
             "countsByProvider": counts,
             "memoryBytesByProvider": memory_by_provider,
             "processes": rows,
@@ -4757,7 +5092,8 @@ def command_claude_statusline(args: argparse.Namespace) -> int:
 
 def command_claude_hook(args: argparse.Namespace) -> int:
     payload = read_stdin_payload()
-    store_event("claude", "claude-hook", args.event, payload)
+    runtime_mode = claude_runtime_mode_event(args.event, payload)
+    store_event("claude", "claude-hook", args.event, claude_hook_storage_payload(payload, runtime_mode))
     print("{}")
     return 0
 
@@ -4771,7 +5107,8 @@ def command_gemini_hook(args: argparse.Namespace) -> int:
 
 def command_codex_notify(args: argparse.Namespace) -> int:
     payload = read_stdin_payload()
-    store_event("codex", "codex-notify", "notify", payload)
+    runtime_mode = codex_runtime_mode_event(payload)
+    store_event("codex", "codex-notify", "notify", codex_notify_storage_payload(payload, runtime_mode))
     return 0
 
 

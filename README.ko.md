@@ -82,6 +82,8 @@ Agent Cat은 `~/.agentcat/latest-snapshot.json`을 읽거나 로컬 API를 호�
 
 메모리 사용량은 `/bin/ps`에서 읽은 로컬 RSS 메모리입니다. 각 프로세스에는 `memoryBytes`, provider별 합계에는 `memoryBytesByProvider`가 들어갑니다. 프롬프트, 대화 본문, 모델 응답은 읽지 않습니다.
 
+`activity.runtimeModes`는 고강도 에이전트 세션을 위한 선택적 로컬 전용 신호입니다. Claude Code `UserPromptSubmit` hook은 `ultrathink` / `ultracode`를 메모리 안에서만 감지하고 프롬프트 원문은 버린 뒤, `mode=ultrathink`, `confidence=exact`, `privacy=prompt_text_discarded` 같은 짧은 수명의 플래그만 저장합니다. `effort.level=xhigh`나 Codex `model_reasoning_effort=xhigh` 같은 메타데이터 신호는 프롬프트나 transcript를 읽지 않고 `mode=effort_xhigh`로 정규화합니다. Claude `Stop` hook이 오면 플래그를 지웁니다. 프롬프트, 파일 경로, transcript, 대화 본문은 저장하지 않습니다.
+
 Windows에서는 가능한 경우 PowerShell 7(`pwsh`)을 우선 사용하고, 빠른 `Get-Process` 스캔을 먼저 시도한 뒤 필요할 때만 command-line 스캔이나 `tasklist`로 fallback합니다. 회사 PC처럼 PowerShell 기동이 느린 환경에서는 `~/.agentcat/settings.json`에서 스캔 타임아웃을 늘릴 수 있습니다.
 
 ```json
