@@ -50,23 +50,32 @@ if (-not $snap) {
 }
 
 # --- 4) verify gemini/antigravity quota ---
+# A populated gemini limit carries status "auto" (not "ok") and may have a null
+# top-level weeklyUsedPercent while still exposing a per-model quotas array, so
+# treat ANY quota signal as success.
 $g   = $snap.providers.gemini
 $lim = $g.limits
+$quotaCount = 0
+if ($lim -and $lim.quotas) { $quotaCount = @($lim.quotas).Count }
 $hasQuota = $false
-if ($lim -and $lim.status -eq 'ok') {
-    if ($null -ne $lim.weeklyUsedPercent -or $lim.quotas -or $null -ne $lim.shortUsedPercent) { $hasQuota = $true }
+if ($lim -and ($quotaCount -gt 0 -or $null -ne $lim.weeklyUsedPercent -or $null -ne $lim.shortUsedPercent)) {
+    $hasQuota = $true
 }
 Write-Output ''
-Write-Output ("gemini.status        = " + $g.status)
-Write-Output ("gemini.limits.status = " + $lim.status)
+Write-Output ("gemini.status            = " + $g.status)
+Write-Output ("gemini.limits.status     = " + $lim.status)
+Write-Output ("gemini.limits.liveError  = " + $lim.liveError)
+Write-Output ("gemini weeklyUsedPercent = " + $lim.weeklyUsedPercent)
+Write-Output ("gemini quota entries     = " + $quotaCount)
 
 if ($hasQuota) {
     Write-Output ''
-    Write-Output 'PASS - Gemini/Antigravity quota is now available. You can close the issue.'
+    Write-Output 'LIKELY FIXED - Gemini/Antigravity quota data is present now.'
+    Write-Output 'If the app still shows blank, paste this whole output back. Full limits:'
     Write-Output ($lim | ConvertTo-Json -Depth 5)
 } else {
     Write-Output ''
-    Write-Output 'STILL NO QUOTA - running the read-only diagnostic so we can pinpoint it.'
+    Write-Output 'NOT FIXED YET - running the read-only diagnostic so we can pinpoint it.'
     Write-Output 'Please paste this entire output back (no tokens/secrets are printed):'
     Write-Output ''
     try {
