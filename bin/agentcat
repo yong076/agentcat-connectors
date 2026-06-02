@@ -57,7 +57,7 @@ LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_S
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
-CLAUDE_JOURNAL_CURSOR_VERSION = 2
+CLAUDE_JOURNAL_CURSOR_VERSION = 3
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
@@ -88,8 +88,11 @@ CONNECTOR_CAPABILITIES = (
     "usage.hourlyTokens",
     "usage.breakdown",
     "usage.projects",
+    "usage.labReport",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
+    "providers.localDiscovery",
+    "activity.additionalCliProviders",
     "limits.liveCache",
     "limits.errorBackoff",
     "limits.quotaFallbackOn429",
@@ -495,6 +498,230 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
     }
 
 
+USAGE_LAB_PERIODS = ("today", "week", "month", "all")
+USAGE_LAB_TOKEN_KEYS = (
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+    "reasoningTokens",
+    "thoughtTokens",
+    "toolTokens",
+)
+
+
+def usage_lab_int(raw: Any) -> int:
+    return _insight_int(raw)
+
+
+def usage_lab_total_from_tokens(tokens: Dict[str, Any]) -> int:
+    total = usage_lab_int(tokens.get("totalTokens")) or usage_lab_int(tokens.get("all"))
+    if total > 0:
+        return total
+    return sum(usage_lab_int(tokens.get(key)) for key in USAGE_LAB_TOKEN_KEYS)
+
+
+def usage_lab_model_period_total(model_data: Dict[str, Any], period: str) -> int:
+    bucket = insight_model_period_bucket(
+        model_data,
+        period,
+        allow_lifetime_fallback=(period == "all"),
+    )
+    return int(bucket[1]) if bucket else 0
+
+
+def usage_lab_provider_period_total(provider: Dict[str, Any], period: str) -> int:
+    tokens = provider.get("tokens") if isinstance(provider.get("tokens"), dict) else {}
+    direct = usage_lab_int(tokens.get(period))
+    if direct > 0:
+        return direct
+    if period == "all":
+        total = usage_lab_total_from_tokens(tokens)
+        if total > 0:
+            return total
+    total = 0
+    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+    for model_data in models.values():
+        if isinstance(model_data, dict):
+            total += usage_lab_model_period_total(model_data, period)
+    return total
+
+
+def usage_lab_latest_iso(lhs: Optional[str], rhs: Optional[str]) -> Optional[str]:
+    if not lhs:
+        return rhs
+    if not rhs:
+        return lhs
+    lhs_date = parse_timestamp(lhs)
+    rhs_date = parse_timestamp(rhs)
+    if lhs_date and rhs_date:
+        return rhs if rhs_date > lhs_date else lhs
+    return rhs if rhs > lhs else lhs
+
+
+def usage_lab_project_key(path: str) -> str:
+    value = str(path or "").strip()
+    while len(value) > 1 and (value.endswith("/") or value.endswith("\\")):
+        value = value[:-1]
+    return value
+
+
+def derive_usage_lab(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a Tokscale-style report from the connector's existing snapshot.
+
+    This intentionally reuses cached provider data instead of adding another
+    filesystem scan loop. Future parser work can feed the same provider fields
+    and this report shape stays stable for the Mac/Windows clients.
+    """
+    providers = snapshot.get("providers") if isinstance(snapshot.get("providers"), dict) else {}
+    provider_entries: List[Dict[str, Any]] = []
+    model_entries: List[Dict[str, Any]] = []
+    daily: Dict[str, Dict[str, Any]] = {}
+    hourly: Dict[str, Dict[str, Any]] = {}
+    projects: Dict[str, Dict[str, Any]] = {}
+    breakdown = empty_breakdown()
+    model_names: set = set()
+
+    for provider_id, provider in providers.items():
+        if not isinstance(provider, dict):
+            continue
+        provider_id = str(provider_id)
+        status = str(provider.get("status") or "unknown")
+
+        period_totals = {
+            period: usage_lab_provider_period_total(provider, period)
+            for period in USAGE_LAB_PERIODS
+        }
+        provider_total = period_totals["all"]
+        models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+        project_payload = provider.get("projects") if isinstance(provider.get("projects"), dict) else {}
+        project_items = project_payload.get("items") if isinstance(project_payload.get("items"), list) else []
+
+        provider_entries.append({
+            "id": provider_id,
+            "status": status,
+            "source": provider.get("source"),
+            "totalTokens": provider_total,
+            "todayTokens": period_totals["today"],
+            "weekTokens": period_totals["week"],
+            "monthTokens": period_totals["month"],
+            "modelCount": len(models),
+            "projectCount": len([item for item in project_items if isinstance(item, dict) and usage_lab_int(item.get("tokens")) > 0]),
+        })
+
+        for model_name, model_data in models.items():
+            if not isinstance(model_data, dict):
+                continue
+            model_name = str(model_name)
+            model_names.add(model_name)
+            model_periods = {
+                period: usage_lab_model_period_total(model_data, period)
+                for period in USAGE_LAB_PERIODS
+            }
+            total_tokens = model_periods["all"]
+            input_tokens = usage_lab_int(model_data.get("inputTokens"))
+            output_tokens = usage_lab_int(model_data.get("outputTokens"))
+            cache_read_tokens = usage_lab_int(model_data.get("cacheReadInputTokens"))
+            cache_write_tokens = usage_lab_int(model_data.get("cacheCreationInputTokens"))
+            cost = estimate_cost(model_name, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+            model_entries.append({
+                "id": f"{provider_id}:{model_name}",
+                "provider": provider_id,
+                "name": model_name,
+                "totalTokens": total_tokens,
+                "todayTokens": model_periods["today"],
+                "weekTokens": model_periods["week"],
+                "monthTokens": model_periods["month"],
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "cacheReadInputTokens": cache_read_tokens,
+                "cacheCreationInputTokens": cache_write_tokens,
+                "estimatedCostUSD": cost["total"] if cost else None,
+            })
+
+        daily_tokens = provider.get("dailyTokens") if isinstance(provider.get("dailyTokens"), dict) else {}
+        for day_key, raw_amount in daily_tokens.items():
+            amount = usage_lab_int(raw_amount)
+            if amount <= 0:
+                continue
+            entry = daily.setdefault(str(day_key), {"date": str(day_key), "totalTokens": 0, "providers": {}})
+            entry["totalTokens"] += amount
+            entry["providers"][provider_id] = entry["providers"].get(provider_id, 0) + amount
+
+        hourly_tokens = provider.get("hourlyTokens") if isinstance(provider.get("hourlyTokens"), dict) else {}
+        for hour_key, raw_amount in hourly_tokens.items():
+            amount = usage_lab_int(raw_amount)
+            if amount <= 0:
+                continue
+            entry = hourly.setdefault(str(hour_key), {"hour": str(hour_key), "totalTokens": 0, "providers": {}})
+            entry["totalTokens"] += amount
+            entry["providers"][provider_id] = entry["providers"].get(provider_id, 0) + amount
+
+        for item in project_items:
+            if not isinstance(item, dict):
+                continue
+            tokens = usage_lab_int(item.get("tokens"))
+            if tokens <= 0:
+                continue
+            raw_path = str(item.get("path") or item.get("id") or item.get("name") or "")
+            key = usage_lab_project_key(raw_path)
+            if not key:
+                continue
+            project = projects.setdefault(key, {
+                "id": key,
+                "path": raw_path,
+                "name": str(item.get("name") or display_project_name(raw_path)),
+                "totalTokens": 0,
+                "providers": {},
+                "lastActive": None,
+            })
+            project["totalTokens"] += tokens
+            project["providers"][provider_id] = project["providers"].get(provider_id, 0) + tokens
+            project["lastActive"] = usage_lab_latest_iso(project.get("lastActive"), item.get("lastActive"))
+
+        raw_breakdown = provider.get("breakdown") if isinstance(provider.get("breakdown"), dict) else {}
+        if raw_breakdown.get("status") == "ok":
+            breakdown["status"] = "ok"
+            for key in ("chat", "tools", "mcp", "shell"):
+                breakdown[key] = int(breakdown.get(key, 0)) + usage_lab_int(raw_breakdown.get(key))
+
+    provider_entries.sort(key=lambda entry: (-int(entry.get("totalTokens") or 0), str(entry.get("id") or "")))
+    model_entries.sort(key=lambda entry: (-int(entry.get("weekTokens") or entry.get("totalTokens") or 0), str(entry.get("name") or "")))
+    project_entries = sorted(projects.values(), key=lambda entry: (-int(entry.get("totalTokens") or 0), str(entry.get("name") or "")))
+    daily_entries = sorted(daily.values(), key=lambda entry: str(entry.get("date") or ""))[-90:]
+    hourly_entries = sorted(hourly.values(), key=lambda entry: str(entry.get("hour") or ""))[-168:]
+
+    total_tokens = sum(int(entry.get("totalTokens") or 0) for entry in provider_entries)
+    today_tokens = sum(int(entry.get("todayTokens") or 0) for entry in provider_entries)
+    week_tokens = sum(int(entry.get("weekTokens") or 0) for entry in provider_entries)
+    month_tokens = sum(int(entry.get("monthTokens") or 0) for entry in provider_entries)
+    total_cost = sum(float(entry.get("estimatedCostUSD") or 0.0) for entry in model_entries)
+
+    return {
+        "status": "ok",
+        "generatedAt": snapshot.get("generatedAt") or now_iso(),
+        "summary": {
+            "totalTokens": total_tokens,
+            "todayTokens": today_tokens,
+            "weekTokens": week_tokens,
+            "monthTokens": month_tokens,
+            "estimatedCostUSD": total_cost,
+            "providerCount": len([entry for entry in provider_entries if int(entry.get("totalTokens") or 0) > 0]),
+            "modelCount": len(model_names),
+            "activeDays": len([entry for entry in daily_entries if int(entry.get("totalTokens") or 0) > 0]),
+            "projectCount": len(project_entries),
+            "topProvider": provider_entries[0]["id"] if provider_entries and int(provider_entries[0].get("totalTokens") or 0) > 0 else None,
+            "topModel": model_entries[0]["name"] if model_entries and int(model_entries[0].get("totalTokens") or 0) > 0 else None,
+        },
+        "providers": provider_entries,
+        "models": model_entries[:50],
+        "daily": daily_entries,
+        "hourly": hourly_entries,
+        "projects": project_entries[:50],
+        "breakdown": breakdown,
+    }
+
+
 IGNORED_EXECUTABLES = {
     "awk",
     "bash",
@@ -527,6 +754,64 @@ IGNORED_EXECUTABLES = {
     "python.exe",
     "python3.exe",
 }
+
+CLI_EXECUTABLE_PROVIDERS = {
+    "opencode": "opencode",
+    "opencode.exe": "opencode",
+    "opencode.cmd": "opencode",
+    "aider": "aider",
+    "aider.exe": "aider",
+    "aider.cmd": "aider",
+    "goose": "goose",
+    "goose.exe": "goose",
+    "goose.cmd": "goose",
+    "qwen": "qwen",
+    "qwen.exe": "qwen",
+    "qwen.cmd": "qwen",
+    "qwen-code": "qwen",
+    "qwen-code.exe": "qwen",
+    "qwen-code.cmd": "qwen",
+    "cursor-agent": "cursor",
+    "cursor-agent.exe": "cursor",
+    "cursor-agent.cmd": "cursor",
+    "cursor-agent-cli": "cursor",
+    "cursor-agent-cli.exe": "cursor",
+    "cursor-agent-cli.cmd": "cursor",
+    "cline": "cline",
+    "cline.exe": "cline",
+    "cline.cmd": "cline",
+    "roo": "roo-code",
+    "roo.exe": "roo-code",
+    "roo.cmd": "roo-code",
+    "roo-code": "roo-code",
+    "roo-code.exe": "roo-code",
+    "roo-code.cmd": "roo-code",
+    "kilo": "kilo-code",
+    "kilo.exe": "kilo-code",
+    "kilo.cmd": "kilo-code",
+    "kilo-code": "kilo-code",
+    "kilo-code.exe": "kilo-code",
+    "kilo-code.cmd": "kilo-code",
+    "continue": "continue",
+    "continue.exe": "continue",
+    "continue.cmd": "continue",
+    "crush": "crush",
+    "crush.exe": "crush",
+    "crush.cmd": "crush",
+}
+
+CLI_PACKAGE_PROVIDER_MARKERS = (
+    ("@opencode-ai/opencode", "opencode"),
+    ("/opencode/bin/", "opencode"),
+    ("@qwen-code/qwen-code", "qwen"),
+    ("/qwen-code/", "qwen"),
+    ("@block/goose", "goose"),
+    ("/goose/bin/", "goose"),
+    ("@cline/cline", "cline"),
+    ("@roo-code/cli", "roo-code"),
+    ("@kilocode/cli", "kilo-code"),
+    ("@continuedev/continue", "continue"),
+)
 
 SENSITIVE_KEY_PARTS = (
     "prompt",
@@ -1600,13 +1885,23 @@ def gemini_display_name(model: Any) -> str:
 
 
 def read_gemini_auth_type() -> Optional[str]:
-    for path in (Path.cwd() / ".gemini" / "settings.json", HOME / ".gemini" / "settings.json"):
+    for path in (
+        Path.cwd() / ".gemini" / "settings.json",
+        HOME / ".gemini" / "settings.json",
+        HOME / ".gemini" / "antigravity-cli" / "settings.json",
+        HOME / ".antigravity" / "settings.json",
+    ):
         raw = read_json(path)
         if not isinstance(raw, dict) or raw.get("_agentcat_error"):
             continue
         security = raw.get("security")
         auth = security.get("auth") if isinstance(security, dict) else None
         selected = auth.get("selectedType") if isinstance(auth, dict) else None
+        # Older gemini-cli / Antigravity builds wrote a flat selectedAuthType.
+        if not (isinstance(selected, str) and selected):
+            legacy = raw.get("selectedAuthType")
+            if isinstance(legacy, str):
+                selected = legacy
         if isinstance(selected, str) and selected:
             return selected
     if os.environ.get("GOOGLE_GENAI_USE_GCA") == "true":
@@ -1615,20 +1910,62 @@ def read_gemini_auth_type() -> Optional[str]:
         return "gemini-api-key"
     if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") == "true":
         return "vertex-ai"
+    # Fallback: if usable OAuth creds exist but settings.json never recorded the
+    # auth type (common for Antigravity, esp. on Windows), treat it as personal
+    # OAuth so the Code Assist quota path runs instead of returning empty.
+    if read_gemini_oauth_credentials():
+        return "oauth-personal"
     return None
 
 
 def read_gemini_oauth_credentials() -> Optional[Dict[str, Any]]:
-    raw = read_json(HOME / ".gemini" / "oauth_creds.json")
-    return raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else None
+    # Antigravity (and Windows installs) may store the OAuth creds outside the
+    # standalone gemini-cli's ~/.gemini/oauth_creds.json — probe known siblings.
+    for path in (
+        HOME / ".gemini" / "oauth_creds.json",
+        HOME / ".gemini" / "antigravity-cli" / "oauth_creds.json",
+        HOME / ".antigravity" / "oauth_creds.json",
+    ):
+        raw = read_json(path)
+        if isinstance(raw, dict) and not raw.get("_agentcat_error"):
+            return raw
+    return None
 
 
 def gemini_oauth2_source_candidates() -> List[Path]:
     candidates: List[Path] = []
-    gemini_bin = shutil.which("gemini")
-    if gemini_bin:
-        resolved = Path(gemini_bin).resolve()
-        candidates.extend([resolved.parent, resolved.parent.parent, resolved.parent.parent / "libexec"])
+    # The gemini-cli (and Antigravity, which bundles gemini-cli-core) can be on
+    # PATH under several names; walk up from each so the sibling node_modules
+    # is reachable regardless of install method.
+    for exe in ("gemini", "agy", "antigravity", "antigravity-cli"):
+        found = shutil.which(exe)
+        if not found:
+            continue
+        resolved = Path(found).resolve()
+        candidates.extend(
+            [
+                resolved.parent,
+                resolved.parent.parent,
+                resolved.parent.parent / "libexec",
+                resolved.parent.parent / "lib",
+            ]
+        )
+    # Windows npm global install locations (%APPDATA%\npm, npm prefix).
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.extend([Path(appdata) / "npm", Path(appdata) / "npm" / "node_modules"])
+    npm_bin = shutil.which("npm")
+    if npm_bin:
+        candidates.append(Path(npm_bin).resolve().parent)
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        candidates.extend(
+            [
+                Path(local_appdata) / "Programs" / "Antigravity",
+                Path(local_appdata) / "Antigravity",
+            ]
+        )
+    # Unix package-manager / nvm fallbacks.
     candidates.extend(
         [
             Path("/opt/homebrew/lib"),
@@ -1637,7 +1974,19 @@ def gemini_oauth2_source_candidates() -> List[Path]:
             HOME / ".nvm" / "versions",
         ]
     )
-    return [path for path in candidates if path.exists()]
+    result: List[Path] = []
+    seen = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if path.exists():
+                result.append(path)
+        except OSError:
+            continue
+    return result
 
 
 def gemini_cli_oauth_client_credentials() -> Optional[Tuple[str, str]]:
@@ -2222,6 +2571,146 @@ def opencode_data_dir() -> Path:
     xdg = os.environ.get("XDG_DATA_HOME")
     base = Path(xdg).expanduser() if xdg else HOME / ".local" / "share"
     return base / "opencode"
+
+
+def app_support_dir(app_name: str) -> Path:
+    if IS_WINDOWS:
+        return HOME / "AppData" / "Roaming" / app_name
+    if sys.platform == "darwin":
+        return HOME / "Library" / "Application Support" / app_name
+    return HOME / ".config" / app_name
+
+
+def vscode_user_storage_roots(app_names: Iterable[str] = ("Code", "Code - Insiders", "VSCodium")) -> List[Path]:
+    roots: List[Path] = []
+    for app_name in app_names:
+        user_root = app_support_dir(app_name) / "User"
+        roots.append(user_root / "workspaceStorage")
+        roots.append(user_root / "globalStorage")
+    return roots
+
+
+def vscode_extension_install_roots(app_names: Iterable[str] = ("Code", "Code - Insiders", "VSCodium", "Cursor", "Windsurf")) -> List[Path]:
+    roots = [
+        HOME / ".vscode" / "extensions",
+        HOME / ".vscode-insiders" / "extensions",
+        HOME / ".vscodium" / "extensions",
+        HOME / ".cursor" / "extensions",
+        HOME / ".windsurf" / "extensions",
+    ]
+    for app_name in app_names:
+        roots.append(app_support_dir(app_name) / "extensions")
+    return roots
+
+
+def vscode_extension_storage_candidates(extension_ids: Iterable[str]) -> List[Path]:
+    roots = vscode_user_storage_roots(("Code", "Code - Insiders", "VSCodium", "Cursor", "Windsurf"))
+    candidates: List[Path] = []
+    for root in roots:
+        if root.name == "globalStorage":
+            for extension_id in extension_ids:
+                candidates.append(root / extension_id)
+    for extension_root in vscode_extension_install_roots():
+        for extension_id in extension_ids:
+            candidates.append(extension_root / extension_id)
+            try:
+                candidates.extend(extension_root.glob(f"{extension_id}-*"))
+            except OSError:
+                continue
+    return candidates
+
+
+def provider_discovery_candidates() -> Dict[str, List[Path]]:
+    return {
+        "aider": [
+            HOME / ".aider",
+            HOME / ".aider.conf.yml",
+            HOME / ".config" / "aider",
+            app_support_dir("aider"),
+        ],
+        "goose": [
+            HOME / ".config" / "goose",
+            HOME / ".local" / "share" / "goose",
+            app_support_dir("goose"),
+            app_support_dir("Goose"),
+        ],
+        "qwen": [
+            HOME / ".qwen",
+            HOME / ".qwen-code",
+            HOME / ".config" / "qwen-code",
+            app_support_dir("qwen-code"),
+            app_support_dir("Qwen Code"),
+        ],
+        "cursor": [
+            app_support_dir("Cursor") / "User" / "workspaceStorage",
+            app_support_dir("Cursor") / "User" / "globalStorage",
+        ],
+        "kiro": [
+            HOME / ".kiro",
+            app_support_dir("Kiro") / "User" / "workspaceStorage",
+            app_support_dir("Kiro") / "User" / "globalStorage",
+        ],
+        "roo-code": vscode_extension_storage_candidates(
+            ("rooveterinaryinc.roo-cline", "roo-code.roo-code", "rooveterinaryinc.roo-code")
+        ),
+        "kilo-code": vscode_extension_storage_candidates(
+            ("kilocode.kilo-code", "kilo-code.kilo-code", "kilocode.kilo")
+        ),
+        "cline": vscode_extension_storage_candidates(
+            ("saoudrizwan.claude-dev", "cline.cline", "cline.bot", "clineb.cline")
+        ),
+        "continue": vscode_extension_storage_candidates(("continue.continue",)),
+        "windsurf": [
+            app_support_dir("Windsurf") / "User" / "workspaceStorage",
+            app_support_dir("Windsurf") / "User" / "globalStorage",
+        ],
+        "zed": [
+            HOME / ".config" / "zed",
+            app_support_dir("Zed"),
+            app_support_dir("zed"),
+        ],
+        "crush": [
+            HOME / ".crush",
+            HOME / ".config" / "crush",
+            app_support_dir("crush"),
+        ],
+    }
+
+
+def local_discovery_snapshot(provider: str, candidates: List[Path]) -> Optional[Dict[str, Any]]:
+    existing: List[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if path.exists():
+                existing.append(path)
+        except OSError:
+            continue
+    if not existing:
+        return None
+
+    source = ",".join(str(path) for path in existing[:8])
+    result = empty_provider_usage(status="installed_no_activity", source=source)
+    result["events"] = 0
+    result["sources"] = {
+        "existingPaths": len(existing),
+        "checkedPaths": len(seen),
+        "probe": "local-artifacts",
+    }
+    return result
+
+
+def local_discovery_snapshots() -> Dict[str, Dict[str, Any]]:
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    for provider, candidates in provider_discovery_candidates().items():
+        snapshot = local_discovery_snapshot(provider, candidates)
+        if snapshot is not None:
+            snapshots[provider] = snapshot
+    return snapshots
 
 
 def opencode_message_metrics(data: Dict[str, Any]) -> Dict[str, int]:
@@ -2848,6 +3337,7 @@ def load_journal_cursor() -> Dict[str, Any]:
             "dailyTokens": _empty_journal_daily_tokens(),
             "hourlyTokens": _empty_journal_hourly_tokens(),
             "models": _empty_journal_models(),
+            "usageRecords": {},
             "projects_needs_rebuild": False,
             "usage_needs_rebuild": False,
             "totals_as_of": None,
@@ -2856,6 +3346,7 @@ def load_journal_cursor() -> Dict[str, Any]:
     has_daily = isinstance(raw.get("dailyTokens"), dict)
     has_hourly = isinstance(raw.get("hourlyTokens"), dict)
     has_models = isinstance(raw.get("models"), dict)
+    has_usage_records = isinstance(raw.get("usageRecords"), dict)
     has_current_version = raw.get("version") == CLAUDE_JOURNAL_CURSOR_VERSION
     offsets = raw.get("offsets") or {}
     totals = raw.get("totals") or {}
@@ -2863,6 +3354,7 @@ def load_journal_cursor() -> Dict[str, Any]:
     daily_tokens = raw.get("dailyTokens") if has_daily else _empty_journal_daily_tokens()
     hourly_tokens = raw.get("hourlyTokens") if has_hourly else _empty_journal_hourly_tokens()
     models = raw.get("models") if has_models else _empty_journal_models()
+    usage_records = raw.get("usageRecords") if has_usage_records else {}
     for k in _JOURNAL_PERIOD_KEYS:
         totals.setdefault(k, 0)
     return {
@@ -2877,8 +3369,13 @@ def load_journal_cursor() -> Dict[str, Any]:
             for model, values in models.items()
             if isinstance(values, dict)
         },
+        "usageRecords": {
+            str(key): value
+            for key, value in usage_records.items()
+            if isinstance(value, dict)
+        },
         "projects_needs_rebuild": not has_projects,
-        "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_current_version),
+        "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_usage_records and has_current_version),
         "totals_as_of": raw.get("totals_as_of"),
     }
 
@@ -2915,6 +3412,8 @@ def parse_claude_usage_line(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if isinstance(cache_creation, dict):
         cache_write_1h = nonnegative_int(cache_creation.get("ephemeral_1h_input_tokens")) or 0
         cache_write_5m = nonnegative_int(cache_creation.get("ephemeral_5m_input_tokens")) or 0
+        if cache_write_1h == 0 and cache_write_5m == 0:
+            cache_write_1h = nonnegative_int(usage.get("cache_creation_input_tokens")) or 0
     else:
         total_write = nonnegative_int(usage.get("cache_creation_input_tokens")) or 0
         cache_write_1h, cache_write_5m = total_write, 0
@@ -2922,11 +3421,59 @@ def parse_claude_usage_line(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     ts = parse_timestamp(obj.get("timestamp"))
     return {
+        "dedupeKey": claude_usage_dedupe_key(obj, msg),
         "timestamp": ts,
         "model": str(msg.get("model") or "unknown"),
         "cwd": str(obj.get("cwd") or ""),
         "input": inp, "output": out, "cache_read": cache_read,
         "cache_write_1h": cache_write_1h, "cache_write_5m": cache_write_5m,
+    }
+
+
+def claude_usage_dedupe_key(obj: Dict[str, Any], msg: Dict[str, Any]) -> Optional[str]:
+    request_id = obj.get("requestId") or obj.get("request_id")
+    if isinstance(request_id, str) and request_id:
+        return f"request:{request_id}"
+    message_id = msg.get("id")
+    if isinstance(message_id, str) and message_id:
+        return f"message:{message_id}"
+    return None
+
+
+def claude_record_total(rec: Dict[str, Any]) -> int:
+    return sum(
+        int(rec.get(key) or 0)
+        for key in ("input", "output", "cache_read", "cache_write_1h", "cache_write_5m")
+    )
+
+
+def claude_record_for_cursor(rec: Dict[str, Any]) -> Dict[str, Any]:
+    timestamp = rec.get("timestamp")
+    return {
+        "timestamp": timestamp.isoformat() if isinstance(timestamp, dt.datetime) else None,
+        "model": rec.get("model"),
+        "cwd": rec.get("cwd"),
+        "input": int(rec.get("input") or 0),
+        "output": int(rec.get("output") or 0),
+        "cache_read": int(rec.get("cache_read") or 0),
+        "cache_write_1h": int(rec.get("cache_write_1h") or 0),
+        "cache_write_5m": int(rec.get("cache_write_5m") or 0),
+    }
+
+
+def claude_record_from_cursor(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    timestamp = parse_timestamp(raw.get("timestamp"))
+    return {
+        "timestamp": timestamp,
+        "model": str(raw.get("model") or "unknown"),
+        "cwd": str(raw.get("cwd") or ""),
+        "input": int_limit(raw.get("input")) or 0,
+        "output": int_limit(raw.get("output")) or 0,
+        "cache_read": int_limit(raw.get("cache_read")) or 0,
+        "cache_write_1h": int_limit(raw.get("cache_write_1h")) or 0,
+        "cache_write_5m": int_limit(raw.get("cache_write_5m")) or 0,
     }
 
 
@@ -2938,6 +3485,7 @@ def _apply_record_to_totals(
     daily_tokens: Optional[Dict[str, int]] = None,
     hourly_tokens: Optional[Dict[str, int]] = None,
     models: Optional[Dict[str, Dict[str, int]]] = None,
+    sign: int = 1,
 ) -> None:
     ts: Optional["dt.datetime"] = rec.get("timestamp")
     if ts is not None and ts.tzinfo is None:
@@ -2955,9 +3503,10 @@ def _apply_record_to_totals(
     model = normalized_model_name(rec.get("model")) or "unknown"
     model_tokens = models.setdefault(model, {}) if models is not None else None
     for rec_key, tok_key, model_key in fields:
-        amount = rec.get(rec_key) or 0
-        if amount <= 0:
+        raw_amount = rec.get(rec_key) or 0
+        if raw_amount <= 0:
             continue
+        amount = int(raw_amount) * sign
         project_total += amount
         totals[f"all_{tok_key}"] = totals.get(f"all_{tok_key}", 0) + amount
         if model_tokens is not None:
@@ -2970,7 +3519,7 @@ def _apply_record_to_totals(
             totals[f"week_{tok_key}"] = totals.get(f"week_{tok_key}", 0) + amount
         if ts >= now - dt.timedelta(days=30):
             totals[f"month_{tok_key}"] = totals.get(f"month_{tok_key}", 0) + amount
-    if project_total <= 0:
+    if project_total == 0:
         return
     if daily_tokens is not None:
         add_to_daily(daily_tokens, project_total, ts)
@@ -3034,6 +3583,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     daily_tokens: Dict[str, int] = cursor.setdefault("dailyTokens", _empty_journal_daily_tokens())
     hourly_tokens: Dict[str, int] = cursor.setdefault("hourlyTokens", _empty_journal_hourly_tokens())
     models: Dict[str, Dict[str, int]] = cursor.setdefault("models", _empty_journal_models())
+    usage_records: Dict[str, Dict[str, Any]] = cursor.setdefault("usageRecords", {})
     if cursor.pop("usage_needs_rebuild", False):
         offsets.clear()
         totals.clear()
@@ -3042,6 +3592,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         daily_tokens.clear()
         hourly_tokens.clear()
         models.clear()
+        usage_records.clear()
         cursor["projects_needs_rebuild"] = False
     if cursor.pop("projects_needs_rebuild", False):
         # Existing cursors predate per-project attribution. Rebuild only
@@ -3077,6 +3628,23 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                         continue
                     rec = parse_claude_usage_line(obj)
                     if rec:
+                        dedupe_key = rec.get("dedupeKey")
+                        if isinstance(dedupe_key, str) and dedupe_key:
+                            previous = claude_record_from_cursor(usage_records.get(dedupe_key))
+                            if previous is not None:
+                                if claude_record_total(rec) <= claude_record_total(previous):
+                                    continue
+                                _apply_record_to_totals(
+                                    totals,
+                                    previous,
+                                    now_utc,
+                                    projects,
+                                    daily_tokens,
+                                    hourly_tokens,
+                                    models,
+                                    sign=-1,
+                                )
+                            usage_records[dedupe_key] = claude_record_for_cursor(rec)
                         _apply_record_to_totals(
                             totals,
                             rec,
@@ -3753,11 +4321,25 @@ def int_map(raw: Any) -> Dict[str, int]:
 
 def periods_from_daily_tokens(daily_tokens: Dict[str, int]) -> Dict[str, int]:
     periods = empty_periods()
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    today_utc = now_utc.date()
+    today_local = now_utc.astimezone().date()
     for day, amount in daily_tokens.items():
         if amount <= 0:
             continue
-        when = parse_timestamp(f"{day}T12:00:00Z") or parse_timestamp(day)
-        add_to_periods(periods, amount, when)
+        periods["all"] = periods.get("all", 0) + amount
+        try:
+            day_date = dt.date.fromisoformat(str(day)[:10])
+        except ValueError:
+            when = parse_timestamp(f"{day}T12:00:00Z") or parse_timestamp(day)
+            add_to_periods(periods, amount, when)
+            continue
+        if day_date in {today_utc, today_local}:
+            periods["today"] = periods.get("today", 0) + amount
+        if day_date >= today_utc - dt.timedelta(days=7) or day_date >= today_local - dt.timedelta(days=7):
+            periods["week"] = periods.get("week", 0) + amount
+        if day_date >= today_utc - dt.timedelta(days=30) or day_date >= today_local - dt.timedelta(days=30):
+            periods["month"] = periods.get("month", 0) + amount
     return periods
 
 
@@ -3848,6 +4430,16 @@ def classify_process(command: str) -> Optional[str]:
         return None
     if "/applications/claude.app/contents/" in normalized:
         return None
+    if "/applications/antigravity.app/contents/" in normalized:
+        return None
+    if "/applications/cursor.app/contents/" in normalized:
+        return None
+    if "/applications/windsurf.app/contents/" in normalized:
+        return None
+    if "/applications/zed.app/contents/" in normalized:
+        return None
+    if "/applications/kiro.app/contents/" in normalized:
+        return None
     if (
         "/windowsapps/openai.codex_" in normalized
         and "/app/codex.exe" in normalized
@@ -3871,8 +4463,34 @@ def classify_process(command: str) -> Optional[str]:
         return "codex"
     if executable in {"claude", "claude.exe", "claude.cmd"} or "@anthropic-ai/claude" in normalized or "claude-code" in normalized:
         return "claude"
-    if executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli"} or "@google/gemini" in normalized:
+    if (
+        executable
+        in {
+            "gemini",
+            "gemini.exe",
+            "gemini.cmd",
+            "gemini-cli",
+            "agy",
+            "agy.exe",
+            "agy.cmd",
+            "antigravity",
+            "antigravity.cmd",
+            "antigravity-cli",
+        }
+        or "@google/gemini" in normalized
+        or "antigravity-cli" in normalized
+        or "/.gemini/antigravity-cli/" in normalized
+        or re.search(r"(^|[/\s])agy(\.exe|\.cmd)?($|[/\s])", normalized) is not None
+        or re.search(r"(^|[/\s])antigravity($|[/\s])", normalized) is not None
+        or re.search(r"(^|[/\s])antigravity-cli(\.exe|\.cmd)?($|[/\s])", normalized) is not None
+    ):
         return "gemini"
+    provider = CLI_EXECUTABLE_PROVIDERS.get(executable)
+    if provider is not None:
+        return provider
+    for marker, provider in CLI_PACKAGE_PROVIDER_MARKERS:
+        if marker in normalized:
+            return provider
     return None
 
 
@@ -4014,7 +4632,7 @@ $rows = @(
 Get-Process |
   Where-Object {
     $text = (($_.ProcessName + ' ' + $_.Path).ToLower())
-    $text -match '(^|[^a-z])(codex|claude|gemini)([^a-z]|$)'
+    $text -match '(^|[^a-z])(codex|claude|gemini|agy|antigravity-cli|opencode|aider|goose|qwen|qwen-code|cursor-agent|cursor-agent-cli|cline|roo|roo-code|kilo|kilo-code|continue|crush)([^a-z]|$)'
   } |
   ForEach-Object {
     [pscustomobject]@{
@@ -4033,7 +4651,7 @@ if (-not $rows) {
   Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,WorkingSetSize |
     Where-Object {
       $text = (($_.Name + ' ' + $_.CommandLine).ToLower())
-      $text -match '(^|[^a-z])(codex|claude|gemini)([^a-z]|$)'
+      $text -match '(^|[^a-z])(codex|claude|gemini|agy|antigravity-cli|opencode|aider|goose|qwen|qwen-code|cursor-agent|cursor-agent-cli|cline|roo|roo-code|kilo|kilo-code|continue|crush)([^a-z]|$)'
     } |
     ForEach-Object {
       [pscustomobject]@{
@@ -4419,6 +5037,8 @@ def build_snapshot() -> Dict[str, Any]:
         "opencode": opencode_snapshot(),
         "copilot": copilot_snapshot(),
     }
+    for provider, data in local_discovery_snapshots().items():
+        providers.setdefault(provider, data)
     for provider, data in providers.items():
         data["limits"] = merge_limits(
             limits_by_provider.get(provider, empty_limits()),
@@ -4444,6 +5064,10 @@ def build_snapshot() -> Dict[str, Any]:
         snapshot["insights"] = {"status": "ok", **derived}
     except Exception as exc:
         snapshot["insights"] = {"status": "error", "error": str(exc)}
+    try:
+        snapshot["usageLab"] = derive_usage_lab(snapshot)
+    except Exception as exc:
+        snapshot["usageLab"] = {"status": "error", "error": str(exc)}
     tmp_path = LATEST_SNAPSHOT.with_suffix(".json.tmp")
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(snapshot, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -4514,7 +5138,7 @@ def statusline_text(payload: Any) -> str:
 
 def setup_prompt_text() -> str:
     install_command = "curl -fsSL https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.sh | bash"
-    return f"""Set up Agent Cat on this Mac for Codex, Claude Code, and Gemini CLI.
+    return f"""Set up Agent Cat on this Mac for Codex, Claude Code, Gemini / Antigravity CLI, OpenCode, VS Code Copilot, Aider, Goose, Qwen Code, Cursor, Cline, Roo Code, Kilo Code, Continue, Windsurf, Kiro, Zed, and Crush.
 
 First run this local connector install command if `agentcat` is missing:
 
@@ -4528,10 +5152,12 @@ If this runtime supports skills or MCP tools, install or use the Agent Cat Usage
 https://github.com/yong076/agentcat-connectors/tree/main/skills/agentcat-usage
 
 Expected behavior:
-- Use `agentcat snapshot --json` as the source of truth for Codex, Claude Code, and Gemini CLI usage.
+- Use `agentcat snapshot --json` as the source of truth for local AI-agent usage across CLI, IDE, and extension surfaces.
 - Codex should use local state plus the Agent Cat notify hook when configured.
 - Claude Code should use local stats plus Agent Cat hooks when configured.
-- Gemini CLI should use local telemetry configured by Agent Cat.
+- Gemini / Antigravity CLI should use local telemetry when available and report under the `gemini` provider.
+- OpenCode and VS Code Copilot should appear automatically when local usage data exists.
+- Aider, Goose, Qwen Code, Cursor, Cline, Roo Code, Kilo Code, Continue, Windsurf, Kiro, Zed, and Crush should appear automatically when local process or artifact signals exist.
 - Report exact provider quotas only when the snapshot exposes them. Otherwise say unavailable.
 - Never store or report prompt text, message content, transcripts, or conversation bodies.
 """
@@ -4562,7 +5188,8 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         self.write_response_body(body)
 
     def do_GET(self) -> None:
-        if self.path == "/healthz":
+        request_path = urllib.parse.urlparse(self.path).path
+        if request_path == "/healthz":
             body = b"ok\n"
             try:
                 self.send_response(200)
@@ -4573,13 +5200,23 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 return
             self.write_response_body(body)
             return
-        if self.path == "/v1/snapshot":
+        if request_path == "/v1/snapshot":
             try:
                 self.send_json(200, snapshot_for_http())
             except Exception as exc:
                 self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return
-        if self.path == "/v1/usage":
+        if request_path == "/v1/usage-lab":
+            try:
+                snapshot = snapshot_for_http()
+                usage_lab = snapshot.get("usageLab")
+                if not isinstance(usage_lab, dict):
+                    usage_lab = derive_usage_lab(snapshot)
+                self.send_json(200, usage_lab)
+            except Exception as exc:
+                self.send_json(500, {"error": "usage_lab_failed", "message": str(exc)})
+            return
+        if request_path == "/v1/usage":
             try:
                 self.send_json(200, fetch_llm_usage_fresh())
             except Exception as exc:

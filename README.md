@@ -2,7 +2,7 @@
 
 [English](README.md) | [한국어](README.ko.md)
 
-Agent Cat Connectors lets the Agent Cat menu bar app see local CLI-agent activity from Codex, Claude Code, and Gemini CLI.
+Agent Cat Connectors lets the Agent Cat menu bar app see local CLI-agent activity from Codex, Claude Code, and Gemini / Antigravity CLI.
 
 It installs a small local collector, keeps data under `~/.agentcat`, and patches supported CLI settings so future sessions can report activity without sending prompts to a remote server.
 
@@ -38,7 +38,7 @@ Then verify:
 agentcat snapshot
 ```
 
-To copy the prompt you can paste into Codex, Claude Code, or Gemini CLI after installation:
+To copy the prompt you can paste into Codex, Claude Code, or Gemini / Antigravity CLI after installation:
 
 ```bash
 agentcat setup-prompt
@@ -58,7 +58,7 @@ agentcat setup-prompt
 | --- | --- | --- |
 | Codex | local SQLite token totals + Codex OAuth usage API | Shows remaining 5-hour, 7-day, and exposed model/review quota percentages when `~/.codex/auth.json` is present. |
 | Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
-| Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
+| Gemini / Antigravity CLI | local telemetry when available + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini-family CLI sessions. Antigravity CLI processes (`agy`) are grouped under the `gemini` provider for compatibility. |
 
 ## Privacy
 
@@ -96,7 +96,7 @@ Agent Cat reports remaining quota when a provider exposes it through the same lo
 
 - Codex: reads `~/.codex/auth.json`, then calls the ChatGPT Codex usage endpoint for rolling 5-hour/7-day utilization and reset times.
 - Claude Code: reads Claude Code OAuth credentials from Keychain or `~/.claude`, then calls the Claude Code OAuth usage endpoint for 5-hour/7-day/model utilization plus monthly extra-usage credits.
-- Gemini CLI: reads `~/.gemini/oauth_creds.json` and `~/.gemini/settings.json`, then calls Gemini Code Assist `loadCodeAssist` and `retrieveUserQuota` for model request quota fractions and reset times.
+- Gemini / Antigravity CLI: reads Gemini OAuth state from `~/.gemini`, then calls Gemini Code Assist `loadCodeAssist` and `retrieveUserQuota` for model request quota fractions and reset times. Antigravity process activity is reported under `providers.gemini`.
 - Fallback: if live quota lookup fails, Codex/Claude still use the latest local status-line or session `token_count` event when available.
 
 The normalized snapshot includes `providers.<name>.limits.quotas[]`. Each quota entry prefers `remaining` or `remainingPercent`, with `usedPercent` and `resetAt` for progress meters. Some providers expose percentages only, not absolute token or request counts; Agent Cat marks unavailable values as unavailable instead of guessing.

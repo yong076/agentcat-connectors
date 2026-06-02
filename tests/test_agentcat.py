@@ -603,6 +603,60 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(model["all"], 15)
         self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 15)
 
+    def test_claude_snapshot_deduplicates_repeated_request_usage(self) -> None:
+        project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"
+        project_dir.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        base_event = {
+            "timestamp": now.isoformat().replace("+00:00", "Z"),
+            "cwd": str(agentcat.HOME / "repo"),
+            "requestId": "req_1",
+            "uuid": "line_1",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-opus-4-7",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 40,
+                        "ephemeral_5m_input_tokens": 50,
+                    },
+                },
+            },
+        }
+        repeated = dict(base_event)
+        repeated["uuid"] = "line_2"
+        smaller_repeat = json.loads(json.dumps(base_event))
+        smaller_repeat["uuid"] = "line_3"
+        smaller_repeat["message"]["usage"]["cache_read_input_tokens"] = 5
+        distinct = json.loads(json.dumps(base_event))
+        distinct["requestId"] = "req_2"
+        distinct["uuid"] = "line_4"
+        distinct["message"]["id"] = "msg_2"
+        distinct["message"]["usage"] = {
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 3,
+            "cache_creation_input_tokens": 4,
+        }
+        (project_dir / "session.jsonl").write_text(
+            "\n".join(json.dumps(item) for item in [base_event, repeated, smaller_repeat, distinct]) + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 11)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 22)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 33)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 94)
+        self.assertEqual(snapshot["tokens"]["all"], 160)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 160)
+        self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 160)
+        self.assertEqual(snapshot["models"]["claude-opus-4-7"]["all"], 160)
+
     def test_gemini_snapshot_reads_otel_token_metrics(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
         now = dt.datetime.now(dt.timezone.utc)
@@ -914,6 +968,65 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertGreater(snapshot["models"]["copilot-openai-auto"]["inputTokens"], 0)
         self.assertGreater(snapshot["models"]["copilot-openai-auto"]["week"], 0)
 
+    def test_local_discovery_snapshots_report_installed_provider_artifacts(self) -> None:
+        (agentcat.HOME / ".config" / "goose").mkdir(parents=True)
+        (agentcat.HOME / ".qwen").mkdir(parents=True)
+        generic_workspace = (
+            agentcat.HOME
+            / "Library"
+            / "Application Support"
+            / "Code"
+            / "User"
+            / "workspaceStorage"
+            / "plain-workspace"
+        )
+        generic_workspace.mkdir(parents=True)
+        roo_storage = (
+            agentcat.HOME
+            / "Library"
+            / "Application Support"
+            / "Code"
+            / "User"
+            / "globalStorage"
+            / "rooveterinaryinc.roo-cline"
+        )
+        roo_storage.mkdir(parents=True)
+
+        snapshots = agentcat.local_discovery_snapshots()
+
+        self.assertEqual(snapshots["goose"]["status"], "installed_no_activity")
+        self.assertEqual(snapshots["qwen"]["status"], "installed_no_activity")
+        self.assertEqual(snapshots["roo-code"]["status"], "installed_no_activity")
+        self.assertEqual(snapshots["goose"]["sources"]["probe"], "local-artifacts")
+        self.assertEqual(snapshots["qwen"]["events"], 0)
+
+        for provider in ("cline", "kilo-code", "continue"):
+            self.assertNotIn(provider, snapshots)
+
+    def test_classify_additional_cli_agent_processes(self) -> None:
+        cases = {
+            "/opt/homebrew/bin/opencode run": "opencode",
+            "/usr/local/bin/aider --model sonnet": "aider",
+            "goose session": "goose",
+            "node /opt/homebrew/bin/qwen-code": "qwen",
+            "/usr/local/bin/cursor-agent --print": "cursor",
+            "cline task": "cline",
+            "roo-code run": "roo-code",
+            "kilo-code run": "kilo-code",
+            "continue --help": "continue",
+            "crush": "crush",
+        }
+        for command, provider in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(agentcat.classify_process(command), provider)
+
+        self.assertIsNone(
+            agentcat.classify_process("/Applications/Cursor.app/Contents/MacOS/Cursor")
+        )
+        self.assertIsNone(
+            agentcat.classify_process("/Applications/Windsurf.app/Contents/MacOS/Windsurf")
+        )
+
     def test_classify_gemini_node_wrapper_processes(self) -> None:
         self.assertEqual(
             agentcat.classify_process("node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"),
@@ -924,6 +1037,21 @@ class AgentCatConnectorTests(unittest.TestCase):
                 "/opt/homebrew/Cellar/node/25.8.1_1/bin/node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"
             ),
             "gemini",
+        )
+        self.assertEqual(
+            agentcat.classify_process("agy --sandbox=false"),
+            "gemini",
+        )
+        self.assertEqual(
+            agentcat.classify_process("/Users/me/.local/bin/antigravity-cli"),
+            "gemini",
+        )
+        self.assertEqual(
+            agentcat.classify_process("node /Users/me/.gemini/antigravity-cli/index.js"),
+            "gemini",
+        )
+        self.assertIsNone(
+            agentcat.classify_process("/Applications/Antigravity.app/Contents/MacOS/Antigravity")
         )
 
     def test_classify_ignores_codex_desktop_electron_helpers_on_windows(self) -> None:
@@ -1097,7 +1225,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["processes"][0]["command"], "claude pid 301")
         self.assertNotIn("Claude", snapshot["processes"][0]["command"])
 
-    def test_windows_activity_keeps_commandline_wrapper_detection(self) -> None:
+    def test_windows_activity_keeps_antigravity_commandline_detection(self) -> None:
         completed = agentcat.subprocess.CompletedProcess(
             args=["pwsh.exe"],
             returncode=0,
@@ -1106,7 +1234,7 @@ class AgentCatConnectorTests(unittest.TestCase):
                     "ProcessId": 302,
                     "ParentProcessId": 1,
                     "Name": "node.exe",
-                    "CommandLine": "node C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@google\\gemini-cli\\index.js",
+                    "CommandLine": "C:\\Users\\me\\AppData\\Local\\agy\\bin\\agy.exe",
                     "CpuPercent": 0,
                     "WorkingSetSize": 10_000_000,
                 }
@@ -1214,7 +1342,13 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertIn("Codex", prompt)
         self.assertIn("Claude Code", prompt)
-        self.assertIn("Gemini CLI", prompt)
+        self.assertIn("Gemini / Antigravity CLI", prompt)
+        self.assertIn("OpenCode", prompt)
+        self.assertIn("VS Code Copilot", prompt)
+        self.assertIn("Aider", prompt)
+        self.assertIn("Goose", prompt)
+        self.assertIn("Qwen Code", prompt)
+        self.assertIn("Roo Code", prompt)
         self.assertIn("agentcat snapshot --json", prompt)
         self.assertIn("skills/agentcat-usage", prompt)
         self.assertIn("Never store or report prompt text", prompt)
@@ -1293,6 +1427,36 @@ class InsightsIntegrationTests(unittest.TestCase):
         finally:
             self._stop(patches)
 
+    def test_build_snapshot_includes_usage_lab_report(self) -> None:
+        patches = self._stub_providers({
+            "codex": {
+                "status": "ok",
+                "tokens": {"week": 150, "all": 200, "totalTokens": 200},
+                "models": {"gpt-5": {"week": 150, "all": 200, "totalTokens": 200}},
+                "dailyTokens": {"2026-05-24": 150},
+                "hourlyTokens": {"2026-05-24T10": 150},
+                "projects": {
+                    "status": "ok",
+                    "items": [{"path": "/tmp/agent-cat", "name": "agent-cat", "tokens": 150}],
+                },
+            },
+            "claude": {"status": "ok", "tokens": {}, "models": {}},
+            "gemini": {"status": "ok", "tokens": {}, "models": {}},
+            "opencode": {"status": "not_found"},
+            "copilot": {"status": "not_found"},
+        })
+        try:
+            with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
+                snap = agentcat.build_snapshot()
+            self.assertIn("usage.labReport", snap["capabilities"])
+            self.assertEqual(snap["usageLab"]["status"], "ok")
+            self.assertEqual(snap["usageLab"]["summary"]["weekTokens"], 150)
+            self.assertEqual(snap["usageLab"]["providers"][0]["id"], "codex")
+            self.assertEqual(snap["usageLab"]["models"][0]["name"], "gpt-5")
+            self.assertEqual(snap["usageLab"]["projects"][0]["name"], "agent-cat")
+        finally:
+            self._stop(patches)
+
     def test_insights_status_error_caught_not_raised(self) -> None:
         patches = self._stub_providers({
             "codex": {"status": "ok", "tokens": {}, "models": {}},
@@ -1309,6 +1473,66 @@ class InsightsIntegrationTests(unittest.TestCase):
             self.assertIn("kaboom", snap["insights"]["error"])
         finally:
             self._stop(patches)
+
+
+class UsageLabTests(unittest.TestCase):
+    def test_usage_lab_aggregates_provider_models_calendar_and_projects(self) -> None:
+        snapshot = {
+            "generatedAt": "2026-05-25T00:00:00Z",
+            "providers": {
+                "claude": {
+                    "status": "ok",
+                    "source": "~/.claude/projects",
+                    "tokens": {"week": 300, "month": 500, "all": 800, "totalTokens": 800},
+                    "models": {
+                        "claude-sonnet-4-6": {
+                            "inputTokens": 200,
+                            "outputTokens": 100,
+                            "cacheReadInputTokens": 50,
+                            "week": 300,
+                            "month": 500,
+                            "all": 800,
+                            "totalTokens": 800,
+                        }
+                    },
+                    "dailyTokens": {"2026-05-24": 300},
+                    "hourlyTokens": {"2026-05-24T11": 300},
+                    "projects": {
+                        "status": "ok",
+                        "items": [
+                            {
+                                "path": "/Users/me/agent-cat/",
+                                "name": "agent-cat",
+                                "tokens": 300,
+                                "lastActive": "2026-05-24T11:00:00Z",
+                            }
+                        ],
+                    },
+                    "breakdown": {"status": "ok", "chat": 2, "tools": 3, "mcp": 1, "shell": 1},
+                },
+                "codex": {
+                    "status": "ok",
+                    "tokens": {"week": 100, "all": 100, "totalTokens": 100},
+                    "models": {"gpt-5": {"week": 100, "all": 100, "totalTokens": 100}},
+                    "dailyTokens": {"2026-05-24": 100},
+                    "hourlyTokens": {"2026-05-24T12": 100},
+                    "projects": {
+                        "status": "ok",
+                        "items": [{"path": "/Users/me/agent-cat", "name": "agent-cat", "tokens": 100}],
+                    },
+                },
+            },
+        }
+
+        report = agentcat.derive_usage_lab(snapshot)
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["summary"]["weekTokens"], 400)
+        self.assertEqual(report["summary"]["topProvider"], "claude")
+        self.assertEqual(report["daily"][0]["totalTokens"], 400)
+        self.assertEqual(report["projects"][0]["totalTokens"], 400)
+        self.assertEqual(report["projects"][0]["providers"], {"claude": 300, "codex": 100})
+        self.assertEqual(report["breakdown"]["tools"], 3)
 
 
 class InsightsTests(unittest.TestCase):
@@ -1519,6 +1743,31 @@ class PricingTests(unittest.TestCase):
             cache_read_tokens=0, cache_write_tokens=0,
         )
         self.assertEqual(cost["total"], 0.0)
+
+
+class GeminiAuthTypeTests(unittest.TestCase):
+    _CLEAN_ENV = {"GEMINI_API_KEY": "", "GOOGLE_GENAI_USE_GCA": "", "GOOGLE_GENAI_USE_VERTEXAI": ""}
+
+    def test_reads_legacy_flat_selected_auth_type(self) -> None:
+        # Older gemini-cli / Antigravity builds wrote a flat selectedAuthType.
+        with patch.object(agentcat, "read_json", return_value={"selectedAuthType": "oauth-personal"}), \
+                patch.dict(agentcat.os.environ, self._CLEAN_ENV, clear=False), \
+                patch.object(agentcat, "read_gemini_oauth_credentials", return_value=None):
+            self.assertEqual(agentcat.read_gemini_auth_type(), "oauth-personal")
+
+    def test_infers_oauth_personal_from_existing_creds(self) -> None:
+        # No settings.json auth type, but valid OAuth creds exist (Antigravity).
+        with patch.object(agentcat, "read_json", return_value=None), \
+                patch.dict(agentcat.os.environ, self._CLEAN_ENV, clear=False), \
+                patch.object(agentcat, "read_gemini_oauth_credentials", return_value={"refresh_token": "x"}):
+            self.assertEqual(agentcat.read_gemini_auth_type(), "oauth-personal")
+
+    def test_nested_selected_type_still_preferred_over_creds(self) -> None:
+        nested = {"security": {"auth": {"selectedType": "vertex-ai"}}}
+        with patch.object(agentcat, "read_json", return_value=nested), \
+                patch.dict(agentcat.os.environ, self._CLEAN_ENV, clear=False), \
+                patch.object(agentcat, "read_gemini_oauth_credentials", return_value={"refresh_token": "x"}):
+            self.assertEqual(agentcat.read_gemini_auth_type(), "vertex-ai")
 
 
 if __name__ == "__main__":

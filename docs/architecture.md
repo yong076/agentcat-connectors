@@ -6,8 +6,8 @@ Agent Cat Connectors is a local-first bridge between terminal AI tools and the A
 
 - `agentcat` CLI: captures hook events, reads local usage stores, and prints normalized snapshots.
 - `agentcat daemon`: serves the same snapshot over `127.0.0.1:8765`.
-- Activity adapter: scans local Codex, Claude Code, and Gemini CLI processes from the unsandboxed helper.
-- Provider adapters: small readers for Codex, Claude Code, and Gemini CLI local usage files.
+- Activity adapter: scans local Codex, Claude Code, and Gemini / Antigravity CLI processes from the unsandboxed helper.
+- Provider adapters: small readers for Codex, Claude Code, and Gemini-family CLI local usage files.
 - Installer: backs up existing settings and merges Agent Cat-managed entries.
 
 ## Data Flow
@@ -24,7 +24,7 @@ Agent Cat Connectors is a local-first bridge between terminal AI tools and the A
 | --- | --- | --- | --- | --- |
 | Codex | Helper process scan | `~/.codex/state_*.sqlite` | Codex OAuth usage API plus local `token_count` fallback | `notify` when no existing notify is configured |
 | Claude Code | Helper process scan | `~/.claude/stats-cache.json` + hook payloads | Claude Code OAuth usage API plus legacy status-line fallback | hooks |
-| Gemini CLI | Helper process scan | Local telemetry after future runs | Gemini Code Assist quota API for Google-login sessions | telemetry settings |
+| Gemini / Antigravity CLI | Helper process scan | Local telemetry when available | Gemini Code Assist quota API for Google-login sessions | telemetry settings; Antigravity `agy` activity maps to `gemini` |
 
 ## Boundaries
 
