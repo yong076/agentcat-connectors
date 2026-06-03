@@ -49,7 +49,7 @@ CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"const OAUTH_CLIENT_ID = '([^']+)';")
+GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"""OAUTH_CLIENT_ID\s*[:=]\s*["']([^"']+)["']""")
 GEMINI_TELEMETRY_PARSE_BYTES = int(os.environ.get("AGENTCAT_GEMINI_PARSE_BYTES", str(64 * 1024 * 1024)))
 GEMINI_TELEMETRY_STREAM_CHUNK_BYTES = int(os.environ.get("AGENTCAT_GEMINI_STREAM_CHUNK_BYTES", str(4 * 1024 * 1024)))
 GEMINI_USAGE_CACHE_VERSION = 1
@@ -64,7 +64,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.7")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.8")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -112,7 +112,7 @@ _GEMINI_CACHE_LOCK = threading.Lock()
 _GEMINI_CACHE_KEY: Optional[Tuple[int, int]] = None
 _GEMINI_CACHE_VALUE: Optional[Dict[str, Any]] = None
 _GEMINI_CACHE_LOADED_AT = 0.0
-GEMINI_OAUTH_CLIENT_SECRET_RE = re.compile(r"const OAUTH_CLIENT_SECRET = '([^']+)';")
+GEMINI_OAUTH_CLIENT_SECRET_RE = re.compile(r"""OAUTH_CLIENT_SECRET\s*[:=]\s*["']([^"']+)["']""")
 
 TOKEN_KEYS = {
     "inputtokens": "inputTokens",
@@ -1959,18 +1959,50 @@ def gemini_oauth2_source_candidates() -> List[Path]:
     if gemini_bin:
         resolved = Path(gemini_bin).resolve()
         candidates.extend([resolved.parent, resolved.parent.parent, resolved.parent.parent / "libexec"])
+    # Windows global-npm prefix (the daemon often runs under pythonw with a minimal
+    # PATH, so shutil.which("gemini") can return None even when the CLI is installed).
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(Path(appdata) / "npm")
     candidates.extend(
         [
+            HOME / "AppData" / "Roaming" / "npm",
+            HOME / ".local" / "lib",
+            HOME / "node_modules",
             Path("/opt/homebrew/lib"),
             Path("/opt/homebrew/Cellar/gemini-cli"),
             Path("/usr/local/lib"),
             HOME / ".nvm" / "versions",
         ]
     )
-    return [path for path in candidates if path.exists()]
+    # De-dupe while preserving order; keep only existing dirs.
+    seen: set = set()
+    unique: List[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.exists():
+            unique.append(path)
+    return unique
+
+
+def _scan_js_for_oauth_creds(path: Path) -> Optional[Tuple[str, str]]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    client_id = GEMINI_OAUTH_CLIENT_ID_RE.search(text)
+    client_secret = GEMINI_OAUTH_CLIENT_SECRET_RE.search(text)
+    if client_id and client_secret:
+        return client_id.group(1), client_secret.group(1)
+    return None
 
 
 def gemini_cli_oauth_client_credentials() -> Optional[Tuple[str, str]]:
+    # Old layout (gemini-cli < ~0.40): the OAuth constants live in an unbundled
+    # source file shipped inside @google/gemini-cli-core.
     rels = (
         Path("node_modules") / "@google" / "gemini-cli-core" / "dist" / "src" / "code_assist" / "oauth2.js",
         Path("node_modules")
@@ -1986,19 +2018,32 @@ def gemini_cli_oauth_client_credentials() -> Optional[Tuple[str, str]]:
         Path("lib") / "node_modules" / "@google" / "gemini-cli" / "node_modules" / "@google" / "gemini-cli-core" / "dist" / "src" / "code_assist" / "oauth2.js",
         Path("libexec") / "lib" / "node_modules" / "@google" / "gemini-cli" / "node_modules" / "@google" / "gemini-cli-core" / "dist" / "src" / "code_assist" / "oauth2.js",
     )
+    # New layout (gemini-cli >= ~0.40, e.g. 0.42.0): everything is bundled into
+    # hashed esbuild chunks under .../@google/gemini-cli/bundle/*.js. The constants
+    # are emitted as `var OAUTH_CLIENT_ID = "..."` inside one of the chunk-*.js files,
+    # so glob the bundle dir rather than relying on a fixed filename.
+    bundle_rels = (
+        Path("node_modules") / "@google" / "gemini-cli" / "bundle",
+        Path("lib") / "node_modules" / "@google" / "gemini-cli" / "bundle",
+        Path("node_modules") / "@google" / "gemini-cli" / "node_modules" / "@google" / "gemini-cli" / "bundle",
+        Path("@google") / "gemini-cli" / "bundle",
+        Path("bundle"),
+    )
     for root in gemini_oauth2_source_candidates():
         for rel in rels:
             path = root / rel
-            if not path.exists():
+            if path.exists():
+                found = _scan_js_for_oauth_creds(path)
+                if found:
+                    return found
+        for rel in bundle_rels:
+            bundle_dir = root / rel
+            if not bundle_dir.is_dir():
                 continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                continue
-            client_id = GEMINI_OAUTH_CLIENT_ID_RE.search(text)
-            client_secret = GEMINI_OAUTH_CLIENT_SECRET_RE.search(text)
-            if client_id and client_secret:
-                return client_id.group(1), client_secret.group(1)
+            for js in sorted(bundle_dir.glob("*.js")):
+                found = _scan_js_for_oauth_creds(js)
+                if found:
+                    return found
     return None
 
 
