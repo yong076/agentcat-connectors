@@ -3318,6 +3318,133 @@ def kiro_snapshot() -> Dict[str, Any]:
     return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
 
 
+# ---------------------------------------------------------------------------
+# Second wave of local-usage providers grafted from the codeburn adapter branch
+# (qwen, crush) plus a thin cline wrapper over the shared cline-family parser.
+# Same two adaptations as the first wave: empty_provider_usage(...) drops the
+# codeburn-only `provider=` kwarg, and add_usage_metrics(...) drops codeburn's
+# `project=`/`session_id=` rollup kwargs, matching this branch's helper API.
+# ---------------------------------------------------------------------------
+
+
+def qwen_project_dirs() -> List[Path]:
+    base = Path(os.environ.get("QWEN_DATA_DIR") or str(HOME / ".qwen" / "projects")).expanduser()
+    try:
+        return [path for path in base.iterdir() if path.is_dir()]
+    except OSError:
+        return []
+
+
+def qwen_snapshot() -> Dict[str, Any]:
+    source = Path(os.environ.get("QWEN_DATA_DIR") or str(HOME / ".qwen" / "projects")).expanduser()
+    result = empty_provider_usage(source=str(source))
+    files: List[Path] = []
+    for project_dir in qwen_project_dirs():
+        chats = project_dir / "chats"
+        try:
+            files.extend(path for path in chats.iterdir() if path.is_file() and path.suffix == ".jsonl")
+        except OSError:
+            continue
+    files = recent_candidate_files(files)
+    events = 0
+    for path in files:
+        file_when = safe_file_mtime(path)
+        for entry in iter_jsonl_file(path):
+            if entry.get("type") != "assistant":
+                continue
+            usage = entry.get("usageMetadata")
+            if not isinstance(usage, dict):
+                continue
+            metrics = {
+                "inputTokens": nonnegative_int(usage.get("promptTokenCount")) or 0,
+                "outputTokens": nonnegative_int(usage.get("candidatesTokenCount")) or 0,
+                "reasoningTokens": nonnegative_int(usage.get("thoughtsTokenCount")) or 0,
+                "cacheReadInputTokens": nonnegative_int(usage.get("cachedContentTokenCount")) or 0,
+            }
+            if add_usage_metrics(
+                result,
+                entry.get("model") or "qwen-auto",
+                metrics,
+                parse_timestamp(entry.get("timestamp")) or file_when,
+            ):
+                events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
+def crush_registry_path() -> Path:
+    explicit = os.environ.get("CRUSH_GLOBAL_DATA")
+    if explicit:
+        return Path(explicit).expanduser() / "projects.json"
+    if IS_WINDOWS:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data).expanduser() if local_app_data else HOME / "AppData" / "Local"
+        return base / "crush" / "projects.json"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg).expanduser() if xdg else HOME / ".local" / "share"
+    return base / "crush" / "projects.json"
+
+
+def crush_project_entries() -> List[Dict[str, str]]:
+    raw = read_json(crush_registry_path())
+    items: Iterable[Any]
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict) and not raw.get("_agentcat_error"):
+        items = raw.values()
+    else:
+        return []
+    out: List[Dict[str, str]] = []
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("path"), str) and isinstance(item.get("data_dir"), str):
+            out.append({"path": item["path"], "data_dir": item["data_dir"]})
+    return out
+
+
+def crush_snapshot() -> Dict[str, Any]:
+    registry = crush_registry_path()
+    result = empty_provider_usage(source=str(registry))
+    entries = crush_project_entries()
+    events = 0
+    saw_sources = False
+    for entry in entries[:LOCAL_PROVIDER_MAX_FILES]:
+        db_path = (Path(entry["path"]).expanduser() / entry["data_dir"] / "crush.db").resolve()
+        if not db_path.is_file():
+            continue
+        saw_sources = True
+        try:
+            with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+                rows = conn.execute(
+                    """
+                    select s.id, s.prompt_tokens, s.completion_tokens, s.created_at, s.updated_at,
+                           (select m.model from messages m
+                            where m.session_id = s.id and m.model is not null and m.model <> ''
+                            group by m.model order by count(*) desc limit 1) as model
+                    from sessions s
+                    where s.parent_session_id is null
+                      and (coalesce(s.prompt_tokens, 0) > 0 or coalesce(s.completion_tokens, 0) > 0)
+                    order by coalesce(s.updated_at, s.created_at) desc
+                    limit ?
+                    """,
+                    (LOCAL_PROVIDER_MAX_FILES,),
+                ).fetchall()
+                for session_id, input_tokens, output_tokens, created_at, updated_at, model in rows:
+                    when = parse_timestamp(updated_at) or parse_timestamp(created_at)
+                    if add_usage_metrics(
+                        result,
+                        normalized_model_name(model) or "unknown",
+                        {"inputTokens": nonnegative_int(input_tokens) or 0, "outputTokens": nonnegative_int(output_tokens) or 0},
+                        when,
+                    ):
+                        events += 1
+        except Exception as exc:
+            result.setdefault("warnings", []).append(f"{db_path.name}: {exc}")
+    return finish_local_usage_snapshot(result, events, sources_seen=saw_sources)
+
+
+def cline_snapshot() -> Dict[str, Any]:
+    return cline_family_snapshot("cline", "saoudrizwan.claude-dev", "cline-auto")
+
+
 def codex_snapshot() -> Dict[str, Any]:
     paths = sorted((HOME / ".codex").glob("state_*.sqlite"))
     result: Dict[str, Any] = {
@@ -5330,6 +5457,9 @@ def build_snapshot() -> Dict[str, Any]:
         "roo-code": roo_code_snapshot(),
         "kilo-code": kilo_code_snapshot(),
         "goose": goose_snapshot(),
+        "qwen": qwen_snapshot(),
+        "crush": crush_snapshot(),
+        "cline": cline_snapshot(),
     }
     for provider, data in providers.items():
         data["limits"] = merge_limits(

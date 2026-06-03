@@ -1261,6 +1261,123 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn(snapshot["status"], ("not_found", "no_token_events_yet"))
         self.assertEqual(snapshot["tokens"]["all"], 0)
 
+    def test_qwen_snapshot_reads_jsonl_usage_metadata(self) -> None:
+        # qwen reads ~/.qwen/projects/*/chats/*.jsonl assistant usageMetadata.
+        # Clear any ambient QWEN_DATA_DIR so the fixture resolves under HOME.
+        with patch.dict(agentcat.os.environ, {}, clear=False):
+            agentcat.os.environ.pop("QWEN_DATA_DIR", None)
+            chats_dir = agentcat.HOME / ".qwen" / "projects" / "proj-qwen-1" / "chats"
+            chats_dir.mkdir(parents=True)
+            now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            lines = [
+                # Assistant turn with explicit usageMetadata -> counted.
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "model": "qwen-coder-plus",
+                        "timestamp": now,
+                        "sessionId": "sess-1",
+                        "usageMetadata": {
+                            "promptTokenCount": 200,
+                            "candidatesTokenCount": 50,
+                            "thoughtsTokenCount": 10,
+                            "cachedContentTokenCount": 30,
+                        },
+                    }
+                ),
+                # User turn must be ignored.
+                json.dumps({"type": "user", "timestamp": now, "text": "hello"}),
+                # Assistant turn without usageMetadata must not fabricate tokens.
+                json.dumps({"type": "assistant", "model": "qwen-coder-plus", "timestamp": now}),
+            ]
+            (chats_dir / "chat-1.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            snapshot = agentcat.qwen_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 290)
+        self.assertEqual(snapshot["tokens"]["week"], 290)
+        model = snapshot["models"]["qwen-coder-plus"]
+        self.assertEqual(model["inputTokens"], 200)
+        self.assertEqual(model["outputTokens"], 50)
+        self.assertEqual(model["reasoningTokens"], 10)
+        self.assertEqual(model["cacheReadInputTokens"], 30)
+
+    def test_crush_snapshot_reads_registry_and_session_store(self) -> None:
+        # crush reads a global projects.json registry that points at per-project
+        # crush.db sqlite stores. Pin the registry under HOME via CRUSH_GLOBAL_DATA.
+        global_data = agentcat.HOME / ".local" / "share" / "crush"
+        global_data.mkdir(parents=True)
+        project_dir = agentcat.HOME / "work" / "crush-proj"
+        data_dir = project_dir / ".crush"
+        data_dir.mkdir(parents=True)
+        registry = global_data / "projects.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "p1": {"path": str(project_dir), "data_dir": ".crush"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        db_path = data_dir / "crush.db"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                create table sessions (
+                  id text primary key,
+                  parent_session_id text,
+                  prompt_tokens integer,
+                  completion_tokens integer,
+                  created_at text,
+                  updated_at text
+                )
+                """
+            )
+            conn.execute(
+                "create table messages (id text primary key, session_id text, model text)"
+            )
+            conn.execute(
+                "insert into sessions values (?, ?, ?, ?, ?, ?)",
+                ("s1", None, 150, 60, now, now),
+            )
+            # A child session must be ignored (parent_session_id not null).
+            conn.execute(
+                "insert into sessions values (?, ?, ?, ?, ?, ?)",
+                ("s2", "s1", 999, 999, now, now),
+            )
+            # A zero-token session must be ignored by the WHERE filter.
+            conn.execute(
+                "insert into sessions values (?, ?, ?, ?, ?, ?)",
+                ("s3", None, 0, 0, now, now),
+            )
+            conn.execute(
+                "insert into messages values (?, ?, ?)",
+                ("m1", "s1", "crush-claude-sonnet-4-6"),
+            )
+            conn.commit()
+
+        with patch.dict(agentcat.os.environ, {"CRUSH_GLOBAL_DATA": str(global_data)}):
+            snapshot = agentcat.crush_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 210)
+        self.assertEqual(snapshot["tokens"]["week"], 210)
+        model = snapshot["models"]["crush-claude-sonnet-4-6"]
+        self.assertEqual(model["inputTokens"], 150)
+        self.assertEqual(model["outputTokens"], 60)
+
+    def test_cline_snapshot_returns_expected_shape_when_idle(self) -> None:
+        # cline reuses the cline-family parser (saoudrizwan.claude-dev). With no
+        # globalStorage tasks on disk it must report not_found with zero tokens,
+        # never fabricated presence tokens.
+        snapshot = agentcat.cline_snapshot()
+        self.assertIn(snapshot["status"], ("not_found", "no_token_events_yet"))
+        self.assertEqual(snapshot["tokens"]["all"], 0)
+
     def test_classify_gemini_node_wrapper_processes(self) -> None:
         self.assertEqual(
             agentcat.classify_process("node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"),
