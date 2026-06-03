@@ -33,6 +33,7 @@ CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
+PROVIDER_CONFIG_FILE = AGENTCAT_HOME / "providers.json"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 GEMINI_USAGE_CACHE = AGENTCAT_HOME / "gemini-usage-cache.json"
 ANTIGRAVITY_CLI_DIR = HOME / ".gemini" / "antigravity-cli"
@@ -107,6 +108,7 @@ CONNECTOR_CAPABILITIES = (
     "hooks.claudeHooks",
     "hooks.geminiTelemetry",
     "activity.windowsProcessScan",
+    "config.providers",
 )
 _GEMINI_CACHE_LOCK = threading.Lock()
 _GEMINI_CACHE_KEY: Optional[Tuple[int, int]] = None
@@ -1351,19 +1353,105 @@ def merge_limits(configured: Dict[str, Any], detected: Dict[str, Any]) -> Dict[s
     return merged
 
 
+def provider_config() -> Dict[str, Dict[str, Any]]:
+    """Read AGENTCAT_HOME/providers.json -> per-provider config dict.
+
+    Returns a mapping of {provider_id: {"enabled": bool, "limits": {...}}}.
+    Tolerates a missing file, a read error sentinel, and any non-dict
+    payload by returning an empty dict (no config => all providers enabled,
+    no extra manual limits). Accepts either {"providers": {...}} or a bare
+    {<id>: {...}} top-level object, mirroring configured_limits()/limits.json.
+    """
+    raw = read_json(PROVIDER_CONFIG_FILE)
+    if not isinstance(raw, dict):
+        return {}
+    if raw.get("_agentcat_error"):
+        return {}
+    providers = raw.get("providers") if isinstance(raw.get("providers"), dict) else raw
+    if not isinstance(providers, dict):
+        return {}
+    return {pid: cfg for pid, cfg in providers.items() if isinstance(cfg, dict)}
+
+
+def provider_is_enabled(cfg: Dict[str, Dict[str, Any]], provider_id: str) -> bool:
+    """Default-enabled. Only False when the provider explicitly sets enabled == False."""
+    entry = cfg.get(provider_id)
+    if not isinstance(entry, dict):
+        return True
+    return entry.get("enabled") is not False
+
+
+def disabled_provider_snapshot(provider_id: str) -> Dict[str, Any]:
+    """Snapshot for a user-disabled provider: status 'disabled', zero tokens.
+
+    Lets the app distinguish 'user turned it off' from 'not_found'. No
+    fabricated tokens — reuses empty_provider_usage's zeroed shape.
+    """
+    return empty_provider_usage(status="disabled", source=None)
+
+
+def read_provider_config_raw() -> Dict[str, Any]:
+    """Current providers.json as the app should see it: {"providers": {...}}."""
+    raw = read_json(PROVIDER_CONFIG_FILE)
+    if isinstance(raw, dict) and not raw.get("_agentcat_error"):
+        inner = raw.get("providers") if isinstance(raw.get("providers"), dict) else raw
+        if isinstance(inner, dict):
+            return {"providers": {k: v for k, v in inner.items() if isinstance(v, dict)}}
+    return {"providers": {}}
+
+
+def write_provider_config(data: Any) -> Dict[str, Any]:
+    """Validate + atomically persist providers.json. Accepts {"providers":{...}}
+    or a bare {<id>:{...}} map; keeps only enabled/limits/source per entry."""
+    if not isinstance(data, dict):
+        raise ValueError("config must be a JSON object")
+    providers = data.get("providers") if isinstance(data.get("providers"), dict) else data
+    if not isinstance(providers, dict):
+        raise ValueError("providers must be an object")
+    clean: Dict[str, Any] = {}
+    for pid, cfg in providers.items():
+        if not isinstance(cfg, dict):
+            continue
+        entry: Dict[str, Any] = {}
+        if "enabled" in cfg:
+            entry["enabled"] = bool(cfg["enabled"])
+        if isinstance(cfg.get("limits"), dict):
+            entry["limits"] = cfg["limits"]
+        if isinstance(cfg.get("source"), str) and cfg["source"]:
+            entry["source"] = cfg["source"]
+        clean[str(pid)] = entry
+    out = {"providers": clean}
+    PROVIDER_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PROVIDER_CONFIG_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(PROVIDER_CONFIG_FILE)
+    return out
+
+
 def configured_limits() -> Dict[str, Dict[str, Any]]:
     base = {provider: empty_limits() for provider in ("codex", "claude", "gemini")}
     raw = read_json(LIMITS_FILE)
     if raw is None:
-        return base
-    if isinstance(raw, dict) and raw.get("_agentcat_error"):
-        return {provider: empty_limits("error", str(raw["_agentcat_error"])) for provider in base}
-    if not isinstance(raw, dict):
-        return {provider: empty_limits("error", "limits.json must be a JSON object") for provider in base}
+        pass
+    elif isinstance(raw, dict) and raw.get("_agentcat_error"):
+        base = {provider: empty_limits("error", str(raw["_agentcat_error"])) for provider in base}
+    elif not isinstance(raw, dict):
+        base = {provider: empty_limits("error", "limits.json must be a JSON object") for provider in base}
+    else:
+        providers = raw.get("providers") if isinstance(raw.get("providers"), dict) else raw
+        for provider in base:
+            base[provider] = normalize_limits(providers.get(provider))
 
-    providers = raw.get("providers") if isinstance(raw.get("providers"), dict) else raw
-    for provider in base:
-        base[provider] = normalize_limits(providers.get(provider))
+    # Unified providers.json: merge in manual 'limits' for ANY provider id.
+    # providers.json wins over limits.json for a given id (it is the newer,
+    # unified config). limits.json's codex/claude/gemini behaviour above is
+    # preserved for backward-compat when providers.json sets nothing.
+    for provider_id, entry in provider_config().items():
+        if not isinstance(entry, dict):
+            continue
+        limits = entry.get("limits")
+        if isinstance(limits, dict):
+            base[provider_id] = normalize_limits(limits)
     return base
 
 
@@ -5666,6 +5754,14 @@ def build_snapshot() -> Dict[str, Any]:
         "llm": llm_snapshot(),
         "gptme": gptme_snapshot(),
     }
+    # Unified providers.json: any provider explicitly disabled by the user is
+    # replaced with a zero-token 'disabled' snapshot so the app can tell
+    # 'turned off' from 'not_found'. Post-process replacement keeps the 17
+    # call sites above untouched.
+    pcfg = provider_config()
+    for provider in list(providers.keys()):
+        if not provider_is_enabled(pcfg, provider):
+            providers[provider] = disabled_provider_snapshot(provider)
     for provider, data in providers.items():
         data["limits"] = merge_limits(
             limits_by_provider.get(provider, empty_limits()),
@@ -5832,9 +5928,32 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(500, {"error": "usage_failed", "message": str(exc)})
             return
+        if self.path == "/v1/config":
+            try:
+                self.send_json(200, read_provider_config_raw())
+            except Exception as exc:
+                self.send_json(500, {"error": "config_read_failed", "message": str(exc)})
+            return
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
+        if self.path == "/v1/config":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except json.JSONDecodeError:
+                self.send_json(400, {"error": "invalid_json"})
+                return
+            try:
+                written = write_provider_config(payload)
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_config", "message": str(exc)})
+                return
+            # Apply immediately on the next snapshot without blocking this response.
+            threading.Thread(target=build_snapshot, daemon=True).start()
+            self.send_json(200, written)
+            return
         if self.path != "/v1/events":
             self.send_json(404, {"error": "not_found"})
             return

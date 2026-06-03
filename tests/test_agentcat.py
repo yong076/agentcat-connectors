@@ -29,6 +29,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             "EVENTS_DB": agentcat.EVENTS_DB,
             "LATEST_SNAPSHOT": agentcat.LATEST_SNAPSHOT,
             "LIMITS_FILE": agentcat.LIMITS_FILE,
+            "PROVIDER_CONFIG_FILE": agentcat.PROVIDER_CONFIG_FILE,
             "GEMINI_TELEMETRY": agentcat.GEMINI_TELEMETRY,
             "GEMINI_USAGE_CACHE": agentcat.GEMINI_USAGE_CACHE,
             "ANTIGRAVITY_CLI_DIR": agentcat.ANTIGRAVITY_CLI_DIR,
@@ -51,6 +52,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat.EVENTS_DB = agentcat_home / "events.sqlite"
         agentcat.LATEST_SNAPSHOT = agentcat_home / "latest-snapshot.json"
         agentcat.LIMITS_FILE = agentcat_home / "limits.json"
+        agentcat.PROVIDER_CONFIG_FILE = agentcat_home / "providers.json"
         agentcat.GEMINI_TELEMETRY = agentcat_home / "gemini" / "telemetry.log"
         agentcat.GEMINI_USAGE_CACHE = agentcat_home / "gemini-usage-cache.json"
         agentcat.ANTIGRAVITY_CLI_DIR = home / ".gemini" / "antigravity-cli"
@@ -112,6 +114,104 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(merged["weeklyUsedPercent"], 13.0)
         self.assertEqual(merged["shortUsedPercent"], 8.0)
         self.assertEqual(merged["quotas"][0]["remainingPercent"], 87.0)
+
+    # --- Unified providers.json config -----------------------------------
+
+    def _write_provider_config(self, payload) -> None:
+        agentcat.PROVIDER_CONFIG_FILE.write_text(
+            json.dumps(payload) if not isinstance(payload, str) else payload,
+            encoding="utf-8",
+        )
+
+    def test_provider_config_capability_is_advertised(self) -> None:
+        self.assertIn("config.providers", agentcat.CONNECTOR_CAPABILITIES)
+        snapshot = agentcat.build_snapshot()
+        self.assertIn("config.providers", snapshot["capabilities"])
+
+    def test_disabled_provider_yields_disabled_status_with_zero_tokens(self) -> None:
+        self._write_provider_config({"providers": {"cursor": {"enabled": False}}})
+
+        snapshot = agentcat.build_snapshot()
+        cursor = snapshot["providers"]["cursor"]
+
+        self.assertEqual(cursor["status"], "disabled")
+        self.assertEqual(cursor["tokens"], {"today": 0, "week": 0, "month": 0, "all": 0})
+        self.assertEqual(cursor["models"], {})
+        self.assertEqual(cursor["projects"]["items"], [])
+        # Disabled providers still carry a limits block for shape consistency.
+        self.assertIn("limits", cursor)
+        # Other providers remain normal (codex unaffected by cursor's flag).
+        self.assertNotEqual(snapshot["providers"]["codex"]["status"], "disabled")
+
+    def test_provider_is_enabled_defaults_true_and_only_false_when_explicit(self) -> None:
+        cfg = {
+            "off": {"enabled": False},
+            "on": {"enabled": True},
+            "limited": {"limits": {"week": 100}},
+        }
+        self.assertFalse(agentcat.provider_is_enabled(cfg, "off"))
+        self.assertTrue(agentcat.provider_is_enabled(cfg, "on"))
+        self.assertTrue(agentcat.provider_is_enabled(cfg, "limited"))
+        self.assertTrue(agentcat.provider_is_enabled(cfg, "absent"))
+
+    def test_manual_limit_for_non_codex_provider_flows_through_snapshot(self) -> None:
+        self._write_provider_config(
+            {"providers": {"goose": {"limits": {"week": 50000, "session": 128000}}}}
+        )
+
+        limits_map = agentcat.configured_limits()
+        self.assertEqual(limits_map["goose"]["weeklyTokens"], 50000)
+        self.assertEqual(limits_map["goose"]["sessionTokens"], 128000)
+
+        snapshot = agentcat.build_snapshot()
+        goose_limits = snapshot["providers"]["goose"]["limits"]
+        self.assertEqual(goose_limits["weeklyTokens"], 50000)
+        self.assertEqual(goose_limits["sessionTokens"], 128000)
+
+    def test_providers_json_overrides_limits_json_for_same_id(self) -> None:
+        agentcat.LIMITS_FILE.write_text(
+            json.dumps({"providers": {"codex": {"week": 1111}}}), encoding="utf-8"
+        )
+        self._write_provider_config({"providers": {"codex": {"limits": {"week": 9999}}}})
+
+        limits_map = agentcat.configured_limits()
+        self.assertEqual(limits_map["codex"]["weeklyTokens"], 9999)
+
+    def test_missing_and_garbage_providers_json_are_tolerated(self) -> None:
+        # No file at all.
+        self.assertEqual(agentcat.provider_config(), {})
+        self.assertEqual(sorted(agentcat.configured_limits().keys()), ["claude", "codex", "gemini"])
+        snap = agentcat.build_snapshot()
+        self.assertNotEqual(snap["providers"]["cursor"]["status"], "disabled")
+
+        # Garbage (invalid JSON) -> read_json error sentinel -> empty config.
+        self._write_provider_config("{ this is not json")
+        self.assertEqual(agentcat.provider_config(), {})
+        snap = agentcat.build_snapshot()
+        self.assertNotEqual(snap["providers"]["cursor"]["status"], "disabled")
+
+        # Non-dict top-level payload is tolerated too.
+        self._write_provider_config([1, 2, 3])
+        self.assertEqual(agentcat.provider_config(), {})
+
+    def test_limits_json_still_works_for_mature_providers(self) -> None:
+        agentcat.LIMITS_FILE.write_text(
+            json.dumps(
+                {
+                    "providers": {
+                        "codex": {"week": 7000},
+                        "claude": {"month": 8000},
+                        "gemini": {"session": 9000},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        limits_map = agentcat.configured_limits()
+        self.assertEqual(limits_map["codex"]["weeklyTokens"], 7000)
+        self.assertEqual(limits_map["claude"]["monthlyTokens"], 8000)
+        self.assertEqual(limits_map["gemini"]["sessionTokens"], 9000)
 
     def test_codex_usage_api_payload_builds_remaining_quota_entries(self) -> None:
         limits = agentcat.codex_limits_from_usage_response(
