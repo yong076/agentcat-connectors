@@ -3014,6 +3014,310 @@ def copilot_snapshot() -> Dict[str, Any]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Local-usage providers grafted from the codeburn adapter branch.
+#
+# These five providers (cursor, kiro, roo-code, kilo-code, goose) read real,
+# durable on-disk agent artifacts — never IDE/process presence. Each parser is
+# verbatim from `feature/codeburn-provider-adapters` except where it had to be
+# adapted to this branch's shared API:
+#   * empty_provider_usage(...) drops the codeburn-only `provider=` kwarg —
+#     this branch's snapshot shape (see opencode_snapshot/copilot_snapshot)
+#     carries no per-dict `provider` key, so the dict key in build_snapshot is
+#     the single source of provider identity.
+#   * add_usage_metrics(...) drops codeburn's `project=`/`session_id=` kwargs;
+#     this branch's add_usage_metrics aggregates tokens/models/daily/hourly and
+#     does not record per-call rollups, matching the mature providers.
+# ---------------------------------------------------------------------------
+
+
+def char_token_estimate_for_length(length: Any) -> int:
+    amount = nonnegative_int(length) or 0
+    if amount <= 0:
+        return 0
+    return max(1, int((amount + 3) / 4))
+
+
+def safe_file_mtime(path: Path) -> Optional[dt.datetime]:
+    try:
+        return dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+    except OSError:
+        return None
+
+
+def recent_candidate_files(paths: Iterable[Path]) -> List[Path]:
+    return recent_files([path for path in paths if path.is_file()])
+
+
+def finish_local_usage_snapshot(result: Dict[str, Any], events: int, *, sources_seen: bool) -> Dict[str, Any]:
+    result["events"] = events
+    if events > 0:
+        result["status"] = "ok"
+    elif sources_seen:
+        result["status"] = "no_token_events_yet"
+    return result
+
+
+def vscode_global_storage_dirs(app_names: Iterable[str], extension_id: str) -> List[Path]:
+    dirs: List[Path] = []
+    for app_name in app_names:
+        if IS_WINDOWS:
+            dirs.append(HOME / "AppData" / "Roaming" / app_name / "User" / "globalStorage" / extension_id)
+        elif sys.platform == "darwin":
+            dirs.append(HOME / "Library" / "Application Support" / app_name / "User" / "globalStorage" / extension_id)
+        else:
+            dirs.append(HOME / ".config" / app_name / "User" / "globalStorage" / extension_id)
+    return dirs
+
+
+def extract_model_from_conversation_history(task_dir: Path, fallback_model: str) -> str:
+    raw = read_json(task_dir / "api_conversation_history.json")
+    if not isinstance(raw, list):
+        return fallback_model
+    model_re = re.compile(r"<model>([^<]+)</model>")
+    for item in raw:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                continue
+            match = model_re.search(block["text"])
+            if match:
+                model = match.group(1)
+                return model.split("/")[-1] if "/" in model else model
+    return fallback_model
+
+
+def parse_cline_task(task_dir: Path, provider: str, fallback_model: str, result: Dict[str, Any]) -> int:
+    raw = read_json(task_dir / "ui_messages.json")
+    if not isinstance(raw, list):
+        return 0
+    model = extract_model_from_conversation_history(task_dir, fallback_model)
+    events = 0
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "say" or item.get("say") != "api_req_started":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        metrics = {
+            "inputTokens": nonnegative_int(parsed.get("tokensIn")) or 0,
+            "outputTokens": nonnegative_int(parsed.get("tokensOut")) or 0,
+            "cacheReadInputTokens": nonnegative_int(parsed.get("cacheReads")) or 0,
+            "cacheCreationInputTokens": nonnegative_int(parsed.get("cacheWrites")) or 0,
+        }
+        when = parse_timestamp(item.get("ts")) or safe_file_mtime(task_dir / "ui_messages.json")
+        if add_usage_metrics(result, model, metrics, when):
+            events += 1
+    return events
+
+
+def cline_family_snapshot(
+    provider: str,
+    extension_id: str,
+    fallback_model: str,
+    app_names: Iterable[str] = ("Code", "Code - Insiders"),
+    extra_base_dirs: Iterable[Path] = (),
+) -> Dict[str, Any]:
+    base_dirs = [*vscode_global_storage_dirs(app_names, extension_id), *extra_base_dirs]
+    result = empty_provider_usage(source=",".join(str(path) for path in base_dirs))
+    events = 0
+    sources_seen = False
+    for base_dir in base_dirs:
+        tasks_dir = base_dir / "tasks"
+        try:
+            task_dirs = [path for path in tasks_dir.iterdir() if path.is_dir()]
+        except OSError:
+            continue
+        for task_dir in recent_files(task_dirs):
+            if not (task_dir / "ui_messages.json").is_file():
+                continue
+            sources_seen = True
+            events += parse_cline_task(task_dir, provider, fallback_model, result)
+    return finish_local_usage_snapshot(result, events, sources_seen=sources_seen)
+
+
+def roo_code_snapshot() -> Dict[str, Any]:
+    return cline_family_snapshot("roo-code", "rooveterinaryinc.roo-cline", "cline-auto")
+
+
+def kilo_code_snapshot() -> Dict[str, Any]:
+    return cline_family_snapshot("kilo-code", "kilocode.kilo-code", "cline-auto")
+
+
+def goose_db_path() -> Path:
+    root = os.environ.get("GOOSE_PATH_ROOT")
+    if root:
+        return Path(root).expanduser() / "data" / "sessions" / "sessions.db"
+    if IS_WINDOWS:
+        return HOME / "AppData" / "Roaming" / "Block" / "goose" / "sessions" / "sessions.db"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg).expanduser() if xdg else HOME / ".local" / "share"
+    return base / "goose" / "sessions" / "sessions.db"
+
+
+def goose_snapshot() -> Dict[str, Any]:
+    db_path = goose_db_path()
+    result = empty_provider_usage(source=str(db_path))
+    if not db_path.is_file():
+        return result
+    events = 0
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+            rows = conn.execute(
+                """
+                select id, created_at, updated_at, accumulated_input_tokens,
+                       accumulated_output_tokens, model_config_json
+                from sessions
+                where coalesce(accumulated_input_tokens, 0) > 0
+                   or coalesce(accumulated_output_tokens, 0) > 0
+                order by updated_at desc
+                limit ?
+                """,
+                (LOCAL_PROVIDER_MAX_FILES,),
+            ).fetchall()
+            for session_id, created_at, updated_at, input_tokens, output_tokens, model_config_raw in rows:
+                model = "unknown"
+                if model_config_raw:
+                    try:
+                        model_config = json.loads(model_config_raw.decode("utf-8", errors="replace") if isinstance(model_config_raw, bytes) else str(model_config_raw))
+                        if isinstance(model_config, dict):
+                            model = normalized_model_name(model_config.get("model_name")) or model
+                    except Exception:
+                        pass
+                metrics = {
+                    "inputTokens": nonnegative_int(input_tokens) or 0,
+                    "outputTokens": nonnegative_int(output_tokens) or 0,
+                }
+                if add_usage_metrics(result, model, metrics, parse_timestamp(updated_at) or parse_timestamp(created_at)):
+                    events += 1
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+    return finish_local_usage_snapshot(result, events, sources_seen=True)
+
+
+def cursor_db_path() -> Path:
+    if IS_WINDOWS:
+        return HOME / "AppData" / "Roaming" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    if sys.platform == "darwin":
+        return HOME / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    return HOME / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+
+
+def cursor_snapshot() -> Dict[str, Any]:
+    db_path = cursor_db_path()
+    result = empty_provider_usage(source=str(db_path))
+    if not db_path.is_file():
+        return result
+    events = 0
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+            rows = conn.execute(
+                """
+                select
+                  json_extract(value, '$.tokenCount.inputTokens') as input_tokens,
+                  json_extract(value, '$.tokenCount.outputTokens') as output_tokens,
+                  json_extract(value, '$.modelInfo.modelName') as model,
+                  json_extract(value, '$.createdAt') as created_at,
+                  length(json_extract(value, '$.text')) as text_length,
+                  json_extract(value, '$.type') as bubble_type
+                from cursorDiskKV
+                where key like 'bubbleId:%'
+                  and json_extract(value, '$.createdAt') is not null
+                order by rowid desc
+                limit ?
+                """,
+                (LOCAL_PROVIDER_MAX_FILES,),
+            ).fetchall()
+            for input_tokens, output_tokens, model, created_at, text_length, bubble_type in rows:
+                input_count = nonnegative_int(input_tokens) or 0
+                output_count = nonnegative_int(output_tokens) or 0
+                if input_count == 0 and output_count == 0:
+                    estimate = char_token_estimate_for_length(text_length)
+                    if bubble_type == 1:
+                        input_count = estimate
+                    else:
+                        output_count = estimate
+                if add_usage_metrics(
+                    result,
+                    normalized_model_name(model) or "cursor-auto",
+                    {"inputTokens": input_count, "outputTokens": output_count},
+                    parse_timestamp(created_at),
+                ):
+                    events += 1
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+    if events >= LOCAL_PROVIDER_MAX_FILES:
+        result["truncated"] = True
+    return finish_local_usage_snapshot(result, events, sources_seen=True)
+
+
+def kiro_agent_dir() -> Path:
+    if IS_WINDOWS:
+        return HOME / "AppData" / "Roaming" / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
+    if sys.platform == "darwin":
+        return HOME / "Library" / "Application Support" / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
+    return HOME / ".config" / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
+
+
+def kiro_snapshot() -> Dict[str, Any]:
+    agent_dir = kiro_agent_dir()
+    result = empty_provider_usage(source=str(agent_dir))
+    files: List[Path] = []
+    try:
+        workspace_dirs = [path for path in agent_dir.iterdir() if path.is_dir() and len(path.name) == 32]
+    except OSError:
+        workspace_dirs = []
+    for workspace_dir in workspace_dirs:
+        try:
+            files.extend(path for path in workspace_dir.iterdir() if path.is_file() and path.suffix == ".chat")
+        except OSError:
+            continue
+    files = recent_candidate_files(files)
+    events = 0
+    for path in files:
+        raw = read_json(path)
+        if not isinstance(raw, dict):
+            continue
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        chat = raw.get("chat") if isinstance(raw.get("chat"), list) else []
+        model = normalized_model_name(metadata.get("modelId")) or "kiro-auto"
+        model = re.sub(r"(\d+)\.(\d+)", r"\1-\2", model)
+        user_text = ""
+        output_chars = 0
+        for message in chat:
+            if not isinstance(message, dict):
+                continue
+            content = str(message.get("content") or "")
+            if message.get("role") == "human" and not content.startswith("<identity>"):
+                user_text = content[:500]
+            elif message.get("role") == "bot":
+                output_chars += len(content)
+        metrics = {
+            "inputTokens": char_token_estimate(user_text),
+            "outputTokens": char_token_estimate_for_length(output_chars),
+        }
+        when = parse_timestamp(metadata.get("startTime")) or safe_file_mtime(path)
+        if add_usage_metrics(result, model, metrics, when):
+            events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
 def codex_snapshot() -> Dict[str, Any]:
     paths = sorted((HOME / ".codex").glob("state_*.sqlite"))
     result: Dict[str, Any] = {
@@ -5021,6 +5325,11 @@ def build_snapshot() -> Dict[str, Any]:
         "gemini": gemini_snapshot(),
         "opencode": opencode_snapshot(),
         "copilot": copilot_snapshot(),
+        "cursor": cursor_snapshot(),
+        "kiro": kiro_snapshot(),
+        "roo-code": roo_code_snapshot(),
+        "kilo-code": kilo_code_snapshot(),
+        "goose": goose_snapshot(),
     }
     for provider, data in providers.items():
         data["limits"] = merge_limits(

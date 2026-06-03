@@ -1088,6 +1088,179 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertGreater(snapshot["models"]["copilot-openai-auto"]["inputTokens"], 0)
         self.assertGreater(snapshot["models"]["copilot-openai-auto"]["week"], 0)
 
+    def test_goose_snapshot_reads_sqlite_session_tokens(self) -> None:
+        # Point the goose data dir under the patched HOME regardless of any
+        # ambient XDG_DATA_HOME so the fixture path matches goose_db_path().
+        data_home = agentcat.HOME / ".local" / "share"
+        with patch.dict(agentcat.os.environ, {"XDG_DATA_HOME": str(data_home)}):
+            self._run_goose_snapshot_fixture()
+
+    def _run_goose_snapshot_fixture(self) -> None:
+        db_path = agentcat.goose_db_path()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                create table sessions (
+                  id text primary key,
+                  created_at text,
+                  updated_at text,
+                  accumulated_input_tokens integer,
+                  accumulated_output_tokens integer,
+                  model_config_json text
+                )
+                """
+            )
+            conn.execute(
+                "insert into sessions values (?, ?, ?, ?, ?, ?)",
+                (
+                    "session-goose-1",
+                    now,
+                    now,
+                    120,
+                    40,
+                    json.dumps({"model_name": "goose-claude-sonnet-4-6"}),
+                ),
+            )
+            # A zero-token row must be ignored by the WHERE filter.
+            conn.execute(
+                "insert into sessions values (?, ?, ?, ?, ?, ?)",
+                ("session-goose-2", now, now, 0, 0, json.dumps({"model_name": "goose-x"})),
+            )
+            conn.commit()
+
+        snapshot = agentcat.goose_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 160)
+        self.assertEqual(snapshot["tokens"]["week"], 160)
+        self.assertEqual(
+            snapshot["models"]["goose-claude-sonnet-4-6"]["inputTokens"], 120
+        )
+        self.assertEqual(
+            snapshot["models"]["goose-claude-sonnet-4-6"]["outputTokens"], 40
+        )
+
+    def test_cursor_snapshot_reads_bubble_token_counts(self) -> None:
+        db_path = agentcat.cursor_db_path()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("create table cursorDiskKV (key text primary key, value text)")
+            # Bubble with explicit token counts.
+            conn.execute(
+                "insert into cursorDiskKV(key, value) values (?, ?)",
+                (
+                    "bubbleId:abc",
+                    json.dumps(
+                        {
+                            "tokenCount": {"inputTokens": 80, "outputTokens": 20},
+                            "modelInfo": {"modelName": "cursor-claude-sonnet-4-6"},
+                            "createdAt": now_ms,
+                            "text": "hello",
+                            "type": 2,
+                        }
+                    ),
+                ),
+            )
+            # Bubble with no token counts -> char estimate fallback (assistant bubble).
+            conn.execute(
+                "insert into cursorDiskKV(key, value) values (?, ?)",
+                (
+                    "bubbleId:def",
+                    json.dumps(
+                        {
+                            "tokenCount": {"inputTokens": 0, "outputTokens": 0},
+                            "modelInfo": {"modelName": "cursor-claude-sonnet-4-6"},
+                            "createdAt": now_ms,
+                            "text": "abcdefgh",
+                            "type": 2,
+                        }
+                    ),
+                ),
+            )
+            # Non-bubble key must be ignored.
+            conn.execute(
+                "insert into cursorDiskKV(key, value) values (?, ?)",
+                ("composerData:zzz", json.dumps({"createdAt": now_ms})),
+            )
+            conn.commit()
+
+        snapshot = agentcat.cursor_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 2)
+        model = snapshot["models"]["cursor-claude-sonnet-4-6"]
+        # 80 input + 20 output from the explicit bubble, plus 2 estimated output
+        # tokens from the 8-char fallback bubble (ceil((8+3)/4) == 2).
+        self.assertEqual(model["inputTokens"], 80)
+        self.assertEqual(model["outputTokens"], 22)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 102)
+        self.assertEqual(snapshot["tokens"]["week"], 102)
+
+    def test_roo_code_snapshot_reads_cline_family_task_tokens(self) -> None:
+        base_dir = agentcat.vscode_global_storage_dirs(
+            ("Code", "Code - Insiders"), "rooveterinaryinc.roo-cline"
+        )[0]
+        task_dir = base_dir / "tasks" / "task-roo-1"
+        task_dir.mkdir(parents=True)
+        ts_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        (task_dir / "api_conversation_history.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "context <model>anthropic/claude-sonnet-4-6</model> more"}
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (task_dir / "ui_messages.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "say",
+                        "say": "api_req_started",
+                        "ts": ts_ms,
+                        "text": json.dumps(
+                            {
+                                "tokensIn": 100,
+                                "tokensOut": 30,
+                                "cacheReads": 10,
+                                "cacheWrites": 5,
+                            }
+                        ),
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.roo_code_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 145)
+        self.assertEqual(snapshot["tokens"]["week"], 145)
+        model = snapshot["models"]["claude-sonnet-4-6"]
+        self.assertEqual(model["inputTokens"], 100)
+        self.assertEqual(model["outputTokens"], 30)
+        self.assertEqual(model["cacheReadInputTokens"], 10)
+        self.assertEqual(model["cacheCreationInputTokens"], 5)
+
+    def test_cline_family_snapshot_reports_no_events_when_idle(self) -> None:
+        # A task dir that exists but has no ui_messages.json must NOT fabricate
+        # tokens — presence-only maps to no_token_events_yet (or not_found when
+        # nothing on disk).
+        snapshot = agentcat.kilo_code_snapshot()
+        self.assertIn(snapshot["status"], ("not_found", "no_token_events_yet"))
+        self.assertEqual(snapshot["tokens"]["all"], 0)
+
     def test_classify_gemini_node_wrapper_processes(self) -> None:
         self.assertEqual(
             agentcat.classify_process("node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"),
