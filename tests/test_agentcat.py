@@ -1378,6 +1378,210 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn(snapshot["status"], ("not_found", "no_token_events_yet"))
         self.assertEqual(snapshot["tokens"]["all"], 0)
 
+    def test_continue_snapshot_reads_dev_data_tokens_generated(self) -> None:
+        # continue.dev writes per-generation events to
+        # ~/.continue/dev_data/<schema>/tokensGenerated.jsonl (and a flat
+        # dev_data/tokensGenerated.jsonl on older schemas). Both must be read.
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        dev_data = agentcat.HOME / ".continue" / "dev_data"
+        versioned = dev_data / "0.2.0"
+        versioned.mkdir(parents=True)
+        (versioned / "tokensGenerated.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "model": "continue-claude-sonnet-4-6",
+                            "promptTokens": 300,
+                            "generatedTokens": 70,
+                            "timestamp": now,
+                        }
+                    ),
+                    # Event with neither token field > 0 must be skipped.
+                    json.dumps(
+                        {
+                            "model": "continue-claude-sonnet-4-6",
+                            "promptTokens": 0,
+                            "generatedTokens": 0,
+                            "timestamp": now,
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        # Flat (legacy) layout in the same dev_data dir.
+        (dev_data / "tokensGenerated.jsonl").write_text(
+            json.dumps(
+                {
+                    "model": "continue-claude-sonnet-4-6",
+                    "promptTokens": 5,
+                    "generatedTokens": 25,
+                    "timestamp": now,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.continue_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 2)
+        # 300 + 70 (versioned) + 5 + 25 (flat) == 400.
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 400)
+        self.assertEqual(snapshot["tokens"]["week"], 400)
+        model = snapshot["models"]["continue-claude-sonnet-4-6"]
+        self.assertEqual(model["inputTokens"], 305)
+        self.assertEqual(model["outputTokens"], 95)
+
+    def test_continue_snapshot_reports_no_events_when_dir_empty(self) -> None:
+        # A dev_data dir that exists but has no token events -> presence only.
+        (agentcat.HOME / ".continue" / "dev_data").mkdir(parents=True)
+        snapshot = agentcat.continue_snapshot()
+        self.assertIn(snapshot["status"], ("not_found", "no_token_events_yet"))
+        self.assertEqual(snapshot["tokens"]["all"], 0)
+
+    def test_pearai_snapshot_reuses_continue_parser(self) -> None:
+        # PearAI is a Continue fork: same dev_data schema under ~/.pearai.
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        versioned = agentcat.HOME / ".pearai" / "dev_data" / "0.1.0"
+        versioned.mkdir(parents=True)
+        (versioned / "tokensGenerated.jsonl").write_text(
+            json.dumps(
+                {
+                    "model": "pearai-gpt-4o",
+                    "promptTokens": 180,
+                    "generatedTokens": 45,
+                    "timestamp": now,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.pearai_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 225)
+        self.assertEqual(snapshot["tokens"]["week"], 225)
+        model = snapshot["models"]["pearai-gpt-4o"]
+        self.assertEqual(model["inputTokens"], 180)
+        self.assertEqual(model["outputTokens"], 45)
+
+    def test_llm_snapshot_reads_responses_table(self) -> None:
+        # simonw's `llm` logs to a sqlite `responses` table. Pin the db under
+        # HOME via LLM_USER_PATH (which `llm` itself honors).
+        user_path = agentcat.HOME / ".llm"
+        user_path.mkdir(parents=True)
+        db_path = user_path / "logs.db"
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                create table responses (
+                  id text primary key,
+                  model text,
+                  input_tokens integer,
+                  output_tokens integer,
+                  datetime_utc text,
+                  conversation_id text
+                )
+                """
+            )
+            conn.execute(
+                "insert into responses(id, model, input_tokens, output_tokens, datetime_utc, conversation_id) values (?, ?, ?, ?, ?, ?)",
+                ("r1", "llm-gpt-4o-mini", 220, 80, now, "c1"),
+            )
+            # Zero-token row must be excluded by the WHERE filter.
+            conn.execute(
+                "insert into responses(id, model, input_tokens, output_tokens, datetime_utc, conversation_id) values (?, ?, ?, ?, ?, ?)",
+                ("r2", "llm-should-skip", 0, 0, now, "c2"),
+            )
+            conn.commit()
+
+        with patch.dict(agentcat.os.environ, {"LLM_USER_PATH": str(user_path)}):
+            snapshot = agentcat.llm_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 300)
+        self.assertEqual(snapshot["tokens"]["week"], 300)
+        model = snapshot["models"]["llm-gpt-4o-mini"]
+        self.assertEqual(model["inputTokens"], 220)
+        self.assertEqual(model["outputTokens"], 80)
+
+    def test_gptme_snapshot_reads_assistant_usage(self) -> None:
+        # gptme writes ~/.local/share/gptme/logs/<conv>/conversation.jsonl.
+        # Token usage may live under metadata.usage; only assistant messages
+        # with token fields are counted.
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        conv_dir = agentcat.HOME / ".local" / "share" / "gptme" / "logs" / "2026-01-01-conv"
+        conv_dir.mkdir(parents=True)
+        lines = [
+            # Counted: assistant with metadata.usage (prompt/completion).
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "content": "hi",
+                    "timestamp": now,
+                    "metadata": {
+                        "model": "gptme-claude-sonnet-4-6",
+                        "usage": {"prompt_tokens": 240, "completion_tokens": 60},
+                    },
+                }
+            ),
+            # IGNORED: user turn.
+            json.dumps({"role": "user", "content": "hello", "timestamp": now}),
+            # IGNORED: assistant turn with no token fields anywhere.
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "content": "no usage here",
+                    "timestamp": now,
+                    "metadata": {"model": "gptme-claude-sonnet-4-6"},
+                }
+            ),
+        ]
+        (conv_dir / "conversation.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        snapshot = agentcat.gptme_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 300)
+        self.assertEqual(snapshot["tokens"]["week"], 300)
+        model = snapshot["models"]["gptme-claude-sonnet-4-6"]
+        self.assertEqual(model["inputTokens"], 240)
+        self.assertEqual(model["outputTokens"], 60)
+
+    def test_gptme_snapshot_reports_no_events_without_token_fields(self) -> None:
+        # When no assistant message carries token fields, gptme must report
+        # presence (no_token_events_yet) and NOT fabricate/char-estimate.
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        conv_dir = agentcat.HOME / ".local" / "share" / "gptme" / "logs" / "2026-02-02-conv"
+        conv_dir.mkdir(parents=True)
+        lines = [
+            json.dumps({"role": "user", "content": "hello", "timestamp": now}),
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "content": "a reply with no usage metadata at all",
+                    "timestamp": now,
+                    "metadata": {"model": "gptme-claude-sonnet-4-6"},
+                }
+            ),
+        ]
+        (conv_dir / "conversation.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        snapshot = agentcat.gptme_snapshot()
+
+        self.assertEqual(snapshot["status"], "no_token_events_yet")
+        self.assertEqual(snapshot["events"], 0)
+        self.assertEqual(snapshot["tokens"]["all"], 0)
+
     def test_classify_gemini_node_wrapper_processes(self) -> None:
         self.assertEqual(
             agentcat.classify_process("node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"),

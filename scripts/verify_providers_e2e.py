@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""End-to-end verification harness for the 8 local-usage providers.
+"""End-to-end verification harness for the 12 local-usage providers.
 
-This is NOT a unit test. It proves that each of the 8 newly-added
+This is NOT a unit test. It proves that each of the 12 newly-added
 local-usage providers (cursor, goose, kiro, roo-code, kilo-code, cline,
-qwen, crush) extracts tokens through the FULL snapshot pipeline
-(build_snapshot()) when run against a realistic on-disk fixture.
+qwen, crush, continue, pearai, llm, gptme) extracts tokens through the FULL
+snapshot pipeline (build_snapshot()) when run against a realistic on-disk
+fixture.
 
 How it works
 ------------
@@ -338,6 +339,101 @@ def write_kiro(home: Path) -> Tuple[int, str]:
     return (expected_in + expected_out, model)
 
 
+def write_continue(home: Path) -> Tuple[int, str]:
+    """~/.continue/dev_data/<schema>/tokensGenerated.jsonl (versioned) plus a
+    flat ~/.continue/dev_data/tokensGenerated.jsonl (legacy) — both globbed.
+    Each line: promptTokens/generatedTokens (+ model, timestamp)."""
+    dev_data = home / ".continue" / "dev_data"
+    versioned = dev_data / "0.2.0"
+    versioned.mkdir(parents=True, exist_ok=True)
+    model = "continue-claude-sonnet-4-6"
+    versioned_lines = [
+        # Counted: 300 prompt / 70 generated.
+        json.dumps({"model": model, "promptTokens": 300, "generatedTokens": 70,
+                    "timestamp": NOW_ISO}),
+        # IGNORED: neither token field > 0.
+        json.dumps({"model": model, "promptTokens": 0, "generatedTokens": 0,
+                    "timestamp": NOW_ISO}),
+    ]
+    (versioned / "tokensGenerated.jsonl").write_text(
+        "\n".join(versioned_lines) + "\n", encoding="utf-8")
+    # Legacy flat layout in the same dev_data dir: 5 prompt / 25 generated.
+    (dev_data / "tokensGenerated.jsonl").write_text(
+        json.dumps({"model": model, "promptTokens": 5, "generatedTokens": 25,
+                    "timestamp": NOW_ISO}) + "\n",
+        encoding="utf-8",
+    )
+    return (300 + 70 + 5 + 25, model)
+
+
+def write_pearai(home: Path) -> Tuple[int, str]:
+    """PearAI is a Continue fork: same dev_data schema under ~/.pearai."""
+    versioned = home / ".pearai" / "dev_data" / "0.1.0"
+    versioned.mkdir(parents=True, exist_ok=True)
+    model = "pearai-gpt-4o"
+    (versioned / "tokensGenerated.jsonl").write_text(
+        json.dumps({"model": model, "promptTokens": 180, "generatedTokens": 45,
+                    "timestamp": NOW_ISO}) + "\n",
+        encoding="utf-8",
+    )
+    return (180 + 45, model)
+
+
+def write_llm(home: Path) -> Tuple[int, str]:
+    """simonw `llm` logs.db `responses` table. We set LLM_USER_PATH to
+    <home>/.llm in run_pipeline so llm_db_path() resolves <LLM_USER_PATH>/logs.db."""
+    user_path = home / ".llm"
+    user_path.mkdir(parents=True, exist_ok=True)
+    db = user_path / "logs.db"
+    model = "llm-gpt-4o-mini"
+    with sqlite3.connect(db) as conn:
+        conn.execute(textwrap.dedent("""
+            create table responses (
+              id text primary key,
+              model text,
+              input_tokens integer,
+              output_tokens integer,
+              datetime_utc text,
+              conversation_id text
+            )
+        """))
+        # Counted: 220 in / 80 out.
+        conn.execute(
+            "insert into responses(id, model, input_tokens, output_tokens, datetime_utc, conversation_id) values (?, ?, ?, ?, ?, ?)",
+            ("r1", model, 220, 80, NOW_ISO, "c1"),
+        )
+        # IGNORED: zero-token row (excluded by WHERE filter).
+        conn.execute(
+            "insert into responses(id, model, input_tokens, output_tokens, datetime_utc, conversation_id) values (?, ?, ?, ?, ?, ?)",
+            ("r2", "llm-should-skip", 0, 0, NOW_ISO, "c2"),
+        )
+        conn.commit()
+    return (220 + 80, model)
+
+
+def write_gptme(home: Path) -> Tuple[int, str]:
+    """gptme ~/.local/share/gptme/logs/<conv>/conversation.jsonl. Only
+    assistant messages with token fields under metadata.usage are counted."""
+    conv = home / ".local" / "share" / "gptme" / "logs" / "2026-01-01-conv"
+    conv.mkdir(parents=True, exist_ok=True)
+    model = "gptme-claude-sonnet-4-6"
+    lines = [
+        # Counted: assistant with metadata.usage (prompt/completion).
+        json.dumps({
+            "role": "assistant", "content": "hi", "timestamp": NOW_ISO,
+            "metadata": {"model": model,
+                         "usage": {"prompt_tokens": 240, "completion_tokens": 60}},
+        }),
+        # IGNORED: user turn.
+        json.dumps({"role": "user", "content": "hello", "timestamp": NOW_ISO}),
+        # IGNORED: assistant turn with no token fields anywhere (no fabrication).
+        json.dumps({"role": "assistant", "content": "no usage", "timestamp": NOW_ISO,
+                    "metadata": {"model": model}}),
+    ]
+    (conv / "conversation.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return (240 + 60, model)
+
+
 # Order matters only for display.
 PROVIDERS: List[Tuple[str, Any]] = [
     ("cursor", write_cursor),
@@ -348,6 +444,10 @@ PROVIDERS: List[Tuple[str, Any]] = [
     ("cline", write_cline),
     ("qwen", write_qwen),
     ("crush", write_crush),
+    ("continue", write_continue),
+    ("pearai", write_pearai),
+    ("llm", write_llm),
+    ("gptme", write_gptme),
 ]
 
 MATURE_FIVE = ("codex", "claude", "gemini", "opencode", "copilot")
@@ -376,6 +476,8 @@ def run_pipeline(home: Path) -> Dict[str, Any]:
     # qwen + crush parsers read their own env vars first — point them at fixtures.
     env["QWEN_DATA_DIR"] = str(home / ".qwen" / "projects")
     env["CRUSH_GLOBAL_DATA"] = str(home / ".local" / "share" / "crush")
+    # llm honors LLM_USER_PATH first — point it at the fixture logs.db dir.
+    env["LLM_USER_PATH"] = str(home / ".llm")
     # Keep the connector from reaching out anywhere it might otherwise.
     env.pop("GOOSE_PATH_ROOT", None)
     env.pop("LOCALAPPDATA", None)
@@ -478,7 +580,8 @@ def main() -> int:
         print("-" * 78)
 
         passed = sum(1 for r in rows if r[5])
-        print(f"8-provider result: {passed}/8 PASS")
+        total = len(rows)
+        print(f"local-provider result: {passed}/{total} PASS")
 
         print()
         print("mature five (expected not_found in empty fake home):")

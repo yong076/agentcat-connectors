@@ -3445,6 +3445,207 @@ def cline_snapshot() -> Dict[str, Any]:
     return cline_family_snapshot("cline", "saoudrizwan.claude-dev", "cline-auto")
 
 
+# ---------------------------------------------------------------------------
+# Third wave of local-usage providers from codexbar's verified specs:
+#   continue (continue.dev) + pearai (Continue fork) share a dev_data/
+#   tokensGenerated.jsonl reader; llm (simonw's CLI) reads a sqlite logs.db;
+#   gptme reads conversation jsonl. Same helper API as the earlier waves:
+#   empty_provider_usage(source=...) -> add_usage_metrics(result, model,
+#   metrics, when) -> finish_local_usage_snapshot(result, events,
+#   sources_seen=...).
+# ---------------------------------------------------------------------------
+
+
+def continue_like_snapshot(global_dir: Path) -> Dict[str, Any]:
+    """Continue.dev (and its PearAI fork) dev-data token log.
+
+    The IDE writes per-generation events to
+    ``<global_dir>/dev_data/tokensGenerated.jsonl`` on older schemas and
+    ``<global_dir>/dev_data/<schema>/tokensGenerated.jsonl`` (e.g. 0.1.0 /
+    0.2.0) on newer ones. We glob recursively so both layouts are covered.
+    Each line is a JSON object with ``promptTokens`` / ``generatedTokens``
+    and an optional ``model`` + ``timestamp``.
+    """
+    dev_data = global_dir / "dev_data"
+    result = empty_provider_usage(source=str(dev_data))
+    files: List[Path] = []
+    try:
+        files = [path for path in dev_data.rglob("tokensGenerated.jsonl") if path.is_file()]
+    except OSError:
+        files = []
+    files = recent_candidate_files(files)
+    events = 0
+    for path in files:
+        file_when = safe_file_mtime(path)
+        for entry in iter_jsonl_file(path):
+            metrics = {
+                "inputTokens": nonnegative_int(entry.get("promptTokens")) or 0,
+                "outputTokens": nonnegative_int(entry.get("generatedTokens")) or 0,
+            }
+            if add_usage_metrics(
+                result,
+                entry.get("model") or "continue-auto",
+                metrics,
+                parse_timestamp(entry.get("timestamp")) or file_when,
+            ):
+                events += 1
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
+def continue_snapshot() -> Dict[str, Any]:
+    return continue_like_snapshot(HOME / ".continue")
+
+
+def pearai_snapshot() -> Dict[str, Any]:
+    return continue_like_snapshot(HOME / ".pearai")
+
+
+def llm_db_path() -> Path:
+    """Resolve simonw `llm`'s logs.db.
+
+    `llm` honors ``LLM_USER_PATH`` first, then falls back to the
+    platformdirs ``io.datasette.llm`` user-data dir. On macOS that is
+    ``~/Library/Application Support/io.datasette.llm``; on Linux we probe
+    both the XDG data dir and the legacy ``~/.config`` location.
+    """
+    explicit = os.environ.get("LLM_USER_PATH")
+    if explicit:
+        return Path(explicit).expanduser() / "logs.db"
+    if IS_WINDOWS:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data).expanduser() if local_app_data else HOME / "AppData" / "Local"
+        return base / "io.datasette.llm" / "logs.db"
+    if sys.platform == "darwin":
+        return HOME / "Library" / "Application Support" / "io.datasette.llm" / "logs.db"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    candidates = [
+        (Path(xdg).expanduser() if xdg else HOME / ".local" / "share") / "io.datasette.llm" / "logs.db",
+        HOME / ".config" / "io.datasette.llm" / "logs.db",
+        HOME / ".local" / "share" / "io.datasette.llm" / "logs.db",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def llm_snapshot() -> Dict[str, Any]:
+    db_path = llm_db_path()
+    result = empty_provider_usage(source=str(db_path))
+    if not db_path.is_file():
+        return result
+    events = 0
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+            rows = conn.execute(
+                """
+                select input_tokens, output_tokens, model, datetime_utc
+                from responses
+                where coalesce(input_tokens, 0) > 0
+                   or coalesce(output_tokens, 0) > 0
+                order by id desc
+                limit ?
+                """,
+                (LOCAL_PROVIDER_MAX_FILES,),
+            ).fetchall()
+            for input_tokens, output_tokens, model, datetime_utc in rows:
+                metrics = {
+                    "inputTokens": nonnegative_int(input_tokens) or 0,
+                    "outputTokens": nonnegative_int(output_tokens) or 0,
+                }
+                if add_usage_metrics(
+                    result,
+                    normalized_model_name(model) or "llm-auto",
+                    metrics,
+                    parse_timestamp(datetime_utc),
+                ):
+                    events += 1
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        return result
+    return finish_local_usage_snapshot(result, events, sources_seen=True)
+
+
+def gptme_usage_metrics(message: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Defensively pull token usage off a gptme assistant message.
+
+    gptme's on-disk schema is less stable than the other providers, so we
+    probe the documented-ish locations in order — ``metadata.usage``,
+    ``metadata.tokens``, then a top-level ``usage`` — and accept either the
+    OpenAI-style ``prompt_tokens``/``completion_tokens`` or the
+    ``input``/``output`` token key variants. Returns None (not zeros) when
+    no token fields are present so the caller can report presence without
+    fabricating numbers.
+    """
+    candidates: List[Any] = []
+    metadata = message.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.append(metadata.get("usage"))
+        candidates.append(metadata.get("tokens"))
+    candidates.append(message.get("usage"))
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        input_tokens = None
+        for key in ("prompt_tokens", "input_tokens", "inputTokens", "input"):
+            input_tokens = nonnegative_int(candidate.get(key))
+            if input_tokens is not None:
+                break
+        output_tokens = None
+        for key in ("completion_tokens", "output_tokens", "outputTokens", "output"):
+            output_tokens = nonnegative_int(candidate.get(key))
+            if output_tokens is not None:
+                break
+        if input_tokens is None and output_tokens is None:
+            continue
+        return {
+            "inputTokens": input_tokens or 0,
+            "outputTokens": output_tokens or 0,
+        }
+    return None
+
+
+def gptme_snapshot() -> Dict[str, Any]:
+    logs_dir = HOME / ".local" / "share" / "gptme" / "logs"
+    result = empty_provider_usage(source=str(logs_dir))
+    files: List[Path] = []
+    try:
+        files = [
+            path / "conversation.jsonl"
+            for path in logs_dir.iterdir()
+            if path.is_dir() and (path / "conversation.jsonl").is_file()
+        ]
+    except OSError:
+        files = []
+    files = recent_candidate_files(files)
+    events = 0
+    saw_token_fields = False
+    for path in files:
+        file_when = safe_file_mtime(path)
+        for message in iter_jsonl_file(path):
+            if message.get("role") != "assistant":
+                continue
+            metrics = gptme_usage_metrics(message)
+            if metrics is None:
+                continue
+            saw_token_fields = True
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            model = message.get("model") or metadata.get("model") or "gptme-auto"
+            when = parse_timestamp(message.get("timestamp")) or file_when
+            if add_usage_metrics(result, model, metrics, when):
+                events += 1
+    # gptme reports presence without inventing numbers: if we never saw a
+    # token field on any assistant message, fall back to no_token_events_yet
+    # rather than char-estimating.
+    if events == 0:
+        result["events"] = 0
+        if files:
+            result["status"] = "no_token_events_yet"
+        return result
+    return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
+
+
 def codex_snapshot() -> Dict[str, Any]:
     paths = sorted((HOME / ".codex").glob("state_*.sqlite"))
     result: Dict[str, Any] = {
@@ -5460,6 +5661,10 @@ def build_snapshot() -> Dict[str, Any]:
         "qwen": qwen_snapshot(),
         "crush": crush_snapshot(),
         "cline": cline_snapshot(),
+        "continue": continue_snapshot(),
+        "pearai": pearai_snapshot(),
+        "llm": llm_snapshot(),
+        "gptme": gptme_snapshot(),
     }
     for provider, data in providers.items():
         data["limits"] = merge_limits(
