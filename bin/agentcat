@@ -1118,6 +1118,23 @@ def read_json(path: Path) -> Optional[Any]:
         return {"_agentcat_error": str(exc)}
 
 
+def read_json_bounded(path: Path, max_bytes: Optional[int] = None) -> Optional[Any]:
+    """read_json that stats first and SKIPS (returns None) when the file is
+    larger than `max_bytes`. Local-usage providers parse whole JSON documents
+    (cline ui_messages.json, kiro .chat) that can grow without bound — refuse
+    to slurp a multi-gigabyte file into memory rather than risk an OOM.
+
+    `max_bytes` defaults to the module-level LOCAL_PROVIDER_PARSE_BYTES,
+    resolved at call time so the cap can be tuned via env/monkeypatch."""
+    cap = LOCAL_PROVIDER_PARSE_BYTES if max_bytes is None else max_bytes
+    try:
+        if path.stat().st_size > cap:
+            return None
+    except OSError:
+        return None
+    return read_json(path)
+
+
 def write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
@@ -1400,6 +1417,33 @@ def read_provider_config_raw() -> Dict[str, Any]:
     return {"providers": {}}
 
 
+# The only limit keys write_provider_config persists. These mirror what
+# normalize_limits() actually consumes (weekly/monthly/session token caps),
+# each coerced through int_limit so a positive integer is stored or the key is
+# dropped. Anything else a client sends in `limits` is discarded — the config
+# file never grows unbounded attacker-controlled keys.
+PROVIDER_LIMIT_KEYS = ("weeklyTokens", "monthlyTokens", "sessionTokens")
+
+
+def sanitize_provider_limits(raw: Any) -> Dict[str, Any]:
+    """Allowlist + coerce a per-provider `limits` block.
+
+    Keeps only the known numeric caps (coerced via int_limit so each is a
+    positive int or dropped) plus a string `source`. Unknown keys are dropped.
+    Returns {} when nothing survives so the caller can omit an empty block.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    clean: Dict[str, Any] = {}
+    for key in PROVIDER_LIMIT_KEYS:
+        value = int_limit(raw.get(key))
+        if value is not None:
+            clean[key] = value
+    if isinstance(raw.get("source"), str) and raw["source"]:
+        clean["source"] = raw["source"]
+    return clean
+
+
 def write_provider_config(data: Any) -> Dict[str, Any]:
     """Validate + atomically persist providers.json. Accepts {"providers":{...}}
     or a bare {<id>:{...}} map; keeps only enabled/limits/source per entry."""
@@ -1416,7 +1460,9 @@ def write_provider_config(data: Any) -> Dict[str, Any]:
         if "enabled" in cfg:
             entry["enabled"] = bool(cfg["enabled"])
         if isinstance(cfg.get("limits"), dict):
-            entry["limits"] = cfg["limits"]
+            limits = sanitize_provider_limits(cfg["limits"])
+            if limits:
+                entry["limits"] = limits
         if isinstance(cfg.get("source"), str) and cfg["source"]:
             entry["source"] = cfg["source"]
         clean[str(pid)] = entry
@@ -2944,9 +2990,16 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
             continue
         if event.get("type") != "assistant.message":
             continue
+        # The transcript path carries no real token counts: input is always
+        # char-estimated, reasoning is always char-estimated, and output falls
+        # back to a char estimate when `outputTokens` is absent. Track whether
+        # this recorded event contributes any char-estimated tokens so the
+        # caller can flag the snapshot as approximate.
+        output_estimated = False
         content_tokens = nonnegative_int(data.get("outputTokens"))
         if content_tokens is None:
             content_tokens = char_token_estimate(data.get("content"))
+            output_estimated = content_tokens > 0
         reasoning_tokens = char_token_estimate(data.get("reasoningText"))
         tool_requests = data.get("toolRequests")
         if content_tokens <= 0 and reasoning_tokens <= 0 and not isinstance(tool_requests, list):
@@ -2958,6 +3011,8 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
         }
         if add_usage_metrics(result, model, metrics, parse_timestamp(event.get("timestamp")) or file_when):
             parsed += 1
+            if pending_input_tokens > 0 or reasoning_tokens > 0 or output_estimated:
+                result["estimated"] = True
         # PR-C: copilot transcript carries the same toolRequests shape
         # opencode does — feed the breakdown counters.
         tool_names: List[str] = []
@@ -3159,7 +3214,7 @@ def vscode_global_storage_dirs(app_names: Iterable[str], extension_id: str) -> L
 
 
 def extract_model_from_conversation_history(task_dir: Path, fallback_model: str) -> str:
-    raw = read_json(task_dir / "api_conversation_history.json")
+    raw = read_json_bounded(task_dir / "api_conversation_history.json")
     if not isinstance(raw, list):
         return fallback_model
     model_re = re.compile(r"<model>([^<]+)</model>")
@@ -3180,7 +3235,7 @@ def extract_model_from_conversation_history(task_dir: Path, fallback_model: str)
 
 
 def parse_cline_task(task_dir: Path, provider: str, fallback_model: str, result: Dict[str, Any]) -> int:
-    raw = read_json(task_dir / "ui_messages.json")
+    raw = read_json_bounded(task_dir / "ui_messages.json")
     if not isinstance(raw, list):
         return 0
     model = extract_model_from_conversation_history(task_dir, fallback_model)
@@ -3311,6 +3366,7 @@ def cursor_snapshot() -> Dict[str, Any]:
     if not db_path.is_file():
         return result
     events = 0
+    estimated = False
     try:
         with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             rows = conn.execute(
@@ -3335,6 +3391,10 @@ def cursor_snapshot() -> Dict[str, Any]:
                 output_count = nonnegative_int(output_tokens) or 0
                 if input_count == 0 and output_count == 0:
                     estimate = char_token_estimate_for_length(text_length)
+                    if estimate > 0:
+                        # Real tokenCount was absent — this bubble's tokens are
+                        # char-estimated. Flag the whole snapshot as approximate.
+                        estimated = True
                     if bubble_type == 1:
                         input_count = estimate
                     else:
@@ -3352,6 +3412,8 @@ def cursor_snapshot() -> Dict[str, Any]:
         return result
     if events >= LOCAL_PROVIDER_MAX_FILES:
         result["truncated"] = True
+    if estimated:
+        result["estimated"] = True
     return finish_local_usage_snapshot(result, events, sources_seen=True)
 
 
@@ -3378,8 +3440,9 @@ def kiro_snapshot() -> Dict[str, Any]:
             continue
     files = recent_candidate_files(files)
     events = 0
+    estimated = False
     for path in files:
-        raw = read_json(path)
+        raw = read_json_bounded(path)
         if not isinstance(raw, dict):
             continue
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
@@ -3403,6 +3466,11 @@ def kiro_snapshot() -> Dict[str, Any]:
         when = parse_timestamp(metadata.get("startTime")) or safe_file_mtime(path)
         if add_usage_metrics(result, model, metrics, when):
             events += 1
+            # kiro never exposes real token counts — every recorded event is
+            # char-estimated, so any event makes the snapshot approximate.
+            estimated = True
+    if estimated:
+        result["estimated"] = True
     return finish_local_usage_snapshot(result, events, sources_seen=bool(files))
 
 
@@ -3550,15 +3618,17 @@ def continue_like_snapshot(global_dir: Path) -> Dict[str, Any]:
     The IDE writes per-generation events to
     ``<global_dir>/dev_data/tokensGenerated.jsonl`` on older schemas and
     ``<global_dir>/dev_data/<schema>/tokensGenerated.jsonl`` (e.g. 0.1.0 /
-    0.2.0) on newer ones. We glob recursively so both layouts are covered.
-    Each line is a JSON object with ``promptTokens`` / ``generatedTokens``
-    and an optional ``model`` + ``timestamp``.
+    0.2.0) on newer ones. We probe exactly those two layouts with explicit
+    globs (never a recursive rglob) so we can't be made to walk an unbounded
+    subtree. Each line is a JSON object with ``promptTokens`` /
+    ``generatedTokens`` and an optional ``model`` + ``timestamp``.
     """
     dev_data = global_dir / "dev_data"
     result = empty_provider_usage(source=str(dev_data))
     files: List[Path] = []
     try:
-        files = [path for path in dev_data.rglob("tokensGenerated.jsonl") if path.is_file()]
+        candidates = [dev_data / "tokensGenerated.jsonl", *dev_data.glob("*/tokensGenerated.jsonl")]
+        files = [path for path in candidates if path.is_file()]
     except OSError:
         files = []
     files = recent_candidate_files(files)
@@ -3600,8 +3670,11 @@ def llm_db_path() -> Path:
     if explicit:
         return Path(explicit).expanduser() / "logs.db"
     if IS_WINDOWS:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        base = Path(local_app_data).expanduser() if local_app_data else HOME / "AppData" / "Local"
+        # Click's get_app_dir() — which `llm` uses for io.datasette.llm —
+        # defaults to roaming=True on Windows, so the data lives under
+        # %APPDATA% (Roaming), not %LOCALAPPDATA%.
+        app_data = os.environ.get("APPDATA")
+        base = Path(app_data).expanduser() if app_data else HOME / "AppData" / "Roaming"
         return base / "io.datasette.llm" / "logs.db"
     if sys.platform == "darwin":
         return HOME / "Library" / "Application Support" / "io.datasette.llm" / "logs.db"
@@ -3694,8 +3767,40 @@ def gptme_usage_metrics(message: Dict[str, Any]) -> Optional[Dict[str, int]]:
     return None
 
 
+def gptme_logs_dir() -> Path:
+    """Resolve gptme's conversation logs dir cross-platform.
+
+    gptme uses platformdirs, so the on-disk location differs per OS. We honor,
+    in order: an explicit ``GPTME_LOGS_HOME`` override, ``XDG_DATA_HOME``, the
+    historical posix default, the Windows ``%LOCALAPPDATA%`` location (note
+    platformdirs doubles the appname on Windows: ``gptme/gptme``), and the
+    macOS Application Support location. We return the first candidate that
+    already exists; if none do, fall back to the posix default so the snapshot
+    still reports a stable ``source`` path.
+    """
+    candidates: List[Path] = []
+    override = os.environ.get("GPTME_LOGS_HOME")
+    if override:
+        candidates.append(Path(override).expanduser() / "logs")
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        candidates.append(Path(xdg).expanduser() / "gptme" / "logs")
+    posix_default = HOME / ".local" / "share" / "gptme" / "logs"
+    candidates.append(posix_default)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(Path(local_app_data).expanduser() / "gptme" / "gptme" / "logs")
+    elif IS_WINDOWS:
+        candidates.append(HOME / "AppData" / "Local" / "gptme" / "gptme" / "logs")
+    candidates.append(HOME / "Library" / "Application Support" / "gptme" / "logs")
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return posix_default
+
+
 def gptme_snapshot() -> Dict[str, Any]:
-    logs_dir = HOME / ".local" / "share" / "gptme" / "logs"
+    logs_dir = gptme_logs_dir()
     result = empty_provider_usage(source=str(logs_dir))
     files: List[Path] = []
     try:
@@ -5727,7 +5832,21 @@ def auto_update_loop(interval_seconds: float, initial_delay_seconds: float) -> N
         time.sleep(max(60.0, interval_seconds))
 
 
+# build_snapshot() is invoked from several threads at once: the refresh loop,
+# every POST /v1/config handler (which spawns its own thread), and CLI/foreground
+# callers. They all write the SAME LATEST_SNAPSHOT tmp file, so serialize the
+# build + tmp-write + atomic replace under one lock to avoid two builders
+# clobbering the same .json.tmp. A plain lock is sufficient here — concurrent
+# requests are rare and the build is fast; no debounce needed.
+_SNAPSHOT_BUILD_LOCK = threading.Lock()
+
+
 def build_snapshot() -> Dict[str, Any]:
+    with _SNAPSHOT_BUILD_LOCK:
+        return _build_snapshot_locked()
+
+
+def _build_snapshot_locked() -> Dict[str, Any]:
     ensure_dirs()
     try:
         latest_by_provider: Dict[str, Any] = latest_events_by_provider()
@@ -5880,6 +5999,40 @@ Expected behavior:
 """
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
+
+
+def is_local_request(headers: Any) -> bool:
+    """Guard state-changing POST routes against CSRF / DNS-rebind attacks.
+
+    Loopback CLI tools (curl, the macOS app) do NOT send Origin/Referer and
+    target the daemon via 127.0.0.1/localhost. Browsers attacking the daemon
+    via a malicious page (DNS rebind, CSRF) DO send an Origin/Referer and may
+    carry an attacker-controlled Host. So we reject when:
+      * an Origin or Referer header is present (browser-only), or
+      * a Host header is present and is not a loopback host (optional :port).
+    GET routes are read-only and stay unguarded.
+    """
+    if headers is None:
+        return True
+    if headers.get("Origin") is not None or headers.get("Referer") is not None:
+        return False
+    host = headers.get("Host")
+    if host is not None:
+        host = host.strip()
+        if host:
+            # Strip an optional :port. IPv6 literals are bracketed
+            # (`[::1]:8765`); for those, split on the last ']' boundary.
+            if host.startswith("["):
+                bracket = host.rfind("]")
+                hostname = host[: bracket + 1] if bracket != -1 else host
+            else:
+                hostname = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+            if hostname.lower() not in _LOOPBACK_HOSTS:
+                return False
+    return True
+
+
 class AgentCatHandler(BaseHTTPRequestHandler):
     server_version = "AgentCat/1"
 
@@ -5937,6 +6090,11 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
+        # Both POST routes (/v1/config, /v1/events) mutate state, so guard them
+        # against CSRF / DNS-rebind before doing any work.
+        if self.path in ("/v1/config", "/v1/events") and not is_local_request(self.headers):
+            self.send_json(403, {"error": "forbidden", "message": "non-local request rejected"})
+            return
         if self.path == "/v1/config":
             length = int(self.headers.get("Content-Length", "0") or "0")
             body = self.rfile.read(length)

@@ -59,6 +59,21 @@ agentcat setup-prompt
 | Codex | 로컬 SQLite token 합계 + Codex OAuth usage API | `~/.codex/auth.json`이 있으면 5시간, 7일, 노출된 모델/리뷰 quota의 남은 비율을 표시합니다. |
 | Claude Code | 로컬 stats/hooks + Claude Code OAuth usage API | Claude Code OAuth credential이 있으면 5시간, 7일, 모델 quota, 월별 extra credit 남은 양을 표시합니다. |
 | Gemini CLI | 로컬 telemetry + Gemini Code Assist quota API | Google 로그인 Gemini CLI 세션에서 모델별 Code Assist request quota 남은 비율을 표시합니다. |
+| GitHub Copilot | 로컬 session-state + VS Code transcript | legacy 이벤트는 실제 token 수를 담고, VS Code transcript 경로는 문자 수 기반 추정이라 해당 스냅샷은 `estimated: true`를 설정합니다. |
+| Cursor | 로컬 `state.vscdb` bubble token 수 | `tokenCount`가 있으면 실제 값을 쓰고, 없는 bubble은 문자 수로 추정하며 `estimated: true`를 설정합니다. |
+| Goose | 로컬 `sessions.db` 누적 token | 세션별 실제 input/output token 합계입니다. |
+| Kiro | 로컬 `.chat` 파일 | 디스크에 실제 token 수가 없어 전부 문자 수 기반 추정이며, 스냅샷은 항상 `estimated: true`를 설정합니다. |
+| Roo Code | 로컬 cline 계열 task 로그 | 요청별 실제 `tokensIn`/`tokensOut`(+ cache read/write)입니다. |
+| Kilo Code | 로컬 cline 계열 task 로그 | 요청별 실제 `tokensIn`/`tokensOut`(+ cache read/write)입니다. |
+| Cline | 로컬 cline 계열 task 로그 | 요청별 실제 `tokensIn`/`tokensOut`(+ cache read/write)입니다. |
+| Qwen Code | 로컬 chat `usageMetadata` | 실제 prompt/candidate/thought/cached token 수입니다. |
+| Crush | 로컬 `crush.db` session store | root session별 실제 prompt/completion token 합계입니다. |
+| Continue | 로컬 `dev_data/tokensGenerated.jsonl` | 생성마다 실제 prompt/generated token 수입니다. |
+| PearAI | 로컬 `dev_data/tokensGenerated.jsonl` (Continue fork) | 생성마다 실제 prompt/generated token 수입니다. |
+| llm (simonw) | 로컬 `logs.db` responses 테이블 | response별 실제 input/output token 수입니다. |
+| gptme | 로컬 `conversation.jsonl` usage | token 필드가 있으면 실제 값을 쓰고, 추정은 하지 않으며 없으면 `no_token_events_yet`로 보고합니다. |
+
+로컬 사용량 provider는 IDE/프로세스 존재 여부가 아니라 디스크에 남는 영속 데이터만 읽습니다. 디스크에 실제 token 수가 없는 provider는 문자 수로 추정하고 해당 스냅샷에 `provider.estimated = true`(아니면 생략/false)를 설정해, 앱이 그 수치를 근사값으로 표시할 수 있게 합니다. 현재 추정 기반: Cursor(fallback bubble), Kiro(항상), Copilot의 VS Code transcript 경로입니다.
 
 ## 개인정보
 

@@ -59,6 +59,21 @@ agentcat setup-prompt
 | Codex | local SQLite token totals + Codex OAuth usage API | Shows remaining 5-hour, 7-day, and exposed model/review quota percentages when `~/.codex/auth.json` is present. |
 | Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
 | Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
+| GitHub Copilot | local session-state + VS Code transcripts | Legacy events carry real token counts; the VS Code transcript path is char-estimated, so those snapshots set `estimated: true`. |
+| Cursor | local `state.vscdb` bubble token counts | Real `tokenCount` when present; falls back to a char estimate for bubbles with no count, setting `estimated: true`. |
+| Goose | local `sessions.db` accumulated tokens | Real per-session input/output token totals. |
+| Kiro | local `.chat` files | No real token counts on disk — fully char-estimated, so snapshots always set `estimated: true`. |
+| Roo Code | local cline-family task logs | Real `tokensIn`/`tokensOut` (plus cache reads/writes) per request. |
+| Kilo Code | local cline-family task logs | Real `tokensIn`/`tokensOut` (plus cache reads/writes) per request. |
+| Cline | local cline-family task logs | Real `tokensIn`/`tokensOut` (plus cache reads/writes) per request. |
+| Qwen Code | local chat `usageMetadata` | Real prompt/candidate/thought/cached token counts. |
+| Crush | local `crush.db` session store | Real prompt/completion token totals per root session. |
+| Continue | local `dev_data/tokensGenerated.jsonl` | Real prompt/generated token counts per generation. |
+| PearAI | local `dev_data/tokensGenerated.jsonl` (Continue fork) | Real prompt/generated token counts per generation. |
+| llm (simonw) | local `logs.db` responses table | Real input/output token counts per response. |
+| gptme | local `conversation.jsonl` usage | Real token fields when present; never estimated — reports `no_token_events_yet` instead of guessing. |
+
+Local-usage providers read durable on-disk artifacts only (never IDE/process presence). Where a provider has no real token counts on disk, the connector char-estimates and flags the provider snapshot with `provider.estimated = true` (omitted/false otherwise) so the app can label those numbers as approximate. Estimate-based today: Cursor (fallback bubbles), Kiro (always), and Copilot's VS Code transcript path.
 
 ## Privacy
 

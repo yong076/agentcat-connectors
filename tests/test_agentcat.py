@@ -1300,6 +1300,183 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["totalTokens"], 102)
         self.assertEqual(snapshot["tokens"]["week"], 102)
 
+    def test_cursor_snapshot_sets_estimated_flag_on_char_fallback(self) -> None:
+        # A bubble with no real tokenCount falls back to a char estimate, which
+        # must flag the snapshot as approximate via estimated == True.
+        db_path = agentcat.cursor_db_path()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("create table cursorDiskKV (key text primary key, value text)")
+            conn.execute(
+                "insert into cursorDiskKV(key, value) values (?, ?)",
+                (
+                    "bubbleId:est",
+                    json.dumps(
+                        {
+                            "tokenCount": {"inputTokens": 0, "outputTokens": 0},
+                            "modelInfo": {"modelName": "cursor-claude-sonnet-4-6"},
+                            "createdAt": now_ms,
+                            "text": "abcdefgh",
+                            "type": 2,
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+
+        snapshot = agentcat.cursor_snapshot()
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertTrue(snapshot.get("estimated"))
+
+    def test_cursor_snapshot_omits_estimated_when_all_real(self) -> None:
+        # Bubbles with explicit real token counts must NOT set estimated.
+        db_path = agentcat.cursor_db_path()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("create table cursorDiskKV (key text primary key, value text)")
+            conn.execute(
+                "insert into cursorDiskKV(key, value) values (?, ?)",
+                (
+                    "bubbleId:real",
+                    json.dumps(
+                        {
+                            "tokenCount": {"inputTokens": 80, "outputTokens": 20},
+                            "modelInfo": {"modelName": "cursor-claude-sonnet-4-6"},
+                            "createdAt": now_ms,
+                            "text": "hello",
+                            "type": 2,
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+
+        snapshot = agentcat.cursor_snapshot()
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertNotIn("estimated", snapshot)
+
+    def _write_kiro_chat(self) -> None:
+        agent_dir = agentcat.kiro_agent_dir()
+        workspace_dir = agent_dir / ("a" * 32)
+        workspace_dir.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        (workspace_dir / "session.chat").write_text(
+            json.dumps(
+                {
+                    "metadata": {"modelId": "kiro-claude-sonnet-4.6", "startTime": now},
+                    "chat": [
+                        {"role": "human", "content": "please summarize this"},
+                        {"role": "bot", "content": "Here is the summary of the requested text."},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_kiro_snapshot_sets_estimated_flag(self) -> None:
+        # kiro never persists real token counts — its snapshot is fully
+        # char-estimated and must therefore carry estimated == True.
+        self._write_kiro_chat()
+        snapshot = agentcat.kiro_snapshot()
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertTrue(snapshot.get("estimated"))
+
+    def test_goose_snapshot_does_not_set_estimated_flag(self) -> None:
+        # goose reports REAL accumulated token counts, so estimated must be
+        # absent — the app should treat its numbers as exact.
+        data_home = agentcat.HOME / ".local" / "share"
+        with patch.dict(agentcat.os.environ, {"XDG_DATA_HOME": str(data_home)}):
+            self._run_goose_snapshot_fixture()
+            snapshot = agentcat.goose_snapshot()
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertNotIn("estimated", snapshot)
+
+    def test_is_local_request_rejects_origin_referer_and_remote_host(self) -> None:
+        from email.message import Message
+
+        def headers(pairs):
+            msg = Message()
+            for key, value in pairs.items():
+                msg[key] = value
+            return msg
+
+        # CLI/loopback request with no browser headers is allowed.
+        self.assertTrue(agentcat.is_local_request(headers({"Host": "127.0.0.1:8765"})))
+        self.assertTrue(agentcat.is_local_request(headers({"Host": "localhost"})))
+        self.assertTrue(agentcat.is_local_request(headers({})))
+        # An Origin header (browser-only) is rejected.
+        self.assertFalse(
+            agentcat.is_local_request(headers({"Host": "127.0.0.1:8765", "Origin": "http://evil.example"}))
+        )
+        # A Referer header is rejected.
+        self.assertFalse(
+            agentcat.is_local_request(headers({"Host": "127.0.0.1", "Referer": "http://evil.example/x"}))
+        )
+        # A non-loopback Host (DNS-rebind) is rejected.
+        self.assertFalse(agentcat.is_local_request(headers({"Host": "attacker.example"})))
+        # IPv6 loopback with a port is allowed.
+        self.assertTrue(agentcat.is_local_request(headers({"Host": "[::1]:8765"})))
+
+    def test_write_provider_config_drops_unknown_limit_keys_and_coerces(self) -> None:
+        written = agentcat.write_provider_config(
+            {
+                "providers": {
+                    "cursor": {
+                        "enabled": True,
+                        "limits": {
+                            "weeklyTokens": "50,000",   # coerced from string
+                            "monthlyTokens": 200000,
+                            "sessionTokens": 0,          # non-positive -> dropped
+                            "evilKey": {"nested": "junk"},  # unknown -> dropped
+                            "rm": "rf",                  # unknown -> dropped
+                        },
+                    }
+                }
+            }
+        )
+        limits = written["providers"]["cursor"]["limits"]
+        self.assertEqual(limits["weeklyTokens"], 50000)
+        self.assertEqual(limits["monthlyTokens"], 200000)
+        # Non-positive and unknown keys must not survive.
+        self.assertNotIn("sessionTokens", limits)
+        self.assertNotIn("evilKey", limits)
+        self.assertNotIn("rm", limits)
+        # The persisted file matches the returned, sanitized config.
+        persisted = json.loads(agentcat.PROVIDER_CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(persisted, written)
+
+    def test_cline_family_skips_oversized_files_without_error(self) -> None:
+        # A ui_messages.json larger than the parse cap must be SKIPPED (no
+        # tokens, no crash) rather than slurped into memory.
+        base_dir = agentcat.vscode_global_storage_dirs(
+            ("Code", "Code - Insiders"), "rooveterinaryinc.roo-cline"
+        )[0]
+        task_dir = base_dir / "tasks" / "task-big"
+        task_dir.mkdir(parents=True)
+        ts_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        (task_dir / "api_conversation_history.json").write_text("[]", encoding="utf-8")
+        big_entry = json.dumps(
+            {
+                "type": "say",
+                "say": "api_req_started",
+                "ts": ts_ms,
+                "text": json.dumps({"tokensIn": 100, "tokensOut": 30}),
+            }
+        )
+        (task_dir / "ui_messages.json").write_text(
+            "[" + big_entry + "]", encoding="utf-8"
+        )
+        # Force the cap below the file size so the bounded reader skips it.
+        small_cap = (task_dir / "ui_messages.json").stat().st_size - 1
+        with patch.object(agentcat, "LOCAL_PROVIDER_PARSE_BYTES", small_cap):
+            snapshot = agentcat.roo_code_snapshot()
+        # No tokens parsed, but the snapshot is well-formed and not an error.
+        self.assertNotEqual(snapshot["status"], "error")
+        self.assertEqual(snapshot["tokens"]["all"], 0)
+
     def test_roo_code_snapshot_reads_cline_family_task_tokens(self) -> None:
         base_dir = agentcat.vscode_global_storage_dirs(
             ("Code", "Code - Insiders"), "rooveterinaryinc.roo-cline"

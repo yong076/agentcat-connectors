@@ -547,7 +547,14 @@ def main() -> int:
                 reason = f"total {actual_total}!={exp_total}"
             elif not model_ok:
                 reason = f"model {exp_model!r} not in {list(models)}"
-            rows.append((name, status, exp_total, actual_total, exp_model, ok))
+            # Informational only (not a pass/fail gate): cursor/kiro fixtures
+            # char-estimate their tokens, so their snapshots now carry
+            # estimated:true. Surface it next to the model so the matrix stays
+            # consistent with the app's provider.estimated contract.
+            detail = exp_model
+            if ok and data.get("estimated") is True:
+                detail = f"{exp_model} (estimated)"
+            rows.append((name, status, exp_total, actual_total, detail, ok))
             if not ok and reason:
                 rows[-1] = (name, status, exp_total, actual_total, reason, ok)
 
