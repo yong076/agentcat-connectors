@@ -2,7 +2,7 @@
 
 All notable changes to the Agent Cat connector are documented here.
 
-## Unreleased
+## 26.23.1
 
 ### Added
 
