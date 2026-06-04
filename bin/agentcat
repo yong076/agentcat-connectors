@@ -64,7 +64,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.23.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.23.1")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -133,6 +133,15 @@ TOKEN_KEYS = {
     "tokens_used": "totalTokens",
     "tokensused": "totalTokens",
 }
+TOKEN_CLASS_KEYS = (
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+    "thoughtTokens",
+    "toolTokens",
+    "reasoningTokens",
+)
 
 # --- Insights pricing (Slice A) ---
 # Bundled USD-per-1M-token prices, split into 4 buckets per model:
@@ -1352,7 +1361,7 @@ def merge_limits(configured: Dict[str, Any], detected: Dict[str, Any]) -> Dict[s
 
 
 def configured_limits() -> Dict[str, Dict[str, Any]]:
-    base = {provider: empty_limits() for provider in ("codex", "claude", "gemini")}
+    base = {provider: empty_limits() for provider in ("codex", "claude", "gemini", "antigravity")}
     raw = read_json(LIMITS_FILE)
     if raw is None:
         return base
@@ -2266,10 +2275,12 @@ def prefer_live_limits(live: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[s
 def runtime_limits() -> Dict[str, Dict[str, Any]]:
     codex_fallback = codex_runtime_limits()
     claude_fallback = claude_runtime_limits()
+    gemini_limits = gemini_live_limits()
     return {
         "codex": prefer_live_limits(codex_live_limits(), codex_fallback),
         "claude": prefer_live_limits(claude_live_limits(), claude_fallback),
-        "gemini": gemini_live_limits(),
+        "gemini": gemini_limits,
+        "antigravity": copy.deepcopy(gemini_limits),
     }
 
 
@@ -3821,6 +3832,7 @@ def gemini_snapshot() -> Dict[str, Any]:
         try:
             usages = []
             source_statuses = {}
+            source_usages = {}
             for source in existing_sources:
                 telemetry_path = Path(source["telemetry"])
                 cache_path = Path(source["cache"])
@@ -3830,6 +3842,7 @@ def gemini_snapshot() -> Dict[str, Any]:
                 save_gemini_usage_state(state, cache_path=cache_path)
                 usage = gemini_usage_result_from_state(state)
                 usages.append(usage)
+                source_usages[str(source["id"])] = usage
                 source_statuses[str(source["id"])] = gemini_source_status(source, usage)
             usage = merge_gemini_usage(usages)
         except Exception as exc:
@@ -3846,6 +3859,7 @@ def gemini_snapshot() -> Dict[str, Any]:
         result["hourlyTokens"] = usage["hourlyTokens"]
         result["events"] = usage["events"]
         result["cache"] = usage["cache"]
+        result["_sourceUsages"] = source_usages
         _GEMINI_CACHE_KEY = cache_key
         _GEMINI_CACHE_VALUE = copy.deepcopy(result)
         _GEMINI_CACHE_LOADED_AT = time.monotonic()
@@ -4377,6 +4391,10 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "models": models,
         "dailyTokens": daily_tokens,
         "hourlyTokens": hourly_tokens,
+        "modelDailyTokens": {
+            str(model): int_map(days)
+            for model, days in (raw_model_daily.items() if isinstance(raw_model_daily, dict) else [])
+        },
         "events": int(state.get("events") or 0),
         "cache": {
             "source": "full-log-index",
@@ -4384,6 +4402,213 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
             "size": int(state.get("size") or 0),
         },
     }
+
+
+def antigravity_history_days() -> set:
+    days = set()
+    path = ANTIGRAVITY_CLI_DIR / "history.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return days
+    for line in lines[-2000:]:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        when = parse_timestamp(payload.get("timestamp"))
+        day = day_key_for_timestamp(when)
+        if day:
+            days.add(day)
+    return days
+
+
+def antigravity_inference_days(activity: Optional[Dict[str, Any]]) -> set:
+    days = antigravity_history_days()
+    counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
+    if isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0 and int(counts.get("gemini") or 0) <= 0:
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        today_utc = day_key_for_timestamp(now_utc)
+        today_local = day_key_for_timestamp(now_utc.astimezone())
+        if today_utc:
+            days.add(today_utc)
+        if today_local:
+            days.add(today_local)
+    return days
+
+
+def _hour_day_key(raw: str) -> str:
+    return str(raw or "")[:10]
+
+
+def filter_google_usage_days(usage: Dict[str, Any], days: set, *, include: bool) -> Dict[str, Any]:
+    daily_tokens = {
+        day: amount
+        for day, amount in int_map(usage.get("dailyTokens")).items()
+        if (day in days) == include
+    }
+    hourly_tokens = {
+        hour: amount
+        for hour, amount in int_map(usage.get("hourlyTokens")).items()
+        if (_hour_day_key(hour) in days) == include
+    }
+    model_daily_raw = usage.get("modelDailyTokens") if isinstance(usage.get("modelDailyTokens"), dict) else {}
+    source_models = usage.get("models") if isinstance(usage.get("models"), dict) else {}
+    models: Dict[str, Dict[str, int]] = {}
+    model_daily_tokens: Dict[str, Dict[str, int]] = {}
+    for model, raw_days in model_daily_raw.items():
+        model_days = {
+            day: amount
+            for day, amount in int_map(raw_days).items()
+            if (day in days) == include
+        }
+        model_total = sum(model_days.values())
+        if model_total <= 0:
+            continue
+        source_model_tokens = int_map(source_models.get(model))
+        original_model_total = (
+            source_model_tokens.get("totalTokens")
+            or source_model_tokens.get("all")
+            or sum(source_model_tokens.get(key, 0) for key in TOKEN_CLASS_KEYS)
+        )
+        periods = periods_from_daily_tokens(model_days)
+        periods["all"] = model_total
+        model_tokens = {
+            key: _scaled_token_class(source_model_tokens.get(key, 0), model_total, original_model_total)
+            for key in TOKEN_CLASS_KEYS
+        }
+        for key, amount in periods.items():
+            if amount > 0:
+                model_tokens[key] = amount
+        models[str(model)] = {key: amount for key, amount in model_tokens.items() if amount > 0}
+        model_daily_tokens[str(model)] = model_days
+
+    total = sum(daily_tokens.values())
+    tokens: Dict[str, int] = {}
+    source_tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else {}
+    original_total = int(source_tokens.get("totalTokens") or source_tokens.get("all") or 0)
+    if total > 0:
+        for key in TOKEN_CLASS_KEYS:
+            amount = _scaled_token_class(int(source_tokens.get(key) or 0), total, original_total)
+            if amount > 0:
+                tokens[key] = amount
+        tokens["totalTokens"] = total
+        periods = periods_from_daily_tokens(daily_tokens)
+        periods["all"] = total
+        for key, amount in periods.items():
+            if amount > 0:
+                tokens[key] = amount
+
+    filtered = {
+        "tokens": tokens,
+        "models": models,
+        "dailyTokens": daily_tokens,
+        "hourlyTokens": hourly_tokens,
+        "modelDailyTokens": model_daily_tokens,
+        "events": int(usage.get("events") or 0) if total > 0 and total == original_total else 0,
+        "cache": copy.deepcopy(usage.get("cache") or {"source": "filtered"}),
+    }
+    if total > 0 and total != original_total:
+        filtered["cache"]["source"] = "filtered-by-antigravity-history"
+    return filtered
+
+
+def google_usage_total(usage: Optional[Dict[str, Any]]) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else {}
+    return int(tokens.get("totalTokens") or tokens.get("all") or sum(v for v in tokens.values() if isinstance(v, int)) or 0)
+
+
+def apply_google_usage(snapshot: Dict[str, Any], usage: Optional[Dict[str, Any]], *, status_if_empty: Optional[str] = None) -> Dict[str, Any]:
+    out = copy.deepcopy(snapshot)
+    usage = usage if isinstance(usage, dict) else {}
+    out["tokens"] = copy.deepcopy(usage.get("tokens") or {})
+    out["models"] = copy.deepcopy(usage.get("models") or {})
+    out["dailyTokens"] = copy.deepcopy(usage.get("dailyTokens") or {})
+    out["hourlyTokens"] = copy.deepcopy(usage.get("hourlyTokens") or {})
+    out["events"] = int(usage.get("events") or 0)
+    out["cache"] = copy.deepcopy(usage.get("cache") or {"source": "none"})
+    out["status"] = "ok" if google_usage_total(usage) > 0 else (status_if_empty or out.get("status") or "no_token_events_yet")
+    return out
+
+
+def antigravity_provider_snapshot(
+    gemini_snapshot_data: Dict[str, Any],
+    usage: Optional[Dict[str, Any]],
+    *,
+    status_if_empty: str,
+    source_note: str,
+) -> Dict[str, Any]:
+    source_status = copy.deepcopy((gemini_snapshot_data.get("sources") or {}).get("antigravityCli") or {})
+    if usage and google_usage_total(usage) > 0:
+        source_status["status"] = "ok" if source_note == "dedicated-telemetry" else "inferred_from_gemini_telemetry"
+        source_status["tokens"] = google_usage_total(usage)
+        source_status["events"] = int(usage.get("events") or source_status.get("events") or 0)
+    out = {
+        "status": "ok" if google_usage_total(usage) > 0 else status_if_empty,
+        "source": source_status.get("source") or str(ANTIGRAVITY_TELEMETRY),
+        "canonicalProvider": "google",
+        "providerLabel": "Antigravity",
+        "displayName": "Antigravity",
+        "sourceAttribution": source_note,
+        "sources": {"antigravityCli": source_status},
+        "tokens": {},
+        "models": {},
+        "dailyTokens": {},
+        "hourlyTokens": {},
+        "events": 0,
+        "cache": {"source": "none"},
+        "breakdown": empty_breakdown(),
+    }
+    return apply_google_usage(out, usage, status_if_empty=status_if_empty)
+
+
+def split_google_cli_snapshots(
+    gemini_snapshot_data: Dict[str, Any],
+    activity: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    source_usages = gemini_snapshot_data.pop("_sourceUsages", {})
+    common_usage = source_usages.get("geminiCli") if isinstance(source_usages, dict) else None
+    antigravity_usage = source_usages.get("antigravityCli") if isinstance(source_usages, dict) else None
+
+    if google_usage_total(antigravity_usage) > 0:
+        gemini_provider = apply_google_usage(gemini_snapshot_data, common_usage, status_if_empty="no_token_events_yet")
+        antigravity_provider = antigravity_provider_snapshot(
+            gemini_snapshot_data,
+            antigravity_usage,
+            status_if_empty="no_token_events_yet",
+            source_note="dedicated-telemetry",
+        )
+        return gemini_provider, antigravity_provider
+
+    inference_days = antigravity_inference_days(activity)
+    counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
+    antigravity_installed = bool(((gemini_snapshot_data.get("sources") or {}).get("antigravityCli") or {}).get("installed"))
+    antigravity_active = isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0
+    if inference_days and google_usage_total(common_usage) > 0 and (antigravity_active or antigravity_installed):
+        inferred_usage = filter_google_usage_days(common_usage, inference_days, include=True)
+        gemini_usage = filter_google_usage_days(common_usage, inference_days, include=False)
+        if google_usage_total(inferred_usage) > 0:
+            gemini_provider = apply_google_usage(gemini_snapshot_data, gemini_usage, status_if_empty="no_token_events_yet")
+            antigravity_provider = antigravity_provider_snapshot(
+                gemini_snapshot_data,
+                inferred_usage,
+                status_if_empty="no_token_events_yet",
+                source_note="inferred-from-gemini-telemetry",
+            )
+            return gemini_provider, antigravity_provider
+
+    status_if_empty = "no_telemetry_yet" if antigravity_installed else "not_found"
+    antigravity_provider = antigravity_provider_snapshot(
+        gemini_snapshot_data,
+        None,
+        status_if_empty=status_if_empty,
+        source_note="no-antigravity-telemetry",
+    )
+    return gemini_snapshot_data, antigravity_provider
 
 
 def command_parts(command: str) -> List[str]:
@@ -4452,10 +4677,14 @@ def classify_process(command: str) -> Optional[str]:
     if executable in {"claude", "claude.exe", "claude.cmd"} or "@anthropic-ai/claude" in normalized or "claude-code" in normalized:
         return "claude"
     if (
-        executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli", "agy", "agy.exe", "antigravity", "antigravity.exe", "antigravity-cli"}
-        or "@google/gemini" in normalized
+        executable in {"agy", "agy.exe", "antigravity", "antigravity.exe", "antigravity-cli"}
         or "/.gemini/antigravity-cli/" in normalized
         or "com.google.antigravity" in normalized
+    ):
+        return "antigravity"
+    if (
+        executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli"}
+        or "@google/gemini" in normalized
     ):
         return "gemini"
     return None
@@ -4486,8 +4715,8 @@ def empty_windows_activity_result() -> Dict[str, Any]:
         "totalMemoryBytes": 0,
         "motionStage": "sleeping",
         "runtimeModes": safe_runtime_modes_snapshot(),
-        "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0},
-        "memoryBytesByProvider": {"codex": 0, "claude": 0, "gemini": 0},
+        "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0},
+        "memoryBytesByProvider": {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0},
         "processes": [],
     }
 
@@ -4507,8 +4736,8 @@ def windows_activity_from_rows(
     scan_warning: Optional[str] = None,
 ) -> Dict[str, Any]:
     rows.sort(key=lambda row: (-float(row["cpuPercent"]), str(row["kind"])))
-    counts = {"codex": 0, "claude": 0, "gemini": 0}
-    memory_by_provider = {"codex": 0, "claude": 0, "gemini": 0}
+    counts = {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0}
+    memory_by_provider = {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0}
     for row in rows:
         provider = str(row["kind"])
         counts[provider] = counts.get(provider, 0) + 1
@@ -4736,8 +4965,8 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
         "totalMemoryBytes": 0,
         "motionStage": "sleeping",
         "runtimeModes": safe_runtime_modes_snapshot(),
-        "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0},
-        "memoryBytesByProvider": {"codex": 0, "claude": 0, "gemini": 0},
+        "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0},
+        "memoryBytesByProvider": {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0},
         "processes": [],
     }
     try:
@@ -4786,8 +5015,8 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
         )
 
     rows.sort(key=lambda row: (-float(row["cpuPercent"]), str(row["kind"])))
-    counts = {"codex": 0, "claude": 0, "gemini": 0}
-    memory_by_provider = {"codex": 0, "claude": 0, "gemini": 0}
+    counts = {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0}
+    memory_by_provider = {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0}
     for row in rows:
         counts[str(row["kind"])] = counts.get(str(row["kind"]), 0) + 1
         memory_by_provider[str(row["kind"])] = memory_by_provider.get(str(row["kind"]), 0) + int(row.get("memoryBytes") or 0)
@@ -5015,10 +5244,13 @@ def build_snapshot() -> Dict[str, Any]:
         latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
     limits_by_provider = configured_limits()
     runtime_limits_by_provider = runtime_limits()
+    activity = terminal_activity_snapshot()
+    gemini_provider, antigravity_provider = split_google_cli_snapshots(gemini_snapshot(), activity)
     providers = {
         "codex": codex_snapshot(),
         "claude": claude_snapshot(),
-        "gemini": gemini_snapshot(),
+        "gemini": gemini_provider,
+        "antigravity": antigravity_provider,
         "opencode": opencode_snapshot(),
         "copilot": copilot_snapshot(),
     }
@@ -5033,7 +5265,7 @@ def build_snapshot() -> Dict[str, Any]:
         "capabilities": list(CONNECTOR_CAPABILITIES),
         "generatedAt": now_iso(),
         "update": auto_update_status_snapshot(),
-        "activity": terminal_activity_snapshot(),
+        "activity": activity,
         "providers": providers,
         "events": {
             "latestByProvider": latest_by_provider,

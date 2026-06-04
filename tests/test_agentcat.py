@@ -841,6 +841,68 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertTrue(agentcat.GEMINI_USAGE_CACHE.exists())
         self.assertTrue(agentcat.ANTIGRAVITY_USAGE_CACHE.exists())
 
+    def test_split_google_cli_snapshots_infers_antigravity_from_history_days(self) -> None:
+        agentcat.ANTIGRAVITY_CLI_DIR.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        today = agentcat.day_key_for_timestamp(now)
+        yesterday = agentcat.day_key_for_timestamp(now - dt.timedelta(days=1))
+        (agentcat.ANTIGRAVITY_CLI_DIR / "history.jsonl").write_text(
+            json.dumps({"timestamp": int(now.timestamp() * 1000), "conversationId": "agy-conv"}) + "\n",
+            encoding="utf-8",
+        )
+        common_usage = {
+            "tokens": {"inputTokens": 210, "outputTokens": 90, "totalTokens": 300, "all": 300},
+            "models": {"gemini-test": {"inputTokens": 210, "outputTokens": 90, "all": 300}},
+            "dailyTokens": {yesterday: 100, today: 200},
+            "hourlyTokens": {f"{yesterday}T12": 100, f"{today}T12": 200},
+            "modelDailyTokens": {"gemini-test": {yesterday: 100, today: 200}},
+            "events": 12,
+            "cache": {"source": "full-log-index"},
+        }
+        gemini = {
+            "status": "ok",
+            "source": str(agentcat.GEMINI_TELEMETRY),
+            "canonicalProvider": "google",
+            "providerLabel": "Gemini",
+            "displayName": "Gemini",
+            "sources": {
+                "geminiCli": {"installed": True, "status": "ok", "tokens": 300},
+                "antigravityCli": {
+                    "installed": True,
+                    "status": "no_telemetry_yet",
+                    "source": str(agentcat.ANTIGRAVITY_TELEMETRY),
+                    "tokens": 0,
+                },
+            },
+            "_sourceUsages": {"geminiCli": common_usage},
+            "tokens": common_usage["tokens"],
+            "models": {},
+            "dailyTokens": common_usage["dailyTokens"],
+            "hourlyTokens": common_usage["hourlyTokens"],
+            "events": 12,
+            "cache": {"source": "full-log-index"},
+            "breakdown": agentcat.empty_breakdown(),
+        }
+
+        gemini_provider, antigravity_provider = agentcat.split_google_cli_snapshots(
+            gemini,
+            {"countsByProvider": {"gemini": 0, "antigravity": 1}},
+        )
+
+        self.assertEqual(gemini_provider["tokens"]["totalTokens"], 100)
+        self.assertEqual(gemini_provider["tokens"]["inputTokens"], 70)
+        self.assertEqual(gemini_provider["tokens"]["outputTokens"], 30)
+        self.assertEqual(gemini_provider["dailyTokens"], {yesterday: 100})
+        self.assertEqual(antigravity_provider["status"], "ok")
+        self.assertEqual(antigravity_provider["tokens"]["totalTokens"], 200)
+        self.assertEqual(antigravity_provider["tokens"]["inputTokens"], 140)
+        self.assertEqual(antigravity_provider["tokens"]["outputTokens"], 60)
+        self.assertEqual(antigravity_provider["dailyTokens"], {today: 200})
+        self.assertEqual(antigravity_provider["models"]["gemini-test"]["all"], 200)
+        self.assertEqual(antigravity_provider["models"]["gemini-test"]["inputTokens"], 140)
+        self.assertEqual(antigravity_provider["models"]["gemini-test"]["outputTokens"], 60)
+        self.assertEqual(antigravity_provider["sourceAttribution"], "inferred-from-gemini-telemetry")
+
     def test_gemini_snapshot_distributes_cumulative_counter_deltas_by_day(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
         today = dt.datetime.now(dt.timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
@@ -1100,22 +1162,22 @@ class AgentCatConnectorTests(unittest.TestCase):
             "gemini",
         )
 
-    def test_classify_antigravity_cli_processes_as_gemini(self) -> None:
+    def test_classify_antigravity_cli_processes_as_antigravity(self) -> None:
         self.assertEqual(
             agentcat.classify_process("agy --print hello"),
-            "gemini",
+            "antigravity",
         )
         self.assertEqual(
             agentcat.classify_process("/Users/me/.local/bin/agy --prompt hello"),
-            "gemini",
+            "antigravity",
         )
         self.assertEqual(
             agentcat.classify_process(r'"C:\Users\me\.local\bin\agy.exe" --print hello'),
-            "gemini",
+            "antigravity",
         )
         self.assertEqual(
             agentcat.classify_process("/Applications/Antigravity.app/Contents/MacOS/antigravity"),
-            "gemini",
+            "antigravity",
         )
 
     def test_classify_ignores_codex_desktop_electron_helpers_on_windows(self) -> None:
@@ -1346,7 +1408,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["scanSource"], "tasklist")
         self.assertIn("PowerShell scan failed", snapshot["scanWarning"])
         self.assertEqual(snapshot["processCount"], 4)
-        self.assertEqual(snapshot["countsByProvider"], {"codex": 1, "claude": 1, "gemini": 2})
+        self.assertEqual(snapshot["countsByProvider"], {"codex": 1, "claude": 1, "gemini": 1, "antigravity": 1})
         self.assertEqual(snapshot["totalMemoryBytes"], 37_217_280)
 
     def test_claude_runtime_limits_reads_statusline_event(self) -> None:
