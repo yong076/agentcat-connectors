@@ -1923,6 +1923,10 @@ def sanitize_claude_cached_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
             continue
         item = dict(quota)
         quota_id = str(item.get("id") or "")
+        # Drop a zero-spend extra-usage (overage cap) bar read back from cache,
+        # so older cached snapshots stop showing phantom "월별 크레딧 100% 남음".
+        if quota_id == "claude:extra_usage" and not float_value(item.get("used")):
+            continue
         if quota_id.startswith("claude:seven_day_") and not quota_id.startswith("claude:seven_day_model:"):
             key = quota_id.removeprefix("claude:")
             if key not in {"seven_day_sonnet", "seven_day_opus"}:
@@ -1968,7 +1972,11 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
             limit = float_value(entry.get("monthly_limit"))
             used = float_value(entry.get("used_credits")) or 0.0
             currency = str(entry.get("currency") or "credits")
-            if limit and limit > 0:
+            # Only surface the extra-usage (pay-as-you-go overage) bar once the
+            # user has actually spent on it. A $0-used monthly cap is not credit
+            # the user holds — showing it as "100% remaining" reads as phantom
+            # credit, so we hide it until there is real overage spend.
+            if limit and limit > 0 and used > 0:
                 remaining = max(limit - used, 0.0)
                 used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
                 quotas.append(
