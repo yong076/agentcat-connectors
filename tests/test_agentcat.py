@@ -595,6 +595,112 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["models"]["gpt-5.4"]["all"], 42)
         self.assertNotIn("unknown", snapshot["models"])
 
+    def test_current_model_capability_is_advertised(self) -> None:
+        self.assertIn("usage.currentModel", agentcat.CONNECTOR_CAPABILITIES)
+
+    def test_note_current_model_keeps_freshest_record_and_finalizes(self) -> None:
+        result: dict = {}
+        now = dt.datetime.now(dt.timezone.utc)
+        agentcat.note_current_model(result, "model-b", now - dt.timedelta(hours=2))
+        agentcat.note_current_model(result, "model-a", now, source="threads")
+        # Older records, timestamp-less records, and "unknown" never win.
+        agentcat.note_current_model(result, "model-c", now - dt.timedelta(hours=1))
+        agentcat.note_current_model(result, "model-d", None)
+        agentcat.note_current_model(result, "unknown", now + dt.timedelta(hours=1))
+
+        agentcat.finalize_current_model(result)
+
+        self.assertNotIn("_currentModelCandidate", result)
+        current = result["currentModel"]
+        self.assertEqual(current["id"], "model-a")
+        self.assertEqual(current["source"], "threads")
+        self.assertRegex(current["updatedAt"], r"^\d{4}-\d{2}-\d{2}T")
+        json.dumps(result)  # snapshot stays JSON-serializable after finalize
+
+    def test_add_usage_metrics_notes_current_model(self) -> None:
+        result: dict = {}
+        now = dt.datetime.now(dt.timezone.utc)
+        agentcat.add_usage_metrics(result, "qwen-coder", {"inputTokens": 5, "outputTokens": 5}, now - dt.timedelta(hours=1))
+        agentcat.add_usage_metrics(result, "qwen-max", {"inputTokens": 1, "outputTokens": 1}, now)
+
+        agentcat.finalize_current_model(result)
+
+        self.assertEqual(result["currentModel"]["id"], "qwen-max")
+
+    def test_codex_snapshot_exposes_current_model_from_latest_thread(self) -> None:
+        codex_dir = agentcat.HOME / ".codex"
+        codex_dir.mkdir(parents=True)
+        db_path = codex_dir / "state_test.sqlite"
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = [
+            (10, "gpt-newest", now.isoformat()),
+            (999, "gpt-heavier-but-older", (now - dt.timedelta(days=3)).isoformat()),
+        ]
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("create table threads(tokens_used integer, model text, updated_at text)")
+            conn.executemany("insert into threads(tokens_used, model, updated_at) values (?, ?, ?)", rows)
+            conn.commit()
+
+        snapshot = agentcat.codex_snapshot()
+        agentcat.finalize_current_model(snapshot)
+
+        current = snapshot["currentModel"]
+        self.assertEqual(current["id"], "gpt-newest")
+        self.assertEqual(current["source"], "threads")
+
+    def test_claude_snapshot_tracks_current_model_from_journal(self) -> None:
+        project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"
+        project_dir.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+
+        def record(ts: dt.datetime, model: str, output_tokens: int) -> str:
+            return json.dumps(
+                {
+                    "timestamp": ts.isoformat().replace("+00:00", "Z"),
+                    "message": {
+                        "model": model,
+                        "usage": {"input_tokens": 1, "output_tokens": output_tokens},
+                    },
+                }
+            )
+
+        (project_dir / "session.jsonl").write_text(
+            record(now - dt.timedelta(hours=3), "claude-sonnet-4-6", 5000) + "\n"
+            + record(now, "claude-opus-4-8", 2) + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+        agentcat.finalize_current_model(snapshot)
+
+        current = snapshot["currentModel"]
+        self.assertEqual(current["id"], "claude-opus-4-8")
+        self.assertEqual(current["source"], "journal")
+
+    def test_gemini_state_tracks_latest_model_for_current_model(self) -> None:
+        state: dict = {}
+        now = dt.datetime.now(dt.timezone.utc)
+        agentcat.add_gemini_delta_to_state(
+            state, token_key="inputTokens", model="gemini-3-pro", amount=5, when=now - dt.timedelta(hours=1)
+        )
+        agentcat.add_gemini_delta_to_state(
+            state, token_key="inputTokens", model="gemini-3-flash", amount=3, when=now
+        )
+
+        usage = agentcat.gemini_usage_result_from_state(state)
+        self.assertEqual(usage["latestModel"]["model"], "gemini-3-flash")
+
+        stale = {
+            "tokens": {},
+            "models": {},
+            "dailyTokens": {},
+            "hourlyTokens": {},
+            "events": 0,
+            "latestModel": {"model": "gemini-older", "when": (now - dt.timedelta(days=1)).isoformat()},
+        }
+        merged = agentcat.merge_gemini_usage([usage, stale])
+        self.assertEqual(merged["latestModel"]["model"], "gemini-3-flash")
+
     def test_claude_snapshot_adds_periods_to_daily_model_tokens(self) -> None:
         claude_dir = agentcat.HOME / ".claude"
         claude_dir.mkdir(parents=True)

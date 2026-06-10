@@ -537,7 +537,12 @@ def main() -> int:
             status_ok = status == "ok"
             total_ok = actual_total == exp_total
             model_ok = exp_model in models
-            ok = status_ok and total_ok and model_ok
+            # currentModel gate: every fixture writes timestamped records, so
+            # the snapshot must name a model-in-use and it must be one the
+            # rollup actually saw (capability usage.currentModel).
+            current = data.get("currentModel") or {}
+            current_ok = bool(current.get("id")) and current.get("id") in models
+            ok = status_ok and total_ok and model_ok and current_ok
             all_pass = all_pass and ok
 
             reason = ""
@@ -547,6 +552,8 @@ def main() -> int:
                 reason = f"total {actual_total}!={exp_total}"
             elif not model_ok:
                 reason = f"model {exp_model!r} not in {list(models)}"
+            elif not current_ok:
+                reason = f"currentModel={current!r}"
             # Informational only (not a pass/fail gate): cursor/kiro fixtures
             # char-estimate their tokens, so their snapshots now carry
             # estimated:true. Surface it next to the model so the matrix stays

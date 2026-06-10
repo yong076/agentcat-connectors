@@ -2,6 +2,26 @@
 
 All notable changes to the Agent Cat connector are documented here.
 
+## 26.23.2
+
+### Added
+
+- **`providers.<id>.currentModel`** (capability `usage.currentModel`): the
+  model behind each provider's freshest record, as
+  `{id, displayName?, source?, updatedAt?}`. Sources per provider:
+  - codex — latest `threads` row (`source: "threads"`)
+  - claude — freshest journal record (`source: "journal"`), enriched with the
+    statusline hook's human display name ("Opus 4.8") when the model matches;
+    statusline stands alone for cursors that predate `latestModel` tracking
+  - gemini — freshest telemetry record (`source: "telemetry"`), tracked in the
+    full-log-index state and merged across Gemini/Antigravity sources
+  - opencode, copilot, and all 12 local-usage providers — freshest record seen
+    by the shared usage aggregation
+  Records without timestamps never win; providers with no model signal omit
+  the field so clients can fall back to the heaviest `models[]` entry.
+  `scripts/verify_providers_e2e.py` now gates on `currentModel` for all 12
+  fixture providers.
+
 ## 26.23.1
 
 ### Added

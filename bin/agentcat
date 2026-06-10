@@ -65,7 +65,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.23.1")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.23.2")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -93,6 +93,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.hourlyTokens",
     "usage.breakdown",
     "usage.projects",
+    "usage.currentModel",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
     "limits.liveCache",
@@ -2598,6 +2599,56 @@ def normalized_model_name(raw: Any) -> Optional[str]:
     return text
 
 
+def note_current_model(
+    result: Dict[str, Any],
+    model_raw: Any,
+    when: Optional[dt.datetime],
+    display_name: Optional[str] = None,
+    source: Optional[str] = None,
+) -> None:
+    """Track the model behind the freshest record seen so far for a provider.
+
+    Stored under a private key (datetime inside, not JSON-safe) and converted
+    to `currentModel` by finalize_current_model() in build_snapshot. Records
+    without a timestamp never win: recency is the whole point of the field.
+    """
+    model = normalized_model_name(model_raw)
+    if model is None or model == "unknown" or when is None:
+        return
+    cand = result.get("_currentModelCandidate")
+    if isinstance(cand, dict):
+        prev = cand.get("when")
+        if isinstance(prev, dt.datetime) and prev >= when:
+            return
+    entry: Dict[str, Any] = {"when": when, "id": model}
+    if display_name:
+        entry["displayName"] = str(display_name)
+    if source:
+        entry["source"] = source
+    result["_currentModelCandidate"] = entry
+
+
+def finalize_current_model(result: Dict[str, Any]) -> None:
+    """Convert the private candidate into `providers.<id>.currentModel`.
+
+    A provider that already set currentModel directly (claude statusline
+    fallback) keeps it; the candidate is discarded either way so the snapshot
+    stays JSON-serializable.
+    """
+    cand = result.pop("_currentModelCandidate", None)
+    if result.get("currentModel") is not None or not isinstance(cand, dict):
+        return
+    current: Dict[str, Any] = {"id": cand.get("id")}
+    if cand.get("displayName"):
+        current["displayName"] = cand["displayName"]
+    if cand.get("source"):
+        current["source"] = cand["source"]
+    when = cand.get("when")
+    if isinstance(when, dt.datetime):
+        current["updatedAt"] = when.isoformat().replace("+00:00", "Z")
+    result["currentModel"] = current
+
+
 TOKEN_TOTAL_PART_KEYS = {
     "inputTokens",
     "outputTokens",
@@ -2646,6 +2697,7 @@ def add_usage_metrics(
     add_to_periods(model_tokens, total, when)
     add_to_daily(daily, total, when)
     add_to_hourly(hourly, total, when)
+    note_current_model(result, model, when)
     return True
 
 
@@ -3915,6 +3967,7 @@ def codex_snapshot() -> Dict[str, Any]:
             model = "unknown"
         model_periods = models.setdefault(model, empty_periods())
         add_to_periods(model_periods, tokens, when)
+        note_current_model(result, model, when, source="threads")
 
     result["status"] = "ok"
     result["threads"] = len(rows)
@@ -4365,6 +4418,16 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                             hourly_tokens,
                             models,
                         )
+                        rec_when = rec.get("timestamp")
+                        rec_model = str(rec.get("model") or "")
+                        if isinstance(rec_when, dt.datetime) and rec_model and rec_model != "unknown":
+                            latest = cursor.get("latestModel")
+                            latest_when = parse_timestamp(latest.get("timestamp")) if isinstance(latest, dict) else None
+                            if latest_when is None or rec_when > latest_when:
+                                cursor["latestModel"] = {
+                                    "timestamp": rec_when.isoformat(),
+                                    "model": rec_model,
+                                }
                         lines_parsed += 1
         except OSError as exc:
             logging.warning("scan_claude_journal: cannot read %s: %s", path_str, exc)
@@ -4469,6 +4532,39 @@ def claude_snapshot() -> Dict[str, Any]:
     _merge_journal_models(result["models"], cursor.get("models") or {})
     if cursor.get("projects"):
         result["projects"] = _journal_projects_snapshot(cursor["projects"])
+
+    # currentModel: the journal knows the freshest record's model; the
+    # statusline hook adds the human display name ("Opus 4.8") when its model
+    # matches (or stands alone for cursors that predate latestModel tracking).
+    latest_model = cursor.get("latestModel")
+    if isinstance(latest_model, dict) and latest_model.get("model"):
+        note_current_model(
+            result,
+            latest_model.get("model"),
+            parse_timestamp(latest_model.get("timestamp")),
+            source="journal",
+        )
+    statusline_payload = latest_event_payload("claude", "claude-statusline")
+    if isinstance(statusline_payload, dict):
+        raw_model = find_first_key(statusline_payload, ["model", "modelName", "model_name"])
+        statusline_id: Optional[str] = None
+        statusline_name: Optional[str] = None
+        if isinstance(raw_model, dict):
+            statusline_id = normalized_model_name(raw_model.get("id"))
+            name = raw_model.get("display_name")
+            statusline_name = str(name) if name else None
+        else:
+            statusline_id = normalized_model_name(raw_model)
+        cand = result.get("_currentModelCandidate")
+        if isinstance(cand, dict):
+            if statusline_name and (statusline_id is None or statusline_id == cand.get("id")):
+                cand["displayName"] = statusline_name
+                cand["source"] = "statusline"
+        elif statusline_id or statusline_name:
+            current: Dict[str, Any] = {"id": statusline_id or statusline_name, "source": "statusline"}
+            if statusline_name:
+                current["displayName"] = statusline_name
+            result["currentModel"] = current
 
     if raw is None:
         return result
@@ -4604,6 +4700,13 @@ def merge_gemini_usage(usages: List[Dict[str, Any]]) -> Dict[str, Any]:
             model_tokens = merged["models"].setdefault(str(model), {})
             merge_token_maps(model_tokens, raw_tokens)
         merged["cache"]["sources"].append(usage.get("cache", {"source": "unknown"}))
+        candidate = usage.get("latestModel")
+        if isinstance(candidate, dict) and candidate.get("model"):
+            current = merged.get("latestModel")
+            candidate_when = parse_timestamp(candidate.get("when"))
+            current_when = parse_timestamp(current.get("when")) if isinstance(current, dict) else None
+            if current_when is None or (candidate_when is not None and candidate_when > current_when):
+                merged["latestModel"] = candidate
     return merged
 
 
@@ -4671,6 +4774,14 @@ def gemini_snapshot() -> Dict[str, Any]:
         result["hourlyTokens"] = usage["hourlyTokens"]
         result["events"] = usage["events"]
         result["cache"] = usage["cache"]
+        latest_model = usage.get("latestModel")
+        if isinstance(latest_model, dict) and latest_model.get("model"):
+            note_current_model(
+                result,
+                latest_model.get("model"),
+                parse_timestamp(latest_model.get("when")),
+                source="telemetry",
+            )
         _GEMINI_CACHE_KEY = cache_key
         _GEMINI_CACHE_VALUE = copy.deepcopy(result)
         _GEMINI_CACHE_LOADED_AT = time.monotonic()
@@ -4990,6 +5101,12 @@ def add_gemini_delta_to_state(
         hourly_tokens = state.setdefault("hourlyTokens", {})
         hourly_tokens[hour_key] = int(hourly_tokens.get(hour_key) or 0) + amount
 
+    if amount > 0 and when is not None and model and model != "unknown":
+        latest = state.get("latestModel")
+        latest_when = parse_timestamp(latest.get("when")) if isinstance(latest, dict) else None
+        if latest_when is None or when > latest_when:
+            state["latestModel"] = {"model": model, "when": when.isoformat()}
+
     state["events"] = int(state.get("events") or 0) + 1
 
 
@@ -5197,7 +5314,7 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
                 model_tokens[key] = amount
         models[str(model)] = model_tokens
 
-    return {
+    usage: Dict[str, Any] = {
         "tokens": tokens,
         "models": models,
         "dailyTokens": daily_tokens,
@@ -5209,6 +5326,13 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
             "size": int(state.get("size") or 0),
         },
     }
+    latest_model = state.get("latestModel")
+    if isinstance(latest_model, dict) and latest_model.get("model"):
+        usage["latestModel"] = {
+            "model": str(latest_model.get("model")),
+            "when": latest_model.get("when"),
+        }
+    return usage
 
 
 def command_parts(command: str) -> List[str]:
@@ -5882,6 +6006,7 @@ def _build_snapshot_locked() -> Dict[str, Any]:
         if not provider_is_enabled(pcfg, provider):
             providers[provider] = disabled_provider_snapshot(provider)
     for provider, data in providers.items():
+        finalize_current_model(data)
         data["limits"] = merge_limits(
             limits_by_provider.get(provider, empty_limits()),
             runtime_limits_by_provider.get(provider, empty_limits()),
