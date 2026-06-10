@@ -192,6 +192,26 @@ def _lookup_pricing(model: str) -> Optional[Dict[str, float]]:
     return None
 
 
+# Tier cutoffs on output $/MTok. Price is the proxy for "how premium" so new
+# families (fable, …) rank automatically once their pricing lands in
+# MODEL_PRICING — never infer tier from the model name.
+MODEL_TIER_FLAGSHIP_MIN_OUTPUT = 25.0
+MODEL_TIER_MINI_MAX_OUTPUT = 5.0
+
+
+def classify_model_tier(model: str) -> Optional[str]:
+    """'flagship' | 'standard' | 'mini' from pricing; None when unknown."""
+    pricing = _lookup_pricing(model)
+    if not pricing:
+        return None
+    output = float(pricing.get("output") or 0)
+    if output >= MODEL_TIER_FLAGSHIP_MIN_OUTPUT:
+        return "flagship"
+    if output < MODEL_TIER_MINI_MAX_OUTPUT:
+        return "mini"
+    return "standard"
+
+
 def estimate_cost(
     model: str,
     input_tokens: int,
@@ -2636,7 +2656,12 @@ def finalize_current_model(result: Dict[str, Any]) -> None:
     stays JSON-serializable.
     """
     cand = result.pop("_currentModelCandidate", None)
-    if result.get("currentModel") is not None or not isinstance(cand, dict):
+    existing = result.get("currentModel")
+    if isinstance(existing, dict) and existing.get("id") and "tier" not in existing:
+        tier = classify_model_tier(str(existing["id"]))
+        if tier:
+            existing["tier"] = tier
+    if existing is not None or not isinstance(cand, dict):
         return
     current: Dict[str, Any] = {"id": cand.get("id")}
     if cand.get("displayName"):
@@ -2646,6 +2671,9 @@ def finalize_current_model(result: Dict[str, Any]) -> None:
     when = cand.get("when")
     if isinstance(when, dt.datetime):
         current["updatedAt"] = when.isoformat().replace("+00:00", "Z")
+    tier = classify_model_tier(str(cand.get("id") or ""))
+    if tier:
+        current["tier"] = tier
     result["currentModel"] = current
 
 

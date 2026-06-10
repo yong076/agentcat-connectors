@@ -617,6 +617,32 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertRegex(current["updatedAt"], r"^\d{4}-\d{2}-\d{2}T")
         json.dumps(result)  # snapshot stays JSON-serializable after finalize
 
+    def test_classify_model_tier_uses_pricing_not_names(self) -> None:
+        self.assertEqual(agentcat.classify_model_tier("claude-opus-4-7"), "flagship")
+        self.assertEqual(agentcat.classify_model_tier("claude-opus-4-7[1m]"), "flagship")
+        self.assertEqual(agentcat.classify_model_tier("claude-sonnet-4-6"), "standard")
+        self.assertEqual(agentcat.classify_model_tier("claude-haiku-4-5"), "mini")
+        self.assertEqual(agentcat.classify_model_tier("gemini-3-flash-preview"), "mini")
+        # Unknown pricing -> no tier, never a name-based guess.
+        self.assertIsNone(agentcat.classify_model_tier("claude-fable-5"))
+
+    def test_finalize_current_model_attaches_tier(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        result: dict = {}
+        agentcat.note_current_model(result, "claude-opus-4-7", now)
+        agentcat.finalize_current_model(result)
+        self.assertEqual(result["currentModel"]["tier"], "flagship")
+
+        # Pre-set currentModel (claude statusline standalone path) gets a tier too.
+        preset = {"currentModel": {"id": "claude-haiku-4-5", "source": "statusline"}}
+        agentcat.finalize_current_model(preset)
+        self.assertEqual(preset["currentModel"]["tier"], "mini")
+
+        unknown: dict = {}
+        agentcat.note_current_model(unknown, "claude-fable-5", now)
+        agentcat.finalize_current_model(unknown)
+        self.assertNotIn("tier", unknown["currentModel"])
+
     def test_add_usage_metrics_notes_current_model(self) -> None:
         result: dict = {}
         now = dt.datetime.now(dt.timezone.utc)
