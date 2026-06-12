@@ -1939,13 +1939,23 @@ def gemini_display_name(model: Any) -> str:
 
 
 def read_gemini_auth_type() -> Optional[str]:
-    for path in (Path.cwd() / ".gemini" / "settings.json", HOME / ".gemini" / "settings.json"):
+    for path in (
+        Path.cwd() / ".gemini" / "settings.json",
+        HOME / ".gemini" / "settings.json",
+        HOME / ".gemini" / "antigravity-cli" / "settings.json",
+        HOME / ".antigravity" / "settings.json",
+    ):
         raw = read_json(path)
         if not isinstance(raw, dict) or raw.get("_agentcat_error"):
             continue
         security = raw.get("security")
         auth = security.get("auth") if isinstance(security, dict) else None
         selected = auth.get("selectedType") if isinstance(auth, dict) else None
+        # Older gemini-cli / Antigravity builds wrote a flat selectedAuthType.
+        if not (isinstance(selected, str) and selected):
+            legacy = raw.get("selectedAuthType")
+            if isinstance(legacy, str):
+                selected = legacy
         if isinstance(selected, str) and selected:
             return selected
     if os.environ.get("GOOGLE_GENAI_USE_GCA") == "true":
@@ -1954,12 +1964,44 @@ def read_gemini_auth_type() -> Optional[str]:
         return "gemini-api-key"
     if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") == "true":
         return "vertex-ai"
+    # Fallback: if usable OAuth creds exist but settings.json never recorded the
+    # auth type (common for Antigravity, esp. on Windows), treat it as personal
+    # OAuth so the Code Assist quota path runs instead of returning empty.
+    if read_gemini_oauth_credentials():
+        return "oauth-personal"
     return None
 
 
+def unwrap_antigravity_oauth_token(raw: Dict[str, Any]) -> Dict[str, Any]:
+    # Antigravity's antigravity-oauth-token nests the OAuth payload under a
+    # "token" key: {"token": {"access_token": ..., "token_type": ...,
+    # "refresh_token": ..., "expiry": ...}, "auth_method": ...}. Flatten it to
+    # the oauth_creds.json shape the rest of the gemini quota path expects,
+    # letting the inner token keys win over any outer duplicates.
+    inner = raw.get("token")
+    if not isinstance(inner, dict):
+        return raw
+    flat = {key: value for key, value in raw.items() if key != "token"}
+    flat.update(inner)
+    return flat
+
+
 def read_gemini_oauth_credentials() -> Optional[Dict[str, Any]]:
-    raw = read_json(HOME / ".gemini" / "oauth_creds.json")
-    return raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else None
+    # Antigravity (and Windows installs) may store the OAuth creds outside the
+    # standalone gemini-cli's ~/.gemini/oauth_creds.json — probe known siblings
+    # (agent-cat-releases#31: Antigravity-only users otherwise get zero quota).
+    for path in (
+        HOME / ".gemini" / "oauth_creds.json",
+        HOME / ".gemini" / "antigravity-cli" / "oauth_creds.json",
+        HOME / ".gemini" / "antigravity-cli" / "antigravity-oauth-token",
+        HOME / ".antigravity" / "oauth_creds.json",
+    ):
+        raw = read_json(path)
+        if isinstance(raw, dict) and not raw.get("_agentcat_error"):
+            if path.name == "antigravity-oauth-token":
+                raw = unwrap_antigravity_oauth_token(raw)
+            return raw
+    return None
 
 
 def gemini_oauth2_source_candidates() -> List[Path]:
