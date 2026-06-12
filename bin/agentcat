@@ -61,6 +61,9 @@ LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERR
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
 CLAUDE_JOURNAL_CURSOR_VERSION = 3
+PROJECT_DAILY_RETENTION_DAYS = 60
+PROJECT_DAILY_SNAPSHOT_DAYS = 14
+PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
@@ -92,6 +95,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.hourlyTokens",
     "usage.breakdown",
     "usage.projects",
+    "projects.daily",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
     "limits.liveCache",
@@ -5236,6 +5240,153 @@ def auto_update_loop(interval_seconds: float, initial_delay_seconds: float) -> N
         time.sleep(max(60.0, interval_seconds))
 
 
+def project_daily_file() -> Path:
+    """Per-day per-project token delta ledger: {"YYYY-MM-DD": {label: tokens}}."""
+    return AGENTCAT_HOME / "project-daily.json"
+
+
+def project_daily_state_file() -> Path:
+    """Delta-accounting baselines: last observed cumulative tokens per project."""
+    return AGENTCAT_HOME / "project-daily-state.json"
+
+
+def load_project_daily() -> Dict[str, Dict[str, int]]:
+    raw = read_json(project_daily_file())
+    out: Dict[str, Dict[str, int]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for day, labels in raw.items():
+        if not PROJECT_DAILY_DAY_RE.match(str(day)) or not isinstance(labels, dict):
+            continue
+        bucket: Dict[str, int] = {}
+        for label, tokens in labels.items():
+            amount = nonnegative_int(tokens)
+            if str(label) and amount:
+                bucket[str(label)] = amount
+        if bucket:
+            out[str(day)] = bucket
+    return out
+
+
+def load_project_daily_baselines() -> Dict[str, int]:
+    raw = read_json(project_daily_state_file())
+    if not isinstance(raw, dict):
+        return {}
+    baselines = raw.get("baselines")
+    if not isinstance(baselines, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for key, value in baselines.items():
+        amount = nonnegative_int(value)
+        if str(key) and amount is not None:
+            out[str(key)] = amount
+    return out
+
+
+def prune_project_daily(days: Dict[str, Dict[str, int]], today: "dt.date") -> bool:
+    """Drop day buckets older than PROJECT_DAILY_RETENTION_DAYS (and malformed keys)."""
+    cutoff = today - dt.timedelta(days=PROJECT_DAILY_RETENTION_DAYS)
+    changed = False
+    for day in list(days.keys()):
+        try:
+            parsed = dt.date.fromisoformat(day)
+        except ValueError:
+            days.pop(day, None)
+            changed = True
+            continue
+        if parsed < cutoff:
+            days.pop(day, None)
+            changed = True
+    return changed
+
+
+def snapshot_project_cumulative(providers: Dict[str, Any]) -> Dict[str, Tuple[str, int]]:
+    """'provider|project-id' -> (label, cumulative tokens) from provider rollups.
+
+    Keyed per provider+project so one provider's counter reset (or a project
+    dropping out of another provider's top-20 list) never bleeds into the
+    others' delta accounting. Labels are basenames only — never paths.
+    """
+    out: Dict[str, Tuple[str, int]] = {}
+    for provider, usage in (providers or {}).items():
+        if not isinstance(usage, dict):
+            continue
+        projects = usage.get("projects")
+        if not isinstance(projects, dict) or projects.get("status") != "ok":
+            continue
+        items = projects.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            project_id = str(item.get("id") or item.get("path") or "").strip()
+            tokens = nonnegative_int(item.get("tokens"))
+            if not project_id or tokens is None:
+                continue
+            label = display_project_name(project_id)
+            if not label:
+                continue
+            out[f"{provider}|{project_id}"] = (label, tokens)
+    return out
+
+
+def project_daily_snapshot_slice(
+    days: Dict[str, Dict[str, int]], today: "dt.date"
+) -> Dict[str, Dict[str, int]]:
+    """Trailing PROJECT_DAILY_SNAPSHOT_DAYS view embedded in the snapshot."""
+    cutoff = today - dt.timedelta(days=PROJECT_DAILY_SNAPSHOT_DAYS - 1)
+    out: Dict[str, Dict[str, int]] = {}
+    for day, labels in days.items():
+        try:
+            parsed = dt.date.fromisoformat(day)
+        except ValueError:
+            continue
+        if parsed >= cutoff and labels:
+            out[day] = dict(labels)
+    return out
+
+
+def update_project_daily(
+    providers: Dict[str, Any], now: Optional["dt.datetime"] = None
+) -> Dict[str, Dict[str, int]]:
+    """Book per-project cumulative growth into LOCAL-day delta buckets.
+
+    Delta accounting against the previous cumulative value: only growth since
+    the last snapshot is booked (to today's local day), so restarts never
+    double-count. First sighting only seeds the baseline (months of history
+    must not land on today), and a shrinking counter rebases the baseline
+    without ever booking a negative delta.
+    """
+    if now is None:
+        now = dt.datetime.now(dt.timezone.utc)
+    today_key = day_key_for_timestamp(now) or now.astimezone().date().isoformat()
+    today = dt.date.fromisoformat(today_key)
+    days = load_project_daily()
+    baselines = load_project_daily_baselines()
+    days_changed = prune_project_daily(days, today)
+    baselines_changed = False
+    for key, (label, tokens) in snapshot_project_cumulative(providers).items():
+        previous = baselines.get(key)
+        if previous is None or tokens < previous:
+            baselines[key] = tokens
+            baselines_changed = True
+            continue
+        delta = tokens - previous
+        if delta == 0:
+            continue
+        baselines[key] = tokens
+        baselines_changed = True
+        bucket = days.setdefault(today_key, {})
+        bucket[label] = int(bucket.get(label) or 0) + delta
+        days_changed = True
+    if days_changed:
+        write_json_atomic(project_daily_file(), days)
+    if baselines_changed:
+        write_json_atomic(project_daily_state_file(), {"baselines": baselines})
+    return project_daily_snapshot_slice(days, today)
+
+
 def build_snapshot() -> Dict[str, Any]:
     ensure_dirs()
     try:
@@ -5271,6 +5422,13 @@ def build_snapshot() -> Dict[str, Any]:
             "latestByProvider": latest_by_provider,
         },
     }
+    # Per-day per-project token deltas (capability "projects.daily").
+    # Additive/optional: failure degrades to an absent field and must NOT
+    # block the snapshot write.
+    try:
+        snapshot["projectsDaily"] = update_project_daily(providers)
+    except Exception as exc:
+        logging.debug("update_project_daily failed: %s", exc)
     # Slice C: embed pre-derived insights so clients (Mac/Windows) decode
     # rather than re-derive. Failure here must NOT block the snapshot write —
     # degrade to insights.status = error and let the client render fallback.

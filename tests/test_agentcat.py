@@ -724,6 +724,102 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(rebuilt_cursor["version"], agentcat.CLAUDE_JOURNAL_CURSOR_VERSION)
         self.assertIn("request:req_legacy", rebuilt_cursor["usageRecords"])
 
+    @staticmethod
+    def _project_daily_providers(tokens: int, path: str = "/Users/tester/work/repo") -> dict:
+        return {
+            "claude": {
+                "status": "ok",
+                "projects": {
+                    "status": "ok",
+                    "items": [
+                        {
+                            "id": path,
+                            "path": path,
+                            "name": agentcat.display_project_name(path),
+                            "tokens": tokens,
+                        }
+                    ],
+                },
+            }
+        }
+
+    def test_project_daily_books_cumulative_growth_to_local_today(self) -> None:
+        today = dt.datetime.now(dt.timezone.utc).astimezone().date().isoformat()
+
+        first = agentcat.update_project_daily(self._project_daily_providers(100))
+        second = agentcat.update_project_daily(self._project_daily_providers(160))
+
+        self.assertEqual(first, {})
+        self.assertEqual(second, {today: {"repo": 60}})
+        ledger = json.loads(agentcat.project_daily_file().read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {today: {"repo": 60}})
+        self.assertNotIn("/Users/tester/work/repo", ledger[today])
+        state = json.loads(agentcat.project_daily_state_file().read_text(encoding="utf-8"))
+        self.assertEqual(state["baselines"]["claude|/Users/tester/work/repo"], 160)
+
+    def test_project_daily_counter_reset_books_no_negative_delta(self) -> None:
+        today = dt.datetime.now(dt.timezone.utc).astimezone().date().isoformat()
+        agentcat.update_project_daily(self._project_daily_providers(100))
+        agentcat.update_project_daily(self._project_daily_providers(160))
+
+        after_reset = agentcat.update_project_daily(self._project_daily_providers(40))
+        resumed = agentcat.update_project_daily(self._project_daily_providers(50))
+
+        self.assertEqual(after_reset, {today: {"repo": 60}})
+        self.assertEqual(resumed, {today: {"repo": 70}})
+        state = json.loads(agentcat.project_daily_state_file().read_text(encoding="utf-8"))
+        self.assertEqual(state["baselines"]["claude|/Users/tester/work/repo"], 50)
+
+    def test_project_daily_sums_provider_deltas_into_one_label(self) -> None:
+        today = dt.datetime.now(dt.timezone.utc).astimezone().date().isoformat()
+        path = "/Users/tester/work/repo"
+
+        def providers(claude_tokens: int, codex_tokens: int) -> dict:
+            merged = self._project_daily_providers(claude_tokens, path)
+            merged["codex"] = self._project_daily_providers(codex_tokens, path)["claude"]
+            return merged
+
+        agentcat.update_project_daily(providers(100, 30))
+        booked = agentcat.update_project_daily(providers(150, 50))
+
+        self.assertEqual(booked, {today: {"repo": 70}})
+
+    def test_project_daily_prunes_days_beyond_retention(self) -> None:
+        today_date = dt.datetime.now(dt.timezone.utc).astimezone().date()
+        old_day = (today_date - dt.timedelta(days=agentcat.PROJECT_DAILY_RETENTION_DAYS + 5)).isoformat()
+        kept_day = (today_date - dt.timedelta(days=30)).isoformat()
+        agentcat.write_json_atomic(
+            agentcat.project_daily_file(),
+            {old_day: {"repo": 5}, kept_day: {"repo": 7}, "not-a-day": {"repo": 9}},
+        )
+
+        snapshot_slice = agentcat.update_project_daily({})
+
+        ledger = json.loads(agentcat.project_daily_file().read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {kept_day: {"repo": 7}})
+        self.assertEqual(snapshot_slice, {})
+
+    def test_project_daily_snapshot_slice_is_capped_to_fourteen_days(self) -> None:
+        today_date = dt.datetime.now(dt.timezone.utc).astimezone().date()
+        inside = (today_date - dt.timedelta(days=agentcat.PROJECT_DAILY_SNAPSHOT_DAYS - 1)).isoformat()
+        outside = (today_date - dt.timedelta(days=agentcat.PROJECT_DAILY_SNAPSHOT_DAYS)).isoformat()
+        agentcat.write_json_atomic(
+            agentcat.project_daily_file(),
+            {inside: {"repo": 3}, outside: {"repo": 4}},
+        )
+
+        snapshot_slice = agentcat.update_project_daily({})
+
+        self.assertEqual(snapshot_slice, {inside: {"repo": 3}})
+        ledger = json.loads(agentcat.project_daily_file().read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {inside: {"repo": 3}, outside: {"repo": 4}})
+
+    def test_build_snapshot_exposes_projects_daily_and_capability(self) -> None:
+        snapshot = agentcat.build_snapshot()
+
+        self.assertIn("projects.daily", snapshot["capabilities"])
+        self.assertIsInstance(snapshot.get("projectsDaily"), dict)
+
     def test_gemini_snapshot_reads_otel_token_metrics(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
         now = dt.datetime.now(dt.timezone.utc)
