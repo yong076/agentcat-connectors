@@ -1799,9 +1799,42 @@ class InsightsIntegrationTests(unittest.TestCase):
         finally:
             self._stop(patches)
 
+    def test_build_snapshot_includes_pricing_block(self) -> None:
+        patches = self._stub_providers({
+            "codex": {"status": "ok", "tokens": {}, "models": {}},
+            "claude": {"status": "ok", "tokens": {}, "models": {}},
+            "gemini": {"status": "ok", "tokens": {}, "models": {}},
+            "opencode": {"status": "not_found"},
+            "copilot": {"status": "not_found"},
+        })
+        try:
+            with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
+                snap = agentcat.build_snapshot()
+            # No pricing cache in the temp AGENTCAT_HOME -> bundled fallback.
+            self.assertEqual(snap["pricing"], {"source": "bundled", "fetchedAt": None})
+        finally:
+            self._stop(patches)
+
 
 class InsightsTests(unittest.TestCase):
     """Slice B — derive_insights() port of Swift AgentInsights.derive()."""
+
+    def setUp(self) -> None:
+        # Hermetic pricing: ignore any real ~/.agentcat/pricing-cache.json so
+        # bundled MODEL_PRICING rates drive the cost assertions below.
+        self.pricing_tmp = tempfile.TemporaryDirectory()
+        self._pricing_cache_patch = patch.object(
+            agentcat,
+            "pricing_cache_file",
+            return_value=Path(self.pricing_tmp.name) / "pricing-cache.json",
+        )
+        self._pricing_cache_patch.start()
+        agentcat._PRICING_TABLE_MEMO = None
+
+    def tearDown(self) -> None:
+        self._pricing_cache_patch.stop()
+        agentcat._PRICING_TABLE_MEMO = None
+        self.pricing_tmp.cleanup()
 
     def _snapshot(self, **providers) -> dict:
         return {"providers": providers}
@@ -1952,6 +1985,23 @@ class InsightsTests(unittest.TestCase):
 class PricingTests(unittest.TestCase):
     """Slice A — split-bucket pricing module."""
 
+    def setUp(self) -> None:
+        # Hermetic pricing: ignore any real ~/.agentcat/pricing-cache.json so
+        # bundled MODEL_PRICING rates drive the cost assertions below.
+        self.pricing_tmp = tempfile.TemporaryDirectory()
+        self._pricing_cache_patch = patch.object(
+            agentcat,
+            "pricing_cache_file",
+            return_value=Path(self.pricing_tmp.name) / "pricing-cache.json",
+        )
+        self._pricing_cache_patch.start()
+        agentcat._PRICING_TABLE_MEMO = None
+
+    def tearDown(self) -> None:
+        self._pricing_cache_patch.stop()
+        agentcat._PRICING_TABLE_MEMO = None
+        self.pricing_tmp.cleanup()
+
     def test_known_model_returns_split_cost(self) -> None:
         cost = agentcat.estimate_cost(
             "claude-opus-4-7",
@@ -2008,6 +2058,189 @@ class PricingTests(unittest.TestCase):
             cache_read_tokens=0, cache_write_tokens=0,
         )
         self.assertEqual(cost["total"], 0.0)
+
+
+class PricingFeedTests(unittest.TestCase):
+    """LiteLLM pricing feed — conversion, tiers, merge precedence, fallback."""
+
+    # Small offline stand-in for model_prices_and_context_window.json. Key
+    # names verified against a live sample during development; tests never
+    # touch the network.
+    LITELLM_FIXTURE = {
+        "sample_spec": {
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+        },
+        "gpt-test": {
+            "input_cost_per_token": 2e-06,
+            "output_cost_per_token": 8e-06,
+            "cache_read_input_token_cost": 5e-07,
+            "mode": "chat",
+        },
+        "anthropic/claude-test": {
+            "input_cost_per_token": 3e-06,
+            "output_cost_per_token": 1.5e-05,
+            "cache_read_input_token_cost": 3e-07,
+            "cache_creation_input_token_cost": 3.75e-06,
+            "input_cost_per_token_above_200k_tokens": 6e-06,
+            "output_cost_per_token_above_200k_tokens": 2.25e-05,
+            "cache_read_input_token_cost_above_200k_tokens": 6e-07,
+            "cache_creation_input_token_cost_above_200k_tokens": 7.5e-06,
+            "cache_creation_input_token_cost_above_1hr": 1e-05,
+            "mode": "chat",
+        },
+        "text-embedding-test": {
+            "input_cost_per_token": 1e-07,
+            "output_cost_per_token": 0.0,
+            "mode": "embedding",
+        },
+        "gpt-5": {
+            "input_cost_per_token": 9e-06,
+            "output_cost_per_token": 9e-05,
+        },
+    }
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache_path = Path(self.tmp.name) / "pricing-cache.json"
+        self._cache_patch = patch.object(
+            agentcat, "pricing_cache_file", return_value=self.cache_path
+        )
+        self._cache_patch.start()
+        agentcat._PRICING_TABLE_MEMO = None
+
+    def tearDown(self) -> None:
+        self._cache_patch.stop()
+        agentcat._PRICING_TABLE_MEMO = None
+        self.tmp.cleanup()
+
+    def _write_cache(self, fetched_at=None) -> dict:
+        payload = {
+            "fetchedAt": fetched_at or agentcat.now_iso(),
+            "models": agentcat.litellm_price_table(self.LITELLM_FIXTURE),
+        }
+        agentcat.write_json_atomic(self.cache_path, payload)
+        return payload
+
+    def test_per_token_rates_convert_to_per_million(self) -> None:
+        table = agentcat.litellm_price_table(self.LITELLM_FIXTURE)
+        self.assertAlmostEqual(table["gpt-test"]["input"], 2.0)
+        self.assertAlmostEqual(table["gpt-test"]["output"], 8.0)
+        self.assertAlmostEqual(table["gpt-test"]["cache_read"], 0.5)
+        self.assertNotIn("cache_write", table["gpt-test"])
+
+    def test_tier_keys_parse_from_fixture(self) -> None:
+        table = agentcat.litellm_price_table(self.LITELLM_FIXTURE)
+        entry = table["anthropic/claude-test"]
+        self.assertEqual(len(entry["tiers"]), 1)
+        tier = entry["tiers"][0]
+        self.assertEqual(tier["threshold"], 200_000)
+        self.assertAlmostEqual(tier["input"], 6.0)
+        self.assertAlmostEqual(tier["output"], 22.5)
+        self.assertAlmostEqual(tier["cache_read"], 0.6)
+        self.assertAlmostEqual(tier["cache_write"], 7.5)
+        # The time-based "_above_1hr" cache TTL key must not become a tier:
+        # 200k is the only threshold parsed from the fixture.
+        self.assertEqual([t["threshold"] for t in entry["tiers"]], [200_000])
+        # Provider-prefixed keys register their basename as an alias.
+        self.assertEqual(table["claude-test"], entry)
+
+    def test_skips_sample_spec_and_models_without_chat_rates(self) -> None:
+        table = agentcat.litellm_price_table(self.LITELLM_FIXTURE)
+        self.assertNotIn("sample_spec", table)
+        self.assertNotIn("text-embedding-test", table)
+
+    def test_no_cache_no_network_falls_back_to_bundled(self) -> None:
+        with patch.object(agentcat, "_fetch_litellm_raw", side_effect=OSError("offline")):
+            state = agentcat.refresh_litellm_pricing(force=True)
+        self.assertEqual(state["status"], "error")
+        self.assertFalse(self.cache_path.exists())
+        _table, meta = agentcat.merged_pricing_table()
+        self.assertEqual(meta, {"source": "bundled", "fetchedAt": None})
+        cost = agentcat.estimate_cost("gpt-5", 1_000_000, 0, 0, 0)
+        self.assertAlmostEqual(cost["input"], agentcat.MODEL_PRICING["gpt-5"]["input"])
+
+    def test_merge_precedence_litellm_wins_and_bundled_fills_gaps(self) -> None:
+        payload = self._write_cache()
+        table, meta = agentcat.merged_pricing_table()
+        self.assertEqual(meta["source"], "litellm")
+        self.assertEqual(meta["fetchedAt"], payload["fetchedAt"])
+        # LiteLLM rate overrides the stale bundled gpt-5 entry...
+        self.assertAlmostEqual(table["gpt-5"]["input"], 9.0)
+        self.assertAlmostEqual(
+            agentcat.estimate_cost("gpt-5", 1_000_000, 0, 0, 0)["input"], 9.0
+        )
+        # ...while bundled stays for models LiteLLM lacks.
+        self.assertAlmostEqual(
+            table["claude-haiku-4-5"]["input"],
+            agentcat.MODEL_PRICING["claude-haiku-4-5"]["input"],
+        )
+
+    def test_fetch_failure_keeps_existing_cache(self) -> None:
+        stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat().replace("+00:00", "Z")
+        self._write_cache(fetched_at=stale)
+        with patch.object(agentcat, "_fetch_litellm_raw", side_effect=OSError("offline")):
+            state = agentcat.refresh_litellm_pricing()
+        self.assertEqual(state["status"], "error")
+        kept = agentcat.read_pricing_cache()
+        self.assertEqual(kept["fetchedAt"], stale)
+        _table, meta = agentcat.merged_pricing_table()
+        self.assertEqual(meta["source"], "litellm")
+
+    def test_fresh_cache_skips_fetch_within_24h(self) -> None:
+        self._write_cache()
+        with patch.object(agentcat, "_fetch_litellm_raw", side_effect=AssertionError("must not fetch")):
+            state = agentcat.refresh_litellm_pricing()
+        self.assertEqual(state["status"], "fresh")
+
+    def test_stale_cache_refetches_and_rewrites(self) -> None:
+        stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).isoformat().replace("+00:00", "Z")
+        self._write_cache(fetched_at=stale)
+        with patch.object(agentcat, "_fetch_litellm_raw", return_value=self.LITELLM_FIXTURE):
+            state = agentcat.refresh_litellm_pricing()
+        self.assertEqual(state["status"], "fetched")
+        kept = agentcat.read_pricing_cache()
+        self.assertNotEqual(kept["fetchedAt"], stale)
+        self.assertIn("gpt-test", kept["models"])
+
+    def test_tiered_rate_applies_only_with_context_tokens(self) -> None:
+        self._write_cache()
+        base = agentcat.estimate_cost("claude-test", 1_000_000, 1_000_000, 1_000_000, 1_000_000)
+        self.assertAlmostEqual(base["input"], 3.0)
+        self.assertAlmostEqual(base["output"], 15.0)
+        self.assertAlmostEqual(base["cache_read"], 0.3)
+        self.assertAlmostEqual(base["cache_write"], 3.75)
+        tiered = agentcat.estimate_cost(
+            "claude-test", 1_000_000, 1_000_000, 1_000_000, 1_000_000,
+            context_tokens=250_000,
+        )
+        self.assertAlmostEqual(tiered["input"], 6.0)
+        self.assertAlmostEqual(tiered["output"], 22.5)
+        self.assertAlmostEqual(tiered["cache_read"], 0.6)
+        self.assertAlmostEqual(tiered["cache_write"], 7.5)
+        below = agentcat.estimate_cost(
+            "claude-test", 1_000_000, 0, 0, 0, context_tokens=100_000
+        )
+        self.assertAlmostEqual(below["input"], 3.0)
+
+    def test_missing_cache_rates_default_safely(self) -> None:
+        self._write_cache()
+        cost = agentcat.estimate_cost("gpt-test", 0, 0, 1_000_000, 1_000_000)
+        self.assertAlmostEqual(cost["cache_read"], 0.5)
+        # cache_write absent from the feed entry -> falls back to input rate.
+        self.assertAlmostEqual(cost["cache_write"], 2.0)
+
+    def test_pricing_feed_capability_and_status(self) -> None:
+        self.assertIn("pricing.feed", agentcat.CONNECTOR_CAPABILITIES)
+        self.assertEqual(
+            agentcat.pricing_status_snapshot(),
+            {"source": "bundled", "fetchedAt": None},
+        )
+        payload = self._write_cache()
+        self.assertEqual(
+            agentcat.pricing_status_snapshot(),
+            {"source": "litellm", "fetchedAt": payload["fetchedAt"]},
+        )
 
 
 if __name__ == "__main__":

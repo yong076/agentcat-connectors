@@ -84,6 +84,14 @@ AUTO_UPDATE_INSTALL_PS1_URL = os.environ.get(
 AUTO_UPDATE_INTERVAL_SECONDS = int(os.environ.get("AGENTCAT_AUTO_UPDATE_INTERVAL_SECONDS", "3600"))
 AUTO_UPDATE_INITIAL_DELAY_SECONDS = int(os.environ.get("AGENTCAT_AUTO_UPDATE_INITIAL_DELAY_SECONDS", "300"))
 AUTO_UPDATE_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AGENTCAT_AUTO_UPDATE_HTTP_TIMEOUT_SECONDS", "10"))
+LITELLM_PRICING_URL = os.environ.get(
+    "AGENTCAT_LITELLM_PRICING_URL",
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+)
+PRICING_FETCH_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_MAX_AGE_SECONDS", str(24 * 3600)))
+PRICING_FETCH_INTERVAL_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_INTERVAL_SECONDS", str(6 * 3600)))
+PRICING_FETCH_INITIAL_DELAY_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_INITIAL_DELAY_SECONDS", "20"))
+PRICING_FETCH_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AGENTCAT_PRICING_FETCH_HTTP_TIMEOUT_SECONDS", "10"))
 CONNECTOR_CAPABILITIES = (
     "snapshot.metadata",
     "connector.autoUpdate",
@@ -96,6 +104,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.breakdown",
     "usage.projects",
     "projects.daily",
+    "pricing.feed",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
     "limits.liveCache",
@@ -181,25 +190,76 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
 }
 
 
-def _lookup_pricing(model: str) -> Optional[Dict[str, float]]:
-    """Resolve a model name to its pricing entry, tolerant of dated suffixes."""
-    if model in MODEL_PRICING:
-        return MODEL_PRICING[model]
+def _lookup_pricing(
+    model: str,
+    table: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a model name to its pricing entry, tolerant of dated suffixes.
+
+    Consults the merged table (LiteLLM feed overlaid on the bundled
+    MODEL_PRICING) unless an explicit table is supplied.
+    """
+    if table is None:
+        table = merged_pricing_table()[0]
+    if model in table:
+        return table[model]
     normalized = model.lower()
-    if normalized in MODEL_PRICING:
-        return MODEL_PRICING[normalized]
+    if normalized in table:
+        return table[normalized]
     trimmed = normalized.replace("-preview", "").replace("-latest", "")
-    if trimmed in MODEL_PRICING:
-        return MODEL_PRICING[trimmed]
+    if trimmed in table:
+        return table[trimmed]
     # Strip trailing dated build id (e.g. -20251022)
     m = re.match(r"^(.+?)-\d{6,}$", trimmed)
-    if m and m.group(1) in MODEL_PRICING:
-        return MODEL_PRICING[m.group(1)]
-    # Prefix match for variants like "claude-opus-4-7-1m"
-    for key in MODEL_PRICING:
-        if trimmed.startswith(key):
-            return MODEL_PRICING[key]
+    if m and m.group(1) in table:
+        return table[m.group(1)]
+    # Longest-prefix match for variants like "claude-opus-4-7-1m"; longest so
+    # "gpt-5.5-codex" prefers a "gpt-5.5" entry over "gpt-5".
+    best_key: Optional[str] = None
+    for key in table:
+        if trimmed.startswith(key) and (best_key is None or len(key) > len(best_key)):
+            best_key = key
+    if best_key is not None:
+        return table[best_key]
     return None
+
+
+def _tier_rates(pricing: Dict[str, Any], context_tokens: Optional[int]) -> Dict[str, float]:
+    """Flatten a price entry into the 4 bucket rates, applying tier overrides.
+
+    Missing cache rates degrade safely: cache_read -> 0 (models without cache
+    pricing report no cache tokens anyway), cache_write -> input rate (a cache
+    write costs at least a fresh prompt). When context_tokens is provided and
+    the entry carries "tiers" (e.g. above-200k long-context rates), the
+    highest tier whose threshold <= context_tokens overrides the base rates.
+    """
+    base_input = float(pricing.get("input") or 0.0)
+    rates = {
+        "input": base_input,
+        "output": float(pricing.get("output") or 0.0),
+        "cache_read": float(pricing.get("cache_read") or 0.0),
+        "cache_write": float(pricing["cache_write"]) if pricing.get("cache_write") is not None else base_input,
+    }
+    tiers = pricing.get("tiers")
+    if context_tokens is None or not isinstance(tiers, list):
+        return rates
+    selected: Optional[Dict[str, Any]] = None
+    selected_threshold = -1.0
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        threshold = tier.get("threshold")
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            continue
+        if context_tokens >= threshold and threshold > selected_threshold:
+            selected = tier
+            selected_threshold = float(threshold)
+    if selected:
+        for bucket in ("input", "output", "cache_read", "cache_write"):
+            value = selected.get(bucket)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                rates[bucket] = float(value)
+    return rates
 
 
 def estimate_cost(
@@ -208,24 +268,33 @@ def estimate_cost(
     output_tokens: int,
     cache_read_tokens: int,
     cache_write_tokens: int,
+    context_tokens: Optional[int] = None,
 ) -> Optional[Dict[str, float]]:
     """Estimate USD cost for a model usage event, split by token bucket.
 
-    Returns {input, output, cache_read, cache_write, total} or None if the
-    model is not in MODEL_PRICING. Cost in each bucket = tokens / 1e6 * rate.
-    Negative or None token counts are coerced to 0.
+    Consults the merged price table (LiteLLM feed when cached, overlaid on
+    the bundled MODEL_PRICING). Returns {input, output, cache_read,
+    cache_write, total} or None if the model is unknown. Cost in each bucket
+    = tokens / 1e6 * rate. Negative or None token counts are coerced to 0.
+
+    Tiered pricing: when the entry carries above-Nk long-context tiers and
+    the caller passes context_tokens, the whole row is priced at the matching
+    tier — mirroring provider behavior where crossing the threshold reprices
+    the request. Aggregated usage rows do not carry context-window size, so
+    without context_tokens the base rate applies (documented simplification).
     """
     pricing = _lookup_pricing(model)
     if pricing is None:
         return None
+    rates = _tier_rates(pricing, context_tokens)
     inp = max(0, int(input_tokens or 0))
     out = max(0, int(output_tokens or 0))
     cr = max(0, int(cache_read_tokens or 0))
     cw = max(0, int(cache_write_tokens or 0))
-    cost_in = inp / 1_000_000.0 * pricing["input"]
-    cost_out = out / 1_000_000.0 * pricing["output"]
-    cost_cr = cr / 1_000_000.0 * pricing["cache_read"]
-    cost_cw = cw / 1_000_000.0 * pricing["cache_write"]
+    cost_in = inp / 1_000_000.0 * rates["input"]
+    cost_out = out / 1_000_000.0 * rates["output"]
+    cost_cr = cr / 1_000_000.0 * rates["cache_read"]
+    cost_cw = cw / 1_000_000.0 * rates["cache_write"]
     return {
         "input": cost_in,
         "output": cost_out,
@@ -233,6 +302,193 @@ def estimate_cost(
         "cache_write": cost_cw,
         "total": cost_in + cost_out + cost_cr + cost_cw,
     }
+
+
+# --- LiteLLM pricing feed (capability "pricing.feed") ---
+# Refreshes the per-model price table from LiteLLM's public JSON at most once
+# per PRICING_FETCH_MAX_AGE_SECONDS (24h). ANY failure keeps the previous
+# cache; with no cache at all the bundled MODEL_PRICING serves estimates. The
+# fetch runs on a background daemon thread (pricing_refresh_loop) so snapshot
+# serving never blocks on the network.
+_LITELLM_RATE_KEYS = {
+    "input_cost_per_token": "input",
+    "output_cost_per_token": "output",
+    "cache_read_input_token_cost": "cache_read",
+    "cache_creation_input_token_cost": "cache_write",
+}
+# Tiered long-context rates, e.g. "input_cost_per_token_above_200k_tokens".
+# Anchored so time-based cache TTL keys ("..._above_1hr") never match.
+_LITELLM_TIER_KEY_RE = re.compile(
+    r"^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|"
+    r"cache_creation_input_token_cost)_above_(\d+)k_tokens$"
+)
+_PRICING_TABLE_LOCK = threading.Lock()
+_PRICING_TABLE_MEMO: Optional[Tuple[Tuple[str, Optional[int], Optional[int]], Dict[str, Dict[str, Any]], Dict[str, Any]]] = None
+
+
+def pricing_cache_file() -> Path:
+    """LiteLLM price cache: {"fetchedAt": iso, "models": {model: per-1M rates}}."""
+    return AGENTCAT_HOME / "pricing-cache.json"
+
+
+def _per_million(raw: Any) -> Optional[float]:
+    """LiteLLM stores USD per token; the connector prices in USD per 1M tokens."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw) * 1_000_000.0
+    if value < 0:
+        return None
+    return value
+
+
+def litellm_price_table(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """Convert LiteLLM model_prices JSON into the bundled MODEL_PRICING shape.
+
+    Output per model: {"input", "output", "cache_read"?, "cache_write"?,
+    "tiers"?: [{"threshold": tokens, <bucket rate overrides>}]} with all rates
+    in USD per 1M tokens. Skips the "sample_spec" metadata entry and models
+    without positive input AND output token rates (embeddings, image models).
+    Provider-prefixed keys ("anthropic/claude-x") also register their basename
+    as an alias when no unprefixed entry exists.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    table: Dict[str, Dict[str, Any]] = {}
+    aliases: Dict[str, Dict[str, Any]] = {}
+    for key, spec in raw.items():
+        if not isinstance(key, str) or key == "sample_spec" or not isinstance(spec, dict):
+            continue
+        entry: Dict[str, Any] = {}
+        for raw_key, bucket in _LITELLM_RATE_KEYS.items():
+            rate = _per_million(spec.get(raw_key))
+            if rate is not None:
+                entry[bucket] = rate
+        if not entry.get("input") or not entry.get("output"):
+            continue
+        tiers: Dict[int, Dict[str, float]] = {}
+        for raw_key, value in spec.items():
+            tier_match = _LITELLM_TIER_KEY_RE.match(raw_key)
+            if not tier_match:
+                continue
+            rate = _per_million(value)
+            if rate is None:
+                continue
+            threshold = int(tier_match.group(2)) * 1000
+            tiers.setdefault(threshold, {})[_LITELLM_RATE_KEYS[tier_match.group(1)]] = rate
+        if tiers:
+            entry["tiers"] = [
+                {"threshold": threshold, **rates}
+                for threshold, rates in sorted(tiers.items())
+            ]
+        model_key = key.strip().lower()
+        table[model_key] = entry
+        if "/" in model_key:
+            basename = model_key.rsplit("/", 1)[-1]
+            if basename:
+                aliases.setdefault(basename, entry)
+    for basename, entry in aliases.items():
+        table.setdefault(basename, entry)
+    return table
+
+
+def read_pricing_cache() -> Optional[Dict[str, Any]]:
+    raw = read_json(pricing_cache_file())
+    if not isinstance(raw, dict) or not isinstance(raw.get("models"), dict):
+        return None
+    return raw
+
+
+def pricing_cache_age_seconds(cache: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not cache:
+        return None
+    fetched = parse_iso_timestamp(cache.get("fetchedAt"))
+    if fetched is None:
+        return None
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, (dt.datetime.now(dt.timezone.utc) - fetched).total_seconds())
+
+
+def _fetch_litellm_raw() -> Any:
+    request = urllib.request.Request(
+        LITELLM_PRICING_URL,
+        headers={"User-Agent": f"AgentCat/{CONNECTOR_VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=PRICING_FETCH_HTTP_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def refresh_litellm_pricing(force: bool = False) -> Dict[str, Any]:
+    """Fetch LiteLLM pricing at most once per PRICING_FETCH_MAX_AGE_SECONDS.
+
+    ANY failure (network, JSON decode, empty table) keeps the existing cache
+    so the last good fetch — or the bundled table — keeps serving estimates.
+    """
+    cache = read_pricing_cache()
+    age = pricing_cache_age_seconds(cache)
+    if not force and cache is not None and age is not None and age < PRICING_FETCH_MAX_AGE_SECONDS:
+        return {"status": "fresh", "fetchedAt": cache.get("fetchedAt")}
+    try:
+        table = litellm_price_table(_fetch_litellm_raw())
+        if not table:
+            raise ValueError("LiteLLM price table was empty")
+        payload = {"fetchedAt": now_iso(), "models": table}
+        write_json_atomic(pricing_cache_file(), payload)
+        return {"status": "fetched", "fetchedAt": payload["fetchedAt"], "models": len(table)}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+            "fetchedAt": cache.get("fetchedAt") if cache else None,
+        }
+
+
+def merged_pricing_table() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Bundled MODEL_PRICING overlaid with the cached LiteLLM feed.
+
+    LiteLLM rates win for models present in both (fresher data); bundled
+    entries remain as the override for models LiteLLM lacks. Memoized on the
+    cache file's (path, mtime, size) so per-snapshot cost estimation does not
+    re-parse the cache JSON.
+    """
+    global _PRICING_TABLE_MEMO
+    path = pricing_cache_file()
+    try:
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = (str(path), None, None)
+    with _PRICING_TABLE_LOCK:
+        memo = _PRICING_TABLE_MEMO
+    if memo is not None and memo[0] == key:
+        return memo[1], memo[2]
+    cache = read_pricing_cache()
+    table: Dict[str, Dict[str, Any]] = dict(MODEL_PRICING)
+    if cache:
+        table.update(cache["models"])
+        meta = {"source": "litellm", "fetchedAt": cache.get("fetchedAt")}
+    else:
+        meta = {"source": "bundled", "fetchedAt": None}
+    with _PRICING_TABLE_LOCK:
+        _PRICING_TABLE_MEMO = (key, table, meta)
+    return table, meta
+
+
+def pricing_status_snapshot() -> Dict[str, Any]:
+    _table, meta = merged_pricing_table()
+    return dict(meta)
+
+
+def pricing_refresh_loop(interval_seconds: float, initial_delay_seconds: float) -> None:
+    time.sleep(max(0.0, initial_delay_seconds))
+    while True:
+        try:
+            state = refresh_litellm_pricing()
+            if state.get("status") == "error":
+                print(f"agentcatd pricing refresh failed: {state.get('error')}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"agentcatd pricing loop failed: {exc}", file=sys.stderr, flush=True)
+        time.sleep(max(60.0, interval_seconds))
 
 
 _FINDING_SEVERITY_ORDER = {"high": 0, "medium": 1, "info": 2}
@@ -5429,6 +5685,12 @@ def build_snapshot() -> Dict[str, Any]:
         snapshot["projectsDaily"] = update_project_daily(providers)
     except Exception as exc:
         logging.debug("update_project_daily failed: %s", exc)
+    # LiteLLM pricing feed metadata (capability "pricing.feed"). Additive and
+    # optional: any failure degrades to the bundled table without blocking.
+    try:
+        snapshot["pricing"] = pricing_status_snapshot()
+    except Exception as exc:
+        logging.debug("pricing_status_snapshot failed: %s", exc)
     # Slice C: embed pre-derived insights so clients (Mac/Windows) decode
     # rather than re-derive. Failure here must NOT block the snapshot write —
     # degrade to insights.status = error and let the client render fallback.
@@ -5607,6 +5869,12 @@ def run_daemon(args: argparse.Namespace) -> int:
         threading.Thread(
             target=auto_update_loop,
             args=(float(AUTO_UPDATE_INTERVAL_SECONDS), float(AUTO_UPDATE_INITIAL_DELAY_SECONDS)),
+            daemon=True,
+        ).start()
+    if PRICING_FETCH_INTERVAL_SECONDS > 0:
+        threading.Thread(
+            target=pricing_refresh_loop,
+            args=(float(PRICING_FETCH_INTERVAL_SECONDS), float(PRICING_FETCH_INITIAL_DELAY_SECONDS)),
             daemon=True,
         ).start()
     server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
