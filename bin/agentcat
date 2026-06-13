@@ -95,6 +95,7 @@ PRICING_FETCH_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AGENTCAT_PRICING_FETC
 CONNECTOR_CAPABILITIES = (
     "snapshot.metadata",
     "connector.autoUpdate",
+    "connector.channel",
     "activity.terminal",
     "activity.memory",
     "activity.runtimeModes",
@@ -5308,6 +5309,9 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
 CONNECTOR_VERSION_RE = re.compile(
     r"CONNECTOR_VERSION\s*=\s*os\.environ\.get\(\s*['\"]AGENTCAT_CONNECTOR_VERSION['\"]\s*,\s*['\"]([^'\"]+)['\"]"
 )
+CONNECTOR_MANIFEST_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[.-][0-9A-Za-z]+)*$")
+PRO_CONNECTOR_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+VALID_UPDATE_CHANNELS = {"public", "pro"}
 
 
 def agentcat_connectors_dir() -> Path:
@@ -5317,6 +5321,10 @@ def agentcat_connectors_dir() -> Path:
 
 def auto_update_state_file() -> Path:
     return AGENTCAT_HOME / "auto-update.json"
+
+
+def update_channel_state_file() -> Path:
+    return AGENTCAT_HOME / "update-channel.json"
 
 
 def current_connector_repo_dir() -> Optional[Path]:
@@ -5372,6 +5380,97 @@ def write_auto_update_state(state: Dict[str, Any]) -> None:
     write_json_atomic(auto_update_state_file(), state)
 
 
+def read_update_channel_state() -> Dict[str, Any]:
+    raw = read_json(update_channel_state_file())
+    return raw if isinstance(raw, dict) else {}
+
+
+def validate_pro_connector_manifest(manifest: Any) -> Dict[str, Any]:
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be an object")
+    if manifest.get("channel") != "pro":
+        raise ValueError("manifest.channel must be pro")
+
+    version = str(manifest.get("version") or "").strip()
+    if not CONNECTOR_MANIFEST_VERSION_RE.match(version):
+        raise ValueError("manifest.version is invalid")
+
+    download_url = str(manifest.get("downloadUrl") or "").strip()
+    parsed = urllib.parse.urlparse(download_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("manifest.downloadUrl must be HTTPS")
+
+    sha256 = str(manifest.get("sha256") or "").strip()
+    if not PRO_CONNECTOR_SHA256_RE.match(sha256):
+        raise ValueError("manifest.sha256 must be 64 lowercase hex chars")
+
+    normalized: Dict[str, Any] = {
+        "version": version,
+        "downloadUrl": download_url,
+        "sha256": sha256,
+        "channel": "pro",
+    }
+    min_app_version = manifest.get("minAppVersion")
+    if min_app_version is not None:
+        min_app_version_text = str(min_app_version).strip()
+        if not CONNECTOR_MANIFEST_VERSION_RE.match(min_app_version_text):
+            raise ValueError("manifest.minAppVersion is invalid")
+        normalized["minAppVersion"] = min_app_version_text
+    return normalized
+
+
+def write_update_channel_state(channel: str, manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if channel not in VALID_UPDATE_CHANNELS:
+        raise ValueError("channel must be public or pro")
+    state: Dict[str, Any] = {
+        "channel": channel,
+        "updatedAt": now_iso(),
+        "currentVersion": CONNECTOR_VERSION,
+    }
+    if channel == "pro":
+        if manifest is None:
+            raise ValueError("pro channel requires a connector manifest")
+        state["manifest"] = validate_pro_connector_manifest(manifest)
+        state["status"] = "manifest_ready"
+        state["installStatus"] = "pending_install"
+    else:
+        state["status"] = "public"
+        state["installStatus"] = "current"
+    write_json_atomic(update_channel_state_file(), state)
+    return state
+
+
+def update_channel_status_snapshot() -> Dict[str, Any]:
+    raw = read_update_channel_state()
+    channel = raw.get("channel") if raw.get("channel") in VALID_UPDATE_CHANNELS else "public"
+    if channel == "pro":
+        manifest = raw.get("manifest")
+        if isinstance(manifest, dict):
+            return {
+                "channel": "pro",
+                "status": raw.get("status") or "manifest_ready",
+                "installStatus": raw.get("installStatus") or "pending_install",
+                "currentVersion": CONNECTOR_VERSION,
+                "targetVersion": manifest.get("version"),
+                "minAppVersion": manifest.get("minAppVersion"),
+                "updatedAt": raw.get("updatedAt"),
+            }
+        return {
+            "channel": "pro",
+            "status": "invalid_manifest",
+            "installStatus": "blocked",
+            "currentVersion": CONNECTOR_VERSION,
+            "updatedAt": raw.get("updatedAt"),
+        }
+    return {
+        "channel": "public",
+        "status": raw.get("status") or "public",
+        "installStatus": raw.get("installStatus") or "current",
+        "currentVersion": CONNECTOR_VERSION,
+        "updatedAt": raw.get("updatedAt"),
+    }
+
+
 def auto_update_status_snapshot() -> Dict[str, Any]:
     enabled, reason = auto_update_enabled_status()
     state = read_auto_update_state()
@@ -5381,11 +5480,13 @@ def auto_update_status_snapshot() -> Dict[str, Any]:
             "enabled": enabled,
             "reason": reason,
             "currentVersion": CONNECTOR_VERSION,
+            "channel": update_channel_status_snapshot(),
         }
     status = dict(state)
     status.setdefault("enabled", enabled)
     status.setdefault("reason", reason)
     status.setdefault("currentVersion", CONNECTOR_VERSION)
+    status["channel"] = update_channel_status_snapshot()
     return status
 
 
@@ -5816,6 +5917,21 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             return
         self.write_response_body(body)
 
+    def read_json_body(self, max_bytes: int = 256 * 1024) -> Dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length > max_bytes:
+            raise ValueError("request body too large")
+        body = self.rfile.read(length)
+        if not body:
+            return {}
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid_json") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        return payload
+
     def do_GET(self) -> None:
         if self.path == "/healthz":
             body = b"ok\n"
@@ -5843,15 +5959,30 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
-        if self.path != "/v1/events":
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/v1/update/channel":
+            try:
+                payload = self.read_json_body()
+                state = write_update_channel_state(
+                    str(payload.get("channel") or ""),
+                    payload.get("manifest") if isinstance(payload.get("manifest"), dict) else None,
+                )
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_update_channel", "message": str(exc)})
+                return
+            except Exception as exc:
+                self.send_json(500, {"error": "update_channel_failed", "message": str(exc)})
+                return
+            self.send_json(200, {"ok": True, "channel": update_channel_status_snapshot(), "state": state})
+            return
+
+        if path != "/v1/events":
             self.send_json(404, {"error": "not_found"})
             return
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(length)
         try:
-            payload = json.loads(body.decode("utf-8")) if body else {}
-        except json.JSONDecodeError:
-            self.send_json(400, {"error": "invalid_json"})
+            payload = self.read_json_body()
+        except ValueError as exc:
+            self.send_json(400, {"error": "invalid_json", "message": str(exc)})
             return
         provider = str(payload.get("provider") or "unknown")
         source = str(payload.get("source") or "http")

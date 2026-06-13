@@ -4,6 +4,8 @@ import datetime as dt
 import json
 import sqlite3
 import tempfile
+import threading
+import urllib.request
 import unittest
 from contextlib import closing, redirect_stdout
 from importlib.machinery import SourceFileLoader
@@ -310,9 +312,90 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("update", snapshot)
         self.assertIn("activity.memory", snapshot["capabilities"])
         self.assertIn("connector.autoUpdate", snapshot["capabilities"])
+        self.assertIn("connector.channel", snapshot["capabilities"])
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
         self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
+        self.assertEqual(snapshot["update"]["channel"]["channel"], "public")
+
+    def test_update_channel_manifest_validation_and_snapshot_status(self) -> None:
+        manifest = {
+            "version": "26.24.0-1",
+            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.24.0-1",
+            "sha256": "a" * 64,
+            "minAppVersion": "26.24.0",
+            "channel": "pro",
+        }
+
+        state = agentcat.write_update_channel_state("pro", manifest)
+        status = agentcat.update_channel_status_snapshot()
+
+        self.assertEqual(state["status"], "manifest_ready")
+        self.assertEqual(state["installStatus"], "pending_install")
+        self.assertEqual(status["channel"], "pro")
+        self.assertEqual(status["targetVersion"], "26.24.0-1")
+        self.assertEqual(status["installStatus"], "pending_install")
+        self.assertTrue(agentcat.update_channel_state_file().exists())
+
+    def test_update_channel_rejects_insecure_or_bad_manifest(self) -> None:
+        manifest = {
+            "version": "26.24.0-1",
+            "downloadUrl": "http://api.agentcat.app/v1/pro/connector/download/26.24.0-1",
+            "sha256": "a" * 64,
+            "channel": "pro",
+        }
+
+        with self.assertRaises(ValueError):
+            agentcat.write_update_channel_state("pro", manifest)
+
+        manifest["downloadUrl"] = "https://api.agentcat.app/v1/pro/connector/download/26.24.0-1"
+        manifest["sha256"] = "A" * 64
+        with self.assertRaises(ValueError):
+            agentcat.write_update_channel_state("pro", manifest)
+
+    def test_update_channel_public_clears_pro_manifest_state(self) -> None:
+        manifest = {
+            "version": "26.24.0-1",
+            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.24.0-1",
+            "sha256": "b" * 64,
+            "channel": "pro",
+        }
+
+        agentcat.write_update_channel_state("pro", manifest)
+        state = agentcat.write_update_channel_state("public")
+
+        self.assertEqual(state["channel"], "public")
+        self.assertNotIn("manifest", state)
+        self.assertEqual(agentcat.update_channel_status_snapshot()["installStatus"], "current")
+
+    def test_http_update_channel_endpoint_persists_manifest(self) -> None:
+        server = agentcat.ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            manifest = {
+                "version": "26.24.0-1",
+                "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.24.0-1",
+                "sha256": "c" * 64,
+                "channel": "pro",
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/update/channel",
+                data=json.dumps({"channel": "pro", "manifest": manifest}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=2.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["channel"]["channel"], "pro")
+        self.assertEqual(agentcat.update_channel_status_snapshot()["targetVersion"], "26.24.0-1")
 
     def test_connector_version_parser_and_comparison(self) -> None:
         text = 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.10")'
