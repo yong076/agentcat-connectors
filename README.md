@@ -2,31 +2,48 @@
 
 [English](README.md) | [한국어](README.ko.md)
 
-Agent Cat Connectors lets the Agent Cat menu bar app see local CLI-agent activity from Codex, Claude Code, and Gemini CLI.
+Agent Cat Connectors lets the Agent Cat menu bar app see local CLI-agent
+activity from Codex, Claude Code, Gemini CLI, and other supported agent tools.
 
-It installs a small local collector, keeps data under `~/.agentcat`, and patches supported CLI settings so future sessions can report activity without sending prompts to a remote server.
+It installs a small local collector, keeps data under `~/.agentcat`, and patches
+supported CLI settings so future sessions can report activity without sending
+prompts to a remote server. This public connector powers the free product:
+local monitoring, provider breadth, quota state, basic costs, budget caps, and
+weekly report inputs.
 
 ## Install
 
-Windows PowerShell:
+The normal user path is app-led:
+
+1. Open Agent Cat.
+2. Go to Home -> Agents / Connector.
+3. Click **Install connector**.
+4. Wait for the app to show live provider data.
+
+The app-led path is preferred because it explains what will change, keeps a
+rollback backup, and verifies the local daemon after install. Use the commands
+below only for development, CI, remote support, or when the app cannot open the
+installer.
+
+Advanced Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.ps1 | iex
 ```
 
-macOS/Linux:
+Advanced macOS/Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.sh | bash
 ```
 
-For a cloned checkout:
+Development from a cloned checkout:
 
 ```bash
 ./install.sh
 ```
 
-On Windows from a cloned checkout:
+Development on Windows from a cloned checkout:
 
 ```powershell
 .\install.ps1
@@ -38,7 +55,8 @@ Then verify:
 agentcat snapshot
 ```
 
-To copy the prompt you can paste into Codex, Claude Code, or Gemini CLI after installation:
+If an agent runtime needs manual setup text after installation, copy the
+fallback prompt:
 
 ```bash
 agentcat setup-prompt
