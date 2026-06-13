@@ -922,7 +922,14 @@ def windows_process_scan_timeout_seconds() -> float:
 
 
 def read_stdin_payload() -> Any:
-    data = sys.stdin.read()
+    try:
+        data = sys.stdin.read()
+    except OSError:
+        # Hooks/statusline commands must stay non-blocking even when the host
+        # process provides no readable stdin (pytest capture, some editor
+        # launchers, detached notification hooks). Treat that as an empty event
+        # payload rather than failing the runtime hook.
+        return {}
     if not data.strip():
         return {}
     try:
