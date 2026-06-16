@@ -43,6 +43,22 @@ Development from a cloned checkout:
 ./install.sh
 ```
 
+Pro connector safe-swap QA (local/private builds only):
+
+```bash
+python3 scripts/pro_channel_install.py \
+  --archive /path/to/agentcat-connectors-pro.tgz \
+  --manifest /path/to/pro-manifest.json \
+  --install-dir "$TMPDIR/agentcat-pro-connectors" \
+  --event-log "$TMPDIR/agentcat-pro-connector-events.jsonl"
+```
+
+The optional event log records `pro_connector_swap_started`,
+`pro_connector_swap_succeeded`, and `pro_connector_swap_rolled_back` without
+contacting the Pro API. App-led installs can additionally pass
+`--event-api-url`, `--event-bearer`, and `--device-id` after entitlement checks.
+Those flags are observability only; install success never depends on them.
+
 Development on Windows from a cloned checkout:
 
 ```powershell

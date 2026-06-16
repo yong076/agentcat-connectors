@@ -17,6 +17,8 @@ import os
 import shutil
 import tarfile
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,56 @@ def verify_archive_checksum(archive: Path, manifest: dict[str, Any]) -> str:
     if actual != expected:
         raise ValueError(f"checksum mismatch: expected {expected}, got {actual}")
     return actual
+
+
+def emit_connector_event(
+    event: str,
+    properties: dict[str, Any],
+    *,
+    event_log: Path | None = None,
+    event_api_url: str | None = None,
+    event_bearer: str | None = None,
+    device_id: str | None = None,
+) -> None:
+    """Best-effort Pro connector lifecycle telemetry.
+
+    The installer must remain usable as a local/offline safe-swap helper, so
+    event emission is optional and never affects install success. The payload is
+    intentionally path-free: install/backup paths stay in the local result JSON,
+    not in product events.
+    """
+    payload = {
+        "event": event,
+        "surface": "pro_connector",
+        "plan": "pro",
+        "device_id": device_id or "local_connector",
+        "properties": properties,
+    }
+    if event_log is not None:
+        try:
+            event_log = event_log.expanduser().resolve()
+            event_log.parent.mkdir(parents=True, exist_ok=True)
+            with event_log.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            pass
+    if event_api_url:
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            request = urllib.request.Request(
+                event_api_url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "agentcat-pro-connector-installer",
+                },
+                method="POST",
+            )
+            if event_bearer:
+                request.add_header("Authorization", f"Bearer {event_bearer}")
+            urllib.request.urlopen(request, timeout=3).close()
+        except (OSError, urllib.error.URLError, urllib.error.HTTPError):
+            pass
 
 
 def _safe_tar_members(tar: tarfile.TarFile, destination: Path) -> list[tarfile.TarInfo]:
@@ -132,12 +184,49 @@ def install_pro_archive(
     manifest: dict[str, Any],
     install_dir: Path,
     backup_root: Path,
+    event_log: Path | None = None,
+    event_api_url: str | None = None,
+    event_bearer: str | None = None,
+    device_id: str | None = None,
 ) -> dict[str, Any]:
     archive = archive.expanduser().resolve()
     verify_archive_checksum(archive, manifest)
     with tempfile.TemporaryDirectory(prefix="agentcat-pro-connector.") as tmp:
         candidate = extract_connector_archive(archive, Path(tmp))
-        result = swap_connector(candidate, install_dir, backup_root)
+        event_properties = {
+            "version": str(manifest.get("version") or ""),
+            "sha256": str(manifest.get("sha256") or ""),
+        }
+        emit_connector_event(
+            "pro_connector_swap_started",
+            event_properties,
+            event_log=event_log,
+            event_api_url=event_api_url,
+            event_bearer=event_bearer,
+            device_id=device_id,
+        )
+        try:
+            result = swap_connector(candidate, install_dir, backup_root)
+        except Exception as exc:
+            rolled_back_properties = dict(event_properties)
+            rolled_back_properties["reason"] = exc.__class__.__name__
+            emit_connector_event(
+                "pro_connector_swap_rolled_back",
+                rolled_back_properties,
+                event_log=event_log,
+                event_api_url=event_api_url,
+                event_bearer=event_bearer,
+                device_id=device_id,
+            )
+            raise
+        emit_connector_event(
+            "pro_connector_swap_succeeded",
+            event_properties,
+            event_log=event_log,
+            event_api_url=event_api_url,
+            event_bearer=event_bearer,
+            device_id=device_id,
+        )
     result.update(
         {
             "channel": "pro",
@@ -155,6 +244,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--install-dir", type=Path, default=Path.home() / ".agentcat" / "connectors")
     parser.add_argument("--backup-root", type=Path, default=Path.home() / ".agentcat" / "backups" / "pro-channel")
+    parser.add_argument("--event-log", type=Path, help="Optional JSONL lifecycle event log for local QA.")
+    parser.add_argument("--event-api-url", help="Optional Pro product event endpoint, e.g. https://api.agentcat.app/v1/pro/events.")
+    parser.add_argument("--event-bearer", help="Optional signed Pro session token for the event endpoint.")
+    parser.add_argument("--device-id", help="Optional product-event device id. Defaults to local_connector.")
     return parser.parse_args()
 
 
@@ -165,6 +258,10 @@ def main() -> int:
         manifest=read_manifest(args.manifest),
         install_dir=args.install_dir,
         backup_root=args.backup_root,
+        event_log=args.event_log,
+        event_api_url=args.event_api_url,
+        event_bearer=args.event_bearer,
+        device_id=args.device_id,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
