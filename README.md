@@ -43,6 +43,27 @@ Development from a cloned checkout:
 ./install.sh
 ```
 
+### Connector archive integrity
+
+When the connector is fetched as a tarball (the archive download and the clone
+fallback in `install.sh`), `install.sh` verifies the archive against a
+known-good SHA256 when one is available, gating the swap exactly like the Pro
+channel (`scripts/pro_channel_install.py`). Note: an existing install created
+via `git clone` updates through `git pull --ff-only` (HTTPS git object
+integrity is the trust boundary there) and does not pass through this archive
+gate yet — routing that path through verification is part of the release-infra
+follow-up below. Supply a digest via either:
+
+- `AGENTCAT_CONNECTORS_SHA256` — a 64 lowercase hex digest passed by the caller
+  (for an app-led update, or local QA), or
+- `AGENTCAT_CONNECTORS_SHA256_URL` — a sidecar digest published next to the
+  tarball.
+
+When no digest is supplied (the current default), the install proceeds as
+before so existing installs keep updating. Publishing a per-release digest and
+wiring it into the auto-update path is the remaining step to make verification
+mandatory on the public channel.
+
 Pro connector safe-swap QA (local/private builds only):
 
 ```bash

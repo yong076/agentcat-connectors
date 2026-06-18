@@ -6051,6 +6051,11 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
     ensure_dirs()
     env = os.environ.copy()
     env["AGENTCAT_CONNECTORS_DIR"] = str(agentcat_connectors_dir())
+    # install.sh verifies the downloaded connector archive against a SHA256 when
+    # one is available (AGENTCAT_CONNECTORS_SHA256 / *_SHA256_URL). The env is
+    # forwarded as-is, so once releases publish a per-version digest the daemon
+    # can populate it here to gate the swap; absent a digest the install path is
+    # unchanged and existing installs keep updating.
     stdout_path = AGENTCAT_HOME / "auto-update.out.log"
     stderr_path = AGENTCAT_HOME / "auto-update.err.log"
     stdout = stdout_path.open("ab")
