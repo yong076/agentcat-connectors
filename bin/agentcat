@@ -20,7 +20,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -60,6 +60,10 @@ LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_S
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
+CLAUDE_DESKTOP_PROJECT_GLOBS = (
+    "local-agent-mode-sessions/**/.claude/projects",
+)
+CLAUDE_DESKTOP_PROJECT_DIR_MAX = int(os.environ.get("AGENTCAT_CLAUDE_DESKTOP_PROJECT_DIR_MAX", "16"))
 CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
@@ -1094,6 +1098,7 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
         "configured": configured,
         "detectedDefault": (not configured and default_path is not None),
         "privacy": "metadata_only",
+        "usageImport": "allowlisted_usage" if provider == "claude" else "metadata_only",
         "readsContent": False,
         "status": "not_configured",
         "dataRoots": [],
@@ -3979,6 +3984,47 @@ def claude_record_from_cursor(raw: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def claude_journal_project_dirs() -> List[Path]:
+    """Return Claude usage journal roots without reading transcript content.
+
+    The canonical CLI root is ~/.claude/projects. Claude Desktop's local
+    agent mode keeps the same JSONL shape under its Application Support
+    directory. We only add the nested `.claude/projects` roots; parsing remains
+    field allowlisted in parse_claude_usage_line().
+    """
+    roots: List[Path] = []
+    seen: Set[str] = set()
+
+    def add(root: Path) -> None:
+        try:
+            resolved = str(root.resolve())
+        except OSError:
+            resolved = str(root)
+        if resolved in seen:
+            return
+        if not root.is_dir():
+            return
+        seen.add(resolved)
+        roots.append(root)
+
+    add(CLAUDE_PROJECTS_DIR)
+    added_desktop = 0
+    for data_root in desktop_app_data_roots("claude"):
+        if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
+            break
+        if not data_root.is_dir():
+            continue
+        for pattern in CLAUDE_DESKTOP_PROJECT_GLOBS:
+            for candidate in sorted(data_root.glob(pattern)):
+                add(candidate)
+                added_desktop += 1
+                if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
+                    break
+            if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
+                break
+    return roots
+
+
 def _apply_record_to_totals(
     totals: Dict[str, int],
     rec: Dict[str, Any],
@@ -4043,31 +4089,31 @@ def _apply_record_to_totals(
 
 def rebuild_claude_journal_projects(now: "dt.datetime") -> Dict[str, Dict[str, Any]]:
     projects: Dict[str, Dict[str, Any]] = {}
-    if not CLAUDE_PROJECTS_DIR.is_dir():
-        return projects
     scratch_totals = _empty_journal_totals()
-    for path in sorted(CLAUDE_PROJECTS_DIR.rglob("*.jsonl")):
-        try:
-            with path.open("rb") as fh:
-                for raw_line in fh:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    rec = parse_claude_usage_line(obj)
-                    if rec:
-                        _apply_record_to_totals(scratch_totals, rec, now, projects)
-        except OSError as exc:
-            logging.warning("rebuild_claude_journal_projects: cannot read %s: %s", str(path), exc)
-            continue
+    for root in claude_journal_project_dirs():
+        for path in sorted(root.rglob("*.jsonl")):
+            try:
+                with path.open("rb") as fh:
+                    for raw_line in fh:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        rec = parse_claude_usage_line(obj)
+                        if rec:
+                            _apply_record_to_totals(scratch_totals, rec, now, projects)
+            except OSError as exc:
+                logging.warning("rebuild_claude_journal_projects: cannot read %s: %s", str(path), exc)
+                continue
     return projects
 
 
 def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
-    if not CLAUDE_PROJECTS_DIR.is_dir():
+    project_roots = claude_journal_project_dirs()
+    if not project_roots:
         return cursor
     now_utc = dt.datetime.now(dt.timezone.utc)
     now_local = now_utc.astimezone().date()
@@ -4102,67 +4148,68 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         # without disturbing global totals or byte offsets.
         projects.clear()
         projects.update(rebuild_claude_journal_projects(now_utc))
-    for path in sorted(CLAUDE_PROJECTS_DIR.rglob("*.jsonl")):
-        path_str = str(path)
-        try:
-            file_size = path.stat().st_size
-        except OSError:
-            continue
-        stored_offset = offsets.get(path_str, 0)
-        if stored_offset > file_size:
-            stored_offset = 0
-        if stored_offset >= file_size:
-            continue
-        lines_parsed = lines_skipped = 0
-        new_offset = stored_offset
-        try:
-            with path.open("rb") as fh:
-                fh.seek(stored_offset)
-                for raw_line in fh:
-                    new_offset += len(raw_line)
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        lines_skipped += 1
-                        continue
-                    rec = parse_claude_usage_line(obj)
-                    if rec:
-                        dedupe_key = rec.get("dedupeKey")
-                        if isinstance(dedupe_key, str) and dedupe_key:
-                            previous = claude_record_from_cursor(usage_records.get(dedupe_key))
-                            if previous is not None:
-                                if claude_record_total(rec) <= claude_record_total(previous):
-                                    continue
-                                _apply_record_to_totals(
-                                    totals,
-                                    previous,
-                                    now_utc,
-                                    projects,
-                                    daily_tokens,
-                                    hourly_tokens,
-                                    models,
-                                    sign=-1,
-                                )
-                            usage_records[dedupe_key] = claude_record_for_cursor(rec)
-                        _apply_record_to_totals(
-                            totals,
-                            rec,
-                            now_utc,
-                            projects,
-                            daily_tokens,
-                            hourly_tokens,
-                            models,
-                        )
-                        lines_parsed += 1
-        except OSError as exc:
-            logging.warning("scan_claude_journal: cannot read %s: %s", path_str, exc)
-            continue
-        offsets[path_str] = new_offset
-        logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
-                      path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
+    for root in project_roots:
+        for path in sorted(root.rglob("*.jsonl")):
+            path_str = str(path)
+            try:
+                file_size = path.stat().st_size
+            except OSError:
+                continue
+            stored_offset = offsets.get(path_str, 0)
+            if stored_offset > file_size:
+                stored_offset = 0
+            if stored_offset >= file_size:
+                continue
+            lines_parsed = lines_skipped = 0
+            new_offset = stored_offset
+            try:
+                with path.open("rb") as fh:
+                    fh.seek(stored_offset)
+                    for raw_line in fh:
+                        new_offset += len(raw_line)
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            lines_skipped += 1
+                            continue
+                        rec = parse_claude_usage_line(obj)
+                        if rec:
+                            dedupe_key = rec.get("dedupeKey")
+                            if isinstance(dedupe_key, str) and dedupe_key:
+                                previous = claude_record_from_cursor(usage_records.get(dedupe_key))
+                                if previous is not None:
+                                    if claude_record_total(rec) <= claude_record_total(previous):
+                                        continue
+                                    _apply_record_to_totals(
+                                        totals,
+                                        previous,
+                                        now_utc,
+                                        projects,
+                                        daily_tokens,
+                                        hourly_tokens,
+                                        models,
+                                        sign=-1,
+                                    )
+                                usage_records[dedupe_key] = claude_record_for_cursor(rec)
+                            _apply_record_to_totals(
+                                totals,
+                                rec,
+                                now_utc,
+                                projects,
+                                daily_tokens,
+                                hourly_tokens,
+                                models,
+                            )
+                            lines_parsed += 1
+            except OSError as exc:
+                logging.warning("scan_claude_journal: cannot read %s: %s", path_str, exc)
+                continue
+            offsets[path_str] = new_offset
+            logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
+                          path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
     cursor["totals_as_of"] = now_utc.isoformat()
     cursor["version"] = CLAUDE_JOURNAL_CURSOR_VERSION
     return cursor

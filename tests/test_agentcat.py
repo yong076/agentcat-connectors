@@ -140,6 +140,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertTrue(claude_app["configured"])
         self.assertEqual(claude_app["status"], "ok")
         self.assertEqual(claude_app["readableFiles"], 1)
+        self.assertEqual(claude_app["usageImport"], "allowlisted_usage")
 
     def test_connector_config_rejects_relative_desktop_app_paths(self) -> None:
         with self.assertRaises(ValueError):
@@ -745,6 +746,63 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(model["week"], 15)
         self.assertEqual(model["all"], 15)
         self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 15)
+
+    def test_claude_snapshot_reads_desktop_local_agent_usage_allowlist(self) -> None:
+        project_dir = (
+            agentcat.HOME
+            / "Library"
+            / "Application Support"
+            / "Claude"
+            / "local-agent-mode-sessions"
+            / "account"
+            / "workspace"
+            / "local-session"
+            / ".claude"
+            / "projects"
+            / "desktop-project"
+        )
+        project_dir.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        session_path = project_dir / "session.jsonl"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "timestamp": now.isoformat().replace("+00:00", "Z"),
+                    "cwd": "/Users/tester/work/desktop-app",
+                    "requestId": "desktop_req_1",
+                    "message": {
+                        "id": "desktop_msg_1",
+                        "model": "claude-sonnet-4-6",
+                        "content": [
+                            {"type": "text", "text": "must never be emitted"},
+                            {"type": "tool_use", "input": {"prompt": "must never be emitted"}},
+                        ],
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 20,
+                            "cache_read_input_tokens": 30,
+                            "cache_creation_input_tokens": 40,
+                        },
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 100)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 20)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 30)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 40)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 190)
+        self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["all"], 190)
+        self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 190)
+        cursor = json.loads(agentcat.JOURNAL_CURSOR_FILE.read_text(encoding="utf-8"))
+        self.assertIn(str(session_path), cursor["offsets"])
+        self.assertNotIn("must never be emitted", json.dumps(cursor, ensure_ascii=False))
 
     def test_claude_snapshot_deduplicates_repeated_request_usage(self) -> None:
         project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"
