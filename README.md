@@ -90,7 +90,7 @@ agentcat setup-prompt
 
 | Provider | Signal | Notes |
 | --- | --- | --- |
-| Codex | local SQLite token totals + Codex OAuth usage API | Shows remaining 5-hour, 7-day, and exposed model/review quota percentages when `~/.codex/auth.json` is present. |
+| Codex | local SQLite token totals + Codex OAuth usage API | Shows remaining 5-hour, 7-day, exposed model/review quota percentages, available reset credits, and Codex credit/spend-cap state when `~/.codex/auth.json` is present. |
 | Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
 | Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
 
@@ -130,7 +130,7 @@ On Windows, Agent Cat prefers PowerShell 7 (`pwsh`) when available, tries a fast
 
 Agent Cat reports remaining quota when a provider exposes it through the same local auth state used by its CLI:
 
-- Codex: reads `~/.codex/auth.json`, then calls the ChatGPT Codex usage endpoint for rolling 5-hour/7-day utilization and reset times.
+- Codex: reads `~/.codex/auth.json`, then calls the ChatGPT Codex usage endpoints for rolling 5-hour/7-day utilization, reset times, available reset credits, and Codex credit/spend-cap state. Reset credits are reported only as availability/metadata; this connector never redeems them.
 - Claude Code: reads Claude Code OAuth credentials from Keychain or `~/.claude`, then calls the Claude Code OAuth usage endpoint for 5-hour/7-day/model utilization plus monthly extra-usage credits.
 - Gemini CLI: reads `~/.gemini/oauth_creds.json` and `~/.gemini/settings.json`, then calls Gemini Code Assist `loadCodeAssist` and `retrieveUserQuota` for model request quota fractions and reset times.
 - Fallback: if live quota lookup fails, Codex/Claude still use the latest local status-line or session `token_count` event when available.
