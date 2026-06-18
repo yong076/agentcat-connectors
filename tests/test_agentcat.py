@@ -115,6 +115,60 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(merged["shortUsedPercent"], 8.0)
         self.assertEqual(merged["quotas"][0]["remainingPercent"], 87.0)
 
+    def test_connector_config_round_trips_desktop_apps_and_provider_enabled(self) -> None:
+        app_path = self.root / "Applications" / "Claude.app"
+        (app_path / "Contents").mkdir(parents=True)
+        data_root = agentcat.HOME / "Library" / "Application Support" / "Claude"
+        data_root.mkdir(parents=True)
+        (data_root / "usage.json").write_text("{}", encoding="utf-8")
+
+        result = agentcat.merge_connector_config_payload(
+            {
+                "providers": {
+                    "claude": {"enabled": False, "limits": {"week": 1000}},
+                },
+                "desktopApps": {
+                    "claude": {"path": str(app_path)},
+                },
+            }
+        )
+
+        self.assertFalse(result["providers"]["claude"]["enabled"])
+        self.assertEqual(result["providers"]["claude"]["limits"]["week"], 1000)
+        claude_app = result["desktopApps"]["claude"]
+        self.assertEqual(claude_app["path"], str(app_path))
+        self.assertTrue(claude_app["configured"])
+        self.assertEqual(claude_app["status"], "ok")
+        self.assertEqual(claude_app["readableFiles"], 1)
+
+    def test_connector_config_rejects_relative_desktop_app_paths(self) -> None:
+        with self.assertRaises(ValueError):
+            agentcat.merge_connector_config_payload(
+                {"desktopApps": {"codex": {"path": "Codex.app"}}}
+            )
+
+    def test_build_snapshot_skips_disabled_provider_and_exposes_desktop_apps(self) -> None:
+        app_path = self.root / "Applications" / "Codex.app"
+        app_path.mkdir(parents=True)
+        agentcat.write_agentcat_settings(
+            {
+                "providers": {"codex": {"enabled": False}},
+                "desktopApps": {"codex": {"path": str(app_path)}},
+            }
+        )
+
+        with patch.object(agentcat, "codex_snapshot", side_effect=AssertionError("codex should be skipped")), \
+             patch.object(agentcat, "claude_snapshot", return_value={"status": "ok", "tokens": {}, "models": {}}), \
+             patch.object(agentcat, "gemini_snapshot", return_value={"status": "ok", "tokens": {}, "models": {}}), \
+             patch.object(agentcat, "opencode_snapshot", return_value={"status": "ok", "tokens": {}, "models": {}}), \
+             patch.object(agentcat, "copilot_snapshot", return_value={"status": "ok", "tokens": {}, "models": {}}):
+            snapshot = agentcat.build_snapshot()
+
+        self.assertEqual(snapshot["providers"]["codex"]["status"], "disabled")
+        self.assertIn("desktopApps", snapshot)
+        self.assertEqual(snapshot["desktopApps"]["codex"]["status"], "installed_no_data")
+        self.assertEqual(snapshot["providers"]["codex"]["desktopApp"]["path"], str(app_path))
+
     def test_codex_usage_api_payload_builds_remaining_quota_entries(self) -> None:
         limits = agentcat.codex_limits_from_usage_response(
             {
