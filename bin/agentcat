@@ -44,6 +44,7 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/wham/usage",
     "https://chatgpt.com/api/codex/usage",
 )
+CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -2176,6 +2177,20 @@ def codex_usage_request(access_token: str, account_id: str, url: str) -> Dict[st
     return payload if isinstance(payload, dict) else {}
 
 
+def codex_reset_credits_request(access_token: str, account_id: str) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "AgentCat/1.0",
+    }
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    req = urllib.request.Request(CODEX_RESET_CREDITS_URL, headers=headers)
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
 def codex_window_quota(
     quota_id: str,
     label: str,
@@ -2202,6 +2217,110 @@ def codex_window_quota(
     )
 
 
+def sum_intish_list(raw: Any) -> Optional[int]:
+    if isinstance(raw, list):
+        values = [int_limit(item) for item in raw]
+        values = [item for item in values if item is not None]
+        return sum(values) if values else None
+    return int_limit(raw)
+
+
+def int_count(raw: Any) -> Optional[int]:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        value = int(raw)
+    elif isinstance(raw, str):
+        text = raw.strip().replace(",", "").replace("_", "")
+        if not text.isdigit():
+            return None
+        value = int(text)
+    else:
+        return None
+    return value if value >= 0 else None
+
+
+def sum_count_list(raw: Any) -> Optional[int]:
+    if isinstance(raw, list):
+        values = [int_count(item) for item in raw]
+        values = [item for item in values if item is not None]
+        return sum(values) if values else None
+    return int_count(raw)
+
+
+def codex_credit_usage_summary(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    summary: Dict[str, Any] = {}
+    for source, target in (
+        ("balance", "balance"),
+        ("has_credits", "hasCredits"),
+        ("unlimited", "unlimited"),
+        ("overage_limit_reached", "overageLimitReached"),
+    ):
+        value = raw.get(source)
+        if isinstance(value, bool):
+            summary[target] = value
+        elif source == "balance" and value is not None:
+            summary[target] = str(value)
+
+    cloud = sum_count_list(raw.get("approx_cloud_messages"))
+    local = sum_count_list(raw.get("approx_local_messages"))
+    if cloud is not None:
+        summary["approxCloudMessages"] = cloud
+    if local is not None:
+        summary["approxLocalMessages"] = local
+    return summary or None
+
+
+def codex_rate_limit_reached_type(raw: Any) -> Optional[str]:
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        value = raw.get("type") or raw.get("reason") or raw.get("name")
+        return str(value) if value is not None else None
+    return None
+
+
+def codex_reset_credit_summaries(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    summaries: List[Dict[str, Any]] = []
+    for item in raw[:10]:
+        if not isinstance(item, dict):
+            continue
+        summary: Dict[str, Any] = {}
+        for source, target in (
+            ("status", "status"),
+            ("title", "title"),
+            ("description", "description"),
+            ("reset_type", "resetType"),
+        ):
+            value = item.get(source)
+            if isinstance(value, str) and value.strip():
+                summary[target] = value.strip()
+        for source, target in (
+            ("granted_at", "grantedAt"),
+            ("expires_at", "expiresAt"),
+            ("redeemed_at", "redeemedAt"),
+        ):
+            value = item.get(source)
+            if value is not None:
+                summary[target] = str(value)
+        if summary:
+            summaries.append(summary)
+    return summaries
+
+
+def merge_codex_reset_credit_details(limits: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    available = int_limit(payload.get("available_count"))
+    if available is not None:
+        limits["resetCreditsAvailable"] = max(available, 0)
+    summaries = codex_reset_credit_summaries(payload.get("credits"))
+    if summaries:
+        limits["resetCredits"] = summaries
+
+
 def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "codex-usage-api") -> Dict[str, Any]:
     limits = empty_limits(status="auto")
     limits["source"] = source
@@ -2210,6 +2329,32 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
     rate_limit = payload.get("rate_limit")
     if not isinstance(rate_limit, dict):
         rate_limit = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
+
+    for source_key, target_key in (
+        ("allowed", "rateLimitAllowed"),
+        ("limit_reached", "rateLimitReached"),
+    ):
+        value = rate_limit.get(source_key)
+        if isinstance(value, bool):
+            limits[target_key] = value
+
+    reached_type = codex_rate_limit_reached_type(payload.get("rate_limit_reached_type"))
+    if reached_type:
+        limits["rateLimitReachedType"] = reached_type
+
+    reset_credits = payload.get("rate_limit_reset_credits")
+    if isinstance(reset_credits, dict):
+        available = int_limit(reset_credits.get("available_count"))
+        if available is not None:
+            limits["resetCreditsAvailable"] = max(available, 0)
+
+    credit_summary = codex_credit_usage_summary(payload.get("credits"))
+    if credit_summary is not None:
+        limits["codexCredits"] = credit_summary
+
+    spend_control = payload.get("spend_control")
+    if isinstance(spend_control, dict) and isinstance(spend_control.get("reached"), bool):
+        limits["spendControlReached"] = spend_control.get("reached")
 
     primary = rate_limit.get("primary_window") or rate_limit.get("primary")
     secondary = rate_limit.get("secondary_window") or rate_limit.get("secondary")
@@ -2293,12 +2438,20 @@ def codex_live_limits() -> Dict[str, Any]:
             try:
                 payload = codex_usage_request(access_token, str(account_id), url)
                 limits = codex_limits_from_usage_response(payload, source=url)
+                try:
+                    reset_payload = codex_reset_credits_request(access_token, str(account_id))
+                    merge_codex_reset_credit_details(limits, reset_payload)
+                except Exception:
+                    pass
                 write_live_limits_cache("codex", limits)
                 return limits
             except urllib.error.HTTPError as exc:
                 last_error = exc
-                if exc.code in (401, 403) and attempt == 0:
-                    break
+                # Codex currently exposes several adjacent usage endpoints.
+                # Some valid sessions receive 403 on /codex/usage while
+                # /wham/usage succeeds with the same access token, so exhaust
+                # the URL list before attempting token refresh.
+                continue
             except Exception as exc:
                 last_error = exc
         if attempt == 0:

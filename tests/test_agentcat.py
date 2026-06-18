@@ -5,6 +5,7 @@ import json
 import sqlite3
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 import unittest
 from contextlib import closing, redirect_stdout
@@ -175,6 +176,8 @@ class AgentCatConnectorTests(unittest.TestCase):
             {
                 "plan_type": "pro",
                 "rate_limit": {
+                    "allowed": True,
+                    "limit_reached": False,
                     "primary_window": {
                         "used_percent": 3,
                         "reset_at": 1770000100,
@@ -194,6 +197,17 @@ class AgentCatConnectorTests(unittest.TestCase):
                         },
                     }
                 ],
+                "credits": {
+                    "balance": "0",
+                    "has_credits": False,
+                    "unlimited": False,
+                    "overage_limit_reached": False,
+                    "approx_cloud_messages": [2, 3],
+                    "approx_local_messages": [7],
+                },
+                "rate_limit_reset_credits": {"available_count": 1},
+                "rate_limit_reached_type": {"type": "rate_limit_reached"},
+                "spend_control": {"reached": False},
             }
         )
 
@@ -204,6 +218,70 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["quotas"][0]["remainingPercent"], 97.0)
         self.assertEqual(limits["quotas"][1]["remainingPercent"], 82.0)
         self.assertEqual(limits["quotas"][2]["remainingPercent"], 100.0)
+        self.assertEqual(limits["rateLimitAllowed"], True)
+        self.assertEqual(limits["rateLimitReached"], False)
+        self.assertEqual(limits["rateLimitReachedType"], "rate_limit_reached")
+        self.assertEqual(limits["resetCreditsAvailable"], 1)
+        self.assertEqual(limits["spendControlReached"], False)
+        self.assertEqual(limits["codexCredits"]["approxCloudMessages"], 5)
+        self.assertEqual(limits["codexCredits"]["approxLocalMessages"], 7)
+        self.assertEqual(limits["codexCredits"]["hasCredits"], False)
+
+    def test_codex_reset_credit_details_are_sanitized(self) -> None:
+        limits = {}
+        agentcat.merge_codex_reset_credit_details(
+            limits,
+            {
+                "available_count": 2,
+                "credits": [
+                    {
+                        "id": "secret-credit-id",
+                        "profile_user_id": "friend-user-id",
+                        "profile_image_url": "https://example.test/avatar.png",
+                        "status": "available",
+                        "title": "One rate limit reset",
+                        "description": "Ready to redeem",
+                        "reset_type": "rate_limit",
+                        "expires_at": "2026-07-01T00:00:00Z",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(limits["resetCreditsAvailable"], 2)
+        self.assertEqual(limits["resetCredits"][0]["status"], "available")
+        self.assertEqual(limits["resetCredits"][0]["title"], "One rate limit reset")
+        self.assertNotIn("id", limits["resetCredits"][0])
+        self.assertNotIn("profile_user_id", limits["resetCredits"][0])
+        self.assertNotIn("profile_image_url", limits["resetCredits"][0])
+
+    def test_codex_live_limits_tries_wham_before_refresh_after_codex_403(self) -> None:
+        (agentcat.HOME / ".codex").mkdir(parents=True)
+        (agentcat.HOME / ".codex" / "auth.json").write_text(
+            json.dumps({"tokens": {"access_token": "access", "refresh_token": "refresh", "account_id": "acct"}}),
+            encoding="utf-8",
+        )
+
+        def usage_side_effect(_access: str, _account: str, url: str) -> dict:
+            if url.endswith("/codex/usage"):
+                raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+            return {
+                "plan_type": "pro",
+                "rate_limit": {"primary_window": {"used_percent": 20, "reset_at": 1770000000}},
+                "rate_limit_reset_credits": {"available_count": 1},
+                "credits": {"approx_cloud_messages": [0], "approx_local_messages": [0]},
+            }
+
+        with patch.object(agentcat, "CODEX_USAGE_URLS", ("https://chatgpt.com/backend-api/codex/usage", "https://chatgpt.com/backend-api/wham/usage")), \
+            patch.object(agentcat, "codex_usage_request", side_effect=usage_side_effect), \
+            patch.object(agentcat, "codex_reset_credits_request", return_value={"available_count": 2, "credits": []}), \
+            patch.object(agentcat, "refresh_codex_access_token", side_effect=AssertionError("refresh should wait until all usage URLs fail")):
+            limits = agentcat.codex_live_limits()
+
+        self.assertEqual(limits["source"], "https://chatgpt.com/backend-api/wham/usage")
+        self.assertEqual(limits["resetCreditsAvailable"], 2)
+        self.assertEqual(limits["codexCredits"]["approxCloudMessages"], 0)
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 80.0)
 
     def test_claude_usage_api_payload_builds_weekly_and_monthly_remaining(self) -> None:
         limits = agentcat.claude_limits_from_usage_response(
