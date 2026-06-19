@@ -826,7 +826,43 @@ SENSITIVE_KEY_PARTS = (
     "input_text",
     "output_text",
     "workspace",
+    "description",
+    "command",
+    "title",
+    "args",
 )
+
+# Exact-match denylist for short keys that would over-match as substrings
+# (e.g. "text" would otherwise redact "context_window", a legitimate metric).
+SENSITIVE_KEY_EXACT = frozenset(
+    {
+        "text",
+        "arg",
+        "argv",
+    }
+)
+
+# Value-based redaction: even when a key is not in the denylist, redact string
+# values that look like filesystem paths or secrets so prompt-shaped content
+# never lands in storage. Token/limit metadata stays numeric, so this only
+# trips on string values.
+SENSITIVE_VALUE_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"^(?:~|/|\./|\.\./|[A-Za-z]:[\\/])"),  # absolute / relative / windows paths
+    re.compile(r"/[^/\s]+/[^/\s]+"),  # multi-segment unix paths anywhere in the value
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),  # OpenAI-style secret keys
+    re.compile(r"\b(?:sk-ant|ghp|gho|ghu|ghs|github_pat|xox[abpr]|AKIA)[A-Za-z0-9_-]{6,}\b"),  # vendor tokens
+    re.compile(r"\bBearer\s+[A-Za-z0-9._-]{10,}\b", re.IGNORECASE),  # bearer tokens
+    re.compile(r"\beyJ[A-Za-z0-9._-]{20,}\b"),  # JWT-shaped tokens
+)
+
+
+def value_is_sensitive(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate or len(candidate) > 4000:
+        # Empty values are harmless; oversized free text is already truncated by
+        # sanitize_payload and is treated conservatively as non-matching here.
+        candidate = candidate[:4000]
+    return any(pattern.search(candidate) for pattern in SENSITIVE_VALUE_PATTERNS)
 
 RUNTIME_MODE_TTL_SECONDS = int(os.environ.get("AGENTCAT_RUNTIME_MODE_TTL_SECONDS", "1800"))
 RUNTIME_MODE_KEYWORD_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
@@ -862,9 +898,32 @@ def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _chmod_quiet(path: Path, mode: int) -> None:
+    # Best-effort: chmod is unsupported / a no-op on Windows, and we never want a
+    # permission tweak to crash the daemon.
+    if IS_WINDOWS:
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 def ensure_dirs() -> None:
     AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
+    _chmod_quiet(AGENTCAT_HOME, 0o700)
     GEMINI_TELEMETRY.parent.mkdir(parents=True, exist_ok=True)
+    # Lock down the private files/dirs directly under ~/.agentcat (events DB,
+    # snapshots, caches, update state) to owner-only access. This is a shallow
+    # pass so the frequently-called ensure_dirs stays cheap; nested telemetry
+    # dirs are normalized when their parent is created.
+    if not IS_WINDOWS:
+        try:
+            children = list(AGENTCAT_HOME.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            _chmod_quiet(child, 0o700 if child.is_dir() else 0o600)
 
 
 def agentcat_settings() -> Dict[str, Any]:
@@ -1293,15 +1352,21 @@ def sanitize_payload(value: Any, depth: int = 0) -> Any:
         for key, child in value.items():
             key_s = str(key)
             key_norm = normalized_key(key_s)
-            if key_norm not in TOKEN_KEYS and any(part in key_norm for part in SENSITIVE_KEY_PARTS):
+            if key_norm not in TOKEN_KEYS and (
+                key_norm in SENSITIVE_KEY_EXACT
+                or any(part in key_norm for part in SENSITIVE_KEY_PARTS)
+            ):
                 out[key_s] = "[redacted]"
             else:
                 out[key_s] = sanitize_payload(child, depth + 1)
         return out
     if isinstance(value, list):
         return [sanitize_payload(item, depth + 1) for item in value[:50]]
-    if isinstance(value, str) and len(value) > 1000:
-        return value[:1000] + "...[truncated]"
+    if isinstance(value, str):
+        if value_is_sensitive(value):
+            return "[redacted]"
+        if len(value) > 1000:
+            return value[:1000] + "...[truncated]"
     return value
 
 
@@ -1675,6 +1740,8 @@ def init_db() -> None:
         )
         conn.execute("create index if not exists idx_events_provider_ts on events(provider, ts desc)")
         conn.commit()
+    # The sqlite file is created on connect; lock it down owner-only afterward.
+    _chmod_quiet(EVENTS_DB, 0o600)
 
 
 def store_event(provider: str, source: str, event_type: Optional[str], payload: Any) -> Dict[str, Any]:
@@ -1736,12 +1803,25 @@ def read_json(path: Path) -> Optional[Any]:
         return {"_agentcat_error": str(exc)}
 
 
+def _is_under_agentcat_home(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(AGENTCAT_HOME.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
         fh.write("\n")
+    # Lock down private state files (snapshot, caches, update channel/state) to
+    # owner-only before publishing. External configs (e.g. ~/.gemini) keep their
+    # own permissions so other tools are unaffected.
+    if _is_under_agentcat_home(path):
+        _chmod_quiet(tmp_path, 0o600)
     tmp_path.replace(path)
 
 
@@ -5891,8 +5971,22 @@ def is_newer_connector_version(remote_version: str, current_version: str = CONNE
     return connector_version_key(remote_version) > connector_version_key(current_version)
 
 
+def free_channel_install_digest() -> Optional[str]:
+    raw = os.environ.get("AGENTCAT_INSTALL_SH_SHA256")
+    if not raw:
+        settings = agentcat_settings()
+        raw = settings_value(settings, ("autoUpdate", "installSha256"), ("installSha256",))
+    digest = str(raw or "").strip().lower()
+    return digest if PRO_CONNECTOR_SHA256_RE.match(digest) else None
+
+
 def auto_update_enabled_status() -> Tuple[bool, str]:
-    if not env_flag("AGENTCAT_AUTO_UPDATE", True):
+    # The free (public) channel pipes install.sh straight into bash, so it stays
+    # OFF by default. It only turns on when the operator explicitly opts in
+    # (AGENTCAT_AUTO_UPDATE / settings) AND a pinned install.sh digest is present
+    # to verify the script before it executes.
+    explicit_env = os.environ.get("AGENTCAT_AUTO_UPDATE")
+    if explicit_env is not None and not env_flag("AGENTCAT_AUTO_UPDATE", True):
         return False, "disabled by AGENTCAT_AUTO_UPDATE"
     if os.environ.get("AGENTCAT_CONNECTOR_VERSION"):
         return False, "disabled while AGENTCAT_CONNECTOR_VERSION overrides the runtime version"
@@ -5900,6 +5994,13 @@ def auto_update_enabled_status() -> Tuple[bool, str]:
     configured = settings_value(settings, ("autoUpdate", "enabled"), ("autoUpdateEnabled",))
     if isinstance(configured, bool) and not configured:
         return False, "disabled by settings"
+    opted_in = (explicit_env is not None and env_flag("AGENTCAT_AUTO_UPDATE", True)) or (
+        isinstance(configured, bool) and configured
+    )
+    if not opted_in:
+        return False, "free-channel auto-update is off by default; opt in via AGENTCAT_AUTO_UPDATE or settings.autoUpdate.enabled"
+    if free_channel_install_digest() is None:
+        return False, "free-channel auto-update requires a pinned install.sh digest (AGENTCAT_INSTALL_SH_SHA256 or settings.autoUpdate.installSha256)"
     repo_dir = current_connector_repo_dir()
     install_dir = agentcat_connectors_dir()
     if repo_dir is None:
@@ -6041,6 +6142,21 @@ def fetch_remote_connector_version() -> str:
     return version
 
 
+def fetch_verified_install_sh(expected_sha256: str) -> bytes:
+    request = urllib.request.Request(
+        AUTO_UPDATE_INSTALL_SH_URL,
+        headers={"User-Agent": f"AgentCat/{CONNECTOR_VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=AUTO_UPDATE_HTTP_TIMEOUT_SECONDS) as response:
+        body = response.read(2 * 1024 * 1024)
+    actual = hashlib.sha256(body).hexdigest()
+    if actual != expected_sha256:
+        raise ValueError(
+            f"install.sh digest mismatch: expected {expected_sha256}, got {actual}"
+        )
+    return body
+
+
 def start_auto_update_install(remote_version: str) -> subprocess.Popen:
     ensure_dirs()
     env = os.environ.copy()
@@ -6069,10 +6185,20 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
                 creationflags=CREATE_NO_WINDOW,
             )
         bash = shutil.which("bash") or "/bin/bash"
-        install_url = shlex.quote(AUTO_UPDATE_INSTALL_SH_URL)
-        command = f"curl --retry 4 --retry-delay 2 --retry-all-errors -fsSL {install_url} | bash"
+        # Never pipe an unverified network script into bash. auto_update_enabled_status
+        # already requires a pinned digest, so download install.sh, verify its
+        # SHA256, persist the verified bytes, and execute that local file. This
+        # avoids the TOCTOU window of re-downloading at execution time.
+        expected = free_channel_install_digest()
+        if expected is None:
+            raise ValueError("refusing to run install.sh without a pinned digest")
+        body = fetch_verified_install_sh(expected)
+        script_path = AGENTCAT_HOME / "auto-update-install.sh"
+        with script_path.open("wb") as fh:
+            fh.write(body)
+        os.chmod(script_path, 0o600)
         return subprocess.Popen(
-            [bash, "-lc", command],
+            [bash, str(script_path)],
             cwd=str(HOME),
             env=env,
             stdout=stdout,
@@ -6457,11 +6583,40 @@ Expected behavior:
 """
 
 
+ALLOWED_HOST_HEADERS = frozenset(
+    {
+        "127.0.0.1",
+        "127.0.0.1:8765",
+        "localhost",
+        "localhost:8765",
+        "[::1]",
+        "[::1]:8765",
+        "::1",
+        "::1:8765",
+    }
+)
+
+
+def host_header_allowed(host: Optional[str]) -> bool:
+    # DNS-rebinding guard: only loopback Host headers are honored. The app and
+    # widgets call http://127.0.0.1:8765 with a localhost Host header, so the
+    # literals (with and without :8765) all pass; everything else is rejected.
+    if not host:
+        return False
+    return host.strip().lower() in ALLOWED_HOST_HEADERS
+
+
 class AgentCatHandler(BaseHTTPRequestHandler):
     server_version = "AgentCat/1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
+
+    def host_header_ok(self) -> bool:
+        if host_header_allowed(self.headers.get("Host")):
+            return True
+        self.send_json(403, {"error": "forbidden", "message": "host_not_allowed"})
+        return False
 
     def write_response_body(self, body: bytes) -> bool:
         try:
@@ -6497,6 +6652,8 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         return payload
 
     def do_GET(self) -> None:
+        if not self.host_header_ok():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/healthz":
             body = b"ok\n"
@@ -6530,6 +6687,8 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
+        if not self.host_header_ok():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/v1/config":
             try:
@@ -6576,8 +6735,26 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         self.send_json(201, event)
 
 
+LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def resolve_bind_host(host: Optional[str]) -> str:
+    # Refuse to expose the daemon beyond loopback. A non-loopback host would
+    # make local usage data reachable from the network, so force 127.0.0.1.
+    candidate = (host or "").strip()
+    if candidate.lower() in LOOPBACK_BIND_HOSTS:
+        return candidate
+    print(
+        f"agentcatd refusing non-loopback bind host {candidate!r}; forcing 127.0.0.1",
+        file=sys.stderr,
+        flush=True,
+    )
+    return "127.0.0.1"
+
+
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
+    args.host = resolve_bind_host(getattr(args, "host", "127.0.0.1"))
     build_snapshot()
     threading.Thread(target=snapshot_refresh_loop, args=(60.0,), daemon=True).start()
     update_enabled, _update_reason = auto_update_enabled_status()

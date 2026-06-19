@@ -516,7 +516,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             request = urllib.request.Request(
                 f"http://127.0.0.1:{port}/v1/update/channel",
                 data=json.dumps({"channel": "pro", "manifest": manifest}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "Host": "127.0.0.1"},
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=2.0) as response:
@@ -545,6 +545,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             "AGENTCAT_AUTO_UPDATE": "1",
             "AGENTCAT_CONNECTOR_VERSION": "",
             "AGENTCAT_CONNECTORS_DIR": str(install_dir),
+            "AGENTCAT_INSTALL_SH_SHA256": "a" * 64,
         }), \
                 patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
                 patch.object(agentcat, "fetch_remote_connector_version", return_value="99.0.0"), \
@@ -561,6 +562,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             "AGENTCAT_AUTO_UPDATE": "1",
             "AGENTCAT_CONNECTOR_VERSION": "",
             "AGENTCAT_CONNECTORS_DIR": str(agentcat.AGENTCAT_HOME / "connectors"),
+            "AGENTCAT_INSTALL_SH_SHA256": "a" * 64,
         }), \
                 patch.object(agentcat, "current_connector_repo_dir", return_value=self.root / "dev"):
             state = agentcat.check_auto_update_once(apply_update=True)
@@ -1986,6 +1988,181 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("agentcat snapshot --json", prompt)
         self.assertIn("skills/agentcat-usage", prompt)
         self.assertIn("Never store or report prompt text", prompt)
+
+    def test_host_header_allow_list_accepts_loopback_literals(self) -> None:
+        for host in (
+            "127.0.0.1",
+            "127.0.0.1:8765",
+            "localhost",
+            "localhost:8765",
+            "::1",
+            "[::1]",
+            "[::1]:8765",
+            "LOCALHOST:8765",
+        ):
+            self.assertTrue(agentcat.host_header_allowed(host), host)
+
+    def test_host_header_allow_list_rejects_rebinding_and_other_ports(self) -> None:
+        for host in (
+            "",
+            None,
+            "evil.example.com",
+            "attacker.local:8765",
+            "127.0.0.1:9999",
+            "192.168.1.10:8765",
+        ):
+            self.assertFalse(agentcat.host_header_allowed(host), host)
+
+    def test_http_get_rejects_foreign_host_header_with_403(self) -> None:
+        server = agentcat.ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/healthz",
+                headers={"Host": "attacker.example.com"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(request, timeout=2.0)
+            self.assertEqual(ctx.exception.code, 403)
+
+            ok_request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/healthz",
+                headers={"Host": "127.0.0.1"},
+            )
+            with urllib.request.urlopen(ok_request, timeout=2.0) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), b"ok\n")
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+    def test_resolve_bind_host_forces_loopback(self) -> None:
+        self.assertEqual(agentcat.resolve_bind_host("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(agentcat.resolve_bind_host("::1"), "::1")
+        self.assertEqual(agentcat.resolve_bind_host("localhost"), "localhost")
+        self.assertEqual(agentcat.resolve_bind_host("0.0.0.0"), "127.0.0.1")
+        self.assertEqual(agentcat.resolve_bind_host("192.168.0.5"), "127.0.0.1")
+        self.assertEqual(agentcat.resolve_bind_host(""), "127.0.0.1")
+
+    def test_free_channel_auto_update_off_by_default(self) -> None:
+        with patch.dict(agentcat.os.environ, {}, clear=False):
+            agentcat.os.environ.pop("AGENTCAT_AUTO_UPDATE", None)
+            agentcat.os.environ.pop("AGENTCAT_INSTALL_SH_SHA256", None)
+            agentcat.os.environ.pop("AGENTCAT_CONNECTOR_VERSION", None)
+            enabled, reason = agentcat.auto_update_enabled_status()
+        self.assertFalse(enabled)
+        self.assertIn("off by default", reason)
+
+    def test_free_channel_opt_in_requires_pinned_digest(self) -> None:
+        install_dir = (agentcat.AGENTCAT_HOME / "connectors").resolve()
+        with patch.dict(agentcat.os.environ, {
+            "AGENTCAT_AUTO_UPDATE": "1",
+            "AGENTCAT_CONNECTOR_VERSION": "",
+            "AGENTCAT_CONNECTORS_DIR": str(install_dir),
+        }), patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir):
+            agentcat.os.environ.pop("AGENTCAT_INSTALL_SH_SHA256", None)
+            enabled, reason = agentcat.auto_update_enabled_status()
+            self.assertFalse(enabled)
+            self.assertIn("pinned install.sh digest", reason)
+
+            agentcat.os.environ["AGENTCAT_INSTALL_SH_SHA256"] = "a" * 64
+            enabled_ok, _ = agentcat.auto_update_enabled_status()
+            self.assertTrue(enabled_ok)
+
+    def test_start_auto_update_install_verifies_digest_before_exec(self) -> None:
+        body = b"#!/bin/sh\necho hardened\n"
+        good = agentcat.hashlib.sha256(body).hexdigest()
+
+        class FakeResp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+            def read(self_inner, _n=None):
+                return body
+
+        with patch.dict(agentcat.os.environ, {"AGENTCAT_INSTALL_SH_SHA256": "b" * 64}), \
+                patch.object(agentcat.urllib.request, "urlopen", return_value=FakeResp()):
+            with self.assertRaises(ValueError) as ctx:
+                agentcat.start_auto_update_install("99.0.0")
+            self.assertIn("digest mismatch", str(ctx.exception))
+
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return type("Proc", (), {"pid": 4242})()
+
+        with patch.dict(agentcat.os.environ, {"AGENTCAT_INSTALL_SH_SHA256": good}), \
+                patch.object(agentcat.urllib.request, "urlopen", return_value=FakeResp()), \
+                patch.object(agentcat.subprocess, "Popen", side_effect=fake_popen):
+            proc = agentcat.start_auto_update_install("99.0.0")
+
+        self.assertEqual(proc.pid, 4242)
+        # Verified bytes are executed from a local file, never piped from curl.
+        script_path = agentcat.AGENTCAT_HOME / "auto-update-install.sh"
+        self.assertTrue(script_path.exists())
+        self.assertEqual(script_path.read_bytes(), body)
+        self.assertNotIn("curl", " ".join(str(part) for part in captured["cmd"]))
+
+    def test_sanitize_payload_redacts_path_and_secret_values(self) -> None:
+        sanitized = agentcat.sanitize_payload(
+            {
+                "note": "/Users/alice/Projects/secret-repo/file.py",
+                "label": "deploy",
+                "token": "sk-ant-api03-abcdefgh12345678",
+                "level": "high",
+                "version": "26.25.0",
+                "generatedAt": "2026-05-01T00:00:00Z",
+            }
+        )
+        self.assertEqual(sanitized["note"], "[redacted]")
+        self.assertEqual(sanitized["token"], "[redacted]")
+        self.assertEqual(sanitized["label"], "deploy")
+        self.assertEqual(sanitized["level"], "high")
+        self.assertEqual(sanitized["version"], "26.25.0")
+        self.assertEqual(sanitized["generatedAt"], "2026-05-01T00:00:00Z")
+
+    def test_sanitize_payload_redacts_command_and_args_keys(self) -> None:
+        sanitized = agentcat.sanitize_payload(
+            {
+                "command": "rm -rf /tmp/x",
+                "description": "private description",
+                "title": "private title",
+                "args": ["--secret", "value"],
+                "text": "free text body",
+                "context_window": {"context_window_size": 1000000},
+            }
+        )
+        self.assertEqual(sanitized["command"], "[redacted]")
+        self.assertEqual(sanitized["description"], "[redacted]")
+        self.assertEqual(sanitized["title"], "[redacted]")
+        self.assertEqual(sanitized["args"], "[redacted]")
+        self.assertEqual(sanitized["text"], "[redacted]")
+        # context_window must survive — it is legitimate usage metadata.
+        self.assertEqual(sanitized["context_window"]["context_window_size"], 1000000)
+
+    @unittest.skipIf(agentcat.IS_WINDOWS, "POSIX file permissions only")
+    def test_ensure_dirs_tightens_permissions(self) -> None:
+        import os as _os
+        import stat as _stat
+
+        agentcat.init_db()
+        agentcat.store_event("claude", "test", "ping", {"ok": True})
+
+        home_mode = _stat.S_IMODE(_os.stat(agentcat.AGENTCAT_HOME).st_mode)
+        self.assertEqual(home_mode, 0o700)
+        db_mode = _stat.S_IMODE(_os.stat(agentcat.EVENTS_DB).st_mode)
+        self.assertEqual(db_mode, 0o600)
+
+        agentcat.write_json_atomic(agentcat.LATEST_SNAPSHOT, {"ok": True})
+        snap_mode = _stat.S_IMODE(_os.stat(agentcat.LATEST_SNAPSHOT).st_mode)
+        self.assertEqual(snap_mode, 0o600)
 
 
 class InsightsIntegrationTests(unittest.TestCase):
