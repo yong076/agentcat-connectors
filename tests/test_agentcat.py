@@ -716,7 +716,10 @@ class AgentCatConnectorTests(unittest.TestCase):
     def test_claude_snapshot_adds_periods_to_daily_model_tokens(self) -> None:
         claude_dir = agentcat.HOME / ".claude"
         claude_dir.mkdir(parents=True)
-        today = dt.datetime.now(dt.timezone.utc).date()
+        # Claude dailyModelTokens dates are LOCAL calendar days, and periods
+        # bucket "today" on the local date — so the fixture must use the local
+        # date, not UTC (which only coincide outside the KST-morning window).
+        today = dt.datetime.now().date()
         old = today - dt.timedelta(days=45)
         stats = {
             "dailyModelTokens": [
