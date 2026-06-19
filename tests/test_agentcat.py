@@ -748,6 +748,52 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["all"], 150)
         self.assertEqual(snapshot["models"]["unknown"]["week"], 9)
 
+    def test_periods_today_matches_daily_today_across_utc_local_boundary(self) -> None:
+        # Regression: add_to_periods bucketed "today" on the UTC date while
+        # add_to_daily buckets on the LOCAL date. Near midnight (when UTC and
+        # local calendar dates differ) the period "today" total and the daily
+        # today bucket disagreed. Both must now key on the LOCAL date.
+        import os
+        import time
+
+        old_tz = os.environ.get("TZ")
+        # UTC+14: an instant at 23:00 UTC lands on the *next* local calendar day,
+        # so its UTC date and local date differ.
+        os.environ["TZ"] = "Pacific/Kiritimati"
+        time.tzset()
+        try:
+            fixed_now = dt.datetime(2026, 6, 18, 23, 30, tzinfo=dt.timezone.utc)
+            # An event 30 minutes earlier: still the same LOCAL "today" as now,
+            # but its UTC date (2026-06-18) differs from the local date
+            # (2026-06-19).
+            when = dt.datetime(2026, 6, 18, 23, 0, tzinfo=dt.timezone.utc)
+            self.assertNotEqual(when.date(), when.astimezone().date())
+            self.assertEqual(when.astimezone().date(), fixed_now.astimezone().date())
+
+            class _FixedNow(dt.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return fixed_now if tz is None else fixed_now.astimezone(tz)
+
+            periods: dict = {}
+            daily: dict = {}
+            with patch.object(agentcat.dt, "datetime", _FixedNow):
+                agentcat.add_to_periods(periods, 100, when)
+                agentcat.add_to_daily(daily, 100, when)
+                today_key = agentcat.day_key_for_timestamp(fixed_now)
+
+            # The event counts toward "today" (local) in periods...
+            self.assertEqual(periods["today"], 100)
+            # ...and lands in the local today bucket of daily, and they agree.
+            self.assertEqual(daily[today_key], 100)
+            self.assertEqual(periods["today"], daily[today_key])
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
+
     def test_claude_snapshot_prefers_jsonl_usage_over_stale_stats_cache(self) -> None:
         claude_dir = agentcat.HOME / ".claude"
         claude_dir.mkdir(parents=True)
@@ -1989,27 +2035,32 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("skills/agentcat-usage", prompt)
         self.assertIn("Never store or report prompt text", prompt)
 
-    def test_host_header_allow_list_accepts_loopback_literals(self) -> None:
+    def test_host_header_allow_list_accepts_loopback_any_port(self) -> None:
         for host in (
             "127.0.0.1",
             "127.0.0.1:8765",
+            "127.0.0.1:9999",  # non-default --port must pass (port is stripped)
             "localhost",
             "localhost:8765",
+            "localhost:12345",
             "::1",
             "[::1]",
             "[::1]:8765",
+            "[::1]:54321",
             "LOCALHOST:8765",
+            # Missing/empty Host is treated as local: the listener binds loopback
+            # only, so the connection already originates on this machine.
+            "",
+            None,
         ):
             self.assertTrue(agentcat.host_header_allowed(host), host)
 
-    def test_host_header_allow_list_rejects_rebinding_and_other_ports(self) -> None:
+    def test_host_header_allow_list_rejects_rebinding(self) -> None:
         for host in (
-            "",
-            None,
             "evil.example.com",
             "attacker.local:8765",
-            "127.0.0.1:9999",
             "192.168.1.10:8765",
+            "127.0.0.1.evil.com",
         ):
             self.assertFalse(agentcat.host_header_allowed(host), host)
 
@@ -2146,6 +2197,29 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(sanitized["text"], "[redacted]")
         # context_window must survive — it is legitimate usage metadata.
         self.assertEqual(sanitized["context_window"]["context_window_size"], 1000000)
+
+    def test_sanitize_payload_redacts_compound_prompt_keys_keeps_metric_keys(self) -> None:
+        # Compound prompt-bearing keys redact via a whole-token match (not just
+        # the bare key); numeric metadata that merely contains a sensitive token
+        # survives (a count/size is not the content).
+        sanitized = agentcat.sanitize_payload(
+            {
+                "user_message": "hello there",
+                "assistant_message": "hi back",
+                "system_prompt": "you are a helpful assistant",
+                "message_count": 12,
+                "command_count": 3,
+                "path_segments": 4,
+                "content_length": 900,
+            }
+        )
+        self.assertEqual(sanitized["user_message"], "[redacted]")
+        self.assertEqual(sanitized["assistant_message"], "[redacted]")
+        self.assertEqual(sanitized["system_prompt"], "[redacted]")
+        self.assertEqual(sanitized["message_count"], 12)
+        self.assertEqual(sanitized["command_count"], 3)
+        self.assertEqual(sanitized["path_segments"], 4)
+        self.assertEqual(sanitized["content_length"], 900)
 
     @unittest.skipIf(agentcat.IS_WINDOWS, "POSIX file permissions only")
     def test_ensure_dirs_tightens_permissions(self) -> None:

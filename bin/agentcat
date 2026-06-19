@@ -842,13 +842,27 @@ SENSITIVE_KEY_EXACT = frozenset(
     }
 )
 
+# Numeric-metadata keys survive redaction even when they contain a sensitive
+# token: a COUNT or SIZE of messages/commands/paths is not the content itself.
+BENIGN_METRIC_SUFFIXES = frozenset(
+    {
+        "count", "counts", "size", "sizes", "total", "totals", "segments",
+        "len", "length", "bytes", "ms", "seconds", "percent", "pct",
+        "ratio", "index", "num", "version",
+    }
+)
+
 # Value-based redaction: even when a key is not in the denylist, redact string
 # values that look like filesystem paths or secrets so prompt-shaped content
 # never lands in storage. Token/limit metadata stays numeric, so this only
 # trips on string values.
 SENSITIVE_VALUE_PATTERNS: Tuple[re.Pattern[str], ...] = (
-    re.compile(r"^(?:~|/|\./|\.\./|[A-Za-z]:[\\/])"),  # absolute / relative / windows paths
-    re.compile(r"/[^/\s]+/[^/\s]+"),  # multi-segment unix paths anywhere in the value
+    # Dir-root-anchored absolute paths only, so 3-segment model identifiers like
+    # "openrouter/anthropic/claude-3-opus" are not mistaken for filesystem paths.
+    re.compile(r"^(?:file://)?/(?:Users|home|var|tmp|private|opt|etc|root)/", re.IGNORECASE),
+    re.compile(r"^~[/\\]"),  # home-relative paths
+    re.compile(r"^[A-Za-z]:[\\/]"),  # windows drive paths
+    re.compile(r"\\Users\\", re.IGNORECASE),  # windows user paths anywhere
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),  # OpenAI-style secret keys
     re.compile(r"\b(?:sk-ant|ghp|gho|ghu|ghs|github_pat|xox[abpr]|AKIA)[A-Za-z0-9_-]{6,}\b"),  # vendor tokens
     re.compile(r"\bBearer\s+[A-Za-z0-9._-]{10,}\b", re.IGNORECASE),  # bearer tokens
@@ -1344,6 +1358,35 @@ def normalized_key(key: Any) -> str:
     return str(key).replace("-", "_").replace(" ", "_").lower()
 
 
+def key_is_sensitive(key_norm: str) -> bool:
+    """Whole-underscore-token denylist check.
+
+    A key is sensitive when a denylisted single-word part appears as a whole
+    ``_`` token — so ``user_message``/``system_prompt``/``repo_path`` redact, not
+    just the bare key — or a multi-token part (``file_path``/``input_text``)
+    appears as a contiguous token run. Numeric-metadata keys whose LAST token is
+    a benign suffix (``message_count``, ``path_segments``, ``content_length``)
+    survive: a count/size is not the content. Token totals (``TOKEN_KEYS``) are
+    filtered by the caller.
+    """
+    if key_norm in SENSITIVE_KEY_EXACT:
+        return True
+    tokens = key_norm.split("_")
+    if tokens[-1] in BENIGN_METRIC_SUFFIXES:
+        return False
+    token_set = set(tokens)
+    for part in SENSITIVE_KEY_PARTS:
+        part_tokens = part.split("_")
+        span = len(part_tokens)
+        if span == 1:
+            if part in token_set:
+                return True
+            continue
+        if any(tokens[i : i + span] == part_tokens for i in range(len(tokens) - span + 1)):
+            return True
+    return False
+
+
 def sanitize_payload(value: Any, depth: int = 0) -> Any:
     if depth > 8:
         return "[truncated]"
@@ -1352,10 +1395,7 @@ def sanitize_payload(value: Any, depth: int = 0) -> Any:
         for key, child in value.items():
             key_s = str(key)
             key_norm = normalized_key(key_s)
-            if key_norm not in TOKEN_KEYS and (
-                key_norm in SENSITIVE_KEY_EXACT
-                or any(part in key_norm for part in SENSITIVE_KEY_PARTS)
-            ):
+            if key_norm not in TOKEN_KEYS and key_is_sensitive(key_norm):
                 out[key_s] = "[redacted]"
             else:
                 out[key_s] = sanitize_payload(child, depth + 1)
@@ -2393,9 +2433,11 @@ def codex_reset_credit_summaries(raw: Any) -> List[Dict[str, Any]]:
 
 
 def merge_codex_reset_credit_details(limits: Dict[str, Any], payload: Dict[str, Any]) -> None:
-    available = int_limit(payload.get("available_count"))
+    # int_count keeps 0 (a real "no reset credits left" signal) instead of
+    # dropping it the way int_limit does for non-positive values.
+    available = int_count(payload.get("available_count"))
     if available is not None:
-        limits["resetCreditsAvailable"] = max(available, 0)
+        limits["resetCreditsAvailable"] = available
     summaries = codex_reset_credit_summaries(payload.get("credits"))
     if summaries:
         limits["resetCredits"] = summaries
@@ -2424,9 +2466,10 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
 
     reset_credits = payload.get("rate_limit_reset_credits")
     if isinstance(reset_credits, dict):
-        available = int_limit(reset_credits.get("available_count"))
+        # int_count surfaces available_count == 0 (int_limit would drop it).
+        available = int_count(reset_credits.get("available_count"))
         if available is not None:
-            limits["resetCreditsAvailable"] = max(available, 0)
+            limits["resetCreditsAvailable"] = available
 
     credit_summary = codex_credit_usage_summary(payload.get("credits"))
     if credit_summary is not None:
@@ -3263,7 +3306,10 @@ def add_to_periods(periods: Dict[str, int], amount: int, when: Optional[dt.datet
     if when is None:
         return
     now = dt.datetime.now(dt.timezone.utc)
-    if when.date() == now.date():
+    # Bucket "today" on the LOCAL calendar date so it agrees with the daily
+    # buckets (add_to_daily keys on when.astimezone().date()). Using the raw UTC
+    # date here disagreed near midnight when UTC and local dates differ.
+    if when.astimezone().date() == now.astimezone().date():
         periods["today"] = periods.get("today", 0) + amount
     if when >= now - dt.timedelta(days=7):
         periods["week"] = periods.get("week", 0) + amount
@@ -6583,27 +6629,37 @@ Expected behavior:
 """
 
 
-ALLOWED_HOST_HEADERS = frozenset(
-    {
-        "127.0.0.1",
-        "127.0.0.1:8765",
-        "localhost",
-        "localhost:8765",
-        "[::1]",
-        "[::1]:8765",
-        "::1",
-        "::1:8765",
-    }
-)
+# Loopback-only Host allow-list. The macOS app, widgets, and CLI all reach the
+# daemon over http://127.0.0.1:<port> with a localhost Host header; anything that
+# resolves elsewhere (DNS-rebinding, a non-loopback name) is rejected with 403.
+ALLOWED_HOST_HEADERS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _host_from_header(raw: Optional[str]) -> str:
+    # Strip an optional :port (any port, so a non-default --port still passes)
+    # and the IPv6 brackets used in Host headers like "[::1]:8765".
+    host = (raw or "").strip()
+    if not host:
+        return ""
+    if host.startswith("["):
+        end = host.find("]")
+        if end != -1:
+            return host[1:end].strip().lower()
+        return host.strip("[]").lower()
+    # IPv4/hostname with optional port; bare IPv6 (multiple colons) has no port.
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host.strip().lower()
 
 
 def host_header_allowed(host: Optional[str]) -> bool:
-    # DNS-rebinding guard: only loopback Host headers are honored. The app and
-    # widgets call http://127.0.0.1:8765 with a localhost Host header, so the
-    # literals (with and without :8765) all pass; everything else is rejected.
-    if not host:
-        return False
-    return host.strip().lower() in ALLOWED_HOST_HEADERS
+    # DNS-rebinding guard: only loopback hosts are honored. A missing/empty Host
+    # (HTTP/1.0 clients) is treated as local because the listener binds loopback
+    # only, so the connection already originates on this machine. Any non-default
+    # --port passes because the optional :port is stripped before membership.
+    if host is None or not host.strip():
+        return True
+    return _host_from_header(host) in ALLOWED_HOST_HEADERS
 
 
 class AgentCatHandler(BaseHTTPRequestHandler):
