@@ -169,16 +169,17 @@ if ($null -eq $antigravity) {
     exit 3
 }
 
-if ($antigravityTokens -le 0 -and $activityAntigravity -le 0 -and $processes.Count -le 0) {
-    Write-Host "FAIL: Antigravity is installed or expected, but no Antigravity activity/tokens were detected."
-    exit 3
-}
-
-if ($antigravityAttribution -eq "inferred-from-gemini-telemetry") {
-    Write-Host "WARN: Antigravity usage was inferred from the shared Gemini telemetry log."
-    Write-Host "PASS: Antigravity is separated in the snapshot. Attach the issue block above if the UI still looks wrong."
+if ($antigravityAttribution -eq "dedicated-telemetry") {
+    Write-Host "PASS: Antigravity is separated in the snapshot with its own dedicated telemetry."
     exit 0
 }
 
-Write-Host "PASS: Antigravity is separated in the snapshot."
+# Antigravity bills server-side and does not write a local telemetry outfile, so an
+# empty token set is the correct, honest state. The card must still be a separate
+# provider; it must never borrow Gemini's tokens.
+if ($antigravityTokens -gt 0) {
+    Write-Host "WARN: Antigravity reports tokens without dedicated telemetry. Attach the issue block above; tokens may be misattributed."
+}
+
+Write-Host "PASS: Antigravity is a separate provider in the snapshot."
 exit 0

@@ -1210,7 +1210,10 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertTrue(agentcat.GEMINI_USAGE_CACHE.exists())
         self.assertTrue(agentcat.ANTIGRAVITY_USAGE_CACHE.exists())
 
-    def test_split_google_cli_snapshots_infers_antigravity_from_history_days(self) -> None:
+    def test_split_google_cli_snapshots_does_not_borrow_gemini_tokens_for_antigravity(self) -> None:
+        # Antigravity bills server-side and never writes a local telemetry outfile,
+        # so it must stay a SEPARATE provider with empty tokens — Gemini-CLI usage
+        # is never inferred onto it, even when Antigravity history/activity exists.
         agentcat.ANTIGRAVITY_CLI_DIR.mkdir(parents=True)
         now = dt.datetime.now(dt.timezone.utc)
         today = agentcat.day_key_for_timestamp(now)
@@ -1258,19 +1261,22 @@ class AgentCatConnectorTests(unittest.TestCase):
             {"countsByProvider": {"gemini": 0, "antigravity": 1}},
         )
 
-        self.assertEqual(gemini_provider["tokens"]["totalTokens"], 100)
-        self.assertEqual(gemini_provider["tokens"]["inputTokens"], 70)
-        self.assertEqual(gemini_provider["tokens"]["outputTokens"], 30)
-        self.assertEqual(gemini_provider["dailyTokens"], {yesterday: 100})
-        self.assertEqual(antigravity_provider["status"], "ok")
-        self.assertEqual(antigravity_provider["tokens"]["totalTokens"], 200)
-        self.assertEqual(antigravity_provider["tokens"]["inputTokens"], 140)
-        self.assertEqual(antigravity_provider["tokens"]["outputTokens"], 60)
-        self.assertEqual(antigravity_provider["dailyTokens"], {today: 200})
-        self.assertEqual(antigravity_provider["models"]["gemini-test"]["all"], 200)
-        self.assertEqual(antigravity_provider["models"]["gemini-test"]["inputTokens"], 140)
-        self.assertEqual(antigravity_provider["models"]["gemini-test"]["outputTokens"], 60)
-        self.assertEqual(antigravity_provider["sourceAttribution"], "inferred-from-gemini-telemetry")
+        # Gemini keeps the full, real usage — no day was split off to Antigravity.
+        self.assertEqual(gemini_provider["tokens"]["totalTokens"], 300)
+        self.assertEqual(gemini_provider["tokens"]["inputTokens"], 210)
+        self.assertEqual(gemini_provider["tokens"]["outputTokens"], 90)
+        self.assertEqual(gemini_provider["dailyTokens"], {yesterday: 100, today: 200})
+
+        # Antigravity is its own provider, but empty and honest — no Gemini tokens.
+        self.assertEqual(antigravity_provider["providerLabel"], "Antigravity")
+        self.assertEqual(antigravity_provider["displayName"], "Antigravity")
+        self.assertEqual(antigravity_provider["canonicalProvider"], "google")
+        self.assertEqual(antigravity_provider["status"], "no_telemetry_yet")
+        self.assertEqual(antigravity_provider["tokens"], {})
+        self.assertEqual(antigravity_provider["models"], {})
+        self.assertEqual(antigravity_provider["dailyTokens"], {})
+        self.assertEqual(antigravity_provider["events"], 0)
+        self.assertNotEqual(antigravity_provider["sourceAttribution"], "inferred-from-gemini-telemetry")
 
     def test_gemini_snapshot_distributes_cumulative_counter_deltas_by_day(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)

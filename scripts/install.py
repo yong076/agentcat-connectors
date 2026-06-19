@@ -438,12 +438,9 @@ def install_gemini_settings(backup_dir: Path) -> None:
         telemetry_path=GEMINI_TELEMETRY,
         label="Gemini",
     )
-    install_google_cli_settings(
-        backup_dir,
-        path=HOME / ".gemini" / "antigravity-cli" / "settings.json",
-        telemetry_path=ANTIGRAVITY_TELEMETRY,
-        label="Antigravity CLI",
-    )
+    # Antigravity bills server-side and ignores the local telemetry sub-keys; the
+    # `enabled` boolean can flip its server-side telemetry, so we never write the
+    # telemetry block into antigravity-cli/settings.json.
 
 
 def remove_managed_block(text: str) -> str:

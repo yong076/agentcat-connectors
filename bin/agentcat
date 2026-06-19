@@ -5349,7 +5349,9 @@ def antigravity_provider_snapshot(
 ) -> Dict[str, Any]:
     source_status = copy.deepcopy((gemini_snapshot_data.get("sources") or {}).get("antigravityCli") or {})
     if usage and google_usage_total(usage) > 0:
-        source_status["status"] = "ok" if source_note == "dedicated-telemetry" else "inferred_from_gemini_telemetry"
+        # Antigravity only reports real tokens when it has its own dedicated
+        # telemetry outfile; Gemini-CLI tokens are never borrowed.
+        source_status["status"] = "ok"
         source_status["tokens"] = google_usage_total(usage)
         source_status["events"] = int(usage.get("events") or source_status.get("events") or 0)
     out = {
@@ -5379,6 +5381,9 @@ def split_google_cli_snapshots(
     common_usage = source_usages.get("geminiCli") if isinstance(source_usages, dict) else None
     antigravity_usage = source_usages.get("antigravityCli") if isinstance(source_usages, dict) else None
 
+    # Tier 1: Antigravity has its own dedicated local telemetry outfile. This is
+    # the only honest source of Antigravity tokens, so the gemini provider keeps
+    # the gemini-cli usage and antigravity gets its own.
     if google_usage_total(antigravity_usage) > 0:
         gemini_provider = apply_google_usage(gemini_snapshot_data, common_usage, status_if_empty="no_token_events_yet")
         antigravity_provider = antigravity_provider_snapshot(
@@ -5389,24 +5394,13 @@ def split_google_cli_snapshots(
         )
         return gemini_provider, antigravity_provider
 
-    inference_days = antigravity_inference_days(activity)
+    # Antigravity bills server-side and never writes a local telemetry outfile, so
+    # there is no honest way to attribute Gemini-CLI tokens to it. Emit Antigravity
+    # as its own provider with empty tokens rather than borrowing Gemini's usage.
     counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
     antigravity_installed = bool(((gemini_snapshot_data.get("sources") or {}).get("antigravityCli") or {}).get("installed"))
     antigravity_active = isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0
-    if inference_days and google_usage_total(common_usage) > 0 and (antigravity_active or antigravity_installed):
-        inferred_usage = filter_google_usage_days(common_usage, inference_days, include=True)
-        gemini_usage = filter_google_usage_days(common_usage, inference_days, include=False)
-        if google_usage_total(inferred_usage) > 0:
-            gemini_provider = apply_google_usage(gemini_snapshot_data, gemini_usage, status_if_empty="no_token_events_yet")
-            antigravity_provider = antigravity_provider_snapshot(
-                gemini_snapshot_data,
-                inferred_usage,
-                status_if_empty="no_token_events_yet",
-                source_note="inferred-from-gemini-telemetry",
-            )
-            return gemini_provider, antigravity_provider
-
-    status_if_empty = "no_telemetry_yet" if antigravity_installed else "not_found"
+    status_if_empty = "no_telemetry_yet" if (antigravity_installed or antigravity_active) else "not_found"
     antigravity_provider = antigravity_provider_snapshot(
         gemini_snapshot_data,
         None,
