@@ -759,6 +759,9 @@ class AgentCatConnectorTests(unittest.TestCase):
         import os
         import time
 
+        if not hasattr(time, "tzset"):
+            self.skipTest("requires POSIX tzset")
+
         old_tz = os.environ.get("TZ")
         # UTC+14: an instant at 23:00 UTC lands on the *next* local calendar day,
         # so its UTC date and local date differ.
@@ -2159,10 +2162,14 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertEqual(proc.pid, 4242)
         # Verified bytes are executed from a local file, never piped from curl.
-        script_path = agentcat.AGENTCAT_HOME / "auto-update-install.sh"
+        script_name = "auto-update-install.ps1" if agentcat.IS_WINDOWS else "auto-update-install.sh"
+        script_path = agentcat.AGENTCAT_HOME / script_name
         self.assertTrue(script_path.exists())
         self.assertEqual(script_path.read_bytes(), body)
-        self.assertNotIn("curl", " ".join(str(part) for part in captured["cmd"]))
+        command_text = " ".join(str(part) for part in captured["cmd"]).lower()
+        self.assertNotIn("curl", command_text)
+        self.assertNotIn("irm", command_text)
+        self.assertNotIn("iex", command_text)
 
     def test_sanitize_payload_redacts_path_and_secret_values(self) -> None:
         sanitized = agentcat.sanitize_payload(

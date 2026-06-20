@@ -6188,9 +6188,9 @@ def fetch_remote_connector_version() -> str:
     return version
 
 
-def fetch_verified_install_sh(expected_sha256: str) -> bytes:
+def fetch_verified_install_script(url: str, expected_sha256: str) -> bytes:
     request = urllib.request.Request(
-        AUTO_UPDATE_INSTALL_SH_URL,
+        url,
         headers={"User-Agent": f"AgentCat/{CONNECTOR_VERSION}"},
     )
     with urllib.request.urlopen(request, timeout=AUTO_UPDATE_HTTP_TIMEOUT_SECONDS) as response:
@@ -6201,6 +6201,10 @@ def fetch_verified_install_sh(expected_sha256: str) -> bytes:
             f"install.sh digest mismatch: expected {expected_sha256}, got {actual}"
         )
     return body
+
+
+def fetch_verified_install_sh(expected_sha256: str) -> bytes:
+    return fetch_verified_install_script(AUTO_UPDATE_INSTALL_SH_URL, expected_sha256)
 
 
 def start_auto_update_install(remote_version: str) -> subprocess.Popen:
@@ -6217,13 +6221,19 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
     stdout = stdout_path.open("ab")
     stderr = stderr_path.open("ab")
     try:
+        expected = free_channel_install_digest()
+        if expected is None:
+            raise ValueError("refusing to run install script without a pinned digest")
         if IS_WINDOWS:
-            script = (
-                "$ErrorActionPreference = 'Stop'; "
-                f"irm -UseBasicParsing {json.dumps(AUTO_UPDATE_INSTALL_PS1_URL)} | iex"
-            )
+            # Keep the Windows path as strict as the Unix path: download once,
+            # verify the pinned digest, then execute the local bytes. This avoids
+            # `irm | iex` and guarantees a mismatch cannot spawn PowerShell.
+            body = fetch_verified_install_script(AUTO_UPDATE_INSTALL_PS1_URL, expected)
+            script_path = AGENTCAT_HOME / "auto-update-install.ps1"
+            with script_path.open("wb") as fh:
+                fh.write(body)
             return subprocess.Popen(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
                 cwd=str(HOME),
                 env=env,
                 stdout=stdout,
@@ -6235,9 +6245,6 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
         # already requires a pinned digest, so download install.sh, verify its
         # SHA256, persist the verified bytes, and execute that local file. This
         # avoids the TOCTOU window of re-downloading at execution time.
-        expected = free_channel_install_digest()
-        if expected is None:
-            raise ValueError("refusing to run install.sh without a pinned digest")
         body = fetch_verified_install_sh(expected)
         script_path = AGENTCAT_HOME / "auto-update-install.sh"
         with script_path.open("wb") as fh:
