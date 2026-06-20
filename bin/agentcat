@@ -60,6 +60,8 @@ LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES
 LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
+CODEX_SESSIONS_CURSOR_FILE = AGENTCAT_HOME / "codex-sessions-cursor.json"
+CODEX_SESSIONS_CURSOR_VERSION = 1
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
 CLAUDE_DESKTOP_PROJECT_GLOBS = (
     "local-agent-mode-sessions/**/.claude/projects",
@@ -3914,7 +3916,438 @@ def copilot_snapshot() -> Dict[str, Any]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Codex sessions-JSONL reader — per-class token accounting from rollout logs
+#
+# Competitors (ccusage / CodexBar / agentsview) read the Codex session logs
+# under {CODEX_HOME or ~/.codex}/sessions/**/*.jsonl rather than the coarse
+# single-total threads.tokens_used in state_*.sqlite. Each log is an append-only
+# JSONL stream of typed entries; we care about:
+#
+#   - type == "turn_context"  -> payload.model  (the active model for the
+#                                 following turn; we track the most recent one)
+#   - type == "event_msg" with payload.type == "token_count"
+#                             -> payload.info.last_token_usage carries the
+#                                per-turn token breakdown:
+#                                  input_tokens, cached_input_tokens,
+#                                  output_tokens, reasoning_output_tokens
+#
+# Normalize like the competitors: cached_input_tokens is a subset of
+# input_tokens, so uncached_input = input_tokens - cached_input_tokens (avoid
+# double counting), and cached_input_tokens maps to cacheRead. reasoning tokens
+# fold into output. Dedup is enforced by a per-file byte offset (we only ever
+# parse lines past it), and a byte-offset + mtime cursor (mirroring the Claude
+# jsonl-cursor pattern) skips unchanged files. The cursor also PERSISTS the
+# accumulated rollups (per-class class totals, per-model class + daily totals,
+# dailyTokens, hourlyTokens, projects) so each snapshot reflects the full
+# running history while only parsing the newly-appended bytes — the period
+# windows (today/week/month/all) are recomputed from the daily buckets at read
+# time so they age correctly across calendar days.
+# ---------------------------------------------------------------------------
+
+
+# Raw per-class keys we persist for Codex turns. These map 1:1 to the
+# connector token-class field names used everywhere else.
+_CODEX_CLASS_KEYS = ("inputTokens", "outputTokens", "cacheReadInputTokens")
+
+
+def codex_home() -> Path:
+    """Resolve the Codex home dir, honoring $CODEX_HOME, else ~/.codex.
+
+    Resolved dynamically (not a frozen module constant) so it tracks the
+    module-level HOME the test harness swaps in, exactly like the other
+    local-provider readers.
+    """
+    override = os.environ.get("CODEX_HOME")
+    if override:
+        return Path(override).expanduser()
+    return HOME / ".codex"
+
+
+def codex_session_token_class_amounts(info: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Extract a per-class token record from a token_count payload.info.
+
+    Reads payload.info.last_token_usage (the per-turn delta competitors use)
+    and normalizes to the connector's token-class keys. Returns None when no
+    usable token fields are present so empty/heartbeat events are ignored.
+    """
+    usage = info.get("last_token_usage")
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = nonnegative_int(usage.get("input_tokens")) or 0
+    cached_input = nonnegative_int(usage.get("cached_input_tokens")) or 0
+    output_tokens = nonnegative_int(usage.get("output_tokens")) or 0
+    reasoning = nonnegative_int(usage.get("reasoning_output_tokens")) or 0
+    # cached_input_tokens is a subset of input_tokens; subtract to avoid
+    # double counting, then route the cached portion to cacheRead.
+    uncached_input = input_tokens - cached_input
+    if uncached_input < 0:
+        uncached_input = 0
+    record = {
+        "inputTokens": uncached_input,
+        "outputTokens": output_tokens + reasoning,
+        "cacheReadInputTokens": cached_input,
+    }
+    if not any(record.values()):
+        return None
+    return record
+
+
+def codex_session_files() -> List[Path]:
+    sessions_dir = codex_home() / "sessions"
+    if not sessions_dir.is_dir():
+        return []
+    try:
+        files = [p for p in sessions_dir.glob("**/*.jsonl") if p.is_file()]
+    except OSError:
+        return []
+    files.sort(key=lambda p: str(p))
+    return files[:LOCAL_PROVIDER_MAX_FILES]
+
+
+def _empty_codex_cursor() -> Dict[str, Any]:
+    return {
+        "version": CODEX_SESSIONS_CURSOR_VERSION,
+        "files": {},
+        # Accumulated rollups, persisted across snapshots.
+        "daily": {},          # dateStr -> total tokens
+        "hourly": {},         # hourStr -> total tokens
+        "modelDaily": {},     # model -> {dateStr -> total tokens}
+        "modelClasses": {},   # model -> {classKey -> tokens}
+        "projects": {},       # cwd -> {tokens, last_active}
+        "turns": 0,
+    }
+
+
+def _coerce_int_map(raw: Any) -> Dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for k, v in raw.items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[str(k)] = int(v)
+    return out
+
+
+def load_codex_sessions_cursor() -> Dict[str, Any]:
+    raw = read_json(CODEX_SESSIONS_CURSOR_FILE)
+    if not isinstance(raw, dict) or raw.get("version") != CODEX_SESSIONS_CURSOR_VERSION:
+        return _empty_codex_cursor()
+    cursor = _empty_codex_cursor()
+    files = raw.get("files")
+    if isinstance(files, dict):
+        for path_str, meta in files.items():
+            if not isinstance(meta, dict):
+                continue
+            cursor["files"][str(path_str)] = {
+                "offset": int(meta.get("offset") or 0),
+                "mtime": float(meta.get("mtime") or 0.0),
+                "size": int(meta.get("size") or 0),
+                "turns": int(meta.get("turns") or 0),
+                "lastModel": (str(meta["lastModel"]) if isinstance(meta.get("lastModel"), str) else None),
+            }
+    cursor["daily"] = _coerce_int_map(raw.get("daily"))
+    cursor["hourly"] = _coerce_int_map(raw.get("hourly"))
+    model_daily = raw.get("modelDaily")
+    if isinstance(model_daily, dict):
+        cursor["modelDaily"] = {
+            str(model): _coerce_int_map(buckets) for model, buckets in model_daily.items()
+        }
+    model_classes = raw.get("modelClasses")
+    if isinstance(model_classes, dict):
+        cursor["modelClasses"] = {
+            str(model): _coerce_int_map(classes) for model, classes in model_classes.items()
+        }
+    projects = raw.get("projects")
+    if isinstance(projects, dict):
+        clean_projects: Dict[str, Any] = {}
+        for cwd, payload in projects.items():
+            if not isinstance(payload, dict):
+                continue
+            clean_projects[str(cwd)] = {
+                "tokens": int(payload.get("tokens") or 0),
+                "last_active": payload.get("last_active"),
+            }
+        cursor["projects"] = clean_projects
+    cursor["turns"] = int(raw.get("turns") or 0)
+    return cursor
+
+
+def save_codex_sessions_cursor(cursor: Dict[str, Any]) -> bool:
+    tmp = CODEX_SESSIONS_CURSOR_FILE.with_suffix(".json.tmp")
+    try:
+        AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(cursor, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        tmp.replace(CODEX_SESSIONS_CURSOR_FILE)
+        return True
+    except Exception as exc:
+        logging.debug("save_codex_sessions_cursor failed: %s", exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def codex_sessions_snapshot() -> Dict[str, Any]:
+    """Per-class Codex token snapshot read from sessions/**/*.jsonl.
+
+    Returns the SAME shape codex_snapshot produces (status/source/tokens/
+    models/dailyTokens/hourlyTokens/breakdown/projects), or status ==
+    'not_found' when no session files exist so the caller can fall back to
+    the state.sqlite path.
+    """
+    result: Dict[str, Any] = {
+        "status": "not_found",
+        "source": None,
+        "tokens": empty_periods(),
+        "models": {},
+        "dailyTokens": {},
+        "hourlyTokens": {},
+        "breakdown": empty_breakdown(),
+        "projects": empty_projects(),
+    }
+    files = codex_session_files()
+    if not files:
+        return result
+
+    sessions_dir = codex_home() / "sessions"
+    result["source"] = f"{sessions_dir}/**/*.jsonl"
+
+    cursor = load_codex_sessions_cursor()
+    file_cursors: Dict[str, Any] = cursor["files"]
+    daily: Dict[str, int] = cursor["daily"]
+    hourly: Dict[str, int] = cursor["hourly"]
+    model_daily: Dict[str, Dict[str, int]] = cursor["modelDaily"]
+    model_classes: Dict[str, Dict[str, int]] = cursor["modelClasses"]
+    projects: Dict[str, Any] = cursor["projects"]
+
+    new_turns = 0
+
+    for path in files:
+        path_str = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        size = int(stat.st_size)
+        mtime = float(stat.st_mtime)
+        meta = file_cursors.get(path_str) or {}
+        prev_offset = int(meta.get("offset") or 0)
+        prev_mtime = float(meta.get("mtime") or 0.0)
+        prev_size = int(meta.get("size") or 0)
+        turn_index = int(meta.get("turns") or 0)
+        # Unchanged file (same size + mtime): nothing new to parse. The byte
+        # offset alone guarantees dedup; mtime+size is the cheap skip gate.
+        if prev_offset >= size and prev_mtime == mtime and prev_size == size:
+            continue
+        # Truncated/rotated file: re-read from the start. The byte offset is
+        # the dedup boundary, so resetting it re-counts the whole (new) file.
+        if prev_offset > size:
+            prev_offset = 0
+            turn_index = 0
+
+        new_offset = prev_offset
+        # Carry the last model seen in this file across incremental reads — the
+        # turn_context that set it may live before prev_offset.
+        prev_model = meta.get("lastModel") if turn_index else None
+        current_model: Optional[str] = prev_model if isinstance(prev_model, str) else None
+        try:
+            with path.open("rb") as fh:
+                fh.seek(prev_offset)
+                for raw_line in fh:
+                    new_offset += len(raw_line)
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    entry_type = obj.get("type")
+                    payload = obj.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    if entry_type == "turn_context":
+                        model = normalized_model_name(payload.get("model"))
+                        if model:
+                            current_model = model
+                        continue
+                    if entry_type != "event_msg" or payload.get("type") != "token_count":
+                        continue
+                    info = payload.get("info")
+                    if not isinstance(info, dict):
+                        continue
+                    amounts = codex_session_token_class_amounts(info)
+                    if amounts is None:
+                        continue
+                    # Dedup is enforced by the byte offset: we only ever read
+                    # lines past prev_offset, so a token_count turn is counted
+                    # exactly once across re-reads of a growing file. turn_index
+                    # stays monotonic for diagnostics in the cursor.
+                    turn_index += 1
+                    new_turns += 1
+                    when = parse_timestamp(obj.get("timestamp"))
+                    model = current_model or normalized_model_name(info.get("model")) or "unknown"
+                    total = sum(amounts.values())
+
+                    # Accumulate the persistent rollups (cursor state). Period
+                    # windows are recomputed from daily buckets after the scan.
+                    model_cls = model_classes.setdefault(model, {})
+                    for cls_key in _CODEX_CLASS_KEYS:
+                        amt = int(amounts.get(cls_key) or 0)
+                        if amt:
+                            model_cls[cls_key] = model_cls.get(cls_key, 0) + amt
+                    if total > 0:
+                        day_key = day_key_for_timestamp(when)
+                        hour_key = hour_key_for_timestamp(when)
+                        if day_key is not None:
+                            daily[day_key] = daily.get(day_key, 0) + total
+                            md = model_daily.setdefault(model, {})
+                            md[day_key] = md.get(day_key, 0) + total
+                        if hour_key is not None:
+                            hourly[hour_key] = hourly.get(hour_key, 0) + total
+                        cwd = str(payload.get("cwd") or obj.get("cwd") or "").strip()
+                        if cwd:
+                            proj = projects.setdefault(cwd, {"tokens": 0, "last_active": None})
+                            proj["tokens"] = int(proj.get("tokens") or 0) + total
+                            if when is not None:
+                                last_dt = parse_timestamp(proj.get("last_active"))
+                                if last_dt is None or when > last_dt:
+                                    proj["last_active"] = when.isoformat().replace("+00:00", "Z")
+        except OSError as exc:
+            logging.warning("codex_sessions_snapshot: cannot read %s: %s", path_str, exc)
+            continue
+
+        file_cursors[path_str] = {
+            "offset": new_offset,
+            "mtime": mtime,
+            "size": size,
+            "turns": turn_index,
+            "lastModel": current_model,
+        }
+
+    cursor["turns"] = int(cursor.get("turns") or 0) + new_turns
+    saved = save_codex_sessions_cursor(cursor)
+    if not saved:
+        logging.debug("codex_sessions_snapshot: cursor save failed")
+
+    return _build_codex_sessions_snapshot(result, cursor)
+
+
+def _codex_periods_from_daily(daily: Dict[str, int]) -> Dict[str, int]:
+    """Recompute today/week/month/all token windows from daily buckets.
+
+    Keys are local-calendar date strings (YYYY-MM-DD), matching
+    day_key_for_timestamp, so the windows age correctly across days without
+    re-reading the JSONL.
+    """
+    periods = empty_periods()
+    today = dt.datetime.now().date()
+    week_floor = today - dt.timedelta(days=7)
+    month_floor = today - dt.timedelta(days=30)
+    for key, amount in daily.items():
+        if amount <= 0:
+            continue
+        try:
+            day = dt.date.fromisoformat(key)
+        except ValueError:
+            continue
+        periods["all"] += amount
+        if day == today:
+            periods["today"] += amount
+        if day >= week_floor:
+            periods["week"] += amount
+        if day >= month_floor:
+            periods["month"] += amount
+    return periods
+
+
+def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any]) -> Dict[str, Any]:
+    daily: Dict[str, int] = cursor.get("daily") or {}
+    hourly: Dict[str, int] = cursor.get("hourly") or {}
+    model_daily: Dict[str, Dict[str, int]] = cursor.get("modelDaily") or {}
+    model_classes: Dict[str, Dict[str, int]] = cursor.get("modelClasses") or {}
+    projects: Dict[str, Any] = cursor.get("projects") or {}
+    total_turns = int(cursor.get("turns") or 0)
+
+    periods = _codex_periods_from_daily(daily)
+    if periods["all"] <= 0:
+        # Session files exist but carried no usable token_count turns yet.
+        result["status"] = "no_token_events_yet"
+        return result
+
+    tokens = dict(periods)
+    tokens["totalTokens"] = periods["all"]
+    # Sum per-class totals across models for the top-level token classes.
+    class_totals: Dict[str, int] = {}
+    for classes in model_classes.values():
+        for cls_key, amt in classes.items():
+            if amt:
+                class_totals[cls_key] = class_totals.get(cls_key, 0) + int(amt)
+    tokens.update(class_totals)
+    result["tokens"] = tokens
+
+    # Per-model rollup: class totals + period windows from per-model daily.
+    models: Dict[str, Dict[str, int]] = {}
+    for model, classes in model_classes.items():
+        entry: Dict[str, int] = {k: int(v) for k, v in classes.items() if v}
+        model_periods = _codex_periods_from_daily(model_daily.get(model) or {})
+        entry.update(model_periods)
+        entry["totalTokens"] = model_periods["all"]
+        models[model] = entry
+    result["models"] = models
+
+    result["dailyTokens"] = {k: v for k, v in daily.items() if v > 0}
+    result["hourlyTokens"] = {k: v for k, v in hourly.items() if v > 0}
+
+    items = []
+    for cwd, payload in projects.items():
+        tok = int(payload.get("tokens") or 0)
+        if tok <= 0:
+            continue
+        items.append({
+            "id": cwd,
+            "path": cwd,
+            "name": display_project_name(cwd),
+            "tokens": tok,
+            "lastActive": payload.get("last_active"),
+        })
+    items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
+    if items:
+        result["projects"] = {"status": "ok", "items": items[:20]}
+
+    if total_turns:
+        result["breakdown"]["chat"] = total_turns
+        result["breakdown"]["status"] = "ok"
+
+    result["status"] = "ok"
+    result["turns"] = total_turns
+    return result
+
+
 def codex_snapshot() -> Dict[str, Any]:
+    # Prefer the per-class sessions-JSONL reader (the technique ccusage /
+    # CodexBar / agentsview use). It gives input/output/cacheRead granularity
+    # and per-model attribution that the coarse threads.tokens_used total
+    # cannot. Fall back to state.sqlite when no sessions/JSONL are found so
+    # nothing regresses.
+    try:
+        sessions = codex_sessions_snapshot()
+    except Exception as exc:  # defensive: never let JSONL parsing break codex
+        logging.debug("codex_sessions_snapshot failed: %s", exc)
+        sessions = {"status": "not_found"}
+    # Use the JSONL path as PRIMARY only when it produced real token data.
+    # When sessions exist but carried no token_count turns yet
+    # ('no_token_events_yet'), still fall back to state.sqlite so the coarse
+    # totals keep showing — nothing regresses.
+    if sessions.get("status") == "ok":
+        return sessions
+
     paths = sorted((HOME / ".codex").glob("state_*.sqlite"))
     result: Dict[str, Any] = {
         "status": "not_found",

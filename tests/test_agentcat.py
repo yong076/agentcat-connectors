@@ -39,6 +39,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             "ANTIGRAVITY_USAGE_CACHE": agentcat.ANTIGRAVITY_USAGE_CACHE,
             "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
             "JOURNAL_CURSOR_FILE": agentcat.JOURNAL_CURSOR_FILE,
+            "CODEX_SESSIONS_CURSOR_FILE": agentcat.CODEX_SESSIONS_CURSOR_FILE,
             "CLAUDE_PROJECTS_DIR": agentcat.CLAUDE_PROJECTS_DIR,
             "_GEMINI_CACHE_KEY": agentcat._GEMINI_CACHE_KEY,
             "_GEMINI_CACHE_VALUE": agentcat._GEMINI_CACHE_VALUE,
@@ -61,6 +62,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat.ANTIGRAVITY_USAGE_CACHE = agentcat_home / "antigravity-usage-cache.json"
         agentcat.LIVE_LIMITS_CACHE = agentcat_home / "live-limits-cache.json"
         agentcat.JOURNAL_CURSOR_FILE = agentcat_home / "jsonl-cursor.json"
+        agentcat.CODEX_SESSIONS_CURSOR_FILE = agentcat_home / "codex-sessions-cursor.json"
         agentcat.CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
         agentcat._GEMINI_CACHE_KEY = None
         agentcat._GEMINI_CACHE_VALUE = None
@@ -712,6 +714,208 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "ok")
         self.assertEqual(snapshot["models"]["gpt-5.4"]["all"], 42)
         self.assertNotIn("unknown", snapshot["models"])
+
+    # --- Codex sessions-JSONL per-class reader -------------------------------
+
+    def _write_codex_session(self, name: str, lines: list) -> Path:
+        sessions_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "06" / "18"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        path = sessions_dir / name
+        path.write_text(
+            "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+        )
+        return path
+
+    @staticmethod
+    def _token_count_event(usage: dict, ts: str, cwd=None) -> dict:
+        info = {"last_token_usage": usage}
+        payload = {"type": "token_count", "info": info}
+        if cwd is not None:
+            payload["cwd"] = cwd
+        return {"type": "event_msg", "payload": payload, "timestamp": ts}
+
+    def test_codex_sessions_jsonl_sums_per_class_and_attributes_model(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_codex_session(
+            "rollout-a.jsonl",
+            [
+                {"type": "session_meta", "payload": {"model_provider": "openai"}},
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                # input 100 (30 cached -> cacheRead, 70 uncached input),
+                # output 40 + reasoning 10 -> 50 output
+                self._token_count_event(
+                    {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 30,
+                        "output_tokens": 40,
+                        "reasoning_output_tokens": 10,
+                    },
+                    now,
+                    cwd="/Users/me/projects/alpha",
+                ),
+                # second turn, same model: input 50 (0 cached), output 20
+                self._token_count_event(
+                    {
+                        "input_tokens": 50,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 0,
+                    },
+                    now,
+                    cwd="/Users/me/projects/alpha",
+                ),
+            ],
+        )
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertTrue(str(snapshot["source"]).endswith("/sessions/**/*.jsonl"))
+        # uncached input: (100-30) + 50 = 120
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 120)
+        # output incl reasoning: (40+10) + 20 = 70
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 70)
+        # cacheRead == cached_input: 30 + 0 = 30
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 30)
+        # all-time total == sum of classes
+        self.assertEqual(snapshot["tokens"]["all"], 120 + 70 + 30)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 120 + 70 + 30)
+        # model attributed from the preceding turn_context
+        model = snapshot["models"]["gpt-5.4"]
+        self.assertEqual(model["inputTokens"], 120)
+        self.assertEqual(model["outputTokens"], 70)
+        self.assertEqual(model["cacheReadInputTokens"], 30)
+        self.assertNotIn("unknown", snapshot["models"])
+        # project attributed via cwd
+        self.assertEqual(snapshot["projects"]["status"], "ok")
+        self.assertEqual(snapshot["projects"]["items"][0]["path"], "/Users/me/projects/alpha")
+        # breakdown chat == token_count turns
+        self.assertEqual(snapshot["breakdown"]["chat"], 2)
+        # hourly buckets sum to all-time total
+        self.assertEqual(sum(snapshot["hourlyTokens"].values()), 120 + 70 + 30)
+
+    def test_codex_sessions_jsonl_attributes_per_model_across_turn_contexts(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_codex_session(
+            "rollout-b.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    {"input_tokens": 10, "cached_input_tokens": 0,
+                     "output_tokens": 5, "reasoning_output_tokens": 0},
+                    now,
+                ),
+                {"type": "turn_context", "payload": {"model": "gpt-5.4-mini"}},
+                self._token_count_event(
+                    {"input_tokens": 7, "cached_input_tokens": 2,
+                     "output_tokens": 3, "reasoning_output_tokens": 1},
+                    now,
+                ),
+            ],
+        )
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["models"]["gpt-5.4"]["inputTokens"], 10)
+        self.assertEqual(snapshot["models"]["gpt-5.4"]["outputTokens"], 5)
+        # second turn switched model: uncached 5, output 3+1=4, cacheRead 2
+        self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["inputTokens"], 5)
+        self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["outputTokens"], 4)
+        self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["cacheReadInputTokens"], 2)
+
+    def test_codex_sessions_jsonl_preferred_over_state_sqlite(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_codex_session(
+            "rollout-c.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    {"input_tokens": 8, "cached_input_tokens": 0,
+                     "output_tokens": 4, "reasoning_output_tokens": 0},
+                    now,
+                ),
+            ],
+        )
+        # Also drop a state.sqlite with a different total; JSONL must win.
+        db_path = agentcat.HOME / ".codex" / "state_test.sqlite"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("create table threads(tokens_used integer, model text, updated_at text)")
+            conn.execute(
+                "insert into threads(tokens_used, model, updated_at) values (?, ?, ?)",
+                (9999, "gpt-old", now),
+            )
+            conn.commit()
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertTrue(str(snapshot["source"]).endswith("/sessions/**/*.jsonl"))
+        self.assertEqual(snapshot["tokens"]["all"], 12)
+        self.assertIn("gpt-5.4", snapshot["models"])
+        self.assertNotIn("gpt-old", snapshot["models"])
+
+    def test_codex_sessions_without_token_events_falls_back_to_sqlite(self) -> None:
+        # Session file with a turn_context but no token_count -> must fall back.
+        self._write_codex_session(
+            "rollout-empty.jsonl",
+            [{"type": "turn_context", "payload": {"model": "gpt-5.4"}}],
+        )
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        db_path = agentcat.HOME / ".codex" / "state_test.sqlite"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("create table threads(tokens_used integer, model text, updated_at text)")
+            conn.execute(
+                "insert into threads(tokens_used, model, updated_at) values (?, ?, ?)",
+                (55, "gpt-old", now),
+            )
+            conn.commit()
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        # Fell back to the sqlite path.
+        self.assertTrue(str(snapshot["source"]).endswith("state_test.sqlite"))
+        self.assertEqual(snapshot["tokens"]["all"], 55)
+
+    def test_codex_sessions_cursor_dedupes_on_reread(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        path = self._write_codex_session(
+            "rollout-d.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    {"input_tokens": 10, "cached_input_tokens": 0,
+                     "output_tokens": 0, "reasoning_output_tokens": 0},
+                    now,
+                ),
+            ],
+        )
+
+        first = agentcat.codex_snapshot()
+        self.assertEqual(first["tokens"]["all"], 10)
+
+        # Re-read with no file change: cursor must prevent double counting.
+        second = agentcat.codex_snapshot()
+        self.assertEqual(second["tokens"]["all"], 10)
+
+        # Append a new token_count turn and re-read: only the delta is added,
+        # and the model attribution survives across the incremental read.
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    self._token_count_event(
+                        {"input_tokens": 5, "cached_input_tokens": 0,
+                         "output_tokens": 0, "reasoning_output_tokens": 0},
+                        now,
+                    )
+                )
+                + "\n"
+            )
+        third = agentcat.codex_snapshot()
+        self.assertEqual(third["tokens"]["all"], 15)
+        self.assertEqual(third["models"]["gpt-5.4"]["inputTokens"], 15)
+        self.assertNotIn("unknown", third["models"])
 
     def test_claude_snapshot_adds_periods_to_daily_model_tokens(self) -> None:
         claude_dir = agentcat.HOME / ".claude"
