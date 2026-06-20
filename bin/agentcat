@@ -20,7 +20,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,6 +44,7 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/wham/usage",
     "https://chatgpt.com/api/codex/usage",
 )
+CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -60,11 +61,18 @@ LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_S
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
+CLAUDE_DESKTOP_PROJECT_GLOBS = (
+    "local-agent-mode-sessions/**/.claude/projects",
+)
+CLAUDE_DESKTOP_PROJECT_DIR_MAX = int(os.environ.get("AGENTCAT_CLAUDE_DESKTOP_PROJECT_DIR_MAX", "16"))
 CLAUDE_JOURNAL_CURSOR_VERSION = 3
+PROJECT_DAILY_RETENTION_DAYS = 60
+PROJECT_DAILY_SNAPSHOT_DAYS = 14
+PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.23.1")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.25.0")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -81,17 +89,30 @@ AUTO_UPDATE_INSTALL_PS1_URL = os.environ.get(
 AUTO_UPDATE_INTERVAL_SECONDS = int(os.environ.get("AGENTCAT_AUTO_UPDATE_INTERVAL_SECONDS", "3600"))
 AUTO_UPDATE_INITIAL_DELAY_SECONDS = int(os.environ.get("AGENTCAT_AUTO_UPDATE_INITIAL_DELAY_SECONDS", "300"))
 AUTO_UPDATE_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AGENTCAT_AUTO_UPDATE_HTTP_TIMEOUT_SECONDS", "10"))
+LITELLM_PRICING_URL = os.environ.get(
+    "AGENTCAT_LITELLM_PRICING_URL",
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+)
+PRICING_FETCH_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_MAX_AGE_SECONDS", str(24 * 3600)))
+PRICING_FETCH_INTERVAL_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_INTERVAL_SECONDS", str(6 * 3600)))
+PRICING_FETCH_INITIAL_DELAY_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_INITIAL_DELAY_SECONDS", "20"))
+PRICING_FETCH_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AGENTCAT_PRICING_FETCH_HTTP_TIMEOUT_SECONDS", "10"))
 CONNECTOR_CAPABILITIES = (
     "snapshot.metadata",
     "connector.autoUpdate",
+    "connector.channel",
     "activity.terminal",
     "activity.memory",
     "activity.runtimeModes",
+    "connector.config",
+    "desktopApps.localMetadata",
     "events.sqlite",
     "usage.dailyTokens",
     "usage.hourlyTokens",
     "usage.breakdown",
     "usage.projects",
+    "projects.daily",
+    "pricing.feed",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
     "limits.liveCache",
@@ -177,25 +198,76 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
 }
 
 
-def _lookup_pricing(model: str) -> Optional[Dict[str, float]]:
-    """Resolve a model name to its pricing entry, tolerant of dated suffixes."""
-    if model in MODEL_PRICING:
-        return MODEL_PRICING[model]
+def _lookup_pricing(
+    model: str,
+    table: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a model name to its pricing entry, tolerant of dated suffixes.
+
+    Consults the merged table (LiteLLM feed overlaid on the bundled
+    MODEL_PRICING) unless an explicit table is supplied.
+    """
+    if table is None:
+        table = merged_pricing_table()[0]
+    if model in table:
+        return table[model]
     normalized = model.lower()
-    if normalized in MODEL_PRICING:
-        return MODEL_PRICING[normalized]
+    if normalized in table:
+        return table[normalized]
     trimmed = normalized.replace("-preview", "").replace("-latest", "")
-    if trimmed in MODEL_PRICING:
-        return MODEL_PRICING[trimmed]
+    if trimmed in table:
+        return table[trimmed]
     # Strip trailing dated build id (e.g. -20251022)
     m = re.match(r"^(.+?)-\d{6,}$", trimmed)
-    if m and m.group(1) in MODEL_PRICING:
-        return MODEL_PRICING[m.group(1)]
-    # Prefix match for variants like "claude-opus-4-7-1m"
-    for key in MODEL_PRICING:
-        if trimmed.startswith(key):
-            return MODEL_PRICING[key]
+    if m and m.group(1) in table:
+        return table[m.group(1)]
+    # Longest-prefix match for variants like "claude-opus-4-7-1m"; longest so
+    # "gpt-5.5-codex" prefers a "gpt-5.5" entry over "gpt-5".
+    best_key: Optional[str] = None
+    for key in table:
+        if trimmed.startswith(key) and (best_key is None or len(key) > len(best_key)):
+            best_key = key
+    if best_key is not None:
+        return table[best_key]
     return None
+
+
+def _tier_rates(pricing: Dict[str, Any], context_tokens: Optional[int]) -> Dict[str, float]:
+    """Flatten a price entry into the 4 bucket rates, applying tier overrides.
+
+    Missing cache rates degrade safely: cache_read -> 0 (models without cache
+    pricing report no cache tokens anyway), cache_write -> input rate (a cache
+    write costs at least a fresh prompt). When context_tokens is provided and
+    the entry carries "tiers" (e.g. above-200k long-context rates), the
+    highest tier whose threshold <= context_tokens overrides the base rates.
+    """
+    base_input = float(pricing.get("input") or 0.0)
+    rates = {
+        "input": base_input,
+        "output": float(pricing.get("output") or 0.0),
+        "cache_read": float(pricing.get("cache_read") or 0.0),
+        "cache_write": float(pricing["cache_write"]) if pricing.get("cache_write") is not None else base_input,
+    }
+    tiers = pricing.get("tiers")
+    if context_tokens is None or not isinstance(tiers, list):
+        return rates
+    selected: Optional[Dict[str, Any]] = None
+    selected_threshold = -1.0
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        threshold = tier.get("threshold")
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            continue
+        if context_tokens >= threshold and threshold > selected_threshold:
+            selected = tier
+            selected_threshold = float(threshold)
+    if selected:
+        for bucket in ("input", "output", "cache_read", "cache_write"):
+            value = selected.get(bucket)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                rates[bucket] = float(value)
+    return rates
 
 
 def estimate_cost(
@@ -204,24 +276,33 @@ def estimate_cost(
     output_tokens: int,
     cache_read_tokens: int,
     cache_write_tokens: int,
+    context_tokens: Optional[int] = None,
 ) -> Optional[Dict[str, float]]:
     """Estimate USD cost for a model usage event, split by token bucket.
 
-    Returns {input, output, cache_read, cache_write, total} or None if the
-    model is not in MODEL_PRICING. Cost in each bucket = tokens / 1e6 * rate.
-    Negative or None token counts are coerced to 0.
+    Consults the merged price table (LiteLLM feed when cached, overlaid on
+    the bundled MODEL_PRICING). Returns {input, output, cache_read,
+    cache_write, total} or None if the model is unknown. Cost in each bucket
+    = tokens / 1e6 * rate. Negative or None token counts are coerced to 0.
+
+    Tiered pricing: when the entry carries above-Nk long-context tiers and
+    the caller passes context_tokens, the whole row is priced at the matching
+    tier — mirroring provider behavior where crossing the threshold reprices
+    the request. Aggregated usage rows do not carry context-window size, so
+    without context_tokens the base rate applies (documented simplification).
     """
     pricing = _lookup_pricing(model)
     if pricing is None:
         return None
+    rates = _tier_rates(pricing, context_tokens)
     inp = max(0, int(input_tokens or 0))
     out = max(0, int(output_tokens or 0))
     cr = max(0, int(cache_read_tokens or 0))
     cw = max(0, int(cache_write_tokens or 0))
-    cost_in = inp / 1_000_000.0 * pricing["input"]
-    cost_out = out / 1_000_000.0 * pricing["output"]
-    cost_cr = cr / 1_000_000.0 * pricing["cache_read"]
-    cost_cw = cw / 1_000_000.0 * pricing["cache_write"]
+    cost_in = inp / 1_000_000.0 * rates["input"]
+    cost_out = out / 1_000_000.0 * rates["output"]
+    cost_cr = cr / 1_000_000.0 * rates["cache_read"]
+    cost_cw = cw / 1_000_000.0 * rates["cache_write"]
     return {
         "input": cost_in,
         "output": cost_out,
@@ -229,6 +310,193 @@ def estimate_cost(
         "cache_write": cost_cw,
         "total": cost_in + cost_out + cost_cr + cost_cw,
     }
+
+
+# --- LiteLLM pricing feed (capability "pricing.feed") ---
+# Refreshes the per-model price table from LiteLLM's public JSON at most once
+# per PRICING_FETCH_MAX_AGE_SECONDS (24h). ANY failure keeps the previous
+# cache; with no cache at all the bundled MODEL_PRICING serves estimates. The
+# fetch runs on a background daemon thread (pricing_refresh_loop) so snapshot
+# serving never blocks on the network.
+_LITELLM_RATE_KEYS = {
+    "input_cost_per_token": "input",
+    "output_cost_per_token": "output",
+    "cache_read_input_token_cost": "cache_read",
+    "cache_creation_input_token_cost": "cache_write",
+}
+# Tiered long-context rates, e.g. "input_cost_per_token_above_200k_tokens".
+# Anchored so time-based cache TTL keys ("..._above_1hr") never match.
+_LITELLM_TIER_KEY_RE = re.compile(
+    r"^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|"
+    r"cache_creation_input_token_cost)_above_(\d+)k_tokens$"
+)
+_PRICING_TABLE_LOCK = threading.Lock()
+_PRICING_TABLE_MEMO: Optional[Tuple[Tuple[str, Optional[int], Optional[int]], Dict[str, Dict[str, Any]], Dict[str, Any]]] = None
+
+
+def pricing_cache_file() -> Path:
+    """LiteLLM price cache: {"fetchedAt": iso, "models": {model: per-1M rates}}."""
+    return AGENTCAT_HOME / "pricing-cache.json"
+
+
+def _per_million(raw: Any) -> Optional[float]:
+    """LiteLLM stores USD per token; the connector prices in USD per 1M tokens."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw) * 1_000_000.0
+    if value < 0:
+        return None
+    return value
+
+
+def litellm_price_table(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """Convert LiteLLM model_prices JSON into the bundled MODEL_PRICING shape.
+
+    Output per model: {"input", "output", "cache_read"?, "cache_write"?,
+    "tiers"?: [{"threshold": tokens, <bucket rate overrides>}]} with all rates
+    in USD per 1M tokens. Skips the "sample_spec" metadata entry and models
+    without positive input AND output token rates (embeddings, image models).
+    Provider-prefixed keys ("anthropic/claude-x") also register their basename
+    as an alias when no unprefixed entry exists.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    table: Dict[str, Dict[str, Any]] = {}
+    aliases: Dict[str, Dict[str, Any]] = {}
+    for key, spec in raw.items():
+        if not isinstance(key, str) or key == "sample_spec" or not isinstance(spec, dict):
+            continue
+        entry: Dict[str, Any] = {}
+        for raw_key, bucket in _LITELLM_RATE_KEYS.items():
+            rate = _per_million(spec.get(raw_key))
+            if rate is not None:
+                entry[bucket] = rate
+        if not entry.get("input") or not entry.get("output"):
+            continue
+        tiers: Dict[int, Dict[str, float]] = {}
+        for raw_key, value in spec.items():
+            tier_match = _LITELLM_TIER_KEY_RE.match(raw_key)
+            if not tier_match:
+                continue
+            rate = _per_million(value)
+            if rate is None:
+                continue
+            threshold = int(tier_match.group(2)) * 1000
+            tiers.setdefault(threshold, {})[_LITELLM_RATE_KEYS[tier_match.group(1)]] = rate
+        if tiers:
+            entry["tiers"] = [
+                {"threshold": threshold, **rates}
+                for threshold, rates in sorted(tiers.items())
+            ]
+        model_key = key.strip().lower()
+        table[model_key] = entry
+        if "/" in model_key:
+            basename = model_key.rsplit("/", 1)[-1]
+            if basename:
+                aliases.setdefault(basename, entry)
+    for basename, entry in aliases.items():
+        table.setdefault(basename, entry)
+    return table
+
+
+def read_pricing_cache() -> Optional[Dict[str, Any]]:
+    raw = read_json(pricing_cache_file())
+    if not isinstance(raw, dict) or not isinstance(raw.get("models"), dict):
+        return None
+    return raw
+
+
+def pricing_cache_age_seconds(cache: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not cache:
+        return None
+    fetched = parse_iso_timestamp(cache.get("fetchedAt"))
+    if fetched is None:
+        return None
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, (dt.datetime.now(dt.timezone.utc) - fetched).total_seconds())
+
+
+def _fetch_litellm_raw() -> Any:
+    request = urllib.request.Request(
+        LITELLM_PRICING_URL,
+        headers={"User-Agent": f"AgentCat/{CONNECTOR_VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=PRICING_FETCH_HTTP_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def refresh_litellm_pricing(force: bool = False) -> Dict[str, Any]:
+    """Fetch LiteLLM pricing at most once per PRICING_FETCH_MAX_AGE_SECONDS.
+
+    ANY failure (network, JSON decode, empty table) keeps the existing cache
+    so the last good fetch — or the bundled table — keeps serving estimates.
+    """
+    cache = read_pricing_cache()
+    age = pricing_cache_age_seconds(cache)
+    if not force and cache is not None and age is not None and age < PRICING_FETCH_MAX_AGE_SECONDS:
+        return {"status": "fresh", "fetchedAt": cache.get("fetchedAt")}
+    try:
+        table = litellm_price_table(_fetch_litellm_raw())
+        if not table:
+            raise ValueError("LiteLLM price table was empty")
+        payload = {"fetchedAt": now_iso(), "models": table}
+        write_json_atomic(pricing_cache_file(), payload)
+        return {"status": "fetched", "fetchedAt": payload["fetchedAt"], "models": len(table)}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+            "fetchedAt": cache.get("fetchedAt") if cache else None,
+        }
+
+
+def merged_pricing_table() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Bundled MODEL_PRICING overlaid with the cached LiteLLM feed.
+
+    LiteLLM rates win for models present in both (fresher data); bundled
+    entries remain as the override for models LiteLLM lacks. Memoized on the
+    cache file's (path, mtime, size) so per-snapshot cost estimation does not
+    re-parse the cache JSON.
+    """
+    global _PRICING_TABLE_MEMO
+    path = pricing_cache_file()
+    try:
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = (str(path), None, None)
+    with _PRICING_TABLE_LOCK:
+        memo = _PRICING_TABLE_MEMO
+    if memo is not None and memo[0] == key:
+        return memo[1], memo[2]
+    cache = read_pricing_cache()
+    table: Dict[str, Dict[str, Any]] = dict(MODEL_PRICING)
+    if cache:
+        table.update(cache["models"])
+        meta = {"source": "litellm", "fetchedAt": cache.get("fetchedAt")}
+    else:
+        meta = {"source": "bundled", "fetchedAt": None}
+    with _PRICING_TABLE_LOCK:
+        _PRICING_TABLE_MEMO = (key, table, meta)
+    return table, meta
+
+
+def pricing_status_snapshot() -> Dict[str, Any]:
+    _table, meta = merged_pricing_table()
+    return dict(meta)
+
+
+def pricing_refresh_loop(interval_seconds: float, initial_delay_seconds: float) -> None:
+    time.sleep(max(0.0, initial_delay_seconds))
+    while True:
+        try:
+            state = refresh_litellm_pricing()
+            if state.get("status") == "error":
+                print(f"agentcatd pricing refresh failed: {state.get('error')}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"agentcatd pricing loop failed: {exc}", file=sys.stderr, flush=True)
+        time.sleep(max(60.0, interval_seconds))
 
 
 _FINDING_SEVERITY_ORDER = {"high": 0, "medium": 1, "info": 2}
@@ -558,7 +826,57 @@ SENSITIVE_KEY_PARTS = (
     "input_text",
     "output_text",
     "workspace",
+    "description",
+    "command",
+    "title",
+    "args",
 )
+
+# Exact-match denylist for short keys that would over-match as substrings
+# (e.g. "text" would otherwise redact "context_window", a legitimate metric).
+SENSITIVE_KEY_EXACT = frozenset(
+    {
+        "text",
+        "arg",
+        "argv",
+    }
+)
+
+# Numeric-metadata keys survive redaction even when they contain a sensitive
+# token: a COUNT or SIZE of messages/commands/paths is not the content itself.
+BENIGN_METRIC_SUFFIXES = frozenset(
+    {
+        "count", "counts", "size", "sizes", "total", "totals", "segments",
+        "len", "length", "bytes", "ms", "seconds", "percent", "pct",
+        "ratio", "index", "num", "version",
+    }
+)
+
+# Value-based redaction: even when a key is not in the denylist, redact string
+# values that look like filesystem paths or secrets so prompt-shaped content
+# never lands in storage. Token/limit metadata stays numeric, so this only
+# trips on string values.
+SENSITIVE_VALUE_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    # Dir-root-anchored absolute paths only, so 3-segment model identifiers like
+    # "openrouter/anthropic/claude-3-opus" are not mistaken for filesystem paths.
+    re.compile(r"^(?:file://)?/(?:Users|home|var|tmp|private|opt|etc|root)/", re.IGNORECASE),
+    re.compile(r"^~[/\\]"),  # home-relative paths
+    re.compile(r"^[A-Za-z]:[\\/]"),  # windows drive paths
+    re.compile(r"\\Users\\", re.IGNORECASE),  # windows user paths anywhere
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),  # OpenAI-style secret keys
+    re.compile(r"\b(?:sk-ant|ghp|gho|ghu|ghs|github_pat|xox[abpr]|AKIA)[A-Za-z0-9_-]{6,}\b"),  # vendor tokens
+    re.compile(r"\bBearer\s+[A-Za-z0-9._-]{10,}\b", re.IGNORECASE),  # bearer tokens
+    re.compile(r"\beyJ[A-Za-z0-9._-]{20,}\b"),  # JWT-shaped tokens
+)
+
+
+def value_is_sensitive(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate or len(candidate) > 4000:
+        # Empty values are harmless; oversized free text is already truncated by
+        # sanitize_payload and is treated conservatively as non-matching here.
+        candidate = candidate[:4000]
+    return any(pattern.search(candidate) for pattern in SENSITIVE_VALUE_PATTERNS)
 
 RUNTIME_MODE_TTL_SECONDS = int(os.environ.get("AGENTCAT_RUNTIME_MODE_TTL_SECONDS", "1800"))
 RUNTIME_MODE_KEYWORD_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
@@ -594,9 +912,32 @@ def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _chmod_quiet(path: Path, mode: int) -> None:
+    # Best-effort: chmod is unsupported / a no-op on Windows, and we never want a
+    # permission tweak to crash the daemon.
+    if IS_WINDOWS:
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 def ensure_dirs() -> None:
     AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
+    _chmod_quiet(AGENTCAT_HOME, 0o700)
     GEMINI_TELEMETRY.parent.mkdir(parents=True, exist_ok=True)
+    # Lock down the private files/dirs directly under ~/.agentcat (events DB,
+    # snapshots, caches, update state) to owner-only access. This is a shallow
+    # pass so the frequently-called ensure_dirs stays cheap; nested telemetry
+    # dirs are normalized when their parent is created.
+    if not IS_WINDOWS:
+        try:
+            children = list(AGENTCAT_HOME.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            _chmod_quiet(child, 0o700 if child.is_dir() else 0o600)
 
 
 def agentcat_settings() -> Dict[str, Any]:
@@ -607,6 +948,10 @@ def agentcat_settings() -> Dict[str, Any]:
     except Exception:
         return {}
     return raw if isinstance(raw, dict) else {}
+
+
+def write_agentcat_settings(settings: Dict[str, Any]) -> None:
+    write_json_atomic(AGENTCAT_HOME / "settings.json", settings)
 
 
 def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
@@ -620,6 +965,338 @@ def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
         if current is not None:
             return current
     return None
+
+
+CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot")
+DESKTOP_APP_PROVIDER_IDS = ("claude", "codex")
+
+DESKTOP_APP_SPECS: Dict[str, Dict[str, Any]] = {
+    "claude": {
+        "displayName": "Claude",
+        "expectedBundleIds": ("com.anthropic.claudefordesktop", "com.anthropic.claude"),
+        "defaultPaths": (
+            "/Applications/Claude.app",
+            "~/Applications/Claude.app",
+        ),
+        "dataRoots": (
+            "~/Library/Application Support/Claude",
+            "~/Library/Containers/com.anthropic.claude/Data/Library/Application Support/Claude",
+        ),
+    },
+    "codex": {
+        "displayName": "Codex",
+        "expectedBundleIds": ("com.openai.codex", "com.openai.chatgpt.codex"),
+        "defaultPaths": (
+            "/Applications/Codex.app",
+            "~/Applications/Codex.app",
+        ),
+        "dataRoots": (
+            "~/Library/Application Support/Codex",
+            "~/Library/Application Support/OpenAI/Codex",
+            "~/Library/Containers/com.openai.codex/Data/Library/Application Support/Codex",
+        ),
+    },
+}
+
+DESKTOP_APP_METADATA_SUFFIXES = {
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".json",
+    ".jsonl",
+    ".log",
+}
+DESKTOP_APP_SCAN_MAX_FILES = int(os.environ.get("AGENTCAT_DESKTOP_APP_SCAN_MAX_FILES", "4000"))
+
+
+def iso_from_timestamp(timestamp: float) -> str:
+    return dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def expand_agentcat_user_path(raw: str) -> Path:
+    text = str(raw)
+    if text == "~":
+        return HOME
+    if text.startswith("~/"):
+        return HOME / text[2:]
+    return Path(text).expanduser()
+
+
+def configured_provider_entries(settings: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    raw = settings.get("providers") if isinstance(settings.get("providers"), dict) else {}
+    entries: Dict[str, Dict[str, Any]] = {}
+    for provider in CONFIG_PROVIDER_IDS:
+        entry = raw.get(provider) if isinstance(raw, dict) else None
+        if isinstance(entry, dict):
+            normalized: Dict[str, Any] = {"enabled": entry.get("enabled") is not False}
+            if isinstance(entry.get("limits"), dict):
+                normalized["limits"] = entry["limits"]
+        else:
+            normalized = {"enabled": True}
+        entries[provider] = normalized
+    if isinstance(raw, dict):
+        for provider, entry in raw.items():
+            if provider in entries:
+                continue
+            if isinstance(entry, dict):
+                entries[str(provider)] = dict(entry)
+    return entries
+
+
+def normalize_desktop_app_path(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("desktop app path must be a string")
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    path = expand_agentcat_user_path(trimmed)
+    if not path.is_absolute():
+        raise ValueError("desktop app path must be absolute")
+    return str(path)
+
+
+def normalize_desktop_app_config(provider: str, raw: Any) -> Dict[str, Any]:
+    if provider not in DESKTOP_APP_PROVIDER_IDS:
+        raise ValueError(f"unsupported desktop app provider: {provider}")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("desktop app config entry must be an object")
+    path = normalize_desktop_app_path(raw.get("path"))
+    return {"path": path} if path else {}
+
+
+def first_existing_default_app_path(provider: str) -> Optional[str]:
+    spec = DESKTOP_APP_SPECS.get(provider) or {}
+    for raw in spec.get("defaultPaths", ()):
+        path = expand_agentcat_user_path(str(raw))
+        try:
+            if path.exists():
+                return str(path)
+        except OSError:
+            continue
+    return None
+
+
+def desktop_app_bundle_id(path: Path) -> Optional[str]:
+    info = path / "Contents" / "Info.plist"
+    try:
+        result = subprocess.run(
+            ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleIdentifier", str(info)],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        bundle_id = result.stdout.strip()
+        if result.returncode == 0 and bundle_id:
+            return bundle_id
+    except Exception:
+        pass
+    try:
+        text = info.read_text(encoding="utf-8", errors="ignore")
+        match = re.search(r"<key>CFBundleIdentifier</key>\s*<string>([^<]+)</string>", text)
+        return match.group(1).strip() if match else None
+    except Exception:
+        return None
+
+
+def desktop_app_data_roots(provider: str) -> List[Path]:
+    spec = DESKTOP_APP_SPECS.get(provider) or {}
+    roots: List[Path] = []
+    for raw in spec.get("dataRoots", ()):
+        try:
+            roots.append(expand_agentcat_user_path(str(raw)))
+        except Exception:
+            continue
+    return roots
+
+
+def scan_desktop_app_data_root(root: Path) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "path": str(root),
+        "exists": False,
+        "readableFiles": 0,
+        "latestModifiedAt": None,
+        "truncated": False,
+    }
+    try:
+        if not root.exists():
+            return result
+        result["exists"] = True
+        latest_mtime: Optional[float] = None
+        scanned = 0
+        for path in root.rglob("*"):
+            scanned += 1
+            if scanned > DESKTOP_APP_SCAN_MAX_FILES:
+                result["truncated"] = True
+                break
+            try:
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in DESKTOP_APP_METADATA_SUFFIXES:
+                    continue
+                stat = path.stat()
+            except OSError:
+                continue
+            result["readableFiles"] = int(result["readableFiles"]) + 1
+            if latest_mtime is None or stat.st_mtime > latest_mtime:
+                latest_mtime = stat.st_mtime
+        if latest_mtime is not None:
+            result["latestModifiedAt"] = iso_from_timestamp(latest_mtime)
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+
+def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+    spec = DESKTOP_APP_SPECS.get(provider) or {}
+    raw_apps = settings.get("desktopApps") if isinstance(settings.get("desktopApps"), dict) else {}
+    raw_entry = raw_apps.get(provider) if isinstance(raw_apps, dict) else None
+    configured_path = None
+    try:
+        if isinstance(raw_entry, dict):
+            configured_path = normalize_desktop_app_path(raw_entry.get("path"))
+    except ValueError:
+        configured_path = None
+    default_path = first_existing_default_app_path(provider)
+    selected_path = configured_path or default_path
+    configured = bool(configured_path)
+
+    base: Dict[str, Any] = {
+        "provider": provider,
+        "displayName": spec.get("displayName") or provider,
+        "path": selected_path,
+        "configured": configured,
+        "detectedDefault": (not configured and default_path is not None),
+        "privacy": "metadata_only",
+        "usageImport": "allowlisted_usage" if provider == "claude" else "metadata_only",
+        "readsContent": False,
+        "status": "not_configured",
+        "dataRoots": [],
+        "readableFiles": 0,
+        "latestModifiedAt": None,
+    }
+    if not selected_path:
+        return base
+
+    path = expand_agentcat_user_path(selected_path)
+    try:
+        exists = path.exists()
+        is_dir = path.is_dir()
+    except OSError as exc:
+        base["status"] = "error"
+        base["error"] = str(exc)
+        return base
+    if not exists:
+        base["status"] = "not_found"
+        return base
+    if not is_dir or path.suffix.lower() != ".app":
+        base["status"] = "unsupported"
+        return base
+
+    bundle_id = desktop_app_bundle_id(path)
+    if bundle_id:
+        base["bundleId"] = bundle_id
+    expected = set(str(item) for item in (spec.get("expectedBundleIds") or ()))
+    if bundle_id and expected and bundle_id not in expected:
+        base["bundleMismatch"] = True
+
+    roots = [scan_desktop_app_data_root(root) for root in desktop_app_data_roots(provider)]
+    base["dataRoots"] = roots
+    readable = sum(int(root.get("readableFiles") or 0) for root in roots)
+    base["readableFiles"] = readable
+    latest_values = [
+        root.get("latestModifiedAt")
+        for root in roots
+        if isinstance(root.get("latestModifiedAt"), str)
+    ]
+    if latest_values:
+        base["latestModifiedAt"] = max(latest_values)
+    base["status"] = "ok" if readable > 0 else "installed_no_data"
+    return base
+
+
+def desktop_app_sources_snapshot(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    resolved = settings if isinstance(settings, dict) else agentcat_settings()
+    return {
+        provider: desktop_app_source_snapshot(provider, resolved)
+        for provider in DESKTOP_APP_PROVIDER_IDS
+    }
+
+
+def attach_desktop_app_sources(
+    providers: Dict[str, Dict[str, Any]],
+    desktop_apps: Dict[str, Any],
+) -> None:
+    for provider, source in desktop_apps.items():
+        if provider in providers and isinstance(providers[provider], dict):
+            providers[provider]["desktopApp"] = source
+
+
+def connector_config_payload(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    resolved = settings if isinstance(settings, dict) else agentcat_settings()
+    return {
+        "providers": configured_provider_entries(resolved),
+        "desktopApps": desktop_app_sources_snapshot(resolved),
+        "capabilities": list(CONNECTOR_CAPABILITIES),
+    }
+
+
+def merge_connector_config_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    settings = agentcat_settings()
+    if not isinstance(settings, dict):
+        settings = {}
+
+    providers_payload = payload.get("providers")
+    if providers_payload is not None:
+        if not isinstance(providers_payload, dict):
+            raise ValueError("providers must be an object")
+        current = settings.get("providers") if isinstance(settings.get("providers"), dict) else {}
+        merged_providers: Dict[str, Any] = dict(current)
+        for provider, raw_entry in providers_payload.items():
+            if not isinstance(raw_entry, dict):
+                raise ValueError("provider config entry must be an object")
+            existing = merged_providers.get(str(provider)) if isinstance(merged_providers.get(str(provider)), dict) else {}
+            entry = dict(existing)
+            if "enabled" in raw_entry:
+                entry["enabled"] = bool(raw_entry.get("enabled"))
+            if isinstance(raw_entry.get("limits"), dict):
+                entry["limits"] = raw_entry["limits"]
+            merged_providers[str(provider)] = entry
+        settings["providers"] = merged_providers
+
+    desktop_payload = payload.get("desktopApps")
+    if desktop_payload is not None:
+        if not isinstance(desktop_payload, dict):
+            raise ValueError("desktopApps must be an object")
+        current_apps = settings.get("desktopApps") if isinstance(settings.get("desktopApps"), dict) else {}
+        merged_apps: Dict[str, Any] = dict(current_apps)
+        for provider, raw_entry in desktop_payload.items():
+            provider_s = str(provider)
+            normalized = normalize_desktop_app_config(provider_s, raw_entry)
+            if normalized:
+                merged_apps[provider_s] = normalized
+            else:
+                merged_apps.pop(provider_s, None)
+        settings["desktopApps"] = merged_apps
+
+    write_agentcat_settings(settings)
+    return connector_config_payload(settings)
+
+
+def disabled_provider_snapshot(provider: str) -> Dict[str, Any]:
+    return {
+        "status": "disabled",
+        "source": "settings",
+        "tokens": {},
+        "models": {},
+        "projects": {},
+        "estimated": False,
+        "message": f"{provider} scanning is disabled in Agent Cat settings",
+    }
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -661,7 +1338,14 @@ def windows_process_scan_timeout_seconds() -> float:
 
 
 def read_stdin_payload() -> Any:
-    data = sys.stdin.read()
+    try:
+        data = sys.stdin.read()
+    except OSError:
+        # Hooks/statusline commands must stay non-blocking even when the host
+        # process provides no readable stdin (pytest capture, some editor
+        # launchers, detached notification hooks). Treat that as an empty event
+        # payload rather than failing the runtime hook.
+        return {}
     if not data.strip():
         return {}
     try:
@@ -674,6 +1358,35 @@ def normalized_key(key: Any) -> str:
     return str(key).replace("-", "_").replace(" ", "_").lower()
 
 
+def key_is_sensitive(key_norm: str) -> bool:
+    """Whole-underscore-token denylist check.
+
+    A key is sensitive when a denylisted single-word part appears as a whole
+    ``_`` token — so ``user_message``/``system_prompt``/``repo_path`` redact, not
+    just the bare key — or a multi-token part (``file_path``/``input_text``)
+    appears as a contiguous token run. Numeric-metadata keys whose LAST token is
+    a benign suffix (``message_count``, ``path_segments``, ``content_length``)
+    survive: a count/size is not the content. Token totals (``TOKEN_KEYS``) are
+    filtered by the caller.
+    """
+    if key_norm in SENSITIVE_KEY_EXACT:
+        return True
+    tokens = key_norm.split("_")
+    if tokens[-1] in BENIGN_METRIC_SUFFIXES:
+        return False
+    token_set = set(tokens)
+    for part in SENSITIVE_KEY_PARTS:
+        part_tokens = part.split("_")
+        span = len(part_tokens)
+        if span == 1:
+            if part in token_set:
+                return True
+            continue
+        if any(tokens[i : i + span] == part_tokens for i in range(len(tokens) - span + 1)):
+            return True
+    return False
+
+
 def sanitize_payload(value: Any, depth: int = 0) -> Any:
     if depth > 8:
         return "[truncated]"
@@ -682,15 +1395,18 @@ def sanitize_payload(value: Any, depth: int = 0) -> Any:
         for key, child in value.items():
             key_s = str(key)
             key_norm = normalized_key(key_s)
-            if key_norm not in TOKEN_KEYS and any(part in key_norm for part in SENSITIVE_KEY_PARTS):
+            if key_norm not in TOKEN_KEYS and key_is_sensitive(key_norm):
                 out[key_s] = "[redacted]"
             else:
                 out[key_s] = sanitize_payload(child, depth + 1)
         return out
     if isinstance(value, list):
         return [sanitize_payload(item, depth + 1) for item in value[:50]]
-    if isinstance(value, str) and len(value) > 1000:
-        return value[:1000] + "...[truncated]"
+    if isinstance(value, str):
+        if value_is_sensitive(value):
+            return "[redacted]"
+        if len(value) > 1000:
+            return value[:1000] + "...[truncated]"
     return value
 
 
@@ -1064,6 +1780,8 @@ def init_db() -> None:
         )
         conn.execute("create index if not exists idx_events_provider_ts on events(provider, ts desc)")
         conn.commit()
+    # The sqlite file is created on connect; lock it down owner-only afterward.
+    _chmod_quiet(EVENTS_DB, 0o600)
 
 
 def store_event(provider: str, source: str, event_type: Optional[str], payload: Any) -> Dict[str, Any]:
@@ -1125,12 +1843,25 @@ def read_json(path: Path) -> Optional[Any]:
         return {"_agentcat_error": str(exc)}
 
 
+def _is_under_agentcat_home(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(AGENTCAT_HOME.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
         fh.write("\n")
+    # Lock down private state files (snapshot, caches, update channel/state) to
+    # owner-only before publishing. External configs (e.g. ~/.gemini) keep their
+    # own permissions so other tools are unaffected.
+    if _is_under_agentcat_home(path):
+        _chmod_quiet(tmp_path, 0o600)
     tmp_path.replace(path)
 
 
@@ -1566,6 +2297,20 @@ def codex_usage_request(access_token: str, account_id: str, url: str) -> Dict[st
     return payload if isinstance(payload, dict) else {}
 
 
+def codex_reset_credits_request(access_token: str, account_id: str) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "AgentCat/1.0",
+    }
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    req = urllib.request.Request(CODEX_RESET_CREDITS_URL, headers=headers)
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
 def codex_window_quota(
     quota_id: str,
     label: str,
@@ -1592,6 +2337,112 @@ def codex_window_quota(
     )
 
 
+def sum_intish_list(raw: Any) -> Optional[int]:
+    if isinstance(raw, list):
+        values = [int_limit(item) for item in raw]
+        values = [item for item in values if item is not None]
+        return sum(values) if values else None
+    return int_limit(raw)
+
+
+def int_count(raw: Any) -> Optional[int]:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        value = int(raw)
+    elif isinstance(raw, str):
+        text = raw.strip().replace(",", "").replace("_", "")
+        if not text.isdigit():
+            return None
+        value = int(text)
+    else:
+        return None
+    return value if value >= 0 else None
+
+
+def sum_count_list(raw: Any) -> Optional[int]:
+    if isinstance(raw, list):
+        values = [int_count(item) for item in raw]
+        values = [item for item in values if item is not None]
+        return sum(values) if values else None
+    return int_count(raw)
+
+
+def codex_credit_usage_summary(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    summary: Dict[str, Any] = {}
+    for source, target in (
+        ("balance", "balance"),
+        ("has_credits", "hasCredits"),
+        ("unlimited", "unlimited"),
+        ("overage_limit_reached", "overageLimitReached"),
+    ):
+        value = raw.get(source)
+        if isinstance(value, bool):
+            summary[target] = value
+        elif source == "balance" and value is not None:
+            summary[target] = str(value)
+
+    cloud = sum_count_list(raw.get("approx_cloud_messages"))
+    local = sum_count_list(raw.get("approx_local_messages"))
+    if cloud is not None:
+        summary["approxCloudMessages"] = cloud
+    if local is not None:
+        summary["approxLocalMessages"] = local
+    return summary or None
+
+
+def codex_rate_limit_reached_type(raw: Any) -> Optional[str]:
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        value = raw.get("type") or raw.get("reason") or raw.get("name")
+        return str(value) if value is not None else None
+    return None
+
+
+def codex_reset_credit_summaries(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    summaries: List[Dict[str, Any]] = []
+    for item in raw[:10]:
+        if not isinstance(item, dict):
+            continue
+        summary: Dict[str, Any] = {}
+        for source, target in (
+            ("status", "status"),
+            ("title", "title"),
+            ("description", "description"),
+            ("reset_type", "resetType"),
+        ):
+            value = item.get(source)
+            if isinstance(value, str) and value.strip():
+                summary[target] = value.strip()
+        for source, target in (
+            ("granted_at", "grantedAt"),
+            ("expires_at", "expiresAt"),
+            ("redeemed_at", "redeemedAt"),
+        ):
+            value = item.get(source)
+            if value is not None:
+                summary[target] = str(value)
+        if summary:
+            summaries.append(summary)
+    return summaries
+
+
+def merge_codex_reset_credit_details(limits: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    # int_count keeps 0 (a real "no reset credits left" signal) instead of
+    # dropping it the way int_limit does for non-positive values.
+    available = int_count(payload.get("available_count"))
+    if available is not None:
+        limits["resetCreditsAvailable"] = available
+    summaries = codex_reset_credit_summaries(payload.get("credits"))
+    if summaries:
+        limits["resetCredits"] = summaries
+
+
 def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "codex-usage-api") -> Dict[str, Any]:
     limits = empty_limits(status="auto")
     limits["source"] = source
@@ -1600,6 +2451,33 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
     rate_limit = payload.get("rate_limit")
     if not isinstance(rate_limit, dict):
         rate_limit = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
+
+    for source_key, target_key in (
+        ("allowed", "rateLimitAllowed"),
+        ("limit_reached", "rateLimitReached"),
+    ):
+        value = rate_limit.get(source_key)
+        if isinstance(value, bool):
+            limits[target_key] = value
+
+    reached_type = codex_rate_limit_reached_type(payload.get("rate_limit_reached_type"))
+    if reached_type:
+        limits["rateLimitReachedType"] = reached_type
+
+    reset_credits = payload.get("rate_limit_reset_credits")
+    if isinstance(reset_credits, dict):
+        # int_count surfaces available_count == 0 (int_limit would drop it).
+        available = int_count(reset_credits.get("available_count"))
+        if available is not None:
+            limits["resetCreditsAvailable"] = available
+
+    credit_summary = codex_credit_usage_summary(payload.get("credits"))
+    if credit_summary is not None:
+        limits["codexCredits"] = credit_summary
+
+    spend_control = payload.get("spend_control")
+    if isinstance(spend_control, dict) and isinstance(spend_control.get("reached"), bool):
+        limits["spendControlReached"] = spend_control.get("reached")
 
     primary = rate_limit.get("primary_window") or rate_limit.get("primary")
     secondary = rate_limit.get("secondary_window") or rate_limit.get("secondary")
@@ -1683,12 +2561,20 @@ def codex_live_limits() -> Dict[str, Any]:
             try:
                 payload = codex_usage_request(access_token, str(account_id), url)
                 limits = codex_limits_from_usage_response(payload, source=url)
+                try:
+                    reset_payload = codex_reset_credits_request(access_token, str(account_id))
+                    merge_codex_reset_credit_details(limits, reset_payload)
+                except Exception:
+                    pass
                 write_live_limits_cache("codex", limits)
                 return limits
             except urllib.error.HTTPError as exc:
                 last_error = exc
-                if exc.code in (401, 403) and attempt == 0:
-                    break
+                # Codex currently exposes several adjacent usage endpoints.
+                # Some valid sessions receive 403 on /codex/usage while
+                # /wham/usage succeeds with the same access token, so exhaust
+                # the URL list before attempting token refresh.
+                continue
             except Exception as exc:
                 last_error = exc
         if attempt == 0:
@@ -2420,7 +3306,10 @@ def add_to_periods(periods: Dict[str, int], amount: int, when: Optional[dt.datet
     if when is None:
         return
     now = dt.datetime.now(dt.timezone.utc)
-    if when.date() == now.date():
+    # Bucket "today" on the LOCAL calendar date so it agrees with the daily
+    # buckets (add_to_daily keys on when.astimezone().date()). Using the raw UTC
+    # date here disagreed near midnight when UTC and local dates differ.
+    if when.astimezone().date() == now.astimezone().date():
         periods["today"] = periods.get("today", 0) + amount
     if when >= now - dt.timedelta(days=7):
         periods["week"] = periods.get("week", 0) + amount
@@ -3374,6 +4263,47 @@ def claude_record_from_cursor(raw: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def claude_journal_project_dirs() -> List[Path]:
+    """Return Claude usage journal roots without reading transcript content.
+
+    The canonical CLI root is ~/.claude/projects. Claude Desktop's local
+    agent mode keeps the same JSONL shape under its Application Support
+    directory. We only add the nested `.claude/projects` roots; parsing remains
+    field allowlisted in parse_claude_usage_line().
+    """
+    roots: List[Path] = []
+    seen: Set[str] = set()
+
+    def add(root: Path) -> None:
+        try:
+            resolved = str(root.resolve())
+        except OSError:
+            resolved = str(root)
+        if resolved in seen:
+            return
+        if not root.is_dir():
+            return
+        seen.add(resolved)
+        roots.append(root)
+
+    add(CLAUDE_PROJECTS_DIR)
+    added_desktop = 0
+    for data_root in desktop_app_data_roots("claude"):
+        if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
+            break
+        if not data_root.is_dir():
+            continue
+        for pattern in CLAUDE_DESKTOP_PROJECT_GLOBS:
+            for candidate in sorted(data_root.glob(pattern)):
+                add(candidate)
+                added_desktop += 1
+                if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
+                    break
+            if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
+                break
+    return roots
+
+
 def _apply_record_to_totals(
     totals: Dict[str, int],
     rec: Dict[str, Any],
@@ -3438,31 +4368,31 @@ def _apply_record_to_totals(
 
 def rebuild_claude_journal_projects(now: "dt.datetime") -> Dict[str, Dict[str, Any]]:
     projects: Dict[str, Dict[str, Any]] = {}
-    if not CLAUDE_PROJECTS_DIR.is_dir():
-        return projects
     scratch_totals = _empty_journal_totals()
-    for path in sorted(CLAUDE_PROJECTS_DIR.rglob("*.jsonl")):
-        try:
-            with path.open("rb") as fh:
-                for raw_line in fh:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    rec = parse_claude_usage_line(obj)
-                    if rec:
-                        _apply_record_to_totals(scratch_totals, rec, now, projects)
-        except OSError as exc:
-            logging.warning("rebuild_claude_journal_projects: cannot read %s: %s", str(path), exc)
-            continue
+    for root in claude_journal_project_dirs():
+        for path in sorted(root.rglob("*.jsonl")):
+            try:
+                with path.open("rb") as fh:
+                    for raw_line in fh:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        rec = parse_claude_usage_line(obj)
+                        if rec:
+                            _apply_record_to_totals(scratch_totals, rec, now, projects)
+            except OSError as exc:
+                logging.warning("rebuild_claude_journal_projects: cannot read %s: %s", str(path), exc)
+                continue
     return projects
 
 
 def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
-    if not CLAUDE_PROJECTS_DIR.is_dir():
+    project_roots = claude_journal_project_dirs()
+    if not project_roots:
         return cursor
     now_utc = dt.datetime.now(dt.timezone.utc)
     now_local = now_utc.astimezone().date()
@@ -3497,67 +4427,68 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         # without disturbing global totals or byte offsets.
         projects.clear()
         projects.update(rebuild_claude_journal_projects(now_utc))
-    for path in sorted(CLAUDE_PROJECTS_DIR.rglob("*.jsonl")):
-        path_str = str(path)
-        try:
-            file_size = path.stat().st_size
-        except OSError:
-            continue
-        stored_offset = offsets.get(path_str, 0)
-        if stored_offset > file_size:
-            stored_offset = 0
-        if stored_offset >= file_size:
-            continue
-        lines_parsed = lines_skipped = 0
-        new_offset = stored_offset
-        try:
-            with path.open("rb") as fh:
-                fh.seek(stored_offset)
-                for raw_line in fh:
-                    new_offset += len(raw_line)
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        lines_skipped += 1
-                        continue
-                    rec = parse_claude_usage_line(obj)
-                    if rec:
-                        dedupe_key = rec.get("dedupeKey")
-                        if isinstance(dedupe_key, str) and dedupe_key:
-                            previous = claude_record_from_cursor(usage_records.get(dedupe_key))
-                            if previous is not None:
-                                if claude_record_total(rec) <= claude_record_total(previous):
-                                    continue
-                                _apply_record_to_totals(
-                                    totals,
-                                    previous,
-                                    now_utc,
-                                    projects,
-                                    daily_tokens,
-                                    hourly_tokens,
-                                    models,
-                                    sign=-1,
-                                )
-                            usage_records[dedupe_key] = claude_record_for_cursor(rec)
-                        _apply_record_to_totals(
-                            totals,
-                            rec,
-                            now_utc,
-                            projects,
-                            daily_tokens,
-                            hourly_tokens,
-                            models,
-                        )
-                        lines_parsed += 1
-        except OSError as exc:
-            logging.warning("scan_claude_journal: cannot read %s: %s", path_str, exc)
-            continue
-        offsets[path_str] = new_offset
-        logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
-                      path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
+    for root in project_roots:
+        for path in sorted(root.rglob("*.jsonl")):
+            path_str = str(path)
+            try:
+                file_size = path.stat().st_size
+            except OSError:
+                continue
+            stored_offset = offsets.get(path_str, 0)
+            if stored_offset > file_size:
+                stored_offset = 0
+            if stored_offset >= file_size:
+                continue
+            lines_parsed = lines_skipped = 0
+            new_offset = stored_offset
+            try:
+                with path.open("rb") as fh:
+                    fh.seek(stored_offset)
+                    for raw_line in fh:
+                        new_offset += len(raw_line)
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            lines_skipped += 1
+                            continue
+                        rec = parse_claude_usage_line(obj)
+                        if rec:
+                            dedupe_key = rec.get("dedupeKey")
+                            if isinstance(dedupe_key, str) and dedupe_key:
+                                previous = claude_record_from_cursor(usage_records.get(dedupe_key))
+                                if previous is not None:
+                                    if claude_record_total(rec) <= claude_record_total(previous):
+                                        continue
+                                    _apply_record_to_totals(
+                                        totals,
+                                        previous,
+                                        now_utc,
+                                        projects,
+                                        daily_tokens,
+                                        hourly_tokens,
+                                        models,
+                                        sign=-1,
+                                    )
+                                usage_records[dedupe_key] = claude_record_for_cursor(rec)
+                            _apply_record_to_totals(
+                                totals,
+                                rec,
+                                now_utc,
+                                projects,
+                                daily_tokens,
+                                hourly_tokens,
+                                models,
+                            )
+                            lines_parsed += 1
+            except OSError as exc:
+                logging.warning("scan_claude_journal: cannot read %s: %s", path_str, exc)
+                continue
+            offsets[path_str] = new_offset
+            logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
+                          path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
     cursor["totals_as_of"] = now_utc.isoformat()
     cursor["version"] = CLAUDE_JOURNAL_CURSOR_VERSION
     return cursor
@@ -4544,7 +5475,9 @@ def antigravity_provider_snapshot(
 ) -> Dict[str, Any]:
     source_status = copy.deepcopy((gemini_snapshot_data.get("sources") or {}).get("antigravityCli") or {})
     if usage and google_usage_total(usage) > 0:
-        source_status["status"] = "ok" if source_note == "dedicated-telemetry" else "inferred_from_gemini_telemetry"
+        # Antigravity only reports real tokens when it has its own dedicated
+        # telemetry outfile; Gemini-CLI tokens are never borrowed.
+        source_status["status"] = "ok"
         source_status["tokens"] = google_usage_total(usage)
         source_status["events"] = int(usage.get("events") or source_status.get("events") or 0)
     out = {
@@ -4574,6 +5507,9 @@ def split_google_cli_snapshots(
     common_usage = source_usages.get("geminiCli") if isinstance(source_usages, dict) else None
     antigravity_usage = source_usages.get("antigravityCli") if isinstance(source_usages, dict) else None
 
+    # Tier 1: Antigravity has its own dedicated local telemetry outfile. This is
+    # the only honest source of Antigravity tokens, so the gemini provider keeps
+    # the gemini-cli usage and antigravity gets its own.
     if google_usage_total(antigravity_usage) > 0:
         gemini_provider = apply_google_usage(gemini_snapshot_data, common_usage, status_if_empty="no_token_events_yet")
         antigravity_provider = antigravity_provider_snapshot(
@@ -4584,24 +5520,13 @@ def split_google_cli_snapshots(
         )
         return gemini_provider, antigravity_provider
 
-    inference_days = antigravity_inference_days(activity)
+    # Antigravity bills server-side and never writes a local telemetry outfile, so
+    # there is no honest way to attribute Gemini-CLI tokens to it. Emit Antigravity
+    # as its own provider with empty tokens rather than borrowing Gemini's usage.
     counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
     antigravity_installed = bool(((gemini_snapshot_data.get("sources") or {}).get("antigravityCli") or {}).get("installed"))
     antigravity_active = isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0
-    if inference_days and google_usage_total(common_usage) > 0 and (antigravity_active or antigravity_installed):
-        inferred_usage = filter_google_usage_days(common_usage, inference_days, include=True)
-        gemini_usage = filter_google_usage_days(common_usage, inference_days, include=False)
-        if google_usage_total(inferred_usage) > 0:
-            gemini_provider = apply_google_usage(gemini_snapshot_data, gemini_usage, status_if_empty="no_token_events_yet")
-            antigravity_provider = antigravity_provider_snapshot(
-                gemini_snapshot_data,
-                inferred_usage,
-                status_if_empty="no_token_events_yet",
-                source_note="inferred-from-gemini-telemetry",
-            )
-            return gemini_provider, antigravity_provider
-
-    status_if_empty = "no_telemetry_yet" if antigravity_installed else "not_found"
+    status_if_empty = "no_telemetry_yet" if (antigravity_installed or antigravity_active) else "not_found"
     antigravity_provider = antigravity_provider_snapshot(
         gemini_snapshot_data,
         None,
@@ -5048,6 +5973,9 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
 CONNECTOR_VERSION_RE = re.compile(
     r"CONNECTOR_VERSION\s*=\s*os\.environ\.get\(\s*['\"]AGENTCAT_CONNECTOR_VERSION['\"]\s*,\s*['\"]([^'\"]+)['\"]"
 )
+CONNECTOR_MANIFEST_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[.-][0-9A-Za-z]+)*$")
+PRO_CONNECTOR_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+VALID_UPDATE_CHANNELS = {"public", "pro"}
 
 
 def agentcat_connectors_dir() -> Path:
@@ -5057,6 +5985,10 @@ def agentcat_connectors_dir() -> Path:
 
 def auto_update_state_file() -> Path:
     return AGENTCAT_HOME / "auto-update.json"
+
+
+def update_channel_state_file() -> Path:
+    return AGENTCAT_HOME / "update-channel.json"
 
 
 def current_connector_repo_dir() -> Optional[Path]:
@@ -5085,8 +6017,22 @@ def is_newer_connector_version(remote_version: str, current_version: str = CONNE
     return connector_version_key(remote_version) > connector_version_key(current_version)
 
 
+def free_channel_install_digest() -> Optional[str]:
+    raw = os.environ.get("AGENTCAT_INSTALL_SH_SHA256")
+    if not raw:
+        settings = agentcat_settings()
+        raw = settings_value(settings, ("autoUpdate", "installSha256"), ("installSha256",))
+    digest = str(raw or "").strip().lower()
+    return digest if PRO_CONNECTOR_SHA256_RE.match(digest) else None
+
+
 def auto_update_enabled_status() -> Tuple[bool, str]:
-    if not env_flag("AGENTCAT_AUTO_UPDATE", True):
+    # The free (public) channel pipes install.sh straight into bash, so it stays
+    # OFF by default. It only turns on when the operator explicitly opts in
+    # (AGENTCAT_AUTO_UPDATE / settings) AND a pinned install.sh digest is present
+    # to verify the script before it executes.
+    explicit_env = os.environ.get("AGENTCAT_AUTO_UPDATE")
+    if explicit_env is not None and not env_flag("AGENTCAT_AUTO_UPDATE", True):
         return False, "disabled by AGENTCAT_AUTO_UPDATE"
     if os.environ.get("AGENTCAT_CONNECTOR_VERSION"):
         return False, "disabled while AGENTCAT_CONNECTOR_VERSION overrides the runtime version"
@@ -5094,6 +6040,13 @@ def auto_update_enabled_status() -> Tuple[bool, str]:
     configured = settings_value(settings, ("autoUpdate", "enabled"), ("autoUpdateEnabled",))
     if isinstance(configured, bool) and not configured:
         return False, "disabled by settings"
+    opted_in = (explicit_env is not None and env_flag("AGENTCAT_AUTO_UPDATE", True)) or (
+        isinstance(configured, bool) and configured
+    )
+    if not opted_in:
+        return False, "free-channel auto-update is off by default; opt in via AGENTCAT_AUTO_UPDATE or settings.autoUpdate.enabled"
+    if free_channel_install_digest() is None:
+        return False, "free-channel auto-update requires a pinned install.sh digest (AGENTCAT_INSTALL_SH_SHA256 or settings.autoUpdate.installSha256)"
     repo_dir = current_connector_repo_dir()
     install_dir = agentcat_connectors_dir()
     if repo_dir is None:
@@ -5112,6 +6065,97 @@ def write_auto_update_state(state: Dict[str, Any]) -> None:
     write_json_atomic(auto_update_state_file(), state)
 
 
+def read_update_channel_state() -> Dict[str, Any]:
+    raw = read_json(update_channel_state_file())
+    return raw if isinstance(raw, dict) else {}
+
+
+def validate_pro_connector_manifest(manifest: Any) -> Dict[str, Any]:
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be an object")
+    if manifest.get("channel") != "pro":
+        raise ValueError("manifest.channel must be pro")
+
+    version = str(manifest.get("version") or "").strip()
+    if not CONNECTOR_MANIFEST_VERSION_RE.match(version):
+        raise ValueError("manifest.version is invalid")
+
+    download_url = str(manifest.get("downloadUrl") or "").strip()
+    parsed = urllib.parse.urlparse(download_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("manifest.downloadUrl must be HTTPS")
+
+    sha256 = str(manifest.get("sha256") or "").strip()
+    if not PRO_CONNECTOR_SHA256_RE.match(sha256):
+        raise ValueError("manifest.sha256 must be 64 lowercase hex chars")
+
+    normalized: Dict[str, Any] = {
+        "version": version,
+        "downloadUrl": download_url,
+        "sha256": sha256,
+        "channel": "pro",
+    }
+    min_app_version = manifest.get("minAppVersion")
+    if min_app_version is not None:
+        min_app_version_text = str(min_app_version).strip()
+        if not CONNECTOR_MANIFEST_VERSION_RE.match(min_app_version_text):
+            raise ValueError("manifest.minAppVersion is invalid")
+        normalized["minAppVersion"] = min_app_version_text
+    return normalized
+
+
+def write_update_channel_state(channel: str, manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if channel not in VALID_UPDATE_CHANNELS:
+        raise ValueError("channel must be public or pro")
+    state: Dict[str, Any] = {
+        "channel": channel,
+        "updatedAt": now_iso(),
+        "currentVersion": CONNECTOR_VERSION,
+    }
+    if channel == "pro":
+        if manifest is None:
+            raise ValueError("pro channel requires a connector manifest")
+        state["manifest"] = validate_pro_connector_manifest(manifest)
+        state["status"] = "manifest_ready"
+        state["installStatus"] = "pending_install"
+    else:
+        state["status"] = "public"
+        state["installStatus"] = "current"
+    write_json_atomic(update_channel_state_file(), state)
+    return state
+
+
+def update_channel_status_snapshot() -> Dict[str, Any]:
+    raw = read_update_channel_state()
+    channel = raw.get("channel") if raw.get("channel") in VALID_UPDATE_CHANNELS else "public"
+    if channel == "pro":
+        manifest = raw.get("manifest")
+        if isinstance(manifest, dict):
+            return {
+                "channel": "pro",
+                "status": raw.get("status") or "manifest_ready",
+                "installStatus": raw.get("installStatus") or "pending_install",
+                "currentVersion": CONNECTOR_VERSION,
+                "targetVersion": manifest.get("version"),
+                "minAppVersion": manifest.get("minAppVersion"),
+                "updatedAt": raw.get("updatedAt"),
+            }
+        return {
+            "channel": "pro",
+            "status": "invalid_manifest",
+            "installStatus": "blocked",
+            "currentVersion": CONNECTOR_VERSION,
+            "updatedAt": raw.get("updatedAt"),
+        }
+    return {
+        "channel": "public",
+        "status": raw.get("status") or "public",
+        "installStatus": raw.get("installStatus") or "current",
+        "currentVersion": CONNECTOR_VERSION,
+        "updatedAt": raw.get("updatedAt"),
+    }
+
+
 def auto_update_status_snapshot() -> Dict[str, Any]:
     enabled, reason = auto_update_enabled_status()
     state = read_auto_update_state()
@@ -5121,11 +6165,13 @@ def auto_update_status_snapshot() -> Dict[str, Any]:
             "enabled": enabled,
             "reason": reason,
             "currentVersion": CONNECTOR_VERSION,
+            "channel": update_channel_status_snapshot(),
         }
     status = dict(state)
     status.setdefault("enabled", enabled)
     status.setdefault("reason", reason)
     status.setdefault("currentVersion", CONNECTOR_VERSION)
+    status["channel"] = update_channel_status_snapshot()
     return status
 
 
@@ -5142,22 +6188,52 @@ def fetch_remote_connector_version() -> str:
     return version
 
 
+def fetch_verified_install_script(url: str, expected_sha256: str) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"AgentCat/{CONNECTOR_VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=AUTO_UPDATE_HTTP_TIMEOUT_SECONDS) as response:
+        body = response.read(2 * 1024 * 1024)
+    actual = hashlib.sha256(body).hexdigest()
+    if actual != expected_sha256:
+        raise ValueError(
+            f"install.sh digest mismatch: expected {expected_sha256}, got {actual}"
+        )
+    return body
+
+
+def fetch_verified_install_sh(expected_sha256: str) -> bytes:
+    return fetch_verified_install_script(AUTO_UPDATE_INSTALL_SH_URL, expected_sha256)
+
+
 def start_auto_update_install(remote_version: str) -> subprocess.Popen:
     ensure_dirs()
     env = os.environ.copy()
     env["AGENTCAT_CONNECTORS_DIR"] = str(agentcat_connectors_dir())
+    # install.sh verifies the downloaded connector archive against a SHA256 when
+    # one is available (AGENTCAT_CONNECTORS_SHA256 / *_SHA256_URL). The env is
+    # forwarded as-is, so once releases publish a per-version digest the daemon
+    # can populate it here to gate the swap; absent a digest the install path is
+    # unchanged and existing installs keep updating.
     stdout_path = AGENTCAT_HOME / "auto-update.out.log"
     stderr_path = AGENTCAT_HOME / "auto-update.err.log"
     stdout = stdout_path.open("ab")
     stderr = stderr_path.open("ab")
     try:
+        expected = free_channel_install_digest()
+        if expected is None:
+            raise ValueError("refusing to run install script without a pinned digest")
         if IS_WINDOWS:
-            script = (
-                "$ErrorActionPreference = 'Stop'; "
-                f"irm -UseBasicParsing {json.dumps(AUTO_UPDATE_INSTALL_PS1_URL)} | iex"
-            )
+            # Keep the Windows path as strict as the Unix path: download once,
+            # verify the pinned digest, then execute the local bytes. This avoids
+            # `irm | iex` and guarantees a mismatch cannot spawn PowerShell.
+            body = fetch_verified_install_script(AUTO_UPDATE_INSTALL_PS1_URL, expected)
+            script_path = AGENTCAT_HOME / "auto-update-install.ps1"
+            with script_path.open("wb") as fh:
+                fh.write(body)
             return subprocess.Popen(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
                 cwd=str(HOME),
                 env=env,
                 stdout=stdout,
@@ -5165,10 +6241,17 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
                 creationflags=CREATE_NO_WINDOW,
             )
         bash = shutil.which("bash") or "/bin/bash"
-        install_url = shlex.quote(AUTO_UPDATE_INSTALL_SH_URL)
-        command = f"curl --retry 4 --retry-delay 2 --retry-all-errors -fsSL {install_url} | bash"
+        # Never pipe an unverified network script into bash. auto_update_enabled_status
+        # already requires a pinned digest, so download install.sh, verify its
+        # SHA256, persist the verified bytes, and execute that local file. This
+        # avoids the TOCTOU window of re-downloading at execution time.
+        body = fetch_verified_install_sh(expected)
+        script_path = AGENTCAT_HOME / "auto-update-install.sh"
+        with script_path.open("wb") as fh:
+            fh.write(body)
+        os.chmod(script_path, 0o600)
         return subprocess.Popen(
-            [bash, "-lc", command],
+            [bash, str(script_path)],
             cwd=str(HOME),
             env=env,
             stdout=stdout,
@@ -5236,8 +6319,157 @@ def auto_update_loop(interval_seconds: float, initial_delay_seconds: float) -> N
         time.sleep(max(60.0, interval_seconds))
 
 
+def project_daily_file() -> Path:
+    """Per-day per-project token delta ledger: {"YYYY-MM-DD": {label: tokens}}."""
+    return AGENTCAT_HOME / "project-daily.json"
+
+
+def project_daily_state_file() -> Path:
+    """Delta-accounting baselines: last observed cumulative tokens per project."""
+    return AGENTCAT_HOME / "project-daily-state.json"
+
+
+def load_project_daily() -> Dict[str, Dict[str, int]]:
+    raw = read_json(project_daily_file())
+    out: Dict[str, Dict[str, int]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for day, labels in raw.items():
+        if not PROJECT_DAILY_DAY_RE.match(str(day)) or not isinstance(labels, dict):
+            continue
+        bucket: Dict[str, int] = {}
+        for label, tokens in labels.items():
+            amount = nonnegative_int(tokens)
+            if str(label) and amount:
+                bucket[str(label)] = amount
+        if bucket:
+            out[str(day)] = bucket
+    return out
+
+
+def load_project_daily_baselines() -> Dict[str, int]:
+    raw = read_json(project_daily_state_file())
+    if not isinstance(raw, dict):
+        return {}
+    baselines = raw.get("baselines")
+    if not isinstance(baselines, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for key, value in baselines.items():
+        amount = nonnegative_int(value)
+        if str(key) and amount is not None:
+            out[str(key)] = amount
+    return out
+
+
+def prune_project_daily(days: Dict[str, Dict[str, int]], today: "dt.date") -> bool:
+    """Drop day buckets older than PROJECT_DAILY_RETENTION_DAYS (and malformed keys)."""
+    cutoff = today - dt.timedelta(days=PROJECT_DAILY_RETENTION_DAYS)
+    changed = False
+    for day in list(days.keys()):
+        try:
+            parsed = dt.date.fromisoformat(day)
+        except ValueError:
+            days.pop(day, None)
+            changed = True
+            continue
+        if parsed < cutoff:
+            days.pop(day, None)
+            changed = True
+    return changed
+
+
+def snapshot_project_cumulative(providers: Dict[str, Any]) -> Dict[str, Tuple[str, int]]:
+    """'provider|project-id' -> (label, cumulative tokens) from provider rollups.
+
+    Keyed per provider+project so one provider's counter reset (or a project
+    dropping out of another provider's top-20 list) never bleeds into the
+    others' delta accounting. Labels are basenames only — never paths.
+    """
+    out: Dict[str, Tuple[str, int]] = {}
+    for provider, usage in (providers or {}).items():
+        if not isinstance(usage, dict):
+            continue
+        projects = usage.get("projects")
+        if not isinstance(projects, dict) or projects.get("status") != "ok":
+            continue
+        items = projects.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            project_id = str(item.get("id") or item.get("path") or "").strip()
+            tokens = nonnegative_int(item.get("tokens"))
+            if not project_id or tokens is None:
+                continue
+            label = display_project_name(project_id)
+            if not label:
+                continue
+            out[f"{provider}|{project_id}"] = (label, tokens)
+    return out
+
+
+def project_daily_snapshot_slice(
+    days: Dict[str, Dict[str, int]], today: "dt.date"
+) -> Dict[str, Dict[str, int]]:
+    """Trailing PROJECT_DAILY_SNAPSHOT_DAYS view embedded in the snapshot."""
+    cutoff = today - dt.timedelta(days=PROJECT_DAILY_SNAPSHOT_DAYS - 1)
+    out: Dict[str, Dict[str, int]] = {}
+    for day, labels in days.items():
+        try:
+            parsed = dt.date.fromisoformat(day)
+        except ValueError:
+            continue
+        if parsed >= cutoff and labels:
+            out[day] = dict(labels)
+    return out
+
+
+def update_project_daily(
+    providers: Dict[str, Any], now: Optional["dt.datetime"] = None
+) -> Dict[str, Dict[str, int]]:
+    """Book per-project cumulative growth into LOCAL-day delta buckets.
+
+    Delta accounting against the previous cumulative value: only growth since
+    the last snapshot is booked (to today's local day), so restarts never
+    double-count. First sighting only seeds the baseline (months of history
+    must not land on today), and a shrinking counter rebases the baseline
+    without ever booking a negative delta.
+    """
+    if now is None:
+        now = dt.datetime.now(dt.timezone.utc)
+    today_key = day_key_for_timestamp(now) or now.astimezone().date().isoformat()
+    today = dt.date.fromisoformat(today_key)
+    days = load_project_daily()
+    baselines = load_project_daily_baselines()
+    days_changed = prune_project_daily(days, today)
+    baselines_changed = False
+    for key, (label, tokens) in snapshot_project_cumulative(providers).items():
+        previous = baselines.get(key)
+        if previous is None or tokens < previous:
+            baselines[key] = tokens
+            baselines_changed = True
+            continue
+        delta = tokens - previous
+        if delta == 0:
+            continue
+        baselines[key] = tokens
+        baselines_changed = True
+        bucket = days.setdefault(today_key, {})
+        bucket[label] = int(bucket.get(label) or 0) + delta
+        days_changed = True
+    if days_changed:
+        write_json_atomic(project_daily_file(), days)
+    if baselines_changed:
+        write_json_atomic(project_daily_state_file(), {"baselines": baselines})
+    return project_daily_snapshot_slice(days, today)
+
+
 def build_snapshot() -> Dict[str, Any]:
     ensure_dirs()
+    settings = agentcat_settings()
+    provider_config = configured_provider_entries(settings)
     try:
         latest_by_provider: Dict[str, Any] = latest_events_by_provider()
     except Exception as exc:
@@ -5245,20 +6477,33 @@ def build_snapshot() -> Dict[str, Any]:
     limits_by_provider = configured_limits()
     runtime_limits_by_provider = runtime_limits()
     activity = terminal_activity_snapshot()
-    gemini_provider, antigravity_provider = split_google_cli_snapshots(gemini_snapshot(), activity)
+    if (provider_config.get("gemini") or {}).get("enabled") is False and (provider_config.get("antigravity") or {}).get("enabled") is False:
+        gemini_provider = disabled_provider_snapshot("gemini")
+        antigravity_provider = disabled_provider_snapshot("antigravity")
+    else:
+        gemini_provider, antigravity_provider = split_google_cli_snapshots(gemini_snapshot(), activity)
     providers = {
-        "codex": codex_snapshot(),
-        "claude": claude_snapshot(),
+        "codex": disabled_provider_snapshot("codex") if (provider_config.get("codex") or {}).get("enabled") is False else codex_snapshot(),
+        "claude": disabled_provider_snapshot("claude") if (provider_config.get("claude") or {}).get("enabled") is False else claude_snapshot(),
         "gemini": gemini_provider,
         "antigravity": antigravity_provider,
-        "opencode": opencode_snapshot(),
-        "copilot": copilot_snapshot(),
+        "opencode": disabled_provider_snapshot("opencode") if (provider_config.get("opencode") or {}).get("enabled") is False else opencode_snapshot(),
+        "copilot": disabled_provider_snapshot("copilot") if (provider_config.get("copilot") or {}).get("enabled") is False else copilot_snapshot(),
     }
+    if (provider_config.get("gemini") or {}).get("enabled") is False:
+        providers["gemini"] = disabled_provider_snapshot("gemini")
+    if (provider_config.get("antigravity") or {}).get("enabled") is False:
+        providers["antigravity"] = disabled_provider_snapshot("antigravity")
     for provider, data in providers.items():
+        if data.get("status") == "disabled":
+            data["limits"] = empty_limits("disabled")
+            continue
         data["limits"] = merge_limits(
             limits_by_provider.get(provider, empty_limits()),
             runtime_limits_by_provider.get(provider, empty_limits()),
         )
+    desktop_apps = desktop_app_sources_snapshot(settings)
+    attach_desktop_app_sources(providers, desktop_apps)
     snapshot = {
         "schemaVersion": SCHEMA_VERSION,
         "connectorVersion": CONNECTOR_VERSION,
@@ -5267,10 +6512,24 @@ def build_snapshot() -> Dict[str, Any]:
         "update": auto_update_status_snapshot(),
         "activity": activity,
         "providers": providers,
+        "desktopApps": desktop_apps,
         "events": {
             "latestByProvider": latest_by_provider,
         },
     }
+    # Per-day per-project token deltas (capability "projects.daily").
+    # Additive/optional: failure degrades to an absent field and must NOT
+    # block the snapshot write.
+    try:
+        snapshot["projectsDaily"] = update_project_daily(providers)
+    except Exception as exc:
+        logging.debug("update_project_daily failed: %s", exc)
+    # LiteLLM pricing feed metadata (capability "pricing.feed"). Additive and
+    # optional: any failure degrades to the bundled table without blocking.
+    try:
+        snapshot["pricing"] = pricing_status_snapshot()
+    except Exception as exc:
+        logging.debug("pricing_status_snapshot failed: %s", exc)
     # Slice C: embed pre-derived insights so clients (Mac/Windows) decode
     # rather than re-derive. Failure here must NOT block the snapshot write —
     # degrade to insights.status = error and let the client render fallback.
@@ -5294,6 +6553,11 @@ def snapshot_for_http() -> Dict[str, Any]:
         snapshot["servedAt"] = now_iso()
         snapshot["update"] = auto_update_status_snapshot()
         snapshot["activity"] = terminal_activity_snapshot()
+        desktop_apps = desktop_app_sources_snapshot(agentcat_settings())
+        snapshot["desktopApps"] = desktop_apps
+        providers = snapshot.get("providers")
+        if isinstance(providers, dict):
+            attach_desktop_app_sources(providers, desktop_apps)
         return snapshot
     return build_snapshot()
 
@@ -5372,11 +6636,50 @@ Expected behavior:
 """
 
 
+# Loopback-only Host allow-list. The macOS app, widgets, and CLI all reach the
+# daemon over http://127.0.0.1:<port> with a localhost Host header; anything that
+# resolves elsewhere (DNS-rebinding, a non-loopback name) is rejected with 403.
+ALLOWED_HOST_HEADERS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _host_from_header(raw: Optional[str]) -> str:
+    # Strip an optional :port (any port, so a non-default --port still passes)
+    # and the IPv6 brackets used in Host headers like "[::1]:8765".
+    host = (raw or "").strip()
+    if not host:
+        return ""
+    if host.startswith("["):
+        end = host.find("]")
+        if end != -1:
+            return host[1:end].strip().lower()
+        return host.strip("[]").lower()
+    # IPv4/hostname with optional port; bare IPv6 (multiple colons) has no port.
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host.strip().lower()
+
+
+def host_header_allowed(host: Optional[str]) -> bool:
+    # DNS-rebinding guard: only loopback hosts are honored. A missing/empty Host
+    # (HTTP/1.0 clients) is treated as local because the listener binds loopback
+    # only, so the connection already originates on this machine. Any non-default
+    # --port passes because the optional :port is stripped before membership.
+    if host is None or not host.strip():
+        return True
+    return _host_from_header(host) in ALLOWED_HOST_HEADERS
+
+
 class AgentCatHandler(BaseHTTPRequestHandler):
     server_version = "AgentCat/1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
+
+    def host_header_ok(self) -> bool:
+        if host_header_allowed(self.headers.get("Host")):
+            return True
+        self.send_json(403, {"error": "forbidden", "message": "host_not_allowed"})
+        return False
 
     def write_response_body(self, body: bytes) -> bool:
         try:
@@ -5396,8 +6699,26 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             return
         self.write_response_body(body)
 
+    def read_json_body(self, max_bytes: int = 256 * 1024) -> Dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length > max_bytes:
+            raise ValueError("request body too large")
+        body = self.rfile.read(length)
+        if not body:
+            return {}
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid_json") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        return payload
+
     def do_GET(self) -> None:
-        if self.path == "/healthz":
+        if not self.host_header_ok():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/healthz":
             body = b"ok\n"
             try:
                 self.send_response(200)
@@ -5408,13 +6729,19 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 return
             self.write_response_body(body)
             return
-        if self.path == "/v1/snapshot":
+        if path == "/v1/config":
+            try:
+                self.send_json(200, connector_config_payload())
+            except Exception as exc:
+                self.send_json(500, {"error": "config_failed", "message": str(exc)})
+            return
+        if path == "/v1/snapshot":
             try:
                 self.send_json(200, snapshot_for_http())
             except Exception as exc:
                 self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return
-        if self.path == "/v1/usage":
+        if path == "/v1/usage":
             try:
                 self.send_json(200, fetch_llm_usage_fresh())
             except Exception as exc:
@@ -5423,15 +6750,46 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
-        if self.path != "/v1/events":
+        if not self.host_header_ok():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/v1/config":
+            try:
+                payload = self.read_json_body()
+                response = merge_connector_config_payload(payload)
+                build_snapshot()
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_config", "message": str(exc)})
+                return
+            except Exception as exc:
+                self.send_json(500, {"error": "config_failed", "message": str(exc)})
+                return
+            self.send_json(200, {"ok": True, **response})
+            return
+
+        if path == "/v1/update/channel":
+            try:
+                payload = self.read_json_body()
+                state = write_update_channel_state(
+                    str(payload.get("channel") or ""),
+                    payload.get("manifest") if isinstance(payload.get("manifest"), dict) else None,
+                )
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_update_channel", "message": str(exc)})
+                return
+            except Exception as exc:
+                self.send_json(500, {"error": "update_channel_failed", "message": str(exc)})
+                return
+            self.send_json(200, {"ok": True, "channel": update_channel_status_snapshot(), "state": state})
+            return
+
+        if path != "/v1/events":
             self.send_json(404, {"error": "not_found"})
             return
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(length)
         try:
-            payload = json.loads(body.decode("utf-8")) if body else {}
-        except json.JSONDecodeError:
-            self.send_json(400, {"error": "invalid_json"})
+            payload = self.read_json_body()
+        except ValueError as exc:
+            self.send_json(400, {"error": "invalid_json", "message": str(exc)})
             return
         provider = str(payload.get("provider") or "unknown")
         source = str(payload.get("source") or "http")
@@ -5440,8 +6798,26 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         self.send_json(201, event)
 
 
+LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def resolve_bind_host(host: Optional[str]) -> str:
+    # Refuse to expose the daemon beyond loopback. A non-loopback host would
+    # make local usage data reachable from the network, so force 127.0.0.1.
+    candidate = (host or "").strip()
+    if candidate.lower() in LOOPBACK_BIND_HOSTS:
+        return candidate
+    print(
+        f"agentcatd refusing non-loopback bind host {candidate!r}; forcing 127.0.0.1",
+        file=sys.stderr,
+        flush=True,
+    )
+    return "127.0.0.1"
+
+
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
+    args.host = resolve_bind_host(getattr(args, "host", "127.0.0.1"))
     build_snapshot()
     threading.Thread(target=snapshot_refresh_loop, args=(60.0,), daemon=True).start()
     update_enabled, _update_reason = auto_update_enabled_status()
@@ -5449,6 +6825,12 @@ def run_daemon(args: argparse.Namespace) -> int:
         threading.Thread(
             target=auto_update_loop,
             args=(float(AUTO_UPDATE_INTERVAL_SECONDS), float(AUTO_UPDATE_INITIAL_DELAY_SECONDS)),
+            daemon=True,
+        ).start()
+    if PRICING_FETCH_INTERVAL_SECONDS > 0:
+        threading.Thread(
+            target=pricing_refresh_loop,
+            args=(float(PRICING_FETCH_INTERVAL_SECONDS), float(PRICING_FETCH_INITIAL_DELAY_SECONDS)),
             daemon=True,
         ).start()
     server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)

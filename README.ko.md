@@ -2,31 +2,49 @@
 
 [English](README.md) | [한국어](README.ko.md)
 
-Agent Cat Connectors는 Agent Cat 메뉴바 앱이 이 Mac에서 실행 중인 Codex, Claude Code, Gemini CLI 활동을 로컬에서 읽을 수 있게 해주는 커넥터입니다.
+Agent Cat Connectors는 Agent Cat 메뉴바 앱이 이 Mac에서 실행 중인 Codex,
+Claude Code, Gemini CLI 및 지원되는 에이전트 도구 활동을 로컬에서 읽을
+수 있게 해주는 커넥터입니다.
 
-작은 로컬 수집기를 설치하고, 데이터는 `~/.agentcat` 아래에 보관합니다. 지원되는 CLI 설정에는 Agent Cat이 관리하는 hook/telemetry 항목을 추가해서 이후 세션부터 활동과 사용량을 보고할 수 있게 합니다. 프롬프트 본문은 원격 서버로 보내지 않습니다.
+작은 로컬 수집기를 설치하고, 데이터는 `~/.agentcat` 아래에 보관합니다.
+지원되는 CLI 설정에는 Agent Cat이 관리하는 hook/telemetry 항목을 추가해서
+이후 세션부터 활동과 사용량을 보고할 수 있게 합니다. 프롬프트 본문은 원격
+서버로 보내지 않습니다. 이 공개 커넥터가 무료 제품의 핵심입니다: 로컬
+모니터링, 넓은 provider 지원, quota 상태, 기본 비용, 예산 cap, 주간 리포트
+입력값을 제공합니다.
 
 ## 설치
 
-Windows PowerShell:
+일반 사용자의 기본 경로는 앱에서 설치하는 것입니다.
+
+1. Agent Cat을 엽니다.
+2. 홈 -> 에이전트 / 커넥터로 이동합니다.
+3. **커넥터 설치**를 누릅니다.
+4. 앱에 실시간 provider 데이터가 뜰 때까지 기다립니다.
+
+앱 주도 설치가 기본입니다. 앱이 어떤 설정을 바꾸는지 설명하고, 롤백 백업을
+남기며, 설치 후 로컬 daemon 상태를 확인하기 때문입니다. 아래 명령어는 개발,
+CI, 원격 지원, 또는 앱 설치 버튼을 열 수 없는 경우의 고급 대체 경로입니다.
+
+고급 Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.ps1 | iex
 ```
 
-macOS/Linux:
+고급 macOS/Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.sh | bash
 ```
 
-클론한 체크아웃에서 실행할 때:
+개발용으로 클론한 체크아웃에서 실행할 때:
 
 ```bash
 ./install.sh
 ```
 
-Windows에서 클론한 체크아웃을 실행할 때:
+Windows에서 개발용 체크아웃을 실행할 때:
 
 ```powershell
 .\install.ps1
@@ -38,7 +56,8 @@ Windows에서 클론한 체크아웃을 실행할 때:
 agentcat snapshot
 ```
 
-설치가 끝난 뒤 Codex, Claude Code, Gemini CLI에 붙여 넣을 수 있는 설정 프롬프트를 복사하려면:
+설치 후 에이전트 런타임에 수동 설정 문구가 필요한 경우 fallback 프롬프트를
+복사하려면:
 
 ```bash
 agentcat setup-prompt

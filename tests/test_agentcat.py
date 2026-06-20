@@ -4,6 +4,9 @@ import datetime as dt
 import json
 import sqlite3
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 import unittest
 from contextlib import closing, redirect_stdout
 from importlib.machinery import SourceFileLoader
@@ -113,11 +116,68 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(merged["shortUsedPercent"], 8.0)
         self.assertEqual(merged["quotas"][0]["remainingPercent"], 87.0)
 
+    def test_connector_config_round_trips_desktop_apps_and_provider_enabled(self) -> None:
+        app_path = self.root / "Applications" / "Claude.app"
+        (app_path / "Contents").mkdir(parents=True)
+        data_root = agentcat.HOME / "Library" / "Application Support" / "Claude"
+        data_root.mkdir(parents=True)
+        (data_root / "usage.json").write_text("{}", encoding="utf-8")
+
+        result = agentcat.merge_connector_config_payload(
+            {
+                "providers": {
+                    "claude": {"enabled": False, "limits": {"week": 1000}},
+                },
+                "desktopApps": {
+                    "claude": {"path": str(app_path)},
+                },
+            }
+        )
+
+        self.assertFalse(result["providers"]["claude"]["enabled"])
+        self.assertEqual(result["providers"]["claude"]["limits"]["week"], 1000)
+        claude_app = result["desktopApps"]["claude"]
+        self.assertEqual(claude_app["path"], str(app_path))
+        self.assertTrue(claude_app["configured"])
+        self.assertEqual(claude_app["status"], "ok")
+        self.assertEqual(claude_app["readableFiles"], 1)
+        self.assertEqual(claude_app["usageImport"], "allowlisted_usage")
+
+    def test_connector_config_rejects_relative_desktop_app_paths(self) -> None:
+        with self.assertRaises(ValueError):
+            agentcat.merge_connector_config_payload(
+                {"desktopApps": {"codex": {"path": "Codex.app"}}}
+            )
+
+    def test_build_snapshot_skips_disabled_provider_and_exposes_desktop_apps(self) -> None:
+        app_path = self.root / "Applications" / "Codex.app"
+        app_path.mkdir(parents=True)
+        agentcat.write_agentcat_settings(
+            {
+                "providers": {"codex": {"enabled": False}},
+                "desktopApps": {"codex": {"path": str(app_path)}},
+            }
+        )
+
+        with patch.object(agentcat, "codex_snapshot", side_effect=AssertionError("codex should be skipped")), \
+             patch.object(agentcat, "claude_snapshot", return_value={"status": "ok", "tokens": {}, "models": {}}), \
+             patch.object(agentcat, "gemini_snapshot", return_value={"status": "ok", "tokens": {}, "models": {}}), \
+             patch.object(agentcat, "opencode_snapshot", return_value={"status": "ok", "tokens": {}, "models": {}}), \
+             patch.object(agentcat, "copilot_snapshot", return_value={"status": "ok", "tokens": {}, "models": {}}):
+            snapshot = agentcat.build_snapshot()
+
+        self.assertEqual(snapshot["providers"]["codex"]["status"], "disabled")
+        self.assertIn("desktopApps", snapshot)
+        self.assertEqual(snapshot["desktopApps"]["codex"]["status"], "installed_no_data")
+        self.assertEqual(snapshot["providers"]["codex"]["desktopApp"]["path"], str(app_path))
+
     def test_codex_usage_api_payload_builds_remaining_quota_entries(self) -> None:
         limits = agentcat.codex_limits_from_usage_response(
             {
                 "plan_type": "pro",
                 "rate_limit": {
+                    "allowed": True,
+                    "limit_reached": False,
                     "primary_window": {
                         "used_percent": 3,
                         "reset_at": 1770000100,
@@ -137,6 +197,17 @@ class AgentCatConnectorTests(unittest.TestCase):
                         },
                     }
                 ],
+                "credits": {
+                    "balance": "0",
+                    "has_credits": False,
+                    "unlimited": False,
+                    "overage_limit_reached": False,
+                    "approx_cloud_messages": [2, 3],
+                    "approx_local_messages": [7],
+                },
+                "rate_limit_reset_credits": {"available_count": 1},
+                "rate_limit_reached_type": {"type": "rate_limit_reached"},
+                "spend_control": {"reached": False},
             }
         )
 
@@ -147,6 +218,70 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["quotas"][0]["remainingPercent"], 97.0)
         self.assertEqual(limits["quotas"][1]["remainingPercent"], 82.0)
         self.assertEqual(limits["quotas"][2]["remainingPercent"], 100.0)
+        self.assertEqual(limits["rateLimitAllowed"], True)
+        self.assertEqual(limits["rateLimitReached"], False)
+        self.assertEqual(limits["rateLimitReachedType"], "rate_limit_reached")
+        self.assertEqual(limits["resetCreditsAvailable"], 1)
+        self.assertEqual(limits["spendControlReached"], False)
+        self.assertEqual(limits["codexCredits"]["approxCloudMessages"], 5)
+        self.assertEqual(limits["codexCredits"]["approxLocalMessages"], 7)
+        self.assertEqual(limits["codexCredits"]["hasCredits"], False)
+
+    def test_codex_reset_credit_details_are_sanitized(self) -> None:
+        limits = {}
+        agentcat.merge_codex_reset_credit_details(
+            limits,
+            {
+                "available_count": 2,
+                "credits": [
+                    {
+                        "id": "secret-credit-id",
+                        "profile_user_id": "friend-user-id",
+                        "profile_image_url": "https://example.test/avatar.png",
+                        "status": "available",
+                        "title": "One rate limit reset",
+                        "description": "Ready to redeem",
+                        "reset_type": "rate_limit",
+                        "expires_at": "2026-07-01T00:00:00Z",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(limits["resetCreditsAvailable"], 2)
+        self.assertEqual(limits["resetCredits"][0]["status"], "available")
+        self.assertEqual(limits["resetCredits"][0]["title"], "One rate limit reset")
+        self.assertNotIn("id", limits["resetCredits"][0])
+        self.assertNotIn("profile_user_id", limits["resetCredits"][0])
+        self.assertNotIn("profile_image_url", limits["resetCredits"][0])
+
+    def test_codex_live_limits_tries_wham_before_refresh_after_codex_403(self) -> None:
+        (agentcat.HOME / ".codex").mkdir(parents=True)
+        (agentcat.HOME / ".codex" / "auth.json").write_text(
+            json.dumps({"tokens": {"access_token": "access", "refresh_token": "refresh", "account_id": "acct"}}),
+            encoding="utf-8",
+        )
+
+        def usage_side_effect(_access: str, _account: str, url: str) -> dict:
+            if url.endswith("/codex/usage"):
+                raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+            return {
+                "plan_type": "pro",
+                "rate_limit": {"primary_window": {"used_percent": 20, "reset_at": 1770000000}},
+                "rate_limit_reset_credits": {"available_count": 1},
+                "credits": {"approx_cloud_messages": [0], "approx_local_messages": [0]},
+            }
+
+        with patch.object(agentcat, "CODEX_USAGE_URLS", ("https://chatgpt.com/backend-api/codex/usage", "https://chatgpt.com/backend-api/wham/usage")), \
+            patch.object(agentcat, "codex_usage_request", side_effect=usage_side_effect), \
+            patch.object(agentcat, "codex_reset_credits_request", return_value={"available_count": 2, "credits": []}), \
+            patch.object(agentcat, "refresh_codex_access_token", side_effect=AssertionError("refresh should wait until all usage URLs fail")):
+            limits = agentcat.codex_live_limits()
+
+        self.assertEqual(limits["source"], "https://chatgpt.com/backend-api/wham/usage")
+        self.assertEqual(limits["resetCreditsAvailable"], 2)
+        self.assertEqual(limits["codexCredits"]["approxCloudMessages"], 0)
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 80.0)
 
     def test_claude_usage_api_payload_builds_weekly_and_monthly_remaining(self) -> None:
         limits = agentcat.claude_limits_from_usage_response(
@@ -310,9 +445,90 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("update", snapshot)
         self.assertIn("activity.memory", snapshot["capabilities"])
         self.assertIn("connector.autoUpdate", snapshot["capabilities"])
+        self.assertIn("connector.channel", snapshot["capabilities"])
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
         self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
+        self.assertEqual(snapshot["update"]["channel"]["channel"], "public")
+
+    def test_update_channel_manifest_validation_and_snapshot_status(self) -> None:
+        manifest = {
+            "version": "26.25.0",
+            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.25.0",
+            "sha256": "a" * 64,
+            "minAppVersion": "26.25.0",
+            "channel": "pro",
+        }
+
+        state = agentcat.write_update_channel_state("pro", manifest)
+        status = agentcat.update_channel_status_snapshot()
+
+        self.assertEqual(state["status"], "manifest_ready")
+        self.assertEqual(state["installStatus"], "pending_install")
+        self.assertEqual(status["channel"], "pro")
+        self.assertEqual(status["targetVersion"], "26.25.0")
+        self.assertEqual(status["installStatus"], "pending_install")
+        self.assertTrue(agentcat.update_channel_state_file().exists())
+
+    def test_update_channel_rejects_insecure_or_bad_manifest(self) -> None:
+        manifest = {
+            "version": "26.25.0",
+            "downloadUrl": "http://api.agentcat.app/v1/pro/connector/download/26.25.0",
+            "sha256": "a" * 64,
+            "channel": "pro",
+        }
+
+        with self.assertRaises(ValueError):
+            agentcat.write_update_channel_state("pro", manifest)
+
+        manifest["downloadUrl"] = "https://api.agentcat.app/v1/pro/connector/download/26.25.0"
+        manifest["sha256"] = "A" * 64
+        with self.assertRaises(ValueError):
+            agentcat.write_update_channel_state("pro", manifest)
+
+    def test_update_channel_public_clears_pro_manifest_state(self) -> None:
+        manifest = {
+            "version": "26.25.0",
+            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.25.0",
+            "sha256": "b" * 64,
+            "channel": "pro",
+        }
+
+        agentcat.write_update_channel_state("pro", manifest)
+        state = agentcat.write_update_channel_state("public")
+
+        self.assertEqual(state["channel"], "public")
+        self.assertNotIn("manifest", state)
+        self.assertEqual(agentcat.update_channel_status_snapshot()["installStatus"], "current")
+
+    def test_http_update_channel_endpoint_persists_manifest(self) -> None:
+        server = agentcat.ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            manifest = {
+                "version": "26.25.0",
+                "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.25.0",
+                "sha256": "c" * 64,
+                "channel": "pro",
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/update/channel",
+                data=json.dumps({"channel": "pro", "manifest": manifest}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Host": "127.0.0.1"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=2.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["channel"]["channel"], "pro")
+        self.assertEqual(agentcat.update_channel_status_snapshot()["targetVersion"], "26.25.0")
 
     def test_connector_version_parser_and_comparison(self) -> None:
         text = 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.10")'
@@ -329,6 +545,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             "AGENTCAT_AUTO_UPDATE": "1",
             "AGENTCAT_CONNECTOR_VERSION": "",
             "AGENTCAT_CONNECTORS_DIR": str(install_dir),
+            "AGENTCAT_INSTALL_SH_SHA256": "a" * 64,
         }), \
                 patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
                 patch.object(agentcat, "fetch_remote_connector_version", return_value="99.0.0"), \
@@ -345,6 +562,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             "AGENTCAT_AUTO_UPDATE": "1",
             "AGENTCAT_CONNECTOR_VERSION": "",
             "AGENTCAT_CONNECTORS_DIR": str(agentcat.AGENTCAT_HOME / "connectors"),
+            "AGENTCAT_INSTALL_SH_SHA256": "a" * 64,
         }), \
                 patch.object(agentcat, "current_connector_repo_dir", return_value=self.root / "dev"):
             state = agentcat.check_auto_update_once(apply_update=True)
@@ -498,7 +716,10 @@ class AgentCatConnectorTests(unittest.TestCase):
     def test_claude_snapshot_adds_periods_to_daily_model_tokens(self) -> None:
         claude_dir = agentcat.HOME / ".claude"
         claude_dir.mkdir(parents=True)
-        today = dt.datetime.now(dt.timezone.utc).date()
+        # Claude dailyModelTokens dates are LOCAL calendar days, and periods
+        # bucket "today" on the local date — so the fixture must use the local
+        # date, not UTC (which only coincide outside the KST-morning window).
+        today = dt.datetime.now().date()
         old = today - dt.timedelta(days=45)
         stats = {
             "dailyModelTokens": [
@@ -529,6 +750,55 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["week"], 100)
         self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["all"], 150)
         self.assertEqual(snapshot["models"]["unknown"]["week"], 9)
+
+    def test_periods_today_matches_daily_today_across_utc_local_boundary(self) -> None:
+        # Regression: add_to_periods bucketed "today" on the UTC date while
+        # add_to_daily buckets on the LOCAL date. Near midnight (when UTC and
+        # local calendar dates differ) the period "today" total and the daily
+        # today bucket disagreed. Both must now key on the LOCAL date.
+        import os
+        import time
+
+        if not hasattr(time, "tzset"):
+            self.skipTest("requires POSIX tzset")
+
+        old_tz = os.environ.get("TZ")
+        # UTC+14: an instant at 23:00 UTC lands on the *next* local calendar day,
+        # so its UTC date and local date differ.
+        os.environ["TZ"] = "Pacific/Kiritimati"
+        time.tzset()
+        try:
+            fixed_now = dt.datetime(2026, 6, 18, 23, 30, tzinfo=dt.timezone.utc)
+            # An event 30 minutes earlier: still the same LOCAL "today" as now,
+            # but its UTC date (2026-06-18) differs from the local date
+            # (2026-06-19).
+            when = dt.datetime(2026, 6, 18, 23, 0, tzinfo=dt.timezone.utc)
+            self.assertNotEqual(when.date(), when.astimezone().date())
+            self.assertEqual(when.astimezone().date(), fixed_now.astimezone().date())
+
+            class _FixedNow(dt.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return fixed_now if tz is None else fixed_now.astimezone(tz)
+
+            periods: dict = {}
+            daily: dict = {}
+            with patch.object(agentcat.dt, "datetime", _FixedNow):
+                agentcat.add_to_periods(periods, 100, when)
+                agentcat.add_to_daily(daily, 100, when)
+                today_key = agentcat.day_key_for_timestamp(fixed_now)
+
+            # The event counts toward "today" (local) in periods...
+            self.assertEqual(periods["today"], 100)
+            # ...and lands in the local today bucket of daily, and they agree.
+            self.assertEqual(daily[today_key], 100)
+            self.assertEqual(periods["today"], daily[today_key])
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
 
     def test_claude_snapshot_prefers_jsonl_usage_over_stale_stats_cache(self) -> None:
         claude_dir = agentcat.HOME / ".claude"
@@ -608,6 +878,63 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(model["week"], 15)
         self.assertEqual(model["all"], 15)
         self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 15)
+
+    def test_claude_snapshot_reads_desktop_local_agent_usage_allowlist(self) -> None:
+        project_dir = (
+            agentcat.HOME
+            / "Library"
+            / "Application Support"
+            / "Claude"
+            / "local-agent-mode-sessions"
+            / "account"
+            / "workspace"
+            / "local-session"
+            / ".claude"
+            / "projects"
+            / "desktop-project"
+        )
+        project_dir.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        session_path = project_dir / "session.jsonl"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "timestamp": now.isoformat().replace("+00:00", "Z"),
+                    "cwd": "/Users/tester/work/desktop-app",
+                    "requestId": "desktop_req_1",
+                    "message": {
+                        "id": "desktop_msg_1",
+                        "model": "claude-sonnet-4-6",
+                        "content": [
+                            {"type": "text", "text": "must never be emitted"},
+                            {"type": "tool_use", "input": {"prompt": "must never be emitted"}},
+                        ],
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 20,
+                            "cache_read_input_tokens": 30,
+                            "cache_creation_input_tokens": 40,
+                        },
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 100)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 20)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 30)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 40)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 190)
+        self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["all"], 190)
+        self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 190)
+        cursor = json.loads(agentcat.JOURNAL_CURSOR_FILE.read_text(encoding="utf-8"))
+        self.assertIn(str(session_path), cursor["offsets"])
+        self.assertNotIn("must never be emitted", json.dumps(cursor, ensure_ascii=False))
 
     def test_claude_snapshot_deduplicates_repeated_request_usage(self) -> None:
         project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"
@@ -723,6 +1050,102 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["models"]["claude-sonnet-4-6"]["all"], 48)
         self.assertEqual(rebuilt_cursor["version"], agentcat.CLAUDE_JOURNAL_CURSOR_VERSION)
         self.assertIn("request:req_legacy", rebuilt_cursor["usageRecords"])
+
+    @staticmethod
+    def _project_daily_providers(tokens: int, path: str = "/Users/tester/work/repo") -> dict:
+        return {
+            "claude": {
+                "status": "ok",
+                "projects": {
+                    "status": "ok",
+                    "items": [
+                        {
+                            "id": path,
+                            "path": path,
+                            "name": agentcat.display_project_name(path),
+                            "tokens": tokens,
+                        }
+                    ],
+                },
+            }
+        }
+
+    def test_project_daily_books_cumulative_growth_to_local_today(self) -> None:
+        today = dt.datetime.now(dt.timezone.utc).astimezone().date().isoformat()
+
+        first = agentcat.update_project_daily(self._project_daily_providers(100))
+        second = agentcat.update_project_daily(self._project_daily_providers(160))
+
+        self.assertEqual(first, {})
+        self.assertEqual(second, {today: {"repo": 60}})
+        ledger = json.loads(agentcat.project_daily_file().read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {today: {"repo": 60}})
+        self.assertNotIn("/Users/tester/work/repo", ledger[today])
+        state = json.loads(agentcat.project_daily_state_file().read_text(encoding="utf-8"))
+        self.assertEqual(state["baselines"]["claude|/Users/tester/work/repo"], 160)
+
+    def test_project_daily_counter_reset_books_no_negative_delta(self) -> None:
+        today = dt.datetime.now(dt.timezone.utc).astimezone().date().isoformat()
+        agentcat.update_project_daily(self._project_daily_providers(100))
+        agentcat.update_project_daily(self._project_daily_providers(160))
+
+        after_reset = agentcat.update_project_daily(self._project_daily_providers(40))
+        resumed = agentcat.update_project_daily(self._project_daily_providers(50))
+
+        self.assertEqual(after_reset, {today: {"repo": 60}})
+        self.assertEqual(resumed, {today: {"repo": 70}})
+        state = json.loads(agentcat.project_daily_state_file().read_text(encoding="utf-8"))
+        self.assertEqual(state["baselines"]["claude|/Users/tester/work/repo"], 50)
+
+    def test_project_daily_sums_provider_deltas_into_one_label(self) -> None:
+        today = dt.datetime.now(dt.timezone.utc).astimezone().date().isoformat()
+        path = "/Users/tester/work/repo"
+
+        def providers(claude_tokens: int, codex_tokens: int) -> dict:
+            merged = self._project_daily_providers(claude_tokens, path)
+            merged["codex"] = self._project_daily_providers(codex_tokens, path)["claude"]
+            return merged
+
+        agentcat.update_project_daily(providers(100, 30))
+        booked = agentcat.update_project_daily(providers(150, 50))
+
+        self.assertEqual(booked, {today: {"repo": 70}})
+
+    def test_project_daily_prunes_days_beyond_retention(self) -> None:
+        today_date = dt.datetime.now(dt.timezone.utc).astimezone().date()
+        old_day = (today_date - dt.timedelta(days=agentcat.PROJECT_DAILY_RETENTION_DAYS + 5)).isoformat()
+        kept_day = (today_date - dt.timedelta(days=30)).isoformat()
+        agentcat.write_json_atomic(
+            agentcat.project_daily_file(),
+            {old_day: {"repo": 5}, kept_day: {"repo": 7}, "not-a-day": {"repo": 9}},
+        )
+
+        snapshot_slice = agentcat.update_project_daily({})
+
+        ledger = json.loads(agentcat.project_daily_file().read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {kept_day: {"repo": 7}})
+        self.assertEqual(snapshot_slice, {})
+
+    def test_project_daily_snapshot_slice_is_capped_to_fourteen_days(self) -> None:
+        today_date = dt.datetime.now(dt.timezone.utc).astimezone().date()
+        inside = (today_date - dt.timedelta(days=agentcat.PROJECT_DAILY_SNAPSHOT_DAYS - 1)).isoformat()
+        outside = (today_date - dt.timedelta(days=agentcat.PROJECT_DAILY_SNAPSHOT_DAYS)).isoformat()
+        agentcat.write_json_atomic(
+            agentcat.project_daily_file(),
+            {inside: {"repo": 3}, outside: {"repo": 4}},
+        )
+
+        snapshot_slice = agentcat.update_project_daily({})
+
+        self.assertEqual(snapshot_slice, {inside: {"repo": 3}})
+        ledger = json.loads(agentcat.project_daily_file().read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {inside: {"repo": 3}, outside: {"repo": 4}})
+
+    def test_build_snapshot_exposes_projects_daily_and_capability(self) -> None:
+        snapshot = agentcat.build_snapshot()
+
+        self.assertIn("projects.daily", snapshot["capabilities"])
+        self.assertIsInstance(snapshot.get("projectsDaily"), dict)
 
     def test_gemini_snapshot_reads_otel_token_metrics(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
@@ -841,7 +1264,10 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertTrue(agentcat.GEMINI_USAGE_CACHE.exists())
         self.assertTrue(agentcat.ANTIGRAVITY_USAGE_CACHE.exists())
 
-    def test_split_google_cli_snapshots_infers_antigravity_from_history_days(self) -> None:
+    def test_split_google_cli_snapshots_does_not_borrow_gemini_tokens_for_antigravity(self) -> None:
+        # Antigravity bills server-side and never writes a local telemetry outfile,
+        # so it must stay a SEPARATE provider with empty tokens — Gemini-CLI usage
+        # is never inferred onto it, even when Antigravity history/activity exists.
         agentcat.ANTIGRAVITY_CLI_DIR.mkdir(parents=True)
         now = dt.datetime.now(dt.timezone.utc)
         today = agentcat.day_key_for_timestamp(now)
@@ -889,19 +1315,22 @@ class AgentCatConnectorTests(unittest.TestCase):
             {"countsByProvider": {"gemini": 0, "antigravity": 1}},
         )
 
-        self.assertEqual(gemini_provider["tokens"]["totalTokens"], 100)
-        self.assertEqual(gemini_provider["tokens"]["inputTokens"], 70)
-        self.assertEqual(gemini_provider["tokens"]["outputTokens"], 30)
-        self.assertEqual(gemini_provider["dailyTokens"], {yesterday: 100})
-        self.assertEqual(antigravity_provider["status"], "ok")
-        self.assertEqual(antigravity_provider["tokens"]["totalTokens"], 200)
-        self.assertEqual(antigravity_provider["tokens"]["inputTokens"], 140)
-        self.assertEqual(antigravity_provider["tokens"]["outputTokens"], 60)
-        self.assertEqual(antigravity_provider["dailyTokens"], {today: 200})
-        self.assertEqual(antigravity_provider["models"]["gemini-test"]["all"], 200)
-        self.assertEqual(antigravity_provider["models"]["gemini-test"]["inputTokens"], 140)
-        self.assertEqual(antigravity_provider["models"]["gemini-test"]["outputTokens"], 60)
-        self.assertEqual(antigravity_provider["sourceAttribution"], "inferred-from-gemini-telemetry")
+        # Gemini keeps the full, real usage — no day was split off to Antigravity.
+        self.assertEqual(gemini_provider["tokens"]["totalTokens"], 300)
+        self.assertEqual(gemini_provider["tokens"]["inputTokens"], 210)
+        self.assertEqual(gemini_provider["tokens"]["outputTokens"], 90)
+        self.assertEqual(gemini_provider["dailyTokens"], {yesterday: 100, today: 200})
+
+        # Antigravity is its own provider, but empty and honest — no Gemini tokens.
+        self.assertEqual(antigravity_provider["providerLabel"], "Antigravity")
+        self.assertEqual(antigravity_provider["displayName"], "Antigravity")
+        self.assertEqual(antigravity_provider["canonicalProvider"], "google")
+        self.assertEqual(antigravity_provider["status"], "no_telemetry_yet")
+        self.assertEqual(antigravity_provider["tokens"], {})
+        self.assertEqual(antigravity_provider["models"], {})
+        self.assertEqual(antigravity_provider["dailyTokens"], {})
+        self.assertEqual(antigravity_provider["events"], 0)
+        self.assertNotEqual(antigravity_provider["sourceAttribution"], "inferred-from-gemini-telemetry")
 
     def test_gemini_snapshot_distributes_cumulative_counter_deltas_by_day(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
@@ -1612,6 +2041,213 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("skills/agentcat-usage", prompt)
         self.assertIn("Never store or report prompt text", prompt)
 
+    def test_host_header_allow_list_accepts_loopback_any_port(self) -> None:
+        for host in (
+            "127.0.0.1",
+            "127.0.0.1:8765",
+            "127.0.0.1:9999",  # non-default --port must pass (port is stripped)
+            "localhost",
+            "localhost:8765",
+            "localhost:12345",
+            "::1",
+            "[::1]",
+            "[::1]:8765",
+            "[::1]:54321",
+            "LOCALHOST:8765",
+            # Missing/empty Host is treated as local: the listener binds loopback
+            # only, so the connection already originates on this machine.
+            "",
+            None,
+        ):
+            self.assertTrue(agentcat.host_header_allowed(host), host)
+
+    def test_host_header_allow_list_rejects_rebinding(self) -> None:
+        for host in (
+            "evil.example.com",
+            "attacker.local:8765",
+            "192.168.1.10:8765",
+            "127.0.0.1.evil.com",
+        ):
+            self.assertFalse(agentcat.host_header_allowed(host), host)
+
+    def test_http_get_rejects_foreign_host_header_with_403(self) -> None:
+        server = agentcat.ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/healthz",
+                headers={"Host": "attacker.example.com"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(request, timeout=2.0)
+            self.assertEqual(ctx.exception.code, 403)
+
+            ok_request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/healthz",
+                headers={"Host": "127.0.0.1"},
+            )
+            with urllib.request.urlopen(ok_request, timeout=2.0) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), b"ok\n")
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+    def test_resolve_bind_host_forces_loopback(self) -> None:
+        self.assertEqual(agentcat.resolve_bind_host("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(agentcat.resolve_bind_host("::1"), "::1")
+        self.assertEqual(agentcat.resolve_bind_host("localhost"), "localhost")
+        self.assertEqual(agentcat.resolve_bind_host("0.0.0.0"), "127.0.0.1")
+        self.assertEqual(agentcat.resolve_bind_host("192.168.0.5"), "127.0.0.1")
+        self.assertEqual(agentcat.resolve_bind_host(""), "127.0.0.1")
+
+    def test_free_channel_auto_update_off_by_default(self) -> None:
+        with patch.dict(agentcat.os.environ, {}, clear=False):
+            agentcat.os.environ.pop("AGENTCAT_AUTO_UPDATE", None)
+            agentcat.os.environ.pop("AGENTCAT_INSTALL_SH_SHA256", None)
+            agentcat.os.environ.pop("AGENTCAT_CONNECTOR_VERSION", None)
+            enabled, reason = agentcat.auto_update_enabled_status()
+        self.assertFalse(enabled)
+        self.assertIn("off by default", reason)
+
+    def test_free_channel_opt_in_requires_pinned_digest(self) -> None:
+        install_dir = (agentcat.AGENTCAT_HOME / "connectors").resolve()
+        with patch.dict(agentcat.os.environ, {
+            "AGENTCAT_AUTO_UPDATE": "1",
+            "AGENTCAT_CONNECTOR_VERSION": "",
+            "AGENTCAT_CONNECTORS_DIR": str(install_dir),
+        }), patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir):
+            agentcat.os.environ.pop("AGENTCAT_INSTALL_SH_SHA256", None)
+            enabled, reason = agentcat.auto_update_enabled_status()
+            self.assertFalse(enabled)
+            self.assertIn("pinned install.sh digest", reason)
+
+            agentcat.os.environ["AGENTCAT_INSTALL_SH_SHA256"] = "a" * 64
+            enabled_ok, _ = agentcat.auto_update_enabled_status()
+            self.assertTrue(enabled_ok)
+
+    def test_start_auto_update_install_verifies_digest_before_exec(self) -> None:
+        body = b"#!/bin/sh\necho hardened\n"
+        good = agentcat.hashlib.sha256(body).hexdigest()
+
+        class FakeResp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+            def read(self_inner, _n=None):
+                return body
+
+        with patch.dict(agentcat.os.environ, {"AGENTCAT_INSTALL_SH_SHA256": "b" * 64}), \
+                patch.object(agentcat.urllib.request, "urlopen", return_value=FakeResp()):
+            with self.assertRaises(ValueError) as ctx:
+                agentcat.start_auto_update_install("99.0.0")
+            self.assertIn("digest mismatch", str(ctx.exception))
+
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return type("Proc", (), {"pid": 4242})()
+
+        with patch.dict(agentcat.os.environ, {"AGENTCAT_INSTALL_SH_SHA256": good}), \
+                patch.object(agentcat.urllib.request, "urlopen", return_value=FakeResp()), \
+                patch.object(agentcat.subprocess, "Popen", side_effect=fake_popen):
+            proc = agentcat.start_auto_update_install("99.0.0")
+
+        self.assertEqual(proc.pid, 4242)
+        # Verified bytes are executed from a local file, never piped from curl.
+        script_name = "auto-update-install.ps1" if agentcat.IS_WINDOWS else "auto-update-install.sh"
+        script_path = agentcat.AGENTCAT_HOME / script_name
+        self.assertTrue(script_path.exists())
+        self.assertEqual(script_path.read_bytes(), body)
+        command_text = " ".join(str(part) for part in captured["cmd"]).lower()
+        self.assertNotIn("curl", command_text)
+        self.assertNotIn("irm", command_text)
+        self.assertNotIn("iex", command_text)
+
+    def test_sanitize_payload_redacts_path_and_secret_values(self) -> None:
+        sanitized = agentcat.sanitize_payload(
+            {
+                "note": "/Users/alice/Projects/secret-repo/file.py",
+                "label": "deploy",
+                "token": "sk-ant-api03-abcdefgh12345678",
+                "level": "high",
+                "version": "26.25.0",
+                "generatedAt": "2026-05-01T00:00:00Z",
+            }
+        )
+        self.assertEqual(sanitized["note"], "[redacted]")
+        self.assertEqual(sanitized["token"], "[redacted]")
+        self.assertEqual(sanitized["label"], "deploy")
+        self.assertEqual(sanitized["level"], "high")
+        self.assertEqual(sanitized["version"], "26.25.0")
+        self.assertEqual(sanitized["generatedAt"], "2026-05-01T00:00:00Z")
+
+    def test_sanitize_payload_redacts_command_and_args_keys(self) -> None:
+        sanitized = agentcat.sanitize_payload(
+            {
+                "command": "rm -rf /tmp/x",
+                "description": "private description",
+                "title": "private title",
+                "args": ["--secret", "value"],
+                "text": "free text body",
+                "context_window": {"context_window_size": 1000000},
+            }
+        )
+        self.assertEqual(sanitized["command"], "[redacted]")
+        self.assertEqual(sanitized["description"], "[redacted]")
+        self.assertEqual(sanitized["title"], "[redacted]")
+        self.assertEqual(sanitized["args"], "[redacted]")
+        self.assertEqual(sanitized["text"], "[redacted]")
+        # context_window must survive — it is legitimate usage metadata.
+        self.assertEqual(sanitized["context_window"]["context_window_size"], 1000000)
+
+    def test_sanitize_payload_redacts_compound_prompt_keys_keeps_metric_keys(self) -> None:
+        # Compound prompt-bearing keys redact via a whole-token match (not just
+        # the bare key); numeric metadata that merely contains a sensitive token
+        # survives (a count/size is not the content).
+        sanitized = agentcat.sanitize_payload(
+            {
+                "user_message": "hello there",
+                "assistant_message": "hi back",
+                "system_prompt": "you are a helpful assistant",
+                "message_count": 12,
+                "command_count": 3,
+                "path_segments": 4,
+                "content_length": 900,
+            }
+        )
+        self.assertEqual(sanitized["user_message"], "[redacted]")
+        self.assertEqual(sanitized["assistant_message"], "[redacted]")
+        self.assertEqual(sanitized["system_prompt"], "[redacted]")
+        self.assertEqual(sanitized["message_count"], 12)
+        self.assertEqual(sanitized["command_count"], 3)
+        self.assertEqual(sanitized["path_segments"], 4)
+        self.assertEqual(sanitized["content_length"], 900)
+
+    @unittest.skipIf(agentcat.IS_WINDOWS, "POSIX file permissions only")
+    def test_ensure_dirs_tightens_permissions(self) -> None:
+        import os as _os
+        import stat as _stat
+
+        agentcat.init_db()
+        agentcat.store_event("claude", "test", "ping", {"ok": True})
+
+        home_mode = _stat.S_IMODE(_os.stat(agentcat.AGENTCAT_HOME).st_mode)
+        self.assertEqual(home_mode, 0o700)
+        db_mode = _stat.S_IMODE(_os.stat(agentcat.EVENTS_DB).st_mode)
+        self.assertEqual(db_mode, 0o600)
+
+        agentcat.write_json_atomic(agentcat.LATEST_SNAPSHOT, {"ok": True})
+        snap_mode = _stat.S_IMODE(_os.stat(agentcat.LATEST_SNAPSHOT).st_mode)
+        self.assertEqual(snap_mode, 0o600)
+
 
 class InsightsIntegrationTests(unittest.TestCase):
     """Slice C — build_snapshot() includes insights, schema is v3."""
@@ -1703,9 +2339,42 @@ class InsightsIntegrationTests(unittest.TestCase):
         finally:
             self._stop(patches)
 
+    def test_build_snapshot_includes_pricing_block(self) -> None:
+        patches = self._stub_providers({
+            "codex": {"status": "ok", "tokens": {}, "models": {}},
+            "claude": {"status": "ok", "tokens": {}, "models": {}},
+            "gemini": {"status": "ok", "tokens": {}, "models": {}},
+            "opencode": {"status": "not_found"},
+            "copilot": {"status": "not_found"},
+        })
+        try:
+            with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
+                snap = agentcat.build_snapshot()
+            # No pricing cache in the temp AGENTCAT_HOME -> bundled fallback.
+            self.assertEqual(snap["pricing"], {"source": "bundled", "fetchedAt": None})
+        finally:
+            self._stop(patches)
+
 
 class InsightsTests(unittest.TestCase):
     """Slice B — derive_insights() port of Swift AgentInsights.derive()."""
+
+    def setUp(self) -> None:
+        # Hermetic pricing: ignore any real ~/.agentcat/pricing-cache.json so
+        # bundled MODEL_PRICING rates drive the cost assertions below.
+        self.pricing_tmp = tempfile.TemporaryDirectory()
+        self._pricing_cache_patch = patch.object(
+            agentcat,
+            "pricing_cache_file",
+            return_value=Path(self.pricing_tmp.name) / "pricing-cache.json",
+        )
+        self._pricing_cache_patch.start()
+        agentcat._PRICING_TABLE_MEMO = None
+
+    def tearDown(self) -> None:
+        self._pricing_cache_patch.stop()
+        agentcat._PRICING_TABLE_MEMO = None
+        self.pricing_tmp.cleanup()
 
     def _snapshot(self, **providers) -> dict:
         return {"providers": providers}
@@ -1856,6 +2525,23 @@ class InsightsTests(unittest.TestCase):
 class PricingTests(unittest.TestCase):
     """Slice A — split-bucket pricing module."""
 
+    def setUp(self) -> None:
+        # Hermetic pricing: ignore any real ~/.agentcat/pricing-cache.json so
+        # bundled MODEL_PRICING rates drive the cost assertions below.
+        self.pricing_tmp = tempfile.TemporaryDirectory()
+        self._pricing_cache_patch = patch.object(
+            agentcat,
+            "pricing_cache_file",
+            return_value=Path(self.pricing_tmp.name) / "pricing-cache.json",
+        )
+        self._pricing_cache_patch.start()
+        agentcat._PRICING_TABLE_MEMO = None
+
+    def tearDown(self) -> None:
+        self._pricing_cache_patch.stop()
+        agentcat._PRICING_TABLE_MEMO = None
+        self.pricing_tmp.cleanup()
+
     def test_known_model_returns_split_cost(self) -> None:
         cost = agentcat.estimate_cost(
             "claude-opus-4-7",
@@ -1912,6 +2598,189 @@ class PricingTests(unittest.TestCase):
             cache_read_tokens=0, cache_write_tokens=0,
         )
         self.assertEqual(cost["total"], 0.0)
+
+
+class PricingFeedTests(unittest.TestCase):
+    """LiteLLM pricing feed — conversion, tiers, merge precedence, fallback."""
+
+    # Small offline stand-in for model_prices_and_context_window.json. Key
+    # names verified against a live sample during development; tests never
+    # touch the network.
+    LITELLM_FIXTURE = {
+        "sample_spec": {
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+        },
+        "gpt-test": {
+            "input_cost_per_token": 2e-06,
+            "output_cost_per_token": 8e-06,
+            "cache_read_input_token_cost": 5e-07,
+            "mode": "chat",
+        },
+        "anthropic/claude-test": {
+            "input_cost_per_token": 3e-06,
+            "output_cost_per_token": 1.5e-05,
+            "cache_read_input_token_cost": 3e-07,
+            "cache_creation_input_token_cost": 3.75e-06,
+            "input_cost_per_token_above_200k_tokens": 6e-06,
+            "output_cost_per_token_above_200k_tokens": 2.25e-05,
+            "cache_read_input_token_cost_above_200k_tokens": 6e-07,
+            "cache_creation_input_token_cost_above_200k_tokens": 7.5e-06,
+            "cache_creation_input_token_cost_above_1hr": 1e-05,
+            "mode": "chat",
+        },
+        "text-embedding-test": {
+            "input_cost_per_token": 1e-07,
+            "output_cost_per_token": 0.0,
+            "mode": "embedding",
+        },
+        "gpt-5": {
+            "input_cost_per_token": 9e-06,
+            "output_cost_per_token": 9e-05,
+        },
+    }
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache_path = Path(self.tmp.name) / "pricing-cache.json"
+        self._cache_patch = patch.object(
+            agentcat, "pricing_cache_file", return_value=self.cache_path
+        )
+        self._cache_patch.start()
+        agentcat._PRICING_TABLE_MEMO = None
+
+    def tearDown(self) -> None:
+        self._cache_patch.stop()
+        agentcat._PRICING_TABLE_MEMO = None
+        self.tmp.cleanup()
+
+    def _write_cache(self, fetched_at=None) -> dict:
+        payload = {
+            "fetchedAt": fetched_at or agentcat.now_iso(),
+            "models": agentcat.litellm_price_table(self.LITELLM_FIXTURE),
+        }
+        agentcat.write_json_atomic(self.cache_path, payload)
+        return payload
+
+    def test_per_token_rates_convert_to_per_million(self) -> None:
+        table = agentcat.litellm_price_table(self.LITELLM_FIXTURE)
+        self.assertAlmostEqual(table["gpt-test"]["input"], 2.0)
+        self.assertAlmostEqual(table["gpt-test"]["output"], 8.0)
+        self.assertAlmostEqual(table["gpt-test"]["cache_read"], 0.5)
+        self.assertNotIn("cache_write", table["gpt-test"])
+
+    def test_tier_keys_parse_from_fixture(self) -> None:
+        table = agentcat.litellm_price_table(self.LITELLM_FIXTURE)
+        entry = table["anthropic/claude-test"]
+        self.assertEqual(len(entry["tiers"]), 1)
+        tier = entry["tiers"][0]
+        self.assertEqual(tier["threshold"], 200_000)
+        self.assertAlmostEqual(tier["input"], 6.0)
+        self.assertAlmostEqual(tier["output"], 22.5)
+        self.assertAlmostEqual(tier["cache_read"], 0.6)
+        self.assertAlmostEqual(tier["cache_write"], 7.5)
+        # The time-based "_above_1hr" cache TTL key must not become a tier:
+        # 200k is the only threshold parsed from the fixture.
+        self.assertEqual([t["threshold"] for t in entry["tiers"]], [200_000])
+        # Provider-prefixed keys register their basename as an alias.
+        self.assertEqual(table["claude-test"], entry)
+
+    def test_skips_sample_spec_and_models_without_chat_rates(self) -> None:
+        table = agentcat.litellm_price_table(self.LITELLM_FIXTURE)
+        self.assertNotIn("sample_spec", table)
+        self.assertNotIn("text-embedding-test", table)
+
+    def test_no_cache_no_network_falls_back_to_bundled(self) -> None:
+        with patch.object(agentcat, "_fetch_litellm_raw", side_effect=OSError("offline")):
+            state = agentcat.refresh_litellm_pricing(force=True)
+        self.assertEqual(state["status"], "error")
+        self.assertFalse(self.cache_path.exists())
+        _table, meta = agentcat.merged_pricing_table()
+        self.assertEqual(meta, {"source": "bundled", "fetchedAt": None})
+        cost = agentcat.estimate_cost("gpt-5", 1_000_000, 0, 0, 0)
+        self.assertAlmostEqual(cost["input"], agentcat.MODEL_PRICING["gpt-5"]["input"])
+
+    def test_merge_precedence_litellm_wins_and_bundled_fills_gaps(self) -> None:
+        payload = self._write_cache()
+        table, meta = agentcat.merged_pricing_table()
+        self.assertEqual(meta["source"], "litellm")
+        self.assertEqual(meta["fetchedAt"], payload["fetchedAt"])
+        # LiteLLM rate overrides the stale bundled gpt-5 entry...
+        self.assertAlmostEqual(table["gpt-5"]["input"], 9.0)
+        self.assertAlmostEqual(
+            agentcat.estimate_cost("gpt-5", 1_000_000, 0, 0, 0)["input"], 9.0
+        )
+        # ...while bundled stays for models LiteLLM lacks.
+        self.assertAlmostEqual(
+            table["claude-haiku-4-5"]["input"],
+            agentcat.MODEL_PRICING["claude-haiku-4-5"]["input"],
+        )
+
+    def test_fetch_failure_keeps_existing_cache(self) -> None:
+        stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat().replace("+00:00", "Z")
+        self._write_cache(fetched_at=stale)
+        with patch.object(agentcat, "_fetch_litellm_raw", side_effect=OSError("offline")):
+            state = agentcat.refresh_litellm_pricing()
+        self.assertEqual(state["status"], "error")
+        kept = agentcat.read_pricing_cache()
+        self.assertEqual(kept["fetchedAt"], stale)
+        _table, meta = agentcat.merged_pricing_table()
+        self.assertEqual(meta["source"], "litellm")
+
+    def test_fresh_cache_skips_fetch_within_24h(self) -> None:
+        self._write_cache()
+        with patch.object(agentcat, "_fetch_litellm_raw", side_effect=AssertionError("must not fetch")):
+            state = agentcat.refresh_litellm_pricing()
+        self.assertEqual(state["status"], "fresh")
+
+    def test_stale_cache_refetches_and_rewrites(self) -> None:
+        stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).isoformat().replace("+00:00", "Z")
+        self._write_cache(fetched_at=stale)
+        with patch.object(agentcat, "_fetch_litellm_raw", return_value=self.LITELLM_FIXTURE):
+            state = agentcat.refresh_litellm_pricing()
+        self.assertEqual(state["status"], "fetched")
+        kept = agentcat.read_pricing_cache()
+        self.assertNotEqual(kept["fetchedAt"], stale)
+        self.assertIn("gpt-test", kept["models"])
+
+    def test_tiered_rate_applies_only_with_context_tokens(self) -> None:
+        self._write_cache()
+        base = agentcat.estimate_cost("claude-test", 1_000_000, 1_000_000, 1_000_000, 1_000_000)
+        self.assertAlmostEqual(base["input"], 3.0)
+        self.assertAlmostEqual(base["output"], 15.0)
+        self.assertAlmostEqual(base["cache_read"], 0.3)
+        self.assertAlmostEqual(base["cache_write"], 3.75)
+        tiered = agentcat.estimate_cost(
+            "claude-test", 1_000_000, 1_000_000, 1_000_000, 1_000_000,
+            context_tokens=250_000,
+        )
+        self.assertAlmostEqual(tiered["input"], 6.0)
+        self.assertAlmostEqual(tiered["output"], 22.5)
+        self.assertAlmostEqual(tiered["cache_read"], 0.6)
+        self.assertAlmostEqual(tiered["cache_write"], 7.5)
+        below = agentcat.estimate_cost(
+            "claude-test", 1_000_000, 0, 0, 0, context_tokens=100_000
+        )
+        self.assertAlmostEqual(below["input"], 3.0)
+
+    def test_missing_cache_rates_default_safely(self) -> None:
+        self._write_cache()
+        cost = agentcat.estimate_cost("gpt-test", 0, 0, 1_000_000, 1_000_000)
+        self.assertAlmostEqual(cost["cache_read"], 0.5)
+        # cache_write absent from the feed entry -> falls back to input rate.
+        self.assertAlmostEqual(cost["cache_write"], 2.0)
+
+    def test_pricing_feed_capability_and_status(self) -> None:
+        self.assertIn("pricing.feed", agentcat.CONNECTOR_CAPABILITIES)
+        self.assertEqual(
+            agentcat.pricing_status_snapshot(),
+            {"source": "bundled", "fetchedAt": None},
+        )
+        payload = self._write_cache()
+        self.assertEqual(
+            agentcat.pricing_status_snapshot(),
+            {"source": "litellm", "fetchedAt": payload["fetchedAt"]},
+        )
 
 
 if __name__ == "__main__":

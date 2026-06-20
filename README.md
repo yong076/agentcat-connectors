@@ -2,31 +2,85 @@
 
 [English](README.md) | [한국어](README.ko.md)
 
-Agent Cat Connectors lets the Agent Cat menu bar app see local CLI-agent activity from Codex, Claude Code, and Gemini CLI.
+Agent Cat Connectors lets the Agent Cat menu bar app see local CLI-agent
+activity from Codex, Claude Code, Gemini CLI, and other supported agent tools.
 
-It installs a small local collector, keeps data under `~/.agentcat`, and patches supported CLI settings so future sessions can report activity without sending prompts to a remote server.
+It installs a small local collector, keeps data under `~/.agentcat`, and patches
+supported CLI settings so future sessions can report activity without sending
+prompts to a remote server. This public connector powers the free product:
+local monitoring, provider breadth, quota state, basic costs, budget caps, and
+weekly report inputs.
 
 ## Install
 
-Windows PowerShell:
+The normal user path is app-led:
+
+1. Open Agent Cat.
+2. Go to Home -> Agents / Connector.
+3. Click **Install connector**.
+4. Wait for the app to show live provider data.
+
+The app-led path is preferred because it explains what will change, keeps a
+rollback backup, and verifies the local daemon after install. Use the commands
+below only for development, CI, remote support, or when the app cannot open the
+installer.
+
+Advanced Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.ps1 | iex
 ```
 
-macOS/Linux:
+Advanced macOS/Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.sh | bash
 ```
 
-For a cloned checkout:
+Development from a cloned checkout:
 
 ```bash
 ./install.sh
 ```
 
-On Windows from a cloned checkout:
+### Connector archive integrity
+
+When the connector is fetched as a tarball (the archive download and the clone
+fallback in `install.sh`), `install.sh` verifies the archive against a
+known-good SHA256 when one is available, gating the swap exactly like the Pro
+channel (`scripts/pro_channel_install.py`). Note: an existing install created
+via `git clone` updates through `git pull --ff-only` (HTTPS git object
+integrity is the trust boundary there) and does not pass through this archive
+gate yet — routing that path through verification is part of the release-infra
+follow-up below. Supply a digest via either:
+
+- `AGENTCAT_CONNECTORS_SHA256` — a 64 lowercase hex digest passed by the caller
+  (for an app-led update, or local QA), or
+- `AGENTCAT_CONNECTORS_SHA256_URL` — a sidecar digest published next to the
+  tarball.
+
+When no digest is supplied (the current default), the install proceeds as
+before so existing installs keep updating. Publishing a per-release digest and
+wiring it into the auto-update path is the remaining step to make verification
+mandatory on the public channel.
+
+Pro connector safe-swap QA (local/private builds only):
+
+```bash
+python3 scripts/pro_channel_install.py \
+  --archive /path/to/agentcat-connectors-pro.tgz \
+  --manifest /path/to/pro-manifest.json \
+  --install-dir "$TMPDIR/agentcat-pro-connectors" \
+  --event-log "$TMPDIR/agentcat-pro-connector-events.jsonl"
+```
+
+The optional event log records `pro_connector_swap_started`,
+`pro_connector_swap_succeeded`, and `pro_connector_swap_rolled_back` without
+contacting the Pro API. App-led installs can additionally pass
+`--event-api-url`, `--event-bearer`, and `--device-id` after entitlement checks.
+Those flags are observability only; install success never depends on them.
+
+Development on Windows from a cloned checkout:
 
 ```powershell
 .\install.ps1
@@ -38,7 +92,8 @@ Then verify:
 agentcat snapshot
 ```
 
-To copy the prompt you can paste into Codex, Claude Code, or Gemini CLI after installation:
+If an agent runtime needs manual setup text after installation, copy the
+fallback prompt:
 
 ```bash
 agentcat setup-prompt
@@ -56,7 +111,7 @@ agentcat setup-prompt
 
 | Provider | Signal | Notes |
 | --- | --- | --- |
-| Codex | local SQLite token totals + Codex OAuth usage API | Shows remaining 5-hour, 7-day, and exposed model/review quota percentages when `~/.codex/auth.json` is present. |
+| Codex | local SQLite token totals + Codex OAuth usage API | Shows remaining 5-hour, 7-day, exposed model/review quota percentages, available reset credits, and Codex credit/spend-cap state when `~/.codex/auth.json` is present. |
 | Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
 | Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
 
@@ -96,7 +151,7 @@ On Windows, Agent Cat prefers PowerShell 7 (`pwsh`) when available, tries a fast
 
 Agent Cat reports remaining quota when a provider exposes it through the same local auth state used by its CLI:
 
-- Codex: reads `~/.codex/auth.json`, then calls the ChatGPT Codex usage endpoint for rolling 5-hour/7-day utilization and reset times.
+- Codex: reads `~/.codex/auth.json`, then calls the ChatGPT Codex usage endpoints for rolling 5-hour/7-day utilization, reset times, available reset credits, and Codex credit/spend-cap state. Reset credits are reported only as availability/metadata; this connector never redeems them.
 - Claude Code: reads Claude Code OAuth credentials from Keychain or `~/.claude`, then calls the Claude Code OAuth usage endpoint for 5-hour/7-day/model utilization plus monthly extra-usage credits.
 - Gemini CLI: reads `~/.gemini/oauth_creds.json` and `~/.gemini/settings.json`, then calls Gemini Code Assist `loadCodeAssist` and `retrieveUserQuota` for model request quota fractions and reset times.
 - Fallback: if live quota lookup fails, Codex/Claude still use the latest local status-line or session `token_count` event when available.

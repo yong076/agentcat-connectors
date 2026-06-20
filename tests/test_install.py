@@ -38,33 +38,48 @@ class AgentCatInstallTests(unittest.TestCase):
             setattr(install, name, value)
         self.tmp.cleanup()
 
-    def test_install_gemini_settings_configures_antigravity_cli_telemetry(self) -> None:
+    def test_install_gemini_settings_configures_gemini_only_not_antigravity(self) -> None:
+        # Antigravity bills server-side and ignores the local telemetry sub-keys;
+        # the install must only write a telemetry block for the real gemini-cli and
+        # must never touch antigravity-cli/settings.json.
         backup_dir = install.BACKUPS_DIR / "test"
         backup_dir.mkdir(parents=True)
 
         install.install_gemini_settings(backup_dir)
 
         gemini_settings = json.loads((install.HOME / ".gemini" / "settings.json").read_text(encoding="utf-8"))
-        antigravity_settings = json.loads(
-            (install.HOME / ".gemini" / "antigravity-cli" / "settings.json").read_text(encoding="utf-8")
-        )
-
         self.assertEqual(gemini_settings["telemetry"]["outfile"], str(install.GEMINI_TELEMETRY))
-        self.assertEqual(antigravity_settings["telemetry"]["outfile"], str(install.ANTIGRAVITY_TELEMETRY))
         self.assertFalse(gemini_settings["telemetry"]["logPrompts"])
-        self.assertFalse(antigravity_settings["telemetry"]["logPrompts"])
 
-    def test_remove_gemini_settings_cleans_antigravity_cli_telemetry(self) -> None:
+        antigravity_path = install.HOME / ".gemini" / "antigravity-cli" / "settings.json"
+        self.assertFalse(antigravity_path.exists())
+
+    def test_remove_gemini_settings_cleans_prior_antigravity_cli_telemetry(self) -> None:
+        # A prior install version may have written an Agent Cat telemetry block into
+        # antigravity-cli/settings.json; uninstall must still clean it up.
         backup_dir = install.BACKUPS_DIR / "test"
         backup_dir.mkdir(parents=True)
+        antigravity_path = install.HOME / ".gemini" / "antigravity-cli" / "settings.json"
+        antigravity_path.parent.mkdir(parents=True, exist_ok=True)
+        antigravity_path.write_text(
+            json.dumps(
+                {
+                    "telemetry": {
+                        "enabled": True,
+                        "target": "local",
+                        "outfile": str(install.ANTIGRAVITY_TELEMETRY),
+                        "logPrompts": False,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         install.install_gemini_settings(backup_dir)
 
         install.remove_agentcat_gemini_settings(backup_dir)
 
         gemini_settings = json.loads((install.HOME / ".gemini" / "settings.json").read_text(encoding="utf-8"))
-        antigravity_settings = json.loads(
-            (install.HOME / ".gemini" / "antigravity-cli" / "settings.json").read_text(encoding="utf-8")
-        )
+        antigravity_settings = json.loads(antigravity_path.read_text(encoding="utf-8"))
         self.assertNotIn("telemetry", gemini_settings)
         self.assertNotIn("telemetry", antigravity_settings)
 
