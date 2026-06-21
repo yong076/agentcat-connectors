@@ -4987,6 +4987,89 @@ def _journal_projects_snapshot(projects: Dict[str, Dict[str, Any]]) -> Dict[str,
     return {"status": "ok", "items": items[:20]}
 
 
+def _path_is_within(child: Path, parent: Path) -> bool:
+    """True when ``child`` resolves to ``parent`` or a path nested under it.
+
+    Defensive: resolution failures fall back to string comparison so a
+    non-existent or permission-denied path never raises.
+    """
+    try:
+        child_resolved = child.resolve()
+    except OSError:
+        child_resolved = child
+    try:
+        parent_resolved = parent.resolve()
+    except OSError:
+        parent_resolved = parent
+    try:
+        child_resolved.relative_to(parent_resolved)
+        return True
+    except ValueError:
+        return False
+
+
+def _classify_claude_journal_root(root: Path) -> str:
+    """Tag a Claude journal root as ``cli`` or ``app``.
+
+    The CLI root is ``CLAUDE_PROJECTS_DIR``; everything reachable under a
+    ``desktop_app_data_roots("claude")`` path is the desktop app. CLI takes
+    precedence when a path somehow matches both.
+    """
+    if _path_is_within(root, CLAUDE_PROJECTS_DIR):
+        return "cli"
+    for data_root in desktop_app_data_roots("claude"):
+        if _path_is_within(root, data_root):
+            return "app"
+    # Unknown provenance: attribute to CLI so the total stays consistent with
+    # claude_journal_project_dirs() enumeration (CLI root added first).
+    return "cli"
+
+
+def claude_usage_by_source() -> Dict[str, Any]:
+    """Sum Claude journal tokens split by surface (CLI vs Desktop app).
+
+    Standalone full scan over the same journal roots used by the merged
+    totals; deliberately independent of the incremental cursor so this stays
+    purely additive and cannot perturb existing offsets/totals. Defensive
+    against unreadable files and malformed lines.
+    """
+    per_source: Dict[str, int] = {"cli": 0, "app": 0}
+    for root in claude_journal_project_dirs():
+        surface = _classify_claude_journal_root(root)
+        try:
+            paths = sorted(root.rglob("*.jsonl"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                with path.open("rb") as fh:
+                    for raw_line in fh:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if not isinstance(obj, dict):
+                            continue
+                        rec = parse_claude_usage_line(obj)
+                        if rec:
+                            per_source[surface] += claude_record_total(rec)
+            except OSError as exc:
+                logging.warning("claude_usage_by_source: cannot read %s: %s", str(path), exc)
+                continue
+    cli_tokens = per_source["cli"]
+    app_tokens = per_source["app"]
+    by_surface = {k: v for k, v in {"cli": cli_tokens, "app": app_tokens}.items() if v > 0}
+    return {
+        "status": "ok" if (cli_tokens > 0 or app_tokens > 0) else "not_available",
+        "units": "tokens",
+        "bySurface": by_surface,
+        "source": "claude-journal-split",
+    }
+
+
 def claude_snapshot() -> Dict[str, Any]:
     path = HOME / ".claude" / "stats-cache.json"
     raw = read_json(path)
@@ -5019,6 +5102,10 @@ def claude_snapshot() -> Dict[str, Any]:
     _merge_journal_models(result["models"], cursor.get("models") or {})
     if cursor.get("projects"):
         result["projects"] = _journal_projects_snapshot(cursor["projects"])
+
+    # Additive per-source split (Claude Code CLI vs Claude Desktop app).
+    # Independent full scan; does not touch any existing field above.
+    result["usageBySource"] = claude_usage_by_source()
 
     if raw is None:
         return result

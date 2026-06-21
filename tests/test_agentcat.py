@@ -1140,6 +1140,78 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn(str(session_path), cursor["offsets"])
         self.assertNotIn("must never be emitted", json.dumps(cursor, ensure_ascii=False))
 
+    @staticmethod
+    def _claude_usage_event(now: dt.datetime, request_id: str, message_id: str,
+                            input_tokens: int) -> str:
+        return json.dumps(
+            {
+                "timestamp": now.isoformat().replace("+00:00", "Z"),
+                "cwd": "/Users/tester/work/proj",
+                "requestId": request_id,
+                "message": {
+                    "id": message_id,
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                },
+            }
+        ) + "\n"
+
+    def test_claude_snapshot_usage_by_source_splits_cli_and_desktop(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+
+        cli_dir = agentcat.CLAUDE_PROJECTS_DIR / "cli-project"
+        cli_dir.mkdir(parents=True)
+        (cli_dir / "session.jsonl").write_text(
+            self._claude_usage_event(now, "cli_req_1", "cli_msg_1", 100),
+            encoding="utf-8",
+        )
+
+        desktop_dir = (
+            agentcat.HOME
+            / "Library"
+            / "Application Support"
+            / "Claude"
+            / "local-agent-mode-sessions"
+            / "account"
+            / "workspace"
+            / "local-session"
+            / ".claude"
+            / "projects"
+            / "desktop-project"
+        )
+        desktop_dir.mkdir(parents=True)
+        (desktop_dir / "session.jsonl").write_text(
+            self._claude_usage_event(now, "app_req_1", "app_msg_1", 40),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+
+        by_source = snapshot["usageBySource"]
+        self.assertEqual(by_source["status"], "ok")
+        self.assertEqual(by_source["units"], "tokens")
+        self.assertEqual(by_source["source"], "claude-journal-split")
+        self.assertEqual(by_source["bySurface"], {"cli": 100, "app": 40})
+        # Additive contract: existing fields stay intact and unchanged.
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 140)
+
+    def test_claude_snapshot_usage_by_source_omits_app_without_desktop_root(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        cli_dir = agentcat.CLAUDE_PROJECTS_DIR / "cli-only-project"
+        cli_dir.mkdir(parents=True)
+        (cli_dir / "session.jsonl").write_text(
+            self._claude_usage_event(now, "cli_req_2", "cli_msg_2", 70),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+
+        by_source = snapshot["usageBySource"]
+        self.assertEqual(by_source["status"], "ok")
+        self.assertEqual(by_source["bySurface"], {"cli": 70})
+        self.assertNotIn("app", by_source["bySurface"])
+
     def test_claude_snapshot_deduplicates_repeated_request_usage(self) -> None:
         project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"
         project_dir.mkdir(parents=True)
