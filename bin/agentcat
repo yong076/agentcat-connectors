@@ -74,7 +74,7 @@ PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.25.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.26.0")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",

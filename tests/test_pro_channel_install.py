@@ -45,7 +45,7 @@ class ProChannelInstallTests(unittest.TestCase):
             (install_dir / "bin").mkdir(parents=True)
             (install_dir / "bin" / "agentcat").write_bytes(b"old")
             manifest = {
-                "version": "26.25.0",
+                "version": "26.26.0",
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
             }
 
@@ -69,7 +69,7 @@ class ProChannelInstallTests(unittest.TestCase):
             )
             event_log = root / "events.jsonl"
             manifest = {
-                "version": "26.25.0",
+                "version": "26.26.0",
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
             }
 
@@ -89,7 +89,7 @@ class ProChannelInstallTests(unittest.TestCase):
             ])
             self.assertTrue(all(event["surface"] == "pro_connector" for event in events))
             self.assertTrue(all(event["device_id"] == "test-device" for event in events))
-            self.assertEqual(events[0]["properties"]["version"], "26.25.0")
+            self.assertEqual(events[0]["properties"]["version"], "26.26.0")
 
     def test_install_pro_archive_writes_rollback_event_when_swap_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,7 +104,7 @@ class ProChannelInstallTests(unittest.TestCase):
             )
             event_log = root / "events.jsonl"
             manifest = {
-                "version": "26.25.0",
+                "version": "26.26.0",
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
             }
 
@@ -168,7 +168,7 @@ class ProChannelInstallTests(unittest.TestCase):
             )
             manifest = root / "manifest.json"
             manifest.write_text(
-                json.dumps({"version": "26.25.0", "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}),
+                json.dumps({"version": "26.26.0", "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}),
                 encoding="utf-8",
             )
             result = installer.install_pro_archive(

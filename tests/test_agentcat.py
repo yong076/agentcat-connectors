@@ -455,10 +455,10 @@ class AgentCatConnectorTests(unittest.TestCase):
 
     def test_update_channel_manifest_validation_and_snapshot_status(self) -> None:
         manifest = {
-            "version": "26.25.0",
-            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.25.0",
+            "version": "26.26.0",
+            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.26.0",
             "sha256": "a" * 64,
-            "minAppVersion": "26.25.0",
+            "minAppVersion": "26.26.0",
             "channel": "pro",
         }
 
@@ -468,14 +468,14 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(state["status"], "manifest_ready")
         self.assertEqual(state["installStatus"], "pending_install")
         self.assertEqual(status["channel"], "pro")
-        self.assertEqual(status["targetVersion"], "26.25.0")
+        self.assertEqual(status["targetVersion"], "26.26.0")
         self.assertEqual(status["installStatus"], "pending_install")
         self.assertTrue(agentcat.update_channel_state_file().exists())
 
     def test_update_channel_rejects_insecure_or_bad_manifest(self) -> None:
         manifest = {
-            "version": "26.25.0",
-            "downloadUrl": "http://api.agentcat.app/v1/pro/connector/download/26.25.0",
+            "version": "26.26.0",
+            "downloadUrl": "http://api.agentcat.app/v1/pro/connector/download/26.26.0",
             "sha256": "a" * 64,
             "channel": "pro",
         }
@@ -483,15 +483,15 @@ class AgentCatConnectorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             agentcat.write_update_channel_state("pro", manifest)
 
-        manifest["downloadUrl"] = "https://api.agentcat.app/v1/pro/connector/download/26.25.0"
+        manifest["downloadUrl"] = "https://api.agentcat.app/v1/pro/connector/download/26.26.0"
         manifest["sha256"] = "A" * 64
         with self.assertRaises(ValueError):
             agentcat.write_update_channel_state("pro", manifest)
 
     def test_update_channel_public_clears_pro_manifest_state(self) -> None:
         manifest = {
-            "version": "26.25.0",
-            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.25.0",
+            "version": "26.26.0",
+            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.26.0",
             "sha256": "b" * 64,
             "channel": "pro",
         }
@@ -510,8 +510,8 @@ class AgentCatConnectorTests(unittest.TestCase):
         try:
             port = server.server_address[1]
             manifest = {
-                "version": "26.25.0",
-                "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.25.0",
+                "version": "26.26.0",
+                "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.26.0",
                 "sha256": "c" * 64,
                 "channel": "pro",
             }
@@ -530,7 +530,7 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["channel"]["channel"], "pro")
-        self.assertEqual(agentcat.update_channel_status_snapshot()["targetVersion"], "26.25.0")
+        self.assertEqual(agentcat.update_channel_status_snapshot()["targetVersion"], "26.26.0")
 
     def test_connector_version_parser_and_comparison(self) -> None:
         text = 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.10")'
@@ -2454,7 +2454,7 @@ class AgentCatConnectorTests(unittest.TestCase):
                 "label": "deploy",
                 "token": "sk-ant-api03-abcdefgh12345678",
                 "level": "high",
-                "version": "26.25.0",
+                "version": "26.26.0",
                 "generatedAt": "2026-05-01T00:00:00Z",
             }
         )
@@ -2462,7 +2462,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(sanitized["token"], "[redacted]")
         self.assertEqual(sanitized["label"], "deploy")
         self.assertEqual(sanitized["level"], "high")
-        self.assertEqual(sanitized["version"], "26.25.0")
+        self.assertEqual(sanitized["version"], "26.26.0")
         self.assertEqual(sanitized["generatedAt"], "2026-05-01T00:00:00Z")
 
     def test_sanitize_payload_redacts_command_and_args_keys(self) -> None:
