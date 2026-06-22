@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/yong076/agentcat-connectors.git"
-ARCHIVE_URL="https://github.com/yong076/agentcat-connectors/archive/refs/heads/main.tar.gz"
+ARCHIVE_URL="${AGENTCAT_CONNECTORS_ARCHIVE_URL:-https://github.com/yong076/agentcat-connectors/archive/refs/heads/main.tar.gz}"
 INSTALL_DIR="${AGENTCAT_CONNECTORS_DIR:-$HOME/.agentcat/connectors}"
 # Optional integrity check for the connector archive. The public auto-update
 # path defaults to the mutable tarball, so verification is opt-in to avoid
@@ -12,6 +12,8 @@ INSTALL_DIR="${AGENTCAT_CONNECTORS_DIR:-$HOME/.agentcat/connectors}"
 #     (e.g. an app-led update once the release pipeline publishes a manifest).
 #   - AGENTCAT_CONNECTORS_SHA256_URL: URL of a sidecar digest published next to
 #     the tarball. Empty (the default today) keeps current behavior unchanged.
+#   - AGENTCAT_CONNECTORS_ARCHIVE_URL: optional pinned archive URL. Empty (the
+#     default today) keeps the public main-branch archive path unchanged.
 ARCHIVE_SHA256="${AGENTCAT_CONNECTORS_SHA256:-}"
 ARCHIVE_SHA256_URL="${AGENTCAT_CONNECTORS_SHA256_URL:-}"
 
@@ -79,6 +81,16 @@ resolve_repo_dir() {
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P || true)"
   if [[ -n "${script_dir}" && -f "${script_dir}/scripts/install.py" && -f "${script_dir}/bin/agentcat" ]]; then
     printf '%s\n' "${script_dir}"
+    return 0
+  fi
+
+  if [[ -n "${AGENTCAT_CONNECTORS_ARCHIVE_URL:-}" ]]; then
+    mkdir -p "$(dirname "${INSTALL_DIR}")"
+    if ! install_from_archive >&2; then
+      printf '[agentcat] pinned connector archive install failed; refusing mutable fallback.\n' >&2
+      return 1
+    fi
+    printf '%s\n' "${INSTALL_DIR}"
     return 0
   fi
 

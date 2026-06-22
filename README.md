@@ -58,6 +58,9 @@ follow-up below. Supply a digest via either:
   (for an app-led update, or local QA), or
 - `AGENTCAT_CONNECTORS_SHA256_URL` — a sidecar digest published next to the
   tarball.
+- `AGENTCAT_CONNECTORS_ARCHIVE_URL` — a pinned archive URL supplied by release
+  automation or local QA. When omitted, the installer keeps using the public
+  `main` branch archive.
 
 When no digest is supplied (the current default), the install proceeds as
 before so existing installs keep updating. Publishing a per-release digest and
