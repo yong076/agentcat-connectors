@@ -74,7 +74,7 @@ PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.26.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.26.2")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -3357,6 +3357,12 @@ def add_to_hourly(hourly: Dict[str, int], amount: int, when: Optional[dt.datetim
     hourly[key] = hourly.get(key, 0) + amount
 
 
+def local_date_changed(start: Optional[dt.datetime], end: Optional[dt.datetime]) -> bool:
+    if start is None or end is None:
+        return False
+    return start.astimezone().date() != end.astimezone().date()
+
+
 def normalized_model_name(raw: Any) -> Optional[str]:
     if raw is None or isinstance(raw, bool):
         return None
@@ -5512,7 +5518,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
         for token_key, model, amount, when, start_when in group:
             if previous_amount is None:
                 delta = amount
-                bucket_when = start_when if start_when and when and start_when.date() != when.date() else (when or start_when)
+                bucket_when = start_when if local_date_changed(start_when, when) else (when or start_when)
             elif amount >= previous_amount:
                 delta = amount - previous_amount
                 bucket_when = when or start_when
@@ -5655,7 +5661,7 @@ def apply_gemini_records_to_state(
         for token_key, model, amount, when, start_when in group:
             if previous_amount is None:
                 delta = amount
-                bucket_when = start_when if start_when and when and start_when.date() != when.date() else (when or start_when)
+                bucket_when = start_when if local_date_changed(start_when, when) else (when or start_when)
             elif amount >= previous_amount:
                 delta = amount - previous_amount
                 bucket_when = when or start_when
@@ -5784,9 +5790,9 @@ def int_map(raw: Any) -> Dict[str, int]:
 
 def periods_from_daily_tokens(daily_tokens: Dict[str, int]) -> Dict[str, int]:
     periods = empty_periods()
-    now_utc = dt.datetime.now(dt.timezone.utc)
-    today_utc = now_utc.date()
-    today_local = now_utc.astimezone().date()
+    today_local = dt.datetime.now(dt.timezone.utc).astimezone().date()
+    week_start = today_local - dt.timedelta(days=7)
+    month_start = today_local - dt.timedelta(days=30)
     for day, amount in daily_tokens.items():
         if amount <= 0:
             continue
@@ -5797,11 +5803,11 @@ def periods_from_daily_tokens(daily_tokens: Dict[str, int]) -> Dict[str, int]:
             when = parse_timestamp(f"{day}T12:00:00Z") or parse_timestamp(day)
             add_to_periods(periods, amount, when)
             continue
-        if day_date in {today_utc, today_local}:
+        if day_date == today_local:
             periods["today"] = periods.get("today", 0) + amount
-        if day_date >= today_utc - dt.timedelta(days=7) or day_date >= today_local - dt.timedelta(days=7):
+        if day_date >= week_start:
             periods["week"] = periods.get("week", 0) + amount
-        if day_date >= today_utc - dt.timedelta(days=30) or day_date >= today_local - dt.timedelta(days=30):
+        if day_date >= month_start:
             periods["month"] = periods.get("month", 0) + amount
     return periods
 

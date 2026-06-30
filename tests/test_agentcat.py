@@ -1004,6 +1004,41 @@ class AgentCatConnectorTests(unittest.TestCase):
                 os.environ["TZ"] = old_tz
             time.tzset()
 
+    def test_periods_from_daily_tokens_uses_only_local_today(self) -> None:
+        import os
+        import time
+
+        if not hasattr(time, "tzset"):
+            self.skipTest("requires POSIX tzset")
+
+        old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "Pacific/Kiritimati"
+        time.tzset()
+        try:
+            fixed_now = dt.datetime(2026, 6, 18, 23, 30, tzinfo=dt.timezone.utc)
+            utc_today = fixed_now.date().isoformat()
+            local_today = agentcat.day_key_for_timestamp(fixed_now)
+            self.assertNotEqual(utc_today, local_today)
+
+            class _FixedNow(dt.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return fixed_now if tz is None else fixed_now.astimezone(tz)
+
+            with patch.object(agentcat.dt, "datetime", _FixedNow):
+                periods = agentcat.periods_from_daily_tokens({utc_today: 100, local_today: 20})
+
+            self.assertEqual(periods["today"], 20)
+            self.assertEqual(periods["week"], 120)
+            self.assertEqual(periods["month"], 120)
+            self.assertEqual(periods["all"], 120)
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
+
     def test_claude_snapshot_prefers_jsonl_usage_over_stale_stats_cache(self) -> None:
         claude_dir = agentcat.HOME / ".claude"
         claude_dir.mkdir(parents=True)
@@ -1656,6 +1691,61 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["dailyTokens"][today_key], 50)
         self.assertEqual(snapshot["models"]["gemini-test"]["all"], 150)
         self.assertEqual(snapshot["events"], 2)
+
+    def test_gemini_initial_cumulative_sample_uses_local_date_boundary(self) -> None:
+        import os
+        import time
+
+        if not hasattr(time, "tzset"):
+            self.skipTest("requires POSIX tzset")
+
+        old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "Asia/Seoul"
+        time.tzset()
+        try:
+            agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
+            start = dt.datetime(2026, 6, 18, 14, 55, tzinfo=dt.timezone.utc)
+            end = dt.datetime(2026, 6, 18, 15, 5, tzinfo=dt.timezone.utc)
+            self.assertEqual(start.date(), end.date())
+            self.assertNotEqual(start.astimezone().date(), end.astimezone().date())
+
+            payload = {
+                "scopeMetrics": [
+                    {
+                        "metrics": [
+                            {
+                                "descriptor": {"name": "gemini_cli.token.usage"},
+                                "dataPoints": [
+                                    {
+                                        "attributes": {
+                                            "model": "gemini-test",
+                                            "session.id": "session-local-midnight",
+                                            "type": "input",
+                                        },
+                                        "startTime": [int(start.timestamp()), 0],
+                                        "endTime": [int(end.timestamp()), 0],
+                                        "value": {"sum": 77},
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+            agentcat.GEMINI_TELEMETRY.write_text(json.dumps(payload), encoding="utf-8")
+
+            snapshot = agentcat.gemini_snapshot()
+            start_key = agentcat.day_key_for_timestamp(start)
+            end_key = agentcat.day_key_for_timestamp(end)
+
+            self.assertEqual(snapshot["dailyTokens"], {start_key: 77})
+            self.assertNotIn(end_key, snapshot["dailyTokens"])
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
 
     def test_gemini_snapshot_indexes_full_log_across_stream_chunks(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
