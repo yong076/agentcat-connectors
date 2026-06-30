@@ -61,7 +61,7 @@ LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_S
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CODEX_SESSIONS_CURSOR_FILE = AGENTCAT_HOME / "codex-sessions-cursor.json"
-CODEX_SESSIONS_CURSOR_VERSION = 1
+CODEX_SESSIONS_CURSOR_VERSION = 2
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
 CLAUDE_DESKTOP_PROJECT_GLOBS = (
     "local-agent-mode-sessions/**/.claude/projects",
@@ -74,7 +74,7 @@ PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.27.1")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.27.2")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -3992,6 +3992,138 @@ def codex_session_roots() -> List[Path]:
     return [root / "sessions", root / "archived_sessions"]
 
 
+def _codex_empty_raw_totals() -> Dict[str, int]:
+    return {"input": 0, "cached": 0, "output": 0}
+
+
+def _codex_usage_raw_totals(usage: Any) -> Optional[Dict[str, int]]:
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = nonnegative_int(usage.get("input_tokens")) or 0
+    cached_raw = usage.get("cached_input_tokens")
+    if cached_raw is None:
+        cached_raw = usage.get("cache_read_input_tokens")
+    cached_input = nonnegative_int(cached_raw) or 0
+    output_tokens = nonnegative_int(usage.get("output_tokens")) or 0
+    reasoning = nonnegative_int(usage.get("reasoning_output_tokens")) or 0
+    record = {
+        "input": input_tokens,
+        "cached": cached_input,
+        "output": output_tokens + reasoning,
+    }
+    if not any(record.values()):
+        return None
+    return record
+
+
+def _codex_coerce_raw_totals(raw: Any) -> Optional[Dict[str, int]]:
+    if not isinstance(raw, dict):
+        return None
+    record = {
+        "input": nonnegative_int(raw.get("input")) or 0,
+        "cached": nonnegative_int(raw.get("cached")) or 0,
+        "output": nonnegative_int(raw.get("output")) or 0,
+    }
+    if not any(record.values()):
+        return None
+    return record
+
+
+def _codex_add_raw_totals(lhs: Optional[Dict[str, int]], rhs: Dict[str, int]) -> Dict[str, int]:
+    base = lhs or _codex_empty_raw_totals()
+    return {
+        "input": int(base.get("input") or 0) + int(rhs.get("input") or 0),
+        "cached": int(base.get("cached") or 0) + int(rhs.get("cached") or 0),
+        "output": int(base.get("output") or 0) + int(rhs.get("output") or 0),
+    }
+
+
+def _codex_total_delta(baseline: Optional[Dict[str, int]], current: Dict[str, int]) -> Dict[str, int]:
+    base = baseline or _codex_empty_raw_totals()
+    return {
+        "input": max(0, int(current.get("input") or 0) - int(base.get("input") or 0)),
+        "cached": max(0, int(current.get("cached") or 0) - int(base.get("cached") or 0)),
+        "output": max(0, int(current.get("output") or 0) - int(base.get("output") or 0)),
+    }
+
+
+def _codex_divergent_total_delta(
+    raw_baseline: Optional[Dict[str, int]],
+    counted_baseline: Optional[Dict[str, int]],
+    current: Dict[str, int],
+) -> Dict[str, int]:
+    raw = raw_baseline or _codex_empty_raw_totals()
+    counted = counted_baseline or _codex_empty_raw_totals()
+
+    def delta(raw_value: int, counted_value: int, current_value: int) -> int:
+        if current_value >= raw_value:
+            return max(0, current_value - raw_value)
+        return max(0, current_value - counted_value)
+
+    return {
+        "input": delta(int(raw.get("input") or 0), int(counted.get("input") or 0), int(current.get("input") or 0)),
+        "cached": delta(int(raw.get("cached") or 0), int(counted.get("cached") or 0), int(current.get("cached") or 0)),
+        "output": delta(int(raw.get("output") or 0), int(counted.get("output") or 0), int(current.get("output") or 0)),
+    }
+
+
+def _codex_totals_equal(lhs: Optional[Dict[str, int]], rhs: Optional[Dict[str, int]]) -> bool:
+    left = lhs or _codex_empty_raw_totals()
+    right = rhs or _codex_empty_raw_totals()
+    return (
+        int(left.get("input") or 0) == int(right.get("input") or 0)
+        and int(left.get("cached") or 0) == int(right.get("cached") or 0)
+        and int(left.get("output") or 0) == int(right.get("output") or 0)
+    )
+
+
+def _codex_totals_at_least(lhs: Dict[str, int], rhs: Dict[str, int]) -> bool:
+    return (
+        int(lhs.get("input") or 0) >= int(rhs.get("input") or 0)
+        and int(lhs.get("cached") or 0) >= int(rhs.get("cached") or 0)
+        and int(lhs.get("output") or 0) >= int(rhs.get("output") or 0)
+    )
+
+
+def _codex_totals_at_most(lhs: Dict[str, int], rhs: Dict[str, int]) -> bool:
+    return (
+        int(lhs.get("input") or 0) <= int(rhs.get("input") or 0)
+        and int(lhs.get("cached") or 0) <= int(rhs.get("cached") or 0)
+        and int(lhs.get("output") or 0) <= int(rhs.get("output") or 0)
+    )
+
+
+def _codex_should_prefer_total_delta(
+    raw_baseline: Optional[Dict[str, int]],
+    current_total: Dict[str, int],
+    total_delta: Dict[str, int],
+    last_delta: Dict[str, int],
+    saw_divergent_totals: bool,
+) -> bool:
+    if saw_divergent_totals or raw_baseline is None:
+        return False
+    return _codex_totals_at_least(current_total, raw_baseline) and _codex_totals_at_most(total_delta, last_delta)
+
+
+def _codex_raw_delta_to_class_amounts(raw_delta: Optional[Dict[str, int]]) -> Optional[Dict[str, int]]:
+    if not isinstance(raw_delta, dict):
+        return None
+    input_tokens = int(raw_delta.get("input") or 0)
+    cached_input = int(raw_delta.get("cached") or 0)
+    output_tokens = int(raw_delta.get("output") or 0)
+    uncached_input = input_tokens - cached_input
+    if uncached_input < 0:
+        uncached_input = 0
+    record = {
+        "inputTokens": uncached_input,
+        "outputTokens": output_tokens,
+        "cacheReadInputTokens": cached_input,
+    }
+    if not any(record.values()):
+        return None
+    return record
+
+
 def codex_session_token_class_amounts(info: Dict[str, Any]) -> Optional[Dict[str, int]]:
     """Extract a per-class token record from a token_count payload.info.
 
@@ -3999,26 +4131,63 @@ def codex_session_token_class_amounts(info: Dict[str, Any]) -> Optional[Dict[str
     and normalizes to the connector's token-class keys. Returns None when no
     usable token fields are present so empty/heartbeat events are ignored.
     """
-    usage = info.get("last_token_usage")
-    if not isinstance(usage, dict):
-        return None
-    input_tokens = nonnegative_int(usage.get("input_tokens")) or 0
-    cached_input = nonnegative_int(usage.get("cached_input_tokens")) or 0
-    output_tokens = nonnegative_int(usage.get("output_tokens")) or 0
-    reasoning = nonnegative_int(usage.get("reasoning_output_tokens")) or 0
-    # cached_input_tokens is a subset of input_tokens; subtract to avoid
-    # double counting, then route the cached portion to cacheRead.
-    uncached_input = input_tokens - cached_input
-    if uncached_input < 0:
-        uncached_input = 0
-    record = {
-        "inputTokens": uncached_input,
-        "outputTokens": output_tokens + reasoning,
-        "cacheReadInputTokens": cached_input,
-    }
-    if not any(record.values()):
-        return None
-    return record
+    return _codex_raw_delta_to_class_amounts(_codex_usage_raw_totals(info.get("last_token_usage")))
+
+
+def codex_session_token_raw_delta(
+    info: Dict[str, Any],
+    counted_baseline: Optional[Dict[str, int]],
+    raw_baseline: Optional[Dict[str, int]],
+    saw_divergent_totals: bool,
+) -> Tuple[Optional[Dict[str, int]], Optional[Dict[str, int]], Optional[Dict[str, int]], bool]:
+    """Return the token delta for one Codex token_count event.
+
+    Newer Codex builds can emit cumulative ``total_token_usage`` without a
+    trustworthy per-turn ``last_token_usage``. This mirrors CodexBar's scanner:
+    prefer last-delta when present, but use total-delta when the cumulative
+    stream shows a smaller non-divergent increment; when only total exists,
+    derive the delta from the previous raw total baseline.
+    """
+    last_delta = _codex_usage_raw_totals(info.get("last_token_usage"))
+    current_total = _codex_usage_raw_totals(info.get("total_token_usage"))
+    delta: Optional[Dict[str, int]] = None
+    next_counted = counted_baseline
+    next_raw = raw_baseline
+    next_saw_divergent = bool(saw_divergent_totals)
+
+    if last_delta is not None:
+        delta = last_delta
+        if current_total is not None:
+            total_delta = _codex_total_delta(raw_baseline, current_total)
+            if _codex_should_prefer_total_delta(
+                raw_baseline,
+                current_total,
+                total_delta,
+                last_delta,
+                next_saw_divergent,
+            ):
+                delta = total_delta
+            next_counted = _codex_add_raw_totals(counted_baseline, delta)
+            next_raw = current_total
+            if not _codex_totals_equal(next_raw, next_counted):
+                next_saw_divergent = True
+        else:
+            next_counted = _codex_add_raw_totals(counted_baseline, delta)
+            next_raw = next_counted
+    elif current_total is not None:
+        delta = (
+            _codex_divergent_total_delta(raw_baseline, counted_baseline, current_total)
+            if next_saw_divergent
+            else _codex_total_delta(raw_baseline, current_total)
+        )
+        next_counted = _codex_add_raw_totals(counted_baseline, delta)
+        next_raw = current_total
+        if not _codex_totals_equal(next_raw, next_counted):
+            next_saw_divergent = True
+
+    if delta is not None and not any(delta.values()):
+        delta = None
+    return delta, next_counted, next_raw, next_saw_divergent
 
 
 def codex_session_files() -> List[Path]:
@@ -4090,6 +4259,9 @@ def load_codex_sessions_cursor() -> Dict[str, Any]:
                 "size": int(meta.get("size") or 0),
                 "turns": int(meta.get("turns") or 0),
                 "lastModel": (str(meta["lastModel"]) if isinstance(meta.get("lastModel"), str) else None),
+                "countedRawTotals": _codex_coerce_raw_totals(meta.get("countedRawTotals")),
+                "rawTotalsBaseline": _codex_coerce_raw_totals(meta.get("rawTotalsBaseline")),
+                "sawDivergentTotals": bool(meta.get("sawDivergentTotals")),
             }
     cursor["daily"] = _coerce_int_map(raw.get("daily"))
     cursor["hourly"] = _coerce_int_map(raw.get("hourly"))
@@ -4199,6 +4371,9 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
         # turn_context that set it may live before prev_offset.
         prev_model = meta.get("lastModel") if turn_index else None
         current_model: Optional[str] = prev_model if isinstance(prev_model, str) else None
+        counted_raw_totals = _codex_coerce_raw_totals(meta.get("countedRawTotals")) if turn_index else None
+        raw_totals_baseline = _codex_coerce_raw_totals(meta.get("rawTotalsBaseline")) if turn_index else None
+        saw_divergent_totals = bool(meta.get("sawDivergentTotals")) if turn_index else False
         try:
             with path.open("rb") as fh:
                 fh.seek(prev_offset)
@@ -4227,7 +4402,13 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
                     info = payload.get("info")
                     if not isinstance(info, dict):
                         continue
-                    amounts = codex_session_token_class_amounts(info)
+                    raw_delta, counted_raw_totals, raw_totals_baseline, saw_divergent_totals = codex_session_token_raw_delta(
+                        info,
+                        counted_raw_totals,
+                        raw_totals_baseline,
+                        saw_divergent_totals,
+                    )
+                    amounts = _codex_raw_delta_to_class_amounts(raw_delta)
                     if amounts is None:
                         continue
                     # Dedup is enforced by the byte offset: we only ever read
@@ -4274,6 +4455,9 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
             "size": size,
             "turns": turn_index,
             "lastModel": current_model,
+            "countedRawTotals": counted_raw_totals,
+            "rawTotalsBaseline": raw_totals_baseline,
+            "sawDivergentTotals": saw_divergent_totals,
         }
 
     cursor["turns"] = int(cursor.get("turns") or 0) + new_turns

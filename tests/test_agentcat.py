@@ -731,8 +731,12 @@ class AgentCatConnectorTests(unittest.TestCase):
         return path
 
     @staticmethod
-    def _token_count_event(usage: dict, ts: str, cwd=None) -> dict:
-        info = {"last_token_usage": usage}
+    def _token_count_event(usage: dict, ts: str, cwd=None, *, total_usage=None) -> dict:
+        info = {}
+        if usage is not None:
+            info["last_token_usage"] = usage
+        if total_usage is not None:
+            info["total_token_usage"] = total_usage
         payload = {"type": "token_count", "info": info}
         if cwd is not None:
             payload["cwd"] = cwd
@@ -888,6 +892,72 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["inputTokens"], 85)
         self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 25)
         self.assertEqual(snapshot["tokens"]["outputTokens"], 5)
+
+    def test_codex_sessions_jsonl_counts_total_token_usage_without_last_delta(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_codex_session(
+            "rollout-total-only.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    None,
+                    now,
+                    total_usage={
+                        "input_tokens": 100,
+                        "cache_read_input_tokens": 20,
+                        "output_tokens": 5,
+                    },
+                ),
+                self._token_count_event(
+                    None,
+                    now,
+                    total_usage={
+                        "input_tokens": 250,
+                        "cache_read_input_tokens": 50,
+                        "output_tokens": 15,
+                    },
+                ),
+            ],
+        )
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 200)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 50)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 15)
+        self.assertEqual(snapshot["tokens"]["all"], 265)
+        self.assertEqual(snapshot["models"]["gpt-5.4"]["totalTokens"], 265)
+
+    def test_codex_sessions_jsonl_prefers_total_delta_when_last_replays_usage(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_codex_session(
+            "rollout-total-delta.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    {"input_tokens": 100, "cached_input_tokens": 0,
+                     "output_tokens": 10, "reasoning_output_tokens": 0},
+                    now,
+                    total_usage={"input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 10},
+                ),
+                # Some Codex logs replay a broad last_token_usage block while
+                # total_token_usage only advances by the smaller true delta.
+                self._token_count_event(
+                    {"input_tokens": 100, "cached_input_tokens": 0,
+                     "output_tokens": 10, "reasoning_output_tokens": 0},
+                    now,
+                    total_usage={"input_tokens": 150, "cached_input_tokens": 0, "output_tokens": 15},
+                ),
+            ],
+        )
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 150)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 15)
+        self.assertEqual(snapshot["tokens"]["all"], 165)
 
     def test_codex_sessions_jsonl_keeps_classes_but_sqlite_floors_period_totals(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
