@@ -74,7 +74,7 @@ PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.26.2")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.27.0")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -4007,8 +4007,12 @@ def codex_session_files() -> List[Path]:
         files = [p for p in sessions_dir.glob("**/*.jsonl") if p.is_file()]
     except OSError:
         return []
+    # Heavy Codex users can exceed the scan cap. Prefer the newest rollouts so
+    # today/week windows do not get stranded on old history, then parse the
+    # selected files in path order for deterministic cursor updates.
+    files = recent_files(files)
     files.sort(key=lambda p: str(p))
-    return files[:LOCAL_PROVIDER_MAX_FILES]
+    return files
 
 
 def _empty_codex_cursor() -> Dict[str, Any]:
@@ -4097,7 +4101,7 @@ def save_codex_sessions_cursor(cursor: Dict[str, Any]) -> bool:
         return False
 
 
-def codex_sessions_snapshot() -> Dict[str, Any]:
+def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
     """Per-class Codex token snapshot read from sessions/**/*.jsonl.
 
     Returns the SAME shape codex_snapshot produces (status/source/tokens/
@@ -4122,7 +4126,7 @@ def codex_sessions_snapshot() -> Dict[str, Any]:
     sessions_dir = codex_home() / "sessions"
     result["source"] = f"{sessions_dir}/**/*.jsonl"
 
-    cursor = load_codex_sessions_cursor()
+    cursor = _empty_codex_cursor() if force_rebuild else load_codex_sessions_cursor()
     file_cursors: Dict[str, Any] = cursor["files"]
     daily: Dict[str, int] = cursor["daily"]
     hourly: Dict[str, int] = cursor["hourly"]
@@ -4336,25 +4340,39 @@ def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any
     return result
 
 
-def codex_snapshot() -> Dict[str, Any]:
-    # Prefer the per-class sessions-JSONL reader (the technique ccusage /
-    # CodexBar / agentsview use). It gives input/output/cacheRead granularity
-    # and per-model attribution that the coarse threads.tokens_used total
-    # cannot. Fall back to state.sqlite when no sessions/JSONL are found so
-    # nothing regresses.
-    try:
-        sessions = codex_sessions_snapshot()
-    except Exception as exc:  # defensive: never let JSONL parsing break codex
-        logging.debug("codex_sessions_snapshot failed: %s", exc)
-        sessions = {"status": "not_found"}
-    # Use the JSONL path as PRIMARY only when it produced real token data.
-    # When sessions exist but carried no token_count turns yet
-    # ('no_token_events_yet'), still fall back to state.sqlite so the coarse
-    # totals keep showing — nothing regresses.
-    if sessions.get("status") == "ok":
-        return sessions
+def codex_state_sqlite_paths() -> List[Path]:
+    roots = [codex_home(), codex_home() / "sqlite"]
+    paths: List[Path] = []
+    seen: set = set()
+    for root in roots:
+        try:
+            candidates = root.glob("state_*.sqlite")
+            for path in candidates:
+                if not path.is_file():
+                    continue
+                key = str(path)
+                try:
+                    key = str(path.resolve())
+                except OSError:
+                    pass
+                if key in seen:
+                    continue
+                seen.add(key)
+                paths.append(path)
+        except OSError:
+            continue
 
-    paths = sorted((HOME / ".codex").glob("state_*.sqlite"))
+    def sort_key(path: Path) -> Tuple[float, str]:
+        try:
+            return (path.stat().st_mtime, str(path))
+        except OSError:
+            return (0.0, str(path))
+
+    return sorted(paths, key=sort_key)
+
+
+def codex_sqlite_snapshot() -> Dict[str, Any]:
+    paths = codex_state_sqlite_paths()
     result: Dict[str, Any] = {
         "status": "not_found",
         "source": None,
@@ -4455,6 +4473,145 @@ def codex_snapshot() -> Dict[str, Any]:
         result["breakdown"]["chat"] = len(rows)
         result["breakdown"]["status"] = "ok"
     return result
+
+
+def _codex_tokens_all(snapshot: Dict[str, Any]) -> int:
+    tokens = snapshot.get("tokens") if isinstance(snapshot, dict) else None
+    if not isinstance(tokens, dict):
+        return 0
+    return int(tokens.get("all") or tokens.get("totalTokens") or 0)
+
+
+def _codex_sessions_need_rebuild(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> bool:
+    if sessions.get("status") != "ok" or sqlite.get("status") != "ok":
+        return False
+    session_all = _codex_tokens_all(sessions)
+    sqlite_all = _codex_tokens_all(sqlite)
+    if session_all <= 0 or sqlite_all < 10_000_000:
+        return False
+    return sqlite_all > session_all * 5
+
+
+def _merge_int_maps_by_max(primary: Dict[str, Any], fallback: Dict[str, Any]) -> bool:
+    changed = False
+    for key, raw in fallback.items():
+        try:
+            amount = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        current = int(primary.get(key) or 0)
+        if amount > current:
+            primary[key] = amount
+            changed = True
+    return changed
+
+
+def merge_codex_sessions_with_sqlite(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(sessions)
+    changed = False
+
+    session_tokens = merged.setdefault("tokens", empty_periods())
+    sqlite_tokens = sqlite.get("tokens") if isinstance(sqlite.get("tokens"), dict) else {}
+    for key in ("today", "week", "month", "all"):
+        sqlite_value = int(sqlite_tokens.get(key) or 0)
+        if sqlite_value > int(session_tokens.get(key) or 0):
+            session_tokens[key] = sqlite_value
+            changed = True
+    if int(session_tokens.get("all") or 0) > int(session_tokens.get("totalTokens") or 0):
+        session_tokens["totalTokens"] = int(session_tokens.get("all") or 0)
+        changed = True
+
+    daily = merged.setdefault("dailyTokens", {})
+    sqlite_daily = sqlite.get("dailyTokens") if isinstance(sqlite.get("dailyTokens"), dict) else {}
+    if isinstance(daily, dict):
+        changed = _merge_int_maps_by_max(daily, sqlite_daily) or changed
+
+    hourly = merged.setdefault("hourlyTokens", {})
+    sqlite_hourly = sqlite.get("hourlyTokens") if isinstance(sqlite.get("hourlyTokens"), dict) else {}
+    if isinstance(hourly, dict):
+        changed = _merge_int_maps_by_max(hourly, sqlite_hourly) or changed
+
+    models = merged.setdefault("models", {})
+    sqlite_models = sqlite.get("models") if isinstance(sqlite.get("models"), dict) else {}
+    if isinstance(models, dict):
+        for model, raw_periods in sqlite_models.items():
+            if not isinstance(raw_periods, dict):
+                continue
+            target = models.setdefault(str(model), {})
+            if not isinstance(target, dict):
+                continue
+            if _merge_int_maps_by_max(target, raw_periods):
+                total = int(target.get("all") or 0)
+                if total > int(target.get("totalTokens") or 0):
+                    target["totalTokens"] = total
+                changed = True
+
+    sqlite_projects = sqlite.get("projects") if isinstance(sqlite.get("projects"), dict) else {}
+    merged_projects = merged.get("projects") if isinstance(merged.get("projects"), dict) else {}
+    if (
+        sqlite_projects.get("status") == "ok"
+        and sqlite_projects.get("items")
+        and (merged_projects.get("status") != "ok" or not merged_projects.get("items"))
+    ):
+        merged["projects"] = copy.deepcopy(sqlite_projects)
+        changed = True
+
+    sqlite_breakdown = sqlite.get("breakdown") if isinstance(sqlite.get("breakdown"), dict) else {}
+    merged_breakdown = merged.setdefault("breakdown", empty_breakdown())
+    if isinstance(merged_breakdown, dict) and sqlite_breakdown.get("status") == "ok":
+        chat = int(sqlite_breakdown.get("chat") or 0)
+        if chat > int(merged_breakdown.get("chat") or 0):
+            merged_breakdown["chat"] = chat
+            merged_breakdown["status"] = "ok"
+            changed = True
+
+    if changed:
+        merged["source"] = f"{sessions.get('source')} + {sqlite.get('source')}"
+        merged["sources"] = {
+            "sessions": sessions.get("source"),
+            "stateSqlite": sqlite.get("source"),
+        }
+        merged["reconciled"] = {
+            "status": "ok",
+            "strategy": "sqlite_period_floor",
+            "sessionTokens": _codex_tokens_all(sessions),
+            "sqliteTokens": _codex_tokens_all(sqlite),
+        }
+        if sqlite.get("threads") is not None:
+            merged["sqliteThreads"] = int(sqlite.get("threads") or 0)
+    return merged
+
+
+def codex_snapshot() -> Dict[str, Any]:
+    # Prefer the per-class sessions-JSONL reader (the technique ccusage /
+    # CodexBar / agentsview use), but reconcile it with Codex's state.sqlite
+    # thread totals. In the field, partial/corrupt JSONL cursors can otherwise
+    # strand users at a tiny recent subtotal while Codex CLI's own usage screen
+    # still has the full local thread total.
+    try:
+        sessions = codex_sessions_snapshot()
+    except Exception as exc:  # defensive: never let JSONL parsing break codex
+        logging.debug("codex_sessions_snapshot failed: %s", exc)
+        sessions = {"status": "not_found"}
+
+    sqlite = codex_sqlite_snapshot()
+
+    if _codex_sessions_need_rebuild(sessions, sqlite):
+        try:
+            rebuilt = codex_sessions_snapshot(force_rebuild=True)
+            if rebuilt.get("status") == "ok":
+                sessions = rebuilt
+        except Exception as exc:
+            logging.debug("codex_sessions_snapshot rebuild failed: %s", exc)
+
+    if sessions.get("status") == "ok":
+        if sqlite.get("status") == "ok":
+            return merge_codex_sessions_with_sqlite(sessions, sqlite)
+        return sessions
+
+    return sqlite
 
 
 # ---------------------------------------------------------------------------

@@ -734,6 +734,31 @@ class AgentCatConnectorTests(unittest.TestCase):
             payload["cwd"] = cwd
         return {"type": "event_msg", "payload": payload, "timestamp": ts}
 
+    def _write_codex_state(
+        self,
+        tokens: int,
+        updated_at,
+        *,
+        model: str = "gpt-old",
+        cwd: str = "/Users/me/projects/state",
+        sqlite_subdir: bool = False,
+    ) -> Path:
+        codex_dir = agentcat.HOME / ".codex"
+        if sqlite_subdir:
+            codex_dir = codex_dir / "sqlite"
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        db_path = codex_dir / "state_5.sqlite"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                "create table threads(tokens_used integer, model text, updated_at, rollout_path text, cwd text)"
+            )
+            conn.execute(
+                "insert into threads(tokens_used, model, updated_at, rollout_path, cwd) values (?, ?, ?, ?, ?)",
+                (tokens, model, updated_at, None, cwd),
+            )
+            conn.commit()
+        return db_path
+
     def test_codex_sessions_jsonl_sums_per_class_and_attributes_model(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         self._write_codex_session(
@@ -824,7 +849,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["outputTokens"], 4)
         self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["cacheReadInputTokens"], 2)
 
-    def test_codex_sessions_jsonl_preferred_over_state_sqlite(self) -> None:
+    def test_codex_sessions_jsonl_keeps_classes_but_sqlite_floors_period_totals(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         self._write_codex_session(
             "rollout-c.jsonl",
@@ -837,23 +862,79 @@ class AgentCatConnectorTests(unittest.TestCase):
                 ),
             ],
         )
-        # Also drop a state.sqlite with a different total; JSONL must win.
-        db_path = agentcat.HOME / ".codex" / "state_test.sqlite"
-        with closing(sqlite3.connect(db_path)) as conn:
-            conn.execute("create table threads(tokens_used integer, model text, updated_at text)")
-            conn.execute(
-                "insert into threads(tokens_used, model, updated_at) values (?, ?, ?)",
-                (9999, "gpt-old", now),
-            )
-            conn.commit()
+        # Also drop a larger state.sqlite total. Codex can keep a full thread
+        # total even when sessions JSONL/cursor coverage is partial, so period
+        # totals must not get stranded on the smaller JSONL subtotal.
+        self._write_codex_state(9999, now)
 
         snapshot = agentcat.codex_snapshot()
 
         self.assertEqual(snapshot["status"], "ok")
-        self.assertTrue(str(snapshot["source"]).endswith("/sessions/**/*.jsonl"))
-        self.assertEqual(snapshot["tokens"]["all"], 12)
+        self.assertIn("/sessions/**/*.jsonl", str(snapshot["source"]))
+        self.assertIn("state_5.sqlite", str(snapshot["source"]))
+        self.assertEqual(snapshot["tokens"]["all"], 9999)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 9999)
+        # JSONL still supplies the precise class breakdown we do have.
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 8)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 4)
         self.assertIn("gpt-5.4", snapshot["models"])
-        self.assertNotIn("gpt-old", snapshot["models"])
+        self.assertIn("gpt-old", snapshot["models"])
+
+    def test_codex_sqlite_snapshot_reads_new_sqlite_subdirectory(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        db_path = self._write_codex_state(777, now, sqlite_subdir=True)
+
+        snapshot = agentcat.codex_sqlite_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(Path(snapshot["source"]), db_path)
+        self.assertEqual(snapshot["tokens"]["all"], 777)
+        self.assertEqual(snapshot["projects"]["status"], "ok")
+
+    def test_codex_snapshot_rebuilds_stale_partial_sessions_cursor(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        path = self._write_codex_session(
+            "rollout-stale.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    {"input_tokens": 20_000_000, "cached_input_tokens": 0,
+                     "output_tokens": 0, "reasoning_output_tokens": 0},
+                    now,
+                ),
+            ],
+        )
+        stat = path.stat()
+        agentcat.CODEX_SESSIONS_CURSOR_FILE.write_text(
+            json.dumps(
+                {
+                    "version": agentcat.CODEX_SESSIONS_CURSOR_VERSION,
+                    "files": {
+                        str(path): {
+                            "offset": stat.st_size,
+                            "mtime": stat.st_mtime,
+                            "size": stat.st_size,
+                            "turns": 1,
+                            "lastModel": "gpt-5.4",
+                        }
+                    },
+                    "daily": {dt.datetime.now().date().isoformat(): 10},
+                    "hourly": {},
+                    "modelDaily": {"gpt-5.4": {dt.datetime.now().date().isoformat(): 10}},
+                    "modelClasses": {"gpt-5.4": {"inputTokens": 10}},
+                    "projects": {},
+                    "turns": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._write_codex_state(20_000_000, now)
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["tokens"]["all"], 20_000_000)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 20_000_000)
+        self.assertEqual(snapshot["models"]["gpt-5.4"]["inputTokens"], 20_000_000)
 
     def test_codex_sessions_without_token_events_falls_back_to_sqlite(self) -> None:
         # Session file with a turn_context but no token_count -> must fall back.
