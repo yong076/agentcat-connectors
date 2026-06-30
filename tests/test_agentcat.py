@@ -172,6 +172,9 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("desktopApps", snapshot)
         self.assertEqual(snapshot["desktopApps"]["codex"]["status"], "installed_no_data")
         self.assertEqual(snapshot["providers"]["codex"]["desktopApp"]["path"], str(app_path))
+        self.assertEqual(snapshot["providers"]["gemini"]["usageCoverage"]["status"], "no_token_events_yet")
+        self.assertEqual(snapshot["providers"]["opencode"]["usageCoverage"]["status"], "no_token_events_yet")
+        self.assertEqual(snapshot["providers"]["copilot"]["usageCoverage"]["status"], "no_token_events_yet")
 
     def test_codex_usage_api_payload_builds_remaining_quota_entries(self) -> None:
         limits = agentcat.codex_limits_from_usage_response(
@@ -717,8 +720,9 @@ class AgentCatConnectorTests(unittest.TestCase):
 
     # --- Codex sessions-JSONL per-class reader -------------------------------
 
-    def _write_codex_session(self, name: str, lines: list) -> Path:
-        sessions_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "06" / "18"
+    def _write_codex_session(self, name: str, lines: list, *, archived: bool = False) -> Path:
+        root_name = "archived_sessions" if archived else "sessions"
+        sessions_dir = agentcat.HOME / ".codex" / root_name / "2026" / "06" / "18"
         sessions_dir.mkdir(parents=True, exist_ok=True)
         path = sessions_dir / name
         path.write_text(
@@ -849,6 +853,42 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["outputTokens"], 4)
         self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["cacheReadInputTokens"], 2)
 
+    def test_codex_sessions_snapshot_reads_archived_sessions_like_codexbar(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_codex_session(
+            "rollout-active.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    {"input_tokens": 10, "cached_input_tokens": 0,
+                     "output_tokens": 0, "reasoning_output_tokens": 0},
+                    now,
+                ),
+            ],
+        )
+        self._write_codex_session(
+            "rollout-archived.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    {"input_tokens": 100, "cached_input_tokens": 25,
+                     "output_tokens": 5, "reasoning_output_tokens": 0},
+                    now,
+                ),
+            ],
+            archived=True,
+        )
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertIn("/sessions/**/*.jsonl", str(snapshot["source"]))
+        self.assertIn("/archived_sessions/**/*.jsonl", str(snapshot["source"]))
+        self.assertEqual(snapshot["tokens"]["all"], 115)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 85)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 25)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 5)
+
     def test_codex_sessions_jsonl_keeps_classes_but_sqlite_floors_period_totals(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         self._write_codex_session(
@@ -879,6 +919,51 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["outputTokens"], 4)
         self.assertIn("gpt-5.4", snapshot["models"])
         self.assertIn("gpt-old", snapshot["models"])
+        self.assertEqual(snapshot["usageCoverage"]["status"], "local_reconciled")
+        self.assertIn("sessions_jsonl", snapshot["usageCoverage"]["includedSources"])
+        self.assertIn("state_sqlite", snapshot["usageCoverage"]["includedSources"])
+
+    def test_codexbar_cost_cache_floors_codex_totals_when_larger(self) -> None:
+        today = dt.datetime.now().date().isoformat()
+        cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "codex-v8.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "producerKey": "codex:cu:test",
+                    "lastScanUnixMs": int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000),
+                    "days": {
+                        today: {
+                            "gpt-5.5": [1_000, 2_000, 300],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_codex_session(
+            "rollout-cache-floor.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.5"}},
+                self._token_count_event(
+                    {"input_tokens": 10, "cached_input_tokens": 0,
+                     "output_tokens": 0, "reasoning_output_tokens": 0},
+                    now,
+                ),
+            ],
+        )
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["tokens"]["all"], 3_300)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 1_000)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 2_000)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 300)
+        self.assertEqual(snapshot["externalReconciled"]["strategy"], "codexbar_cost_cache_floor")
+        self.assertEqual(snapshot["usageCoverage"]["status"], "local_reconciled_with_codexbar_cache")
+        self.assertIn("codexbar_cost_cache", snapshot["usageCoverage"]["includedSources"])
 
     def test_codex_sqlite_snapshot_reads_new_sqlite_subdirectory(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -1327,6 +1412,35 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(by_source["status"], "ok")
         self.assertEqual(by_source["bySurface"], {"cli": 70})
         self.assertNotIn("app", by_source["bySurface"])
+
+    def test_codexbar_cost_cache_floors_claude_totals_when_larger(self) -> None:
+        today = dt.datetime.now().date().isoformat()
+        cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "claude-v2.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "lastScanUnixMs": int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000),
+                    "days": {
+                        today: {
+                            "claude-sonnet-4-6": [100, 40, 20],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.claude_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["tokens"]["all"], 160)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 100)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 40)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 20)
+        self.assertEqual(snapshot["reconciled"]["strategy"], "codexbar_claude_cost_cache_floor")
+        self.assertEqual(snapshot["usageCoverage"]["codexbarCostCache"]["includedAsFloor"], True)
 
     def test_claude_snapshot_deduplicates_repeated_request_usage(self) -> None:
         project_dir = agentcat.CLAUDE_PROJECTS_DIR / "test-project"

@@ -74,7 +74,7 @@ PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
 LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
     HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.27.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.27.1")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -113,6 +113,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.hourlyTokens",
     "usage.breakdown",
     "usage.projects",
+    "usage.coverage",
     "projects.daily",
     "pricing.feed",
     "usage.opencode.sqlite",
@@ -1167,6 +1168,8 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
     selected_path = configured_path or default_path
     configured = bool(configured_path)
 
+    usage_import = "allowlisted_usage" if provider == "claude" else "metadata_only"
+    tokens_included = usage_import == "allowlisted_usage"
     base: Dict[str, Any] = {
         "provider": provider,
         "displayName": spec.get("displayName") or provider,
@@ -1174,7 +1177,8 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
         "configured": configured,
         "detectedDefault": (not configured and default_path is not None),
         "privacy": "metadata_only",
-        "usageImport": "allowlisted_usage" if provider == "claude" else "metadata_only",
+        "usageImport": usage_import,
+        "tokensIncluded": tokens_included,
         "readsContent": False,
         "status": "not_configured",
         "dataRoots": [],
@@ -1217,7 +1221,14 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
     ]
     if latest_values:
         base["latestModifiedAt"] = max(latest_values)
-    base["status"] = "ok" if readable > 0 else "installed_no_data"
+    if readable > 0:
+        if tokens_included:
+            base["status"] = "ok"
+        else:
+            base["status"] = "installed_no_data"
+            base["statusDetail"] = "metadata_only_not_counted"
+    else:
+        base["status"] = "installed_no_data"
     return base
 
 
@@ -3970,6 +3981,17 @@ def codex_home() -> Path:
     return HOME / ".codex"
 
 
+def codex_session_roots() -> List[Path]:
+    """CodexBar-compatible local session roots.
+
+    Codex keeps active logs under ``sessions`` and can move older logs to the
+    sibling ``archived_sessions`` directory. Counting only ``sessions`` makes
+    heavy users look like they used a tiny fraction of their real 30-day usage.
+    """
+    root = codex_home()
+    return [root / "sessions", root / "archived_sessions"]
+
+
 def codex_session_token_class_amounts(info: Dict[str, Any]) -> Optional[Dict[str, int]]:
     """Extract a per-class token record from a token_count payload.info.
 
@@ -4000,13 +4022,26 @@ def codex_session_token_class_amounts(info: Dict[str, Any]) -> Optional[Dict[str
 
 
 def codex_session_files() -> List[Path]:
-    sessions_dir = codex_home() / "sessions"
-    if not sessions_dir.is_dir():
+    roots = [root for root in codex_session_roots() if root.is_dir()]
+    if not roots:
         return []
-    try:
-        files = [p for p in sessions_dir.glob("**/*.jsonl") if p.is_file()]
-    except OSError:
-        return []
+    files: List[Path] = []
+    seen: Set[str] = set()
+    for root in roots:
+        try:
+            candidates = [p for p in root.glob("**/*.jsonl") if p.is_file()]
+        except OSError:
+            continue
+        for path in candidates:
+            key = str(path)
+            try:
+                key = str(path.resolve())
+            except OSError:
+                pass
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(path)
     # Heavy Codex users can exceed the scan cap. Prefer the newest rollouts so
     # today/week windows do not get stranded on old history, then parse the
     # selected files in path order for deterministic cursor updates.
@@ -4123,8 +4158,8 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
     if not files:
         return result
 
-    sessions_dir = codex_home() / "sessions"
-    result["source"] = f"{sessions_dir}/**/*.jsonl"
+    roots = [root for root in codex_session_roots() if root.is_dir()]
+    result["source"] = " + ".join(f"{root}/**/*.jsonl" for root in roots)
 
     cursor = _empty_codex_cursor() if force_rebuild else load_codex_sessions_cursor()
     file_cursors: Dict[str, Any] = cursor["files"]
@@ -4482,6 +4517,348 @@ def _codex_tokens_all(snapshot: Dict[str, Any]) -> int:
     return int(tokens.get("all") or tokens.get("totalTokens") or 0)
 
 
+CODEXBAR_COST_CACHE_VERSIONS = {
+    "codex": 8,
+    "claude": 2,
+}
+
+
+def codexbar_cost_cache_path(provider: str) -> Path:
+    version = CODEXBAR_COST_CACHE_VERSIONS.get(provider, 1)
+    return HOME / "Library" / "Caches" / "CodexBar" / "cost-usage" / f"{provider}-v{version}.json"
+
+
+def _codexbar_cost_cache_updated_at(raw: Dict[str, Any]) -> Optional[str]:
+    last_scan = raw.get("lastScanUnixMs")
+    if not isinstance(last_scan, (int, float)) or isinstance(last_scan, bool) or last_scan <= 0:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(float(last_scan) / 1000.0, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _codexbar_packed_usage(value: Any) -> Optional[Dict[str, int]]:
+    """Decode CodexBar cost-cache day/model rows.
+
+    CodexBar's MIT local cost scanner stores rows as [input, cacheRead,
+    output]. The connector consumes only these aggregate token counts.
+    """
+    if not isinstance(value, list) or len(value) < 3:
+        return None
+    inp = nonnegative_int(value[0]) or 0
+    cache_read = nonnegative_int(value[1]) or 0
+    out = nonnegative_int(value[2]) or 0
+    total = inp + cache_read + out
+    if total <= 0:
+        return None
+    return {
+        "inputTokens": inp,
+        "cacheReadInputTokens": cache_read,
+        "outputTokens": out,
+        "totalTokens": total,
+    }
+
+
+def codexbar_cost_cache_snapshot(provider: str) -> Dict[str, Any]:
+    """Optional aggregate floor from CodexBar's local cost scanner cache."""
+    path = codexbar_cost_cache_path(provider)
+    result = empty_provider_usage(source=str(path))
+    result["sourceKind"] = "codexbar_cost_cache"
+    raw = read_json(path)
+    if not isinstance(raw, dict):
+        return result
+    if raw.get("version") != 1:
+        result["status"] = "unsupported_schema"
+        result["cacheVersion"] = raw.get("version")
+        return result
+    days = raw.get("days")
+    if not isinstance(days, dict):
+        return result
+
+    daily: Dict[str, int] = {}
+    model_daily: Dict[str, Dict[str, int]] = {}
+    model_classes: Dict[str, Dict[str, int]] = {}
+    for day_raw, models in days.items():
+        day = str(day_raw)
+        try:
+            dt.date.fromisoformat(day)
+        except ValueError:
+            continue
+        if not isinstance(models, dict):
+            continue
+        for model_raw, packed in models.items():
+            usage = _codexbar_packed_usage(packed)
+            if usage is None:
+                continue
+            model = normalized_model_name(model_raw) or "unknown"
+            total = int(usage["totalTokens"])
+            daily[day] = daily.get(day, 0) + total
+            model_days = model_daily.setdefault(model, {})
+            model_days[day] = model_days.get(day, 0) + total
+            classes = model_classes.setdefault(model, {})
+            for key in ("inputTokens", "cacheReadInputTokens", "outputTokens", "totalTokens"):
+                amount = int(usage.get(key) or 0)
+                if amount:
+                    classes[key] = classes.get(key, 0) + amount
+
+    periods = _codex_periods_from_daily(daily)
+    if periods["all"] <= 0:
+        result["status"] = "no_token_events_yet"
+        return result
+
+    tokens = dict(periods)
+    tokens["totalTokens"] = periods["all"]
+    for classes in model_classes.values():
+        for key in ("inputTokens", "cacheReadInputTokens", "outputTokens"):
+            amount = int(classes.get(key) or 0)
+            if amount:
+                tokens[key] = tokens.get(key, 0) + amount
+
+    models_out: Dict[str, Dict[str, int]] = {}
+    for model, classes in model_classes.items():
+        entry = {key: int(value) for key, value in classes.items() if int(value) > 0}
+        model_periods = _codex_periods_from_daily(model_daily.get(model) or {})
+        entry.update(model_periods)
+        entry["totalTokens"] = model_periods["all"]
+        models_out[model] = entry
+
+    result.update({
+        "status": "ok",
+        "tokens": tokens,
+        "models": models_out,
+        "dailyTokens": {k: v for k, v in daily.items() if v > 0},
+        "updatedAt": _codexbar_cost_cache_updated_at(raw),
+        "cacheProducerKey": raw.get("producerKey"),
+        "cacheDays": len(days),
+    })
+    return result
+
+
+def merge_provider_with_usage_floor(
+    primary: Dict[str, Any],
+    floor: Dict[str, Any],
+    *,
+    strategy: str,
+) -> Dict[str, Any]:
+    if floor.get("status") != "ok":
+        return primary
+    primary_total = _codex_tokens_all(primary)
+    floor_total = _codex_tokens_all(floor)
+    if floor_total <= 0:
+        return primary
+    if primary.get("status") != "ok" or primary_total <= 0:
+        replacement = copy.deepcopy(floor)
+        replacement["reconciled"] = {
+            "status": "ok",
+            "strategy": strategy,
+            "primaryStatus": primary.get("status"),
+            "floorTokens": floor_total,
+        }
+        return replacement
+    if floor_total <= primary_total:
+        return primary
+
+    merged = copy.deepcopy(primary)
+    tokens = merged.setdefault("tokens", {})
+    floor_tokens = floor.get("tokens") if isinstance(floor.get("tokens"), dict) else {}
+    for key in ("today", "week", "month", "all", "totalTokens", *TOKEN_TOTAL_PART_KEYS):
+        floor_value = int(floor_tokens.get(key) or 0)
+        if floor_value > int(tokens.get(key) or 0):
+            tokens[key] = floor_value
+
+    daily = merged.setdefault("dailyTokens", {})
+    floor_daily = floor.get("dailyTokens") if isinstance(floor.get("dailyTokens"), dict) else {}
+    if isinstance(daily, dict):
+        for day, amount in floor_daily.items():
+            value = int(amount or 0)
+            if value > int(daily.get(day) or 0):
+                daily[str(day)] = value
+
+    models = merged.setdefault("models", {})
+    floor_models = floor.get("models") if isinstance(floor.get("models"), dict) else {}
+    if isinstance(models, dict):
+        for model, payload in floor_models.items():
+            if not isinstance(payload, dict):
+                continue
+            target = models.setdefault(str(model), {})
+            if not isinstance(target, dict):
+                continue
+            for key, amount in payload.items():
+                if isinstance(amount, (int, float)) and not isinstance(amount, bool):
+                    value = int(amount)
+                    if value > int(target.get(key) or 0):
+                        target[key] = value
+
+    source = str(merged.get("source") or "")
+    floor_source = str(floor.get("source") or "")
+    if floor_source and floor_source not in source:
+        merged["source"] = f"{source} + {floor_source}" if source else floor_source
+    merged["externalReconciled"] = {
+        "status": "ok",
+        "strategy": strategy,
+        "primaryTokens": primary_total,
+        "floorTokens": floor_total,
+        "source": floor.get("source"),
+        "sourceKind": floor.get("sourceKind"),
+    }
+    return merged
+
+
+def attach_local_usage_coverage(provider: str, snapshot: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
+    """Attach source coverage diagnostics for QA without changing totals."""
+    if not isinstance(snapshot, dict) or snapshot.get("status") == "disabled":
+        return snapshot
+    descriptors: Dict[str, Dict[str, Any]] = {
+        "claude": {
+            "includedSources": ["claude_projects_jsonl", "stats_cache", "claude_desktop_allowlist"],
+            "privacy": "usage_fields_only",
+            "note": "Reads Claude Code/Claude Desktop JSONL usage fields only: message.usage, model, timestamp, cwd. Prompts and transcripts are ignored.",
+        },
+        "gemini": {
+            "includedSources": ["agentcat_otel_telemetry", "gemini_code_assist_quota"],
+            "privacy": "token_metrics_only",
+            "note": "Gemini local token usage requires the Agent Cat telemetry outfile toggle; quota uses local Gemini OAuth when available.",
+        },
+        "antigravity": {
+            "includedSources": ["agentcat_antigravity_telemetry", "local_antigravity_probe"],
+            "privacy": "token_metrics_only",
+            "note": "Antigravity does not borrow Gemini CLI tokens; it needs its own telemetry/probe signal.",
+        },
+        "opencode": {
+            "includedSources": ["opencode_sqlite_messages"],
+            "privacy": "assistant_token_metadata",
+            "note": "Reads OpenCode local SQLite assistant message token metadata and session project path.",
+        },
+        "copilot": {
+            "includedSources": ["copilot_legacy_events", "vscode_copilot_transcripts"],
+            "privacy": "token_metadata_or_estimate",
+            "note": "Uses explicit Copilot output tokens when present and local transcript estimates when the transcript lacks token fields.",
+        },
+    }
+    descriptor = descriptors.get(provider)
+    if descriptor is None:
+        return snapshot
+    tokens = snapshot.get("tokens") if isinstance(snapshot.get("tokens"), dict) else {}
+    total = int(tokens.get("totalTokens") or tokens.get("all") or 0)
+    snapshot_status = str(snapshot.get("status") or "not_found")
+    coverage_status = "local_usage_available" if total > 0 else (
+        "no_token_events_yet" if snapshot_status == "ok" else snapshot_status
+    )
+    coverage = {
+        "status": coverage_status,
+        "includedSources": descriptor["includedSources"],
+        "periodWindow": {
+            "today": "local_calendar_day",
+            "week": "trailing_7_calendar_days_including_today",
+            "month": "trailing_30_calendar_days_including_today",
+        },
+        "privacy": descriptor["privacy"],
+        "note": descriptor["note"],
+        "tokens": {
+            "all": total,
+            "today": int(tokens.get("today") or 0),
+            "week": int(tokens.get("week") or 0),
+            "month": int(tokens.get("month") or 0),
+        },
+    }
+    coverage.update({k: v for k, v in extra.items() if v is not None})
+    snapshot["usageCoverage"] = coverage
+    return snapshot
+
+
+def _codex_token_period_summary(snapshot: Dict[str, Any]) -> Dict[str, int]:
+    tokens = snapshot.get("tokens") if isinstance(snapshot, dict) else None
+    if not isinstance(tokens, dict):
+        return empty_periods()
+    summary = empty_periods()
+    for key in ("today", "week", "month", "all"):
+        summary[key] = int(tokens.get(key) or 0)
+    summary["totalTokens"] = int(tokens.get("totalTokens") or summary["all"])
+    return summary
+
+
+def attach_codex_usage_coverage(
+    snapshot: Dict[str, Any],
+    sessions: Dict[str, Any],
+    sqlite: Dict[str, Any],
+    codexbar_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    session_ok = sessions.get("status") == "ok"
+    sqlite_ok = sqlite.get("status") == "ok"
+    if session_ok and sqlite_ok and snapshot.get("reconciled"):
+        status = "local_reconciled"
+    elif session_ok and sqlite_ok:
+        status = "local_combined"
+    elif session_ok:
+        status = "sessions_jsonl"
+    elif sqlite_ok:
+        status = "state_sqlite"
+    else:
+        status = str(snapshot.get("status") or "not_found")
+
+    included_sources: List[str] = []
+    if session_ok:
+        included_sources.append("sessions_jsonl")
+    if sqlite_ok:
+        included_sources.append("state_sqlite")
+    codexbar_ok = isinstance(codexbar_cache, dict) and codexbar_cache.get("status") == "ok"
+    if codexbar_ok:
+        included_sources.append("codexbar_cost_cache")
+        if snapshot.get("externalReconciled"):
+            status = "local_reconciled_with_codexbar_cache"
+
+    snapshot["usageCoverage"] = {
+        "status": status,
+        "includedSources": included_sources,
+        "periodWindow": {
+            "today": "local_calendar_day",
+            "week": "trailing_7_calendar_days_including_today",
+            "month": "trailing_30_calendar_days_including_today",
+        },
+        "sessions": {
+            "status": sessions.get("status"),
+            "source": sessions.get("source"),
+            "tokens": _codex_token_period_summary(sessions),
+            "turns": int(sessions.get("turns") or 0),
+        },
+        "stateSqlite": {
+            "status": sqlite.get("status"),
+            "source": sqlite.get("source"),
+            "tokens": _codex_token_period_summary(sqlite),
+            "threads": int(sqlite.get("threads") or 0),
+        },
+        "desktopApp": {
+            "usageImport": "metadata_only",
+            "tokensIncluded": False,
+            "note": "Codex.app/profile files are detected for setup diagnostics only; local token totals come from ~/.codex sessions JSONL and state_*.sqlite.",
+        },
+        "accountUsage": {
+            "status": "on_demand",
+            "includedInSnapshot": False,
+            "httpPath": "/v1/usage",
+            "cli": "agentcat usage --json",
+            "note": "Use this path to compare local usage with CodexBar/OAuth account usage without slowing the 60s local snapshot poll.",
+        },
+    }
+    if isinstance(codexbar_cache, dict):
+        codexbar_included = bool(
+            snapshot.get("externalReconciled")
+            or (
+                isinstance(snapshot.get("reconciled"), dict)
+                and snapshot["reconciled"].get("strategy") == "codexbar_cost_cache_floor"
+            )
+        )
+        snapshot["usageCoverage"]["codexbarCostCache"] = {
+            "status": codexbar_cache.get("status"),
+            "source": codexbar_cache.get("source"),
+            "tokens": _codex_token_period_summary(codexbar_cache),
+            "updatedAt": codexbar_cache.get("updatedAt"),
+            "includedAsFloor": codexbar_included,
+        }
+    return snapshot
+
+
 def _codex_sessions_need_rebuild(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> bool:
     if sessions.get("status") != "ok" or sqlite.get("status") != "ok":
         return False
@@ -4606,12 +4983,29 @@ def codex_snapshot() -> Dict[str, Any]:
         except Exception as exc:
             logging.debug("codex_sessions_snapshot rebuild failed: %s", exc)
 
+    codexbar_cache = codexbar_cost_cache_snapshot("codex")
     if sessions.get("status") == "ok":
         if sqlite.get("status") == "ok":
-            return merge_codex_sessions_with_sqlite(sessions, sqlite)
-        return sessions
+            local = merge_codex_sessions_with_sqlite(sessions, sqlite)
+            merged = merge_provider_with_usage_floor(
+                local,
+                codexbar_cache,
+                strategy="codexbar_cost_cache_floor",
+            )
+            return attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+        merged = merge_provider_with_usage_floor(
+            sessions,
+            codexbar_cache,
+            strategy="codexbar_cost_cache_floor",
+        )
+        return attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
 
-    return sqlite
+    merged = merge_provider_with_usage_floor(
+        sqlite,
+        codexbar_cache,
+        strategy="codexbar_cost_cache_floor",
+    )
+    return attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
 
 
 # ---------------------------------------------------------------------------
@@ -5269,9 +5663,30 @@ def claude_snapshot() -> Dict[str, Any]:
     # Additive per-source split (Claude Code CLI vs Claude Desktop app).
     # Independent full scan; does not touch any existing field above.
     result["usageBySource"] = claude_usage_by_source()
+    claude_cost_cache = codexbar_cost_cache_snapshot("claude")
 
     if raw is None:
-        return result
+        merged = merge_provider_with_usage_floor(
+            result,
+            claude_cost_cache,
+            strategy="codexbar_claude_cost_cache_floor",
+        )
+        return attach_local_usage_coverage(
+            "claude",
+            merged,
+            codexbarCostCache={
+                "status": claude_cost_cache.get("status"),
+                "source": claude_cost_cache.get("source"),
+                "tokens": _codex_token_period_summary(claude_cost_cache),
+                "includedAsFloor": bool(
+                    merged.get("externalReconciled")
+                    or (
+                        isinstance(merged.get("reconciled"), dict)
+                        and merged["reconciled"].get("strategy") == "codexbar_claude_cost_cache_floor"
+                    )
+                ),
+            },
+        )
 
     if result["status"] not in ("error",):
         result["status"] = "ok"
@@ -5328,7 +5743,27 @@ def claude_snapshot() -> Dict[str, Any]:
         result["dailyActivityDays"] = len(daily_activity)
     elif isinstance(daily_activity, list):
         result["dailyActivityDays"] = len(daily_activity)
-    return result
+    merged = merge_provider_with_usage_floor(
+        result,
+        claude_cost_cache,
+        strategy="codexbar_claude_cost_cache_floor",
+    )
+    return attach_local_usage_coverage(
+        "claude",
+        merged,
+        codexbarCostCache={
+            "status": claude_cost_cache.get("status"),
+            "source": claude_cost_cache.get("source"),
+            "tokens": _codex_token_period_summary(claude_cost_cache),
+            "includedAsFloor": bool(
+                merged.get("externalReconciled")
+                or (
+                    isinstance(merged.get("reconciled"), dict)
+                    and merged["reconciled"].get("strategy") == "codexbar_claude_cost_cache_floor"
+                )
+            ),
+        },
+    )
 
 
 def gemini_source_descriptors() -> List[Dict[str, Any]]:
@@ -7177,6 +7612,8 @@ def build_snapshot() -> Dict[str, Any]:
         providers["gemini"] = disabled_provider_snapshot("gemini")
     if (provider_config.get("antigravity") or {}).get("enabled") is False:
         providers["antigravity"] = disabled_provider_snapshot("antigravity")
+    for provider in ("gemini", "antigravity", "opencode", "copilot"):
+        attach_local_usage_coverage(provider, providers.get(provider, {}))
     for provider, data in providers.items():
         if data.get("status") == "disabled":
             data["limits"] = empty_limits("disabled")
@@ -7536,6 +7973,27 @@ def command_snapshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_usage(args: argparse.Namespace) -> int:
+    payload = fetch_llm_usage_fresh()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        if payload.get("error"):
+            print(f"agentcat usage: {payload.get('error')} {payload.get('message') or ''}".strip())
+            return 1
+        print("Agent Cat on-demand usage")
+        providers = payload.get("providers") if isinstance(payload.get("providers"), dict) else {}
+        for provider, data in providers.items():
+            tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+            quota = data.get("quota") if isinstance(data.get("quota"), dict) else {}
+            total = int(tokens.get("total") or 0)
+            used = quota.get("used_percent")
+            source = data.get("source") or "unknown"
+            suffix = f", used {used:.1f}%" if isinstance(used, (int, float)) else ""
+            print(f"- {provider}: {data.get('status')}, {total:,} tokens, source {source}{suffix}")
+    return 0 if not payload.get("error") else 1
+
+
 def command_event(args: argparse.Namespace) -> int:
     payload = read_stdin_payload()
     event = store_event(args.provider, args.source, args.event, payload)
@@ -7621,6 +8079,10 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot = subparsers.add_parser("snapshot")
     snapshot.add_argument("--json", action="store_true")
     snapshot.set_defaults(func=command_snapshot)
+
+    usage = subparsers.add_parser("usage")
+    usage.add_argument("--json", action="store_true")
+    usage.set_defaults(func=command_usage)
 
     event = subparsers.add_parser("event")
     event.add_argument("--provider", required=True)
