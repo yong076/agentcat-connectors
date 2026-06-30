@@ -2879,6 +2879,28 @@ class AgentCatConnectorTests(unittest.TestCase):
         snap_mode = _stat.S_IMODE(_os.stat(agentcat.LATEST_SNAPSHOT).st_mode)
         self.assertEqual(snap_mode, 0o600)
 
+    def test_write_json_atomic_concurrent_writers_do_not_share_tmp_path(self) -> None:
+        target = agentcat.AGENTCAT_HOME / "latest-snapshot.json"
+        errors = []
+
+        def writer(worker: int) -> None:
+            try:
+                for index in range(25):
+                    agentcat.write_json_atomic(target, {"worker": worker, "index": index})
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(worker,)) for worker in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        self.assertIn("worker", payload)
+        self.assertIn("index", payload)
+
 
 class InsightsIntegrationTests(unittest.TestCase):
     """Slice C — build_snapshot() includes insights, schema is v3."""
