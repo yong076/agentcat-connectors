@@ -1483,6 +1483,27 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(by_source["bySurface"], {"cli": 70})
         self.assertNotIn("app", by_source["bySurface"])
 
+    def test_claude_usage_by_source_recomputes_only_when_files_change(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        cli_dir = agentcat.CLAUDE_PROJECTS_DIR / "cache-project"
+        cli_dir.mkdir(parents=True)
+        session = cli_dir / "session.jsonl"
+        session.write_text(
+            self._claude_usage_event(now, "cache_req_1", "cache_msg_1", 50),
+            encoding="utf-8",
+        )
+
+        first = agentcat.claude_usage_by_source()
+        self.assertEqual(first["bySurface"], {"cli": 50})
+        # Unchanged files → the memoized value is returned on the next tick.
+        self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 50})
+
+        # Appending grows the file (size + mtime change) → cache invalidates and
+        # the token total re-scans.
+        with session.open("a", encoding="utf-8") as fh:
+            fh.write(self._claude_usage_event(now, "cache_req_2", "cache_msg_2", 30))
+        self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 80})
+
     def test_codexbar_cost_cache_floors_claude_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()
         cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"
