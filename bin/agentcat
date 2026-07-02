@@ -4306,7 +4306,7 @@ def save_codex_sessions_cursor(cursor: Dict[str, Any]) -> bool:
     try:
         AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
         with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(cursor, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(cursor, fh, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
             fh.write("\n")
         tmp.replace(CODEX_SESSIONS_CURSOR_FILE)
         return True
@@ -5356,7 +5356,7 @@ def save_journal_cursor(cursor: Dict[str, Any]) -> bool:
     try:
         AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
         with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(cursor, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(cursor, fh, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
             fh.write("\n")
         tmp.replace(JOURNAL_CURSOR_FILE)
         return True
