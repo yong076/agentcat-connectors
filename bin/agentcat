@@ -5777,14 +5777,52 @@ def _classify_claude_journal_root(root: Path) -> str:
     return "cli"
 
 
+_CLAUDE_USAGE_BY_SOURCE_LOCK = threading.Lock()
+_CLAUDE_USAGE_BY_SOURCE_KEY: Optional[Tuple] = None
+_CLAUDE_USAGE_BY_SOURCE_VALUE: Optional[Dict[str, Any]] = None
+
+
+def _claude_journal_signature() -> Tuple:
+    """Cheap fingerprint of every Claude journal file: (path, mtime_ns, size).
+
+    Walking + stat'ing is orders of magnitude cheaper than reading and
+    JSON-parsing the whole corpus, so it lets ``claude_usage_by_source`` skip
+    the full re-scan on the 60s snapshot tick unless a file actually changed.
+    """
+    entries = []
+    for root in claude_journal_project_dirs():
+        surface = _classify_claude_journal_root(root)
+        try:
+            paths = sorted(root.rglob("*.jsonl"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                stat = path.stat()
+                entries.append((str(path), surface, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                continue
+    return tuple(entries)
+
+
 def claude_usage_by_source() -> Dict[str, Any]:
     """Sum Claude journal tokens split by surface (CLI vs Desktop app).
 
-    Standalone full scan over the same journal roots used by the merged
-    totals; deliberately independent of the incremental cursor so this stays
-    purely additive and cannot perturb existing offsets/totals. Defensive
-    against unreadable files and malformed lines.
+    Standalone scan over the same journal roots used by the merged totals;
+    deliberately independent of the incremental cursor so this stays purely
+    additive and cannot perturb existing offsets/totals. Defensive against
+    unreadable files and malformed lines.
+
+    Memoized on the journal file signature so the daemon's 60s snapshot tick
+    only re-reads the (potentially hundreds of MB) corpus when a file changed,
+    instead of every cycle.
     """
+    global _CLAUDE_USAGE_BY_SOURCE_KEY, _CLAUDE_USAGE_BY_SOURCE_VALUE
+    signature = _claude_journal_signature()
+    with _CLAUDE_USAGE_BY_SOURCE_LOCK:
+        if _CLAUDE_USAGE_BY_SOURCE_VALUE is not None and _CLAUDE_USAGE_BY_SOURCE_KEY == signature:
+            return dict(_CLAUDE_USAGE_BY_SOURCE_VALUE)
+
     per_source: Dict[str, int] = {"cli": 0, "app": 0}
     for root in claude_journal_project_dirs():
         surface = _classify_claude_journal_root(root)
@@ -5814,12 +5852,16 @@ def claude_usage_by_source() -> Dict[str, Any]:
     cli_tokens = per_source["cli"]
     app_tokens = per_source["app"]
     by_surface = {k: v for k, v in {"cli": cli_tokens, "app": app_tokens}.items() if v > 0}
-    return {
+    value = {
         "status": "ok" if (cli_tokens > 0 or app_tokens > 0) else "not_available",
         "units": "tokens",
         "bySurface": by_surface,
         "source": "claude-journal-split",
     }
+    with _CLAUDE_USAGE_BY_SOURCE_LOCK:
+        _CLAUDE_USAGE_BY_SOURCE_KEY = signature
+        _CLAUDE_USAGE_BY_SOURCE_VALUE = value
+    return dict(value)
 
 
 def claude_snapshot() -> Dict[str, Any]:
