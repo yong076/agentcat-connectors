@@ -1467,6 +1467,37 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "ok")
         self.assertEqual(snapshot["tokens"]["totalTokens"], 140)
 
+    def test_claude_usage_by_source_reattributes_desktop_launched_cli_sessions(self) -> None:
+        # The desktop app runs embedded Claude Code whose journal lands in the
+        # shared CLI dir; its claude-code-sessions index carries the session's
+        # cliSessionId. That journal must count as "app", not "cli".
+        now = dt.datetime.now(dt.timezone.utc)
+        desktop_session_id = "22e8e2ec-c639-4373-990e-4242f7e3f846"
+
+        cli_dir = agentcat.CLAUDE_PROJECTS_DIR / "mixed-project"
+        cli_dir.mkdir(parents=True)
+        # A normal CLI session and a desktop-launched one, both in the CLI dir.
+        (cli_dir / "plain-cli.jsonl").write_text(
+            self._claude_usage_event(now, "cli_r", "cli_m", 70), encoding="utf-8",
+        )
+        (cli_dir / f"{desktop_session_id}.jsonl").write_text(
+            self._claude_usage_event(now, "dt_r", "dt_m", 30), encoding="utf-8",
+        )
+
+        sessions_dir = (
+            agentcat.HOME / "Library" / "Application Support" / "Claude"
+            / "claude-code-sessions" / "acct" / "ws"
+        )
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "local_x.json").write_text(
+            json.dumps({"sessionId": "local_x", "cliSessionId": desktop_session_id, "cwd": "/x"}),
+            encoding="utf-8",
+        )
+
+        by_source = agentcat.claude_snapshot()["usageBySource"]
+        # 70 stays CLI, the 30 desktop-launched session moves to app.
+        self.assertEqual(by_source["bySurface"], {"cli": 70, "app": 30})
+
     def test_claude_snapshot_usage_by_source_omits_app_without_desktop_root(self) -> None:
         now = dt.datetime.now(dt.timezone.utc)
         cli_dir = agentcat.CLAUDE_PROJECTS_DIR / "cli-only-project"

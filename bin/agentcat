@@ -5777,6 +5777,35 @@ def _classify_claude_journal_root(root: Path) -> str:
     return "cli"
 
 
+def _desktop_originated_claude_session_ids() -> Set[str]:
+    """Session ids of Claude Code runs launched from the Claude desktop app.
+
+    The desktop app now runs embedded Claude Code, whose journals land in the
+    SHARED CLI dir (``~/.claude/projects``) — so by root they'd count as "cli".
+    The desktop app records each such run in
+    ``<app-support>/claude-code-sessions/**/*.json`` with a ``cliSessionId`` that
+    equals the journal filename stem, letting us reattribute those journals to
+    the desktop ("app") surface. Defensive against unreadable/partial indexes.
+    """
+    ids: Set[str] = set()
+    for data_root in desktop_app_data_roots("claude"):
+        sessions_dir = data_root / "claude-code-sessions"
+        try:
+            paths = sessions_dir.rglob("*.json")
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(obj, dict):
+                sid = obj.get("cliSessionId")
+                if isinstance(sid, str) and sid:
+                    ids.add(sid)
+    return ids
+
+
 _CLAUDE_USAGE_BY_SOURCE_LOCK = threading.Lock()
 _CLAUDE_USAGE_BY_SOURCE_KEY: Optional[Tuple] = None
 _CLAUDE_USAGE_BY_SOURCE_VALUE: Optional[Dict[str, Any]] = None
@@ -5818,7 +5847,11 @@ def claude_usage_by_source() -> Dict[str, Any]:
     instead of every cycle.
     """
     global _CLAUDE_USAGE_BY_SOURCE_KEY, _CLAUDE_USAGE_BY_SOURCE_VALUE
-    signature = _claude_journal_signature()
+    # Desktop-launched Claude Code journals live in the shared CLI dir; reattribute
+    # them to "app" by session id. Fold the id set into the cache key so the split
+    # recomputes when the desktop session index changes.
+    desktop_ids = _desktop_originated_claude_session_ids()
+    signature = (_claude_journal_signature(), tuple(sorted(desktop_ids)))
     with _CLAUDE_USAGE_BY_SOURCE_LOCK:
         if _CLAUDE_USAGE_BY_SOURCE_VALUE is not None and _CLAUDE_USAGE_BY_SOURCE_KEY == signature:
             return dict(_CLAUDE_USAGE_BY_SOURCE_VALUE)
@@ -5831,6 +5864,9 @@ def claude_usage_by_source() -> Dict[str, Any]:
         except OSError:
             continue
         for path in paths:
+            # A CLI-root journal whose session id was launched from the desktop
+            # app is really desktop usage.
+            file_surface = "app" if (surface == "cli" and path.stem in desktop_ids) else surface
             try:
                 with path.open("rb") as fh:
                     for raw_line in fh:
@@ -5845,7 +5881,7 @@ def claude_usage_by_source() -> Dict[str, Any]:
                             continue
                         rec = parse_claude_usage_line(obj)
                         if rec:
-                            per_source[surface] += claude_record_total(rec)
+                            per_source[file_surface] += claude_record_total(rec)
             except OSError as exc:
                 logging.warning("claude_usage_by_source: cannot read %s: %s", str(path), exc)
                 continue
