@@ -412,6 +412,90 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(normalized["quotas"][0]["model"], "gemini-3-flash-preview")
         self.assertEqual(normalized["quotas"][1]["model"], "gemini-3.1-flash-lite")
 
+    def test_unwrap_antigravity_oauth_token_flattens_nested_token(self) -> None:
+        flat = agentcat.unwrap_antigravity_oauth_token(
+            {"token": {"access_token": "x", "refresh_token": "y"}, "auth_method": "oauth"}
+        )
+
+        self.assertEqual(flat["access_token"], "x")
+        self.assertEqual(flat["refresh_token"], "y")
+        self.assertEqual(flat["auth_method"], "oauth")
+        self.assertNotIn("token", flat)
+
+    def test_unwrap_antigravity_oauth_token_passes_through_flat_payload(self) -> None:
+        raw = {"access_token": "x", "refresh_token": "y"}
+
+        self.assertEqual(agentcat.unwrap_antigravity_oauth_token(raw), raw)
+
+    def test_gemini_oauth_credentials_unwrap_antigravity_token_file(self) -> None:
+        token_path = agentcat.HOME / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        token_path.parent.mkdir(parents=True)
+        token_path.write_text(
+            json.dumps(
+                {
+                    "token": {
+                        "access_token": "x",
+                        "token_type": "Bearer",
+                        "refresh_token": "y",
+                        "expiry": "2026-06-12T00:00:00Z",
+                    },
+                    "auth_method": "oauth",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        creds = agentcat.read_gemini_oauth_credentials()
+
+        self.assertIsNotNone(creds)
+        self.assertEqual(creds["access_token"], "x")
+        self.assertEqual(creds["refresh_token"], "y")
+        self.assertEqual(creds["expiry"], "2026-06-12T00:00:00Z")
+        self.assertNotIn("token", creds)
+
+    def test_gemini_oauth_credentials_probe_order(self) -> None:
+        gemini_creds = agentcat.HOME / ".gemini" / "oauth_creds.json"
+        antigravity_dir = agentcat.HOME / ".gemini" / "antigravity-cli"
+        antigravity_dir.mkdir(parents=True)
+        gemini_creds.write_text(json.dumps({"access_token": "gemini"}), encoding="utf-8")
+        (antigravity_dir / "oauth_creds.json").write_text(json.dumps({"access_token": "antigravity"}), encoding="utf-8")
+        (antigravity_dir / "antigravity-oauth-token").write_text(
+            json.dumps({"token": {"access_token": "wrapped"}}), encoding="utf-8"
+        )
+        legacy_dir = agentcat.HOME / ".antigravity"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "oauth_creds.json").write_text(json.dumps({"access_token": "legacy"}), encoding="utf-8")
+
+        self.assertEqual(agentcat.read_gemini_oauth_credentials()["access_token"], "gemini")
+
+        gemini_creds.unlink()
+        self.assertEqual(agentcat.read_gemini_oauth_credentials()["access_token"], "antigravity")
+
+        (antigravity_dir / "oauth_creds.json").unlink()
+        self.assertEqual(agentcat.read_gemini_oauth_credentials()["access_token"], "wrapped")
+
+        (antigravity_dir / "antigravity-oauth-token").unlink()
+        self.assertEqual(agentcat.read_gemini_oauth_credentials()["access_token"], "legacy")
+
+        (legacy_dir / "oauth_creds.json").unlink()
+        self.assertIsNone(agentcat.read_gemini_oauth_credentials())
+
+    def test_gemini_auth_type_reads_antigravity_settings_legacy_key(self) -> None:
+        settings_path = agentcat.HOME / ".gemini" / "antigravity-cli" / "settings.json"
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps({"selectedAuthType": "oauth-personal"}), encoding="utf-8")
+
+        self.assertEqual(agentcat.read_gemini_auth_type(), "oauth-personal")
+
+    def test_gemini_auth_type_falls_back_to_oauth_personal_when_creds_exist(self) -> None:
+        token_path = agentcat.HOME / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        token_path.parent.mkdir(parents=True)
+        token_path.write_text(json.dumps({"token": {"access_token": "x", "refresh_token": "y"}}), encoding="utf-8")
+
+        env = {"GOOGLE_GENAI_USE_GCA": "", "GEMINI_API_KEY": "", "GOOGLE_GENAI_USE_VERTEXAI": ""}
+        with patch.dict(agentcat.os.environ, env):
+            self.assertEqual(agentcat.read_gemini_auth_type(), "oauth-personal")
+
     def test_live_limit_cache_returns_stale_limits_when_allowed(self) -> None:
         limits = agentcat.empty_limits(status="auto")
         limits["quotas"] = [
