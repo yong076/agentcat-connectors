@@ -488,7 +488,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat.write_support_bundle(bundle, report)
         text = bundle.read_text(encoding="utf-8")
         self.assertNotIn(str(agentcat.HOME), text)
-        self.assertIn("~/secret/path", text)
+        self.assertIn("~/secret/path", text.replace("\\", "/"))
 
     def test_fetch_llm_usage_fresh_returns_ondemand_contract(self) -> None:
         with patch.object(agentcat.sys, "platform", "linux"):
@@ -1097,7 +1097,8 @@ class AgentCatConnectorTests(unittest.TestCase):
         snapshot = agentcat.codex_snapshot()
 
         self.assertEqual(snapshot["status"], "ok")
-        self.assertTrue(str(snapshot["source"]).endswith("/sessions/**/*.jsonl"))
+        source = str(snapshot["source"]).replace("\\", "/")
+        self.assertTrue(source.endswith("/sessions/**/*.jsonl"))
         # uncached input: (100-30) + 50 = 120
         self.assertEqual(snapshot["tokens"]["inputTokens"], 120)
         # output incl reasoning: (40+10) + 20 = 70
@@ -1180,8 +1181,9 @@ class AgentCatConnectorTests(unittest.TestCase):
         snapshot = agentcat.codex_snapshot()
 
         self.assertEqual(snapshot["status"], "ok")
-        self.assertIn("/sessions/**/*.jsonl", str(snapshot["source"]))
-        self.assertIn("/archived_sessions/**/*.jsonl", str(snapshot["source"]))
+        source = str(snapshot["source"]).replace("\\", "/")
+        self.assertIn("/sessions/**/*.jsonl", source)
+        self.assertIn("/archived_sessions/**/*.jsonl", source)
         self.assertEqual(snapshot["tokens"]["all"], 115)
         self.assertEqual(snapshot["tokens"]["inputTokens"], 85)
         self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 25)
@@ -1274,8 +1276,9 @@ class AgentCatConnectorTests(unittest.TestCase):
         snapshot = agentcat.codex_snapshot()
 
         self.assertEqual(snapshot["status"], "ok")
-        self.assertIn("/sessions/**/*.jsonl", str(snapshot["source"]))
-        self.assertIn("state_5.sqlite", str(snapshot["source"]))
+        source = str(snapshot["source"]).replace("\\", "/")
+        self.assertIn("/sessions/**/*.jsonl", source)
+        self.assertIn("state_5.sqlite", source)
         self.assertEqual(snapshot["tokens"]["all"], 9999)
         self.assertEqual(snapshot["tokens"]["totalTokens"], 9999)
         # JSONL still supplies the precise class breakdown we do have.
@@ -2585,9 +2588,13 @@ class AgentCatConnectorTests(unittest.TestCase):
             agentcat.classify_process(r'"C:\Users\me\.local\bin\agy.exe" --print hello'),
             "antigravity",
         )
-        self.assertEqual(
+        self.assertIsNone(
             agentcat.classify_process("/Applications/Antigravity.app/Contents/MacOS/antigravity"),
-            "antigravity",
+        )
+        self.assertIsNone(
+            agentcat.classify_process(
+                "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper"
+            ),
         )
 
     def test_classify_ignores_codex_desktop_electron_helpers_on_windows(self) -> None:
