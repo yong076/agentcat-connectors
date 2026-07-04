@@ -334,6 +334,216 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIsNone(sanitized["quotas"][0]["model"])
         self.assertNotIn("omelette", sanitized["quotas"][0]["id"])
 
+    def _write_claude_credentials(self, oauth: dict) -> None:
+        creds_dir = agentcat.HOME / ".claude"
+        creds_dir.mkdir(parents=True, exist_ok=True)
+        (creds_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": oauth}), encoding="utf-8"
+        )
+
+    def test_merge_limits_preserves_detection_reason(self) -> None:
+        # build_snapshot merges configured (manual limits.json, usually empty) with the
+        # runtime/live result. A not_configured live result must keep its reason so the
+        # app can explain the failure instead of showing a blank "not configured".
+        configured = agentcat.empty_limits()
+        detected = agentcat.empty_limits(reason="token_missing")
+        merged = agentcat.merge_limits(configured, detected)
+        self.assertEqual(merged["status"], "not_configured")
+        self.assertEqual(merged["reason"], "token_missing")
+
+    def test_merge_limits_configured_ok_clears_stale_reason(self) -> None:
+        configured = agentcat.normalize_limits({"week": 1000})  # status ok
+        detected = agentcat.empty_limits(reason="not_applicable")
+        merged = agentcat.merge_limits(configured, detected)
+        self.assertEqual(merged["status"], "ok")
+        self.assertIsNone(merged.get("reason"))
+
+    def test_claude_oauth_credentials_reports_token_missing(self) -> None:
+        with patch.object(agentcat.sys, "platform", "linux"):
+            result = agentcat.read_claude_oauth_credentials()
+        self.assertIsNone(result["oauth"])
+        self.assertEqual(result["reason"], "token_missing")
+
+    def test_claude_oauth_credentials_reads_file_credentials(self) -> None:
+        self._write_claude_credentials({"accessToken": "tok", "expiresAt": 999})
+        with patch.object(agentcat.sys, "platform", "linux"):
+            result = agentcat.read_claude_oauth_credentials()
+        self.assertIsNone(result["reason"])
+        self.assertEqual(result["oauth"]["accessToken"], "tok")
+
+    def test_claude_oauth_credentials_flags_keychain_denial(self) -> None:
+        denied = agentcat.subprocess.CalledProcessError(45, "security")
+        with patch.object(agentcat.sys, "platform", "darwin"), patch.object(
+            agentcat.subprocess, "check_output", side_effect=denied
+        ):
+            result = agentcat.read_claude_oauth_credentials()
+        self.assertIsNone(result["oauth"])
+        self.assertEqual(result["reason"], "keychain_denied")
+
+    def test_claude_oauth_credentials_keychain_not_found_is_token_missing(self) -> None:
+        not_found = agentcat.subprocess.CalledProcessError(44, "security")
+        with patch.object(agentcat.sys, "platform", "darwin"), patch.object(
+            agentcat.subprocess, "check_output", side_effect=not_found
+        ):
+            result = agentcat.read_claude_oauth_credentials()
+        self.assertEqual(result["reason"], "token_missing")
+
+    def test_claude_oauth_credentials_honors_claude_config_dir(self) -> None:
+        alt = self.root / "alt-claude"
+        alt.mkdir()
+        (alt / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "alt-tok"}}), encoding="utf-8"
+        )
+        with patch.object(agentcat.sys, "platform", "linux"), patch.dict(
+            agentcat.os.environ, {"CLAUDE_CONFIG_DIR": str(alt)}
+        ):
+            result = agentcat.read_claude_oauth_credentials()
+        self.assertIsNone(result["reason"])
+        self.assertEqual(result["oauth"]["accessToken"], "alt-tok")
+
+    def test_claude_usage_response_without_quotas_is_cacheable_not_applicable(self) -> None:
+        limits = agentcat.claude_limits_from_usage_response({})
+        self.assertEqual(limits["status"], "not_configured")
+        self.assertEqual(limits["reason"], "not_applicable")
+        # The definitive negative is now cached, so the 60s tick stops re-probing.
+        agentcat.write_live_limits_cache("claude", limits)
+        cached = agentcat.cached_live_limits("claude", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["reason"], "not_applicable")
+
+    def test_doctor_report_flags_missing_providers(self) -> None:
+        with patch.object(agentcat.sys, "platform", "linux"), patch.object(
+            agentcat.urllib.request, "urlopen", side_effect=OSError("no daemon")
+        ):
+            report = agentcat.doctor_report()
+        by_id = {check["id"]: check for check in report["checks"]}
+        self.assertEqual(by_id["daemon.reachable"]["status"], "error")
+        self.assertEqual(by_id["daemon.reachable"]["reason"], "daemon_unreachable")
+        self.assertEqual(by_id["claude.credentials"]["reason"], "token_missing")
+        self.assertEqual(by_id["claude.journal"]["reason"], "journal_dir_not_found")
+        self.assertEqual(report["status"], "broken")
+
+    def test_doctor_report_ok_when_claude_data_present(self) -> None:
+        proj = agentcat.CLAUDE_PROJECTS_DIR / "acme"
+        proj.mkdir(parents=True)
+        (proj / "session.jsonl").write_text("{}\n", encoding="utf-8")
+        self._write_claude_credentials({"accessToken": "tok"})
+        with patch.object(agentcat.sys, "platform", "linux"), patch.object(
+            agentcat.urllib.request, "urlopen", side_effect=OSError("no daemon")
+        ):
+            report = agentcat.doctor_report()
+        by_id = {check["id"]: check for check in report["checks"]}
+        self.assertEqual(by_id["claude.credentials"]["status"], "ok")
+        self.assertEqual(by_id["claude.journal"]["status"], "ok")
+
+    def test_redact_paths_strips_username_and_repo_names(self) -> None:
+        # A daemon log line with both the slash path and Claude Code's dash-encoded
+        # project dir must lose the username AND the repo/project name.
+        line = (
+            "WARNING scan_claude_journal: cannot read "
+            "/Users/alice/.claude/projects/-Users-alice-Work-secret-repo/9f2b.jsonl"
+        )
+        red = agentcat._redact_paths(line)
+        self.assertNotIn("alice", red)
+        self.assertNotIn("secret-repo", red)
+        self.assertNotIn("/Users/", red)
+
+    def test_doctor_daemon_reachable_rejects_foreign_200(self) -> None:
+        class ForeignResp:
+            status = 200
+
+            def read(self, _n: int = -1) -> bytes:
+                return b"<html>some other app</html>"
+
+            def __enter__(self) -> "ForeignResp":
+                return self
+
+            def __exit__(self, *_a: object) -> bool:
+                return False
+
+        with patch.object(agentcat.sys, "platform", "linux"), patch.object(
+            agentcat.urllib.request, "urlopen", return_value=ForeignResp()
+        ):
+            report = agentcat.doctor_report()
+        by_id = {check["id"]: check for check in report["checks"]}
+        self.assertEqual(by_id["daemon.reachable"]["status"], "error")
+
+    def test_not_applicable_cache_uses_short_ttl(self) -> None:
+        limits = agentcat.claude_limits_from_usage_response({})
+        agentcat.write_live_limits_cache("claude", limits)
+        self.assertIsNotNone(agentcat.cached_live_limits("claude", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS))
+        # Backdate past the short TTL: it must expire even though max_age is 900s.
+        raw = json.loads(agentcat.LIVE_LIMITS_CACHE.read_text(encoding="utf-8"))
+        raw["claude"]["cachedAt"] -= agentcat.LIVE_LIMITS_NOT_APPLICABLE_TTL + 5
+        agentcat.LIVE_LIMITS_CACHE.write_text(json.dumps(raw), encoding="utf-8")
+        self.assertIsNone(agentcat.cached_live_limits("claude", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS))
+
+    def test_doctor_bundle_is_privacy_safe(self) -> None:
+        bundle = self.root / "support.md"
+        report = {
+            "connectorVersion": "26.27.3",
+            "status": "ok",
+            "checks": [{"id": "x", "status": "ok", "detail": str(agentcat.HOME / "secret" / "path")}],
+        }
+        agentcat.write_support_bundle(bundle, report)
+        text = bundle.read_text(encoding="utf-8")
+        self.assertNotIn(str(agentcat.HOME), text)
+        self.assertIn("~/secret/path", text)
+
+    def test_fetch_llm_usage_fresh_returns_ondemand_contract(self) -> None:
+        with patch.object(agentcat.sys, "platform", "linux"):
+            payload = agentcat.fetch_llm_usage_fresh()
+        self.assertIn("generatedAt", payload)
+        self.assertEqual(set(payload["providers"]), {"claude", "codex", "gemini"})
+        claude = payload["providers"]["claude"]
+        self.assertEqual(claude["reason"], "token_missing")
+        self.assertIsNone(claude["cost_usd"])
+        self.assertEqual(
+            claude["tokens"], {"total": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+        )
+
+    def test_claude_live_limits_force_bypasses_cache(self) -> None:
+        cached = agentcat.empty_limits(status="auto")
+        cached["quotas"] = [{"id": "x", "label": "7d", "usedPercent": 10.0, "remainingPercent": 90.0}]
+        agentcat.write_live_limits_cache("claude", cached)
+        # Without force: the fresh cache is returned (no creds read, no network).
+        self.assertEqual(agentcat.claude_live_limits().get("status"), "auto")
+        # With force: cache is skipped → falls through to the (missing) token reason.
+        with patch.object(agentcat.sys, "platform", "linux"):
+            forced = agentcat.claude_live_limits(force=True)
+        self.assertEqual(forced.get("reason"), "token_missing")
+
+    def test_live_usage_provider_picks_tightest_quota(self) -> None:
+        limits = agentcat.empty_limits(status="auto")
+        limits["quotas"] = [
+            {"id": "a", "label": "5h", "usedPercent": 20.0, "remainingPercent": 80.0, "resetAt": 111},
+            {"id": "b", "label": "7d", "usedPercent": 75.0, "remainingPercent": 25.0, "resetAt": 222},
+        ]
+        provider = agentcat.live_usage_provider_from_limits(limits)
+        self.assertEqual(provider["status"], "ok")
+        self.assertEqual(provider["quota"]["remaining_percent"], 25.0)
+        self.assertEqual(provider["quota"]["reset_description"], "7d")
+        self.assertIsNone(provider["cost_usd"])
+
+    def test_claude_live_limits_reports_reason_when_no_token(self) -> None:
+        with patch.object(agentcat.sys, "platform", "linux"):
+            limits = agentcat.claude_live_limits()
+        self.assertEqual(limits["status"], "not_configured")
+        self.assertEqual(limits["reason"], "token_missing")
+
+    def test_claude_live_limits_reports_expired_token_without_network(self) -> None:
+        self._write_claude_credentials({"accessToken": "tok", "expiresAt": 1})
+
+        def no_network(*_args, **_kwargs):
+            raise AssertionError("must not call the usage API for an expired token")
+
+        with patch.object(agentcat.sys, "platform", "linux"), patch.object(
+            agentcat.urllib.request, "urlopen", side_effect=no_network
+        ):
+            limits = agentcat.claude_live_limits()
+        self.assertEqual(limits["status"], "not_configured")
+        self.assertEqual(limits["reason"], "token_expired")
+
     def test_gemini_quota_api_payload_builds_model_remaining(self) -> None:
         limits = agentcat.gemini_limits_from_quota_response(
             {
@@ -1962,7 +2172,9 @@ class AgentCatConnectorTests(unittest.TestCase):
 
     def test_gemini_snapshot_distributes_cumulative_counter_deltas_by_day(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
-        today = dt.datetime.now(dt.timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+        # Local noon, not UTC noon: the product buckets on the local calendar date,
+        # so a UTC-noon fixture lands on the previous day when run 00:00-09:00 KST.
+        today = dt.datetime.now().astimezone().replace(hour=12, minute=0, second=0, microsecond=0)
         yesterday = today - dt.timedelta(days=1)
         start_time = [int(yesterday.timestamp()), 0]
 
@@ -2066,7 +2278,9 @@ class AgentCatConnectorTests(unittest.TestCase):
 
     def test_gemini_snapshot_indexes_full_log_across_stream_chunks(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
-        today = dt.datetime.now(dt.timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+        # Local noon, not UTC noon: the product buckets on the local calendar date,
+        # so a UTC-noon fixture lands on the previous day when run 00:00-09:00 KST.
+        today = dt.datetime.now().astimezone().replace(hour=12, minute=0, second=0, microsecond=0)
         old_day = today - dt.timedelta(days=9)
 
         def payload(session: str, value: int, when: dt.datetime) -> dict:

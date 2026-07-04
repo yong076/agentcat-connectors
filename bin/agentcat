@@ -59,10 +59,18 @@ LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_B
 LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
 LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
 LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
+# A "no quota for this account" answer is cached to stop the per-tick reprobe loop, but on
+# a shorter horizon than a good result so a transient empty response or a later plan upgrade
+# is re-checked within minutes, not 15.
+LIVE_LIMITS_NOT_APPLICABLE_TTL = int(os.environ.get("AGENTCAT_LIVE_LIMITS_NOT_APPLICABLE_TTL", "300"))
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CODEX_SESSIONS_CURSOR_FILE = AGENTCAT_HOME / "codex-sessions-cursor.json"
 CODEX_SESSIONS_CURSOR_VERSION = 2
-CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
+# Claude Code stores its config under $CLAUDE_CONFIG_DIR when set (dotfiles-managed
+# / multi-account setups), otherwise ~/.claude. Honor it so those users' journals
+# and credentials are found instead of silently reading zero.
+CLAUDE_CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or str(HOME / ".claude")).expanduser()
+CLAUDE_PROJECTS_DIR = CLAUDE_CONFIG_DIR / "projects"
 CLAUDE_DESKTOP_PROJECT_GLOBS = (
     "local-agent-mode-sessions/**/.claude/projects",
 )
@@ -71,10 +79,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_llm_cli_env = os.environ.get("LLM_USAGE_CLI_PATH", "")
-LLM_USAGE_CLI = Path(_llm_cli_env) if _llm_cli_env else \
-    HOME / "Trappist" / "llm-usage-cli" / "llm_usage_cli.py"
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.27.3")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.27.4")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -2024,7 +2029,12 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     if cached_at is None or not isinstance(limits, dict):
         return None
     age = int(time.time()) - cached_at
-    effective_max_age = LIVE_LIMITS_ERROR_BACKOFF_SECONDS if limits.get("status") == "error" else max_age_seconds
+    if limits.get("status") == "error":
+        effective_max_age = LIVE_LIMITS_ERROR_BACKOFF_SECONDS
+    elif limits.get("status") == "not_configured" and limits.get("reason") == "not_applicable":
+        effective_max_age = LIVE_LIMITS_NOT_APPLICABLE_TTL
+    else:
+        effective_max_age = max_age_seconds
     if age > effective_max_age and not allow_stale:
         return None
     out = dict(limits)
@@ -2038,6 +2048,11 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
 def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
     status = limits.get("status")
     if status == "error":
+        pass
+    elif status == "not_configured" and limits.get("reason") == "not_applicable":
+        # A definitive "this account has no quota API data" answer from the live
+        # API — cache it (throttled to the normal max-age) so the daemon stops
+        # re-probing api.anthropic.com every tick.
         pass
     elif status not in {"auto", "ok"} or not limits.get("quotas"):
         return
@@ -2058,7 +2073,11 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
         pass
 
 
-def empty_limits(status: str = "not_configured", error: Optional[str] = None) -> Dict[str, Any]:
+def empty_limits(
+    status: str = "not_configured",
+    error: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
     limits: Dict[str, Any] = {
         "status": status,
         "source": str(LIMITS_FILE),
@@ -2075,6 +2094,11 @@ def empty_limits(status: str = "not_configured", error: Optional[str] = None) ->
     }
     if error:
         limits["error"] = error
+    if reason:
+        # Machine-readable cause the app can turn into an actionable message
+        # (e.g. token_missing, keychain_denied, token_expired). Distinct from
+        # `error`, which carries a raw exception string from a live API call.
+        limits["reason"] = reason
     return limits
 
 
@@ -2110,8 +2134,15 @@ def merge_limits(configured: Dict[str, Any], detected: Dict[str, Any]) -> Dict[s
     if configured.get("status") == "ok":
         merged["status"] = "ok"
         merged["source"] = configured.get("source") or merged.get("source")
+        merged.pop("reason", None)  # a configured-ok override supersedes any detection reason
     elif merged.get("status") in {None, "not_configured"}:
+        # Fall back to the configured limits, but keep the live detection's
+        # diagnostic reason so the app can still explain WHY it's not configured
+        # (token_missing / keychain_denied / token_expired / not_applicable).
+        reason = detected.get("reason")
         merged = dict(configured)
+        if reason and not merged.get("reason"):
+            merged["reason"] = reason
     return merged
 
 
@@ -2566,8 +2597,8 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
     return limits
 
 
-def codex_live_limits() -> Dict[str, Any]:
-    cached = cached_live_limits("codex", LIVE_LIMITS_MAX_AGE_SECONDS)
+def codex_live_limits(force: bool = False) -> Dict[str, Any]:
+    cached = None if force else cached_live_limits("codex", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
         return cached
     auth = read_codex_auth()
@@ -2619,37 +2650,79 @@ def codex_live_limits() -> Dict[str, Any]:
     return limits
 
 
-def read_claude_oauth_token() -> Optional[str]:
+def claude_config_dir() -> Path:
+    """Resolve Claude Code's config directory at call time.
+
+    Honors ``$CLAUDE_CONFIG_DIR`` (Claude Code's own override) and otherwise
+    falls back to ``~/.claude``. Resolved per-call rather than at import so the
+    daemon picks up an env var injected into its launch environment.
+    """
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser()
+    return HOME / ".claude"
+
+
+_CLAUDE_KEYCHAIN_WARNED = False
+
+
+def _warn_keychain_once(message: str, *args: Any) -> None:
+    """Log a Claude Keychain read failure at most once. This path runs every 60s snapshot
+    tick on a denied/locked keychain and would otherwise flood the unrotated daemon log."""
+    global _CLAUDE_KEYCHAIN_WARNED
+    if not _CLAUDE_KEYCHAIN_WARNED:
+        logging.warning(message, *args)
+        _CLAUDE_KEYCHAIN_WARNED = True
+
+
+def read_claude_oauth_credentials() -> Dict[str, Any]:
+    """Resolve Claude Code OAuth credentials with a machine-readable failure reason.
+
+    Returns ``{"oauth": <dict|None>, "reason": <str|None>}``. When no usable
+    credentials are found, ``reason`` is one of:
+      - ``keychain_denied``: the macOS Keychain refused the read (ACL deny,
+        locked/headless session) — a distinct, diagnosable state, not "logged out".
+      - ``token_missing``: no credentials on disk and no OAuth block present.
+    """
     candidates: List[Any] = []
+    keychain_denied = False
     if sys.platform == "darwin":
         try:
             raw = subprocess.check_output(
                 ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 timeout=5,
             )
             candidates.append(json.loads(raw))
-        except Exception:
-            pass
+        except subprocess.CalledProcessError as exc:
+            # 44 = item genuinely not found (no Claude Code login in this Keychain).
+            # Any other non-zero exit means the read was refused/blocked, which the
+            # old bare `except: pass` hid as an indistinguishable "not configured".
+            if exc.returncode != 44:
+                keychain_denied = True
+                _warn_keychain_once("agentcat: Claude Keychain read refused (security exit %s)", exc.returncode)
+        except Exception as exc:  # security binary missing, timeout, malformed JSON
+            _warn_keychain_once("agentcat: Claude Keychain read failed: %s", type(exc).__name__)
 
-    for path in (HOME / ".claude" / ".credentials.json", HOME / ".claude" / "credentials.json"):
+    config_dir = claude_config_dir()
+    for path in (config_dir / ".credentials.json", config_dir / "credentials.json"):
         raw = read_json(path)
         if isinstance(raw, dict) and not raw.get("_agentcat_error"):
             candidates.append(raw)
 
     for item in candidates:
-        oauth = item.get("claudeAiOauth") if isinstance(item, dict) else None
+        if not isinstance(item, dict):
+            continue
+        oauth = item.get("claudeAiOauth")
         if not isinstance(oauth, dict):
-            oauth = item.get("claude_ai_oauth") if isinstance(item, dict) else None
-        token = None
-        if isinstance(oauth, dict):
-            token = oauth.get("accessToken") or oauth.get("access_token")
-        if token is None and isinstance(item, dict):
-            token = item.get("accessToken") or item.get("access_token")
-        if isinstance(token, str) and token:
-            return token
-    return None
+            oauth = item.get("claude_ai_oauth")
+        if isinstance(oauth, dict) and (oauth.get("accessToken") or oauth.get("access_token")):
+            return {"oauth": oauth, "reason": None}
+        if item.get("accessToken") or item.get("access_token"):
+            return {"oauth": item, "reason": None}
+
+    return {"oauth": None, "reason": "keychain_denied" if keychain_denied else "token_missing"}
 
 
 def claude_quota_label(key: str) -> str:
@@ -2797,17 +2870,32 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
     quotas.sort(key=claude_quota_sort_key)
     limits["quotas"] = quotas
     if not quotas:
+        # The token authenticated but the usage API returned no quota buckets
+        # (console / API-key-adjacent accounts have no subscription quota to report).
+        # Tag it so the app can say so, and so this definitive negative is cacheable
+        # instead of re-hitting the API on every 60s tick.
         limits["status"] = "not_configured"
+        limits["reason"] = "not_applicable"
     return limits
 
 
-def claude_live_limits() -> Dict[str, Any]:
-    cached = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS)
+def claude_live_limits(force: bool = False) -> Dict[str, Any]:
+    cached = None if force else cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
         return sanitize_claude_cached_limits(cached)
-    token = read_claude_oauth_token()
-    if not token:
-        return empty_limits()
+    creds = read_claude_oauth_credentials()
+    oauth = creds["oauth"]
+    if not isinstance(oauth, dict):
+        return empty_limits(reason=creds["reason"])
+    token = oauth.get("accessToken") or oauth.get("access_token")
+    if not (isinstance(token, str) and token):
+        return empty_limits(reason="token_missing")
+    expires_at = int_limit(oauth.get("expiresAt"))
+    if expires_at and time.time() * 1000 >= expires_at:
+        # The stored access token is already expired. Claude Code refreshes its own
+        # token when it runs; a connector that only reads the file cannot recover
+        # until then, so surface an actionable reason instead of a guaranteed 401.
+        return empty_limits(reason="token_expired")
     req = urllib.request.Request(
         CLAUDE_USAGE_URL,
         headers={
@@ -3124,8 +3212,8 @@ def gemini_quota_compact_sort_key(quota: Dict[str, Any]) -> Tuple[float, int, st
     )
 
 
-def gemini_live_limits() -> Dict[str, Any]:
-    cached = cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS)
+def gemini_live_limits(force: bool = False) -> Dict[str, Any]:
+    cached = None if force else cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
         return normalize_gemini_limits(cached)
     auth_type = read_gemini_auth_type()
@@ -5207,61 +5295,72 @@ def codex_snapshot() -> Dict[str, Any]:
 # llm-usage-cli bridge — on-demand accurate per-class usage from OAuth APIs
 # ---------------------------------------------------------------------------
 
-def fetch_llm_usage_fresh() -> Dict[str, Any]:
-    """Call llm-usage-cli --json and return normalized per-provider usage.
+def live_usage_provider_from_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a live-limits result to the app's on-demand LiveUsageProvider shape.
 
-    This hits OAuth endpoints (Anthropic/OpenAI/Gemini) for authoritative
-    billing-accurate per-class token data. Intended for on-demand refresh
-    (user-triggered via /v1/usage), not continuous polling.
+    OAuth/subscription providers expose quota (used/remaining/reset), not billing tokens
+    or dollar cost — so tokens are zero and cost_usd is null (the app UI hides both and
+    shows the quota). A failure carries its machine-readable reason (token_expired / …).
     """
-    if not LLM_USAGE_CLI.is_file():
-        return {"error": "llm_usage_cli_not_found", "path": str(LLM_USAGE_CLI)}
-    try:
-        result = subprocess.run(
-            [sys.executable, str(LLM_USAGE_CLI), "--json", "--timeout", "20"],
-            capture_output=True, text=True, timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return {"error": "timeout", "message": "llm-usage-cli timed out after 30s"}
-    except Exception as exc:
-        return {"error": "subprocess_failed", "message": str(exc)}
+    status = limits.get("status")
+    provider: Dict[str, Any] = {
+        "status": "ok" if status in ("ok", "auto") else (status or "error"),
+        "source": "oauth-live",
+        "model": None,
+        "tokens": {"total": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+        "cost_usd": None,
+        "updated_at": now_iso(),
+    }
+    if limits.get("reason"):
+        provider["reason"] = limits["reason"]
 
-    if result.returncode != 0:
-        return {"error": "cli_error", "stderr": result.stderr[:500]}
-
-    try:
-        raw = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        return {"error": "json_parse_failed", "message": str(exc)}
-
-    providers: Dict[str, Any] = {}
-    for entry in raw if isinstance(raw, list) else []:
-        provider = str(entry.get("provider") or "unknown")
-        providers[provider] = {
-            "status": "ok" if entry.get("ok") else "error",
-            "source": entry.get("usage_source"),
-            "model": entry.get("model"),
-            "tokens": {
-                "total": entry.get("total_tokens") or 0,
-                "input": entry.get("input_tokens") or 0,
-                "output": entry.get("output_tokens") or 0,
-                "cache_read": entry.get("cache_read_tokens") or 0,
-                "cache_write": entry.get("cache_creation_tokens") or 0,
-            },
-            "cost_usd": entry.get("total_cost"),
-            "quota": {
-                "used_percent": entry.get("used_percent"),
-                "remaining_percent": entry.get("remaining_percent"),
-                "reset_at": entry.get("reset_at"),
-                "reset_description": entry.get("reset_description"),
-            },
-            "updated_at": entry.get("updated_at"),
+    # Headline quota = the tightest window (highest used%), else the weekly/short summary.
+    tightest: Optional[Dict[str, Any]] = None
+    for quota in limits.get("quotas") or []:
+        if not isinstance(quota, dict):
+            continue
+        used = quota.get("usedPercent")
+        if isinstance(used, (int, float)) and (tightest is None or used > tightest.get("usedPercent", -1.0)):
+            tightest = quota
+    if tightest is not None:
+        provider["quota"] = {
+            "used_percent": tightest.get("usedPercent"),
+            "remaining_percent": tightest.get("remainingPercent"),
+            "reset_at": tightest.get("resetAt"),
+            "reset_description": tightest.get("label"),
         }
+    else:
+        used = limits.get("weeklyUsedPercent")
+        reset = limits.get("weeklyResetAt")
+        if used is None:
+            used = limits.get("shortUsedPercent")
+            reset = limits.get("shortResetAt")
+        if isinstance(used, (int, float)):
+            provider["quota"] = {
+                "used_percent": used,
+                "remaining_percent": max(0.0, 100.0 - used),
+                "reset_at": reset,
+                "reset_description": None,
+            }
+    return provider
 
+
+def fetch_llm_usage_fresh() -> Dict[str, Any]:
+    """On-demand authoritative usage/quota for the OAuth providers.
+
+    User-triggered via `agentcat usage` / GET /v1/usage — not continuous polling. Forces a
+    fresh live-limits fetch (bypassing the cache) so a just-fixed login shows immediately
+    instead of waiting out the error backoff. Never refreshes or writes a provider's token,
+    so an expired token yields a reason (token_expired / …), not a silent blank.
+    """
     return {
         "generatedAt": now_iso(),
-        "source": "llm-usage-cli",
-        "providers": providers,
+        "source": "on-demand-oauth",
+        "providers": {
+            "claude": live_usage_provider_from_limits(claude_live_limits(force=True)),
+            "codex": live_usage_provider_from_limits(codex_live_limits(force=True)),
+            "gemini": live_usage_provider_from_limits(gemini_live_limits(force=True)),
+        },
     }
 
 
@@ -8206,6 +8305,14 @@ def resolve_bind_host(host: Optional[str]) -> str:
 
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
+    # Give the long-running daemon a real, leveled log so failures (keychain
+    # denials, provider parse errors) leave a diagnosable trail in the launchd
+    # stderr file instead of vanishing. Reason codes + ~-relative paths only —
+    # never payloads (telemetry/privacy boundary).
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     args.host = resolve_bind_host(getattr(args, "host", "127.0.0.1"))
     build_snapshot()
     threading.Thread(target=snapshot_refresh_loop, args=(60.0,), daemon=True).start()
@@ -8336,6 +8443,262 @@ def command_update_check(args: argparse.Namespace) -> int:
     return 0 if state.get("status") != "error" else 1
 
 
+def _tilde(path: Any) -> str:
+    """Render a path with $HOME collapsed to ~, so diagnostics never leak the username.
+    Boundary-checked so a sibling like /Users/alice-old is not mangled to ~-old."""
+    text = str(path)
+    home = str(HOME)
+    if home and home != "/" and (text == home or text.startswith(home + os.sep)):
+        return "~" + text[len(home):]
+    return text
+
+
+def _redact_paths(text: str) -> str:
+    """Strip anything path-shaped from free-text (daemon log lines) before it can leave
+    the machine. Catches both the slash form (/Users/alice/...) and the dash-encoded form
+    Claude Code uses for journal dir names (-Users-alice-Repo-...), plus any residual
+    absolute path — so no username, repo, or project name survives into a support bundle."""
+    home = str(HOME)
+    if home and home != "/":
+        text = text.replace(home, "~")
+        text = re.sub(re.escape(home.replace(os.sep, "-")) + r"[^\s:'\"]*", "<path>", text)
+    # Dash-encoded project dirs (Claude Code encodes a project's cwd as -Users-…/-home-…).
+    text = re.sub(r"-(?:Users|home|root|var)-[^\s:'\"]*", "<path>", text)
+    # Any residual absolute path body (keeps ~-relative and loopback URLs intact).
+    text = re.sub(r"/[^\s:'\"]+", "<path>", text)
+    return text
+
+
+def _doctor_check(
+    check_id: str,
+    status: str,
+    reason: Optional[str] = None,
+    detail: Optional[str] = None,
+    fix: Optional[str] = None,
+) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {"id": check_id, "status": status}
+    if reason:
+        entry["reason"] = reason
+    if detail:
+        entry["detail"] = detail
+    if fix:
+        entry["fix"] = fix
+    return entry
+
+
+def doctor_report(check_network: bool = False) -> Dict[str, Any]:
+    """Diagnose why providers are or aren't detected on this machine.
+
+    Returns ``{"status": ok|degraded|broken, "connectorVersion", "checks": [...]}``
+    where each check is ``{id, status, reason?, detail?, fix?}``. Details carry only
+    counts and ~-relative paths — never journal contents, project names, or tokens.
+    """
+    checks: List[Dict[str, Any]] = []
+
+    # Daemon reachability (loopback healthz — cheap, always run).
+    port = int(os.environ.get("AGENTCAT_PORT") or 8765)
+    healthz_ok = False
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=2) as resp:
+            # Require the body to be our own "ok" — a foreign app squatting the port and
+            # returning 200 must not read as a healthy daemon.
+            body = resp.read(64).decode("utf-8", "replace").strip()
+            healthz_ok = getattr(resp, "status", 200) == 200 and body == "ok"
+    except Exception:
+        healthz_ok = False
+    if healthz_ok:
+        checks.append(_doctor_check("daemon.reachable", "ok", detail=f"responding on 127.0.0.1:{port}"))
+    else:
+        checks.append(_doctor_check(
+            "daemon.reachable", "error", reason="daemon_unreachable",
+            detail=f"no /healthz on 127.0.0.1:{port}", fix="restart_daemon",
+        ))
+
+    # Snapshot freshness (file mtime — the daemon rewrites it every tick).
+    try:
+        snapshot_age = time.time() - LATEST_SNAPSHOT.stat().st_mtime
+    except OSError:
+        snapshot_age = None
+    if snapshot_age is None:
+        checks.append(_doctor_check(
+            "daemon.snapshot", "error", reason="snapshot_missing",
+            detail=f"no snapshot at {_tilde(LATEST_SNAPSHOT)}", fix="restart_daemon",
+        ))
+    elif snapshot_age > 600:
+        checks.append(_doctor_check("daemon.snapshot", "warn", reason="snapshot_stale", detail=f"{int(snapshot_age)}s old"))
+    else:
+        checks.append(_doctor_check("daemon.snapshot", "ok", detail=f"{int(snapshot_age)}s old"))
+
+    # Claude credentials (reuses the OAuth reason codes).
+    creds = read_claude_oauth_credentials()
+    if isinstance(creds.get("oauth"), dict):
+        checks.append(_doctor_check("claude.credentials", "ok", detail="OAuth token present"))
+    else:
+        reason = creds.get("reason") or "token_missing"
+        if reason == "keychain_denied":
+            checks.append(_doctor_check(
+                "claude.credentials", "warn", reason=reason,
+                detail="the daemon was denied Keychain access to the Claude Code token", fix="grant_keychain_access",
+            ))
+        else:
+            checks.append(_doctor_check(
+                "claude.credentials", "warn", reason=reason,
+                detail="no Claude Code login found — run `claude` to sign in", fix="relogin_provider",
+            ))
+
+    # Claude usage journal — resolved call-time (like credentials/hooks) so doctor never
+    # audits a different dir than it reports for credentials under $CLAUDE_CONFIG_DIR.
+    claude_projects = claude_config_dir() / "projects"
+    if not claude_projects.exists():
+        checks.append(_doctor_check(
+            "claude.journal", "warn", reason="journal_dir_not_found",
+            detail=f"{_tilde(claude_projects)} not found (Claude Code not run on this device?)", fix="run_provider_once",
+        ))
+    elif next(iter(claude_projects.rglob("*.jsonl")), None) is not None:
+        checks.append(_doctor_check("claude.journal", "ok", detail=f"journals under {_tilde(claude_projects)}"))
+    else:
+        checks.append(_doctor_check(
+            "claude.journal", "warn", reason="no_local_activity",
+            detail="no *.jsonl — no local Claude Code activity on this device", fix="run_provider_once",
+        ))
+
+    # Claude hooks (also surfaces an unparsable settings.json).
+    settings = read_json(claude_config_dir() / "settings.json")
+    if isinstance(settings, dict) and settings.get("_agentcat_error"):
+        checks.append(_doctor_check(
+            "claude.hooks", "warn", reason="settings_invalid_json",
+            detail="~/.claude/settings.json is not valid JSON; hooks could not be installed", fix="reinstall_hooks",
+        ))
+    elif isinstance(settings, dict) and "agentcat" in json.dumps(settings.get("hooks") or {}):
+        checks.append(_doctor_check("claude.hooks", "ok", detail="agentcat hook wired into settings.json"))
+    else:
+        checks.append(_doctor_check(
+            "claude.hooks", "warn", reason="hook_not_installed",
+            detail="no agentcat hook in ~/.claude/settings.json", fix="reinstall_hooks",
+        ))
+
+    # Codex sessions — count both sessions/ and archived_sessions/ (matching the product's
+    # codex_session_roots), else a heavy user whose logs were archived looks like a non-user.
+    codex_roots = codex_session_roots()
+    if not any(root.exists() for root in codex_roots):
+        checks.append(_doctor_check(
+            "codex.sessions", "warn", reason="codex_not_found",
+            detail=f"{_tilde(codex_roots[0])} not found", fix="run_provider_once",
+        ))
+    elif any(next(iter(root.rglob("*.jsonl")), None) is not None for root in codex_roots):
+        checks.append(_doctor_check("codex.sessions", "ok", detail="session logs present"))
+    else:
+        checks.append(_doctor_check("codex.sessions", "warn", reason="no_local_activity", detail="no Codex session logs yet"))
+
+    # Gemini telemetry.
+    try:
+        gemini_size = GEMINI_TELEMETRY.stat().st_size
+    except OSError:
+        gemini_size = None
+    if gemini_size is None:
+        checks.append(_doctor_check(
+            "gemini.telemetry", "warn", reason="telemetry_not_configured",
+            detail=f"{_tilde(GEMINI_TELEMETRY)} not found", fix="configure_telemetry",
+        ))
+    elif gemini_size == 0:
+        checks.append(_doctor_check("gemini.telemetry", "warn", reason="telemetry_empty", detail="telemetry log is empty"))
+    else:
+        checks.append(_doctor_check("gemini.telemetry", "ok", detail=f"telemetry log {gemini_size} bytes"))
+
+    # Optional live checks (network) — only when explicitly asked.
+    if check_network:
+        live = claude_live_limits()
+        status = live.get("status")
+        if status in ("ok", "auto"):
+            checks.append(_doctor_check("claude.live_limits", "ok", detail="usage API reachable"))
+        else:
+            checks.append(_doctor_check(
+                "claude.live_limits", "warn",
+                reason=live.get("reason") or status, detail=live.get("error") or "no quota returned",
+            ))
+
+    order = {"ok": 0, "info": 0, "warn": 1, "error": 2}
+    worst = max((order.get(check["status"], 0) for check in checks), default=0)
+    overall = {0: "ok", 1: "degraded", 2: "broken"}[worst]
+    return {"status": overall, "connectorVersion": CONNECTOR_VERSION, "checks": checks}
+
+
+def render_doctor_text(report: Dict[str, Any]) -> str:
+    icons = {"ok": "OK ", "info": " · ", "warn": " ! ", "error": " X "}
+    lines = [f"agentcat doctor — {report['status'].upper()} (connector {report['connectorVersion']})"]
+    for check in report["checks"]:
+        line = f"  [{icons.get(check['status'], ' ? ')}] {check['id']}"
+        if check.get("detail"):
+            line += f" — {check['detail']}"
+        if check.get("fix"):
+            line += f"  (fix: {check['fix']})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _log_tail_redacted(log_path: Path, max_lines: int = 50, max_bytes: int = 65536) -> List[str]:
+    """Read at most the last max_bytes of a possibly-huge, unrotated log and return the
+    last max_lines, each run through _redact_paths so no path/username/repo can leak."""
+    try:
+        with log_path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            raw = fh.read()
+    except OSError:
+        return ["(no log)"]
+    lines = raw.decode("utf-8", "replace").splitlines()[-max_lines:]
+    return [_redact_paths(line) for line in lines] or ["(empty)"]
+
+
+def write_support_bundle(path: Any, report: Dict[str, Any]) -> None:
+    """Write a GitHub-attachable support bundle. The structured checks are already path-safe
+    (built via _tilde + counts); the free-text daemon-log tail is redacted by construction."""
+    lines = [
+        "# agentcat support bundle",
+        "",
+        f"connector: {report.get('connectorVersion')}",
+        f"status: {report.get('status')}",
+        "",
+        "## checks",
+    ]
+    for check in report.get("checks", []):
+        suffix = f" · {check['reason']}" if check.get("reason") else ""
+        lines.append(f"- [{check['status']}] {check['id']}{suffix} — {check.get('detail', '')}")
+    lines += ["", "## daemon log (tail, redacted)"]
+    lines += _log_tail_redacted(AGENTCAT_HOME / "agentcatd.err.log")
+    text = "\n".join(lines) + "\n"
+    # Defense in depth: the log tail is already fully path-redacted line-by-line, and check
+    # details come pre-collapsed via _tilde — but as a final net, collapse any raw absolute
+    # HOME path a future check detail might forget to tilde (leaves ~-relative paths intact).
+    home = str(HOME)
+    if home and home != "/":
+        text = text.replace(home, "~")
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8")
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    report = doctor_report(check_network=bool(getattr(args, "network", False)))
+    bundle = getattr(args, "bundle", None)
+    if bundle:
+        try:
+            write_support_bundle(bundle, report)
+        except OSError as exc:
+            print(f"could not write bundle to {bundle}: {exc}", file=sys.stderr)
+            bundle = None
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(render_doctor_text(report))
+        if bundle:
+            print(f"\nSupport bundle written to {bundle} (safe to attach to a GitHub issue).")
+    # Binary exit: 0 = healthy, non-zero = something to look at. A daemon that simply
+    # isn't running yet should not read as an unrecoverable "broken" (exit 2) to a script.
+    return 0 if report["status"] == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentcat")
     subparsers = parser.add_subparsers(dest="command")
@@ -8385,6 +8748,12 @@ def build_parser() -> argparse.ArgumentParser:
     update_check.add_argument("--apply", action="store_true")
     update_check.add_argument("--json", action="store_true")
     update_check.set_defaults(func=command_update_check)
+
+    doctor = subparsers.add_parser("doctor")
+    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--network", action="store_true")
+    doctor.add_argument("--bundle")
+    doctor.set_defaults(func=command_doctor)
 
     return parser
 

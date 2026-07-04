@@ -191,6 +191,22 @@ def install_binary(repo_dir: Path, backup_dir: Path) -> None:
 
 
 def plist_text() -> str:
+    env_entries = [
+        ("AGENTCAT_HOME", str(AGENTCAT_HOME)),
+        ("HOME", str(HOME)),
+        ("PATH", f"{LOCAL_BIN}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+    ]
+    # launchd does not inherit the interactive shell environment, so the background daemon
+    # can't see provider config-dir overrides the user exported in their shell rc. Capture
+    # them at install time and pin them into the plist, or the daemon silently reads the
+    # defaults (~/.claude, ~/.codex) and never finds a dotfiles/multi-account user's data.
+    for var in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        value = os.environ.get(var)
+        if value:
+            env_entries.append((var, value))
+    env_xml = "\n".join(
+        f"    <key>{key}</key>\n    <string>{value}</string>" for key, value in env_entries
+    )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -213,12 +229,7 @@ def plist_text() -> str:
   <string>{AGENTCAT_HOME}/agentcatd.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>AGENTCAT_HOME</key>
-    <string>{AGENTCAT_HOME}</string>
-    <key>HOME</key>
-    <string>{HOME}</string>
-    <key>PATH</key>
-    <string>{LOCAL_BIN}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+{env_xml}
   </dict>
 </dict>
 </plist>
