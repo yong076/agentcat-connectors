@@ -11,6 +11,25 @@ prompts to a remote server. This public connector powers the free product:
 local monitoring, provider breadth, quota state, basic costs, budget caps, and
 weekly report inputs.
 
+## License
+
+Agent Cat Connectors is source-available under the
+[PolyForm Shield License 1.0.0](LICENSE). It is not OSI open source.
+
+**Commercial competitive use is prohibited.** Do not use this connector to
+build, operate, sell, or distribute a competing product, hosted service,
+analytics tool, quota monitor, reporting product, or team/admin product without
+a separate commercial license from Trappist.
+
+You may inspect, install, modify, and distribute the connector for permitted
+purposes, including use with Agent Cat. You may not use it to provide, package,
+host, sell, or distribute a product or service that competes with Agent Cat or
+Trappist's Agent Cat-related connector, monitoring, quota, analytics, reporting,
+account, or team tooling without a separate commercial license.
+
+See [`NOTICE`](NOTICE) for the required copyright and line-of-business notices.
+For commercial licensing, contact `meow@agentcat.app`.
+
 ## Install
 
 The normal user path is app-led:
