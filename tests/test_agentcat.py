@@ -2585,9 +2585,13 @@ class AgentCatConnectorTests(unittest.TestCase):
             agentcat.classify_process(r'"C:\Users\me\.local\bin\agy.exe" --print hello'),
             "antigravity",
         )
-        self.assertEqual(
+        self.assertIsNone(
             agentcat.classify_process("/Applications/Antigravity.app/Contents/MacOS/antigravity"),
-            "antigravity",
+        )
+        self.assertIsNone(
+            agentcat.classify_process(
+                "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper"
+            ),
         )
 
     def test_classify_ignores_codex_desktop_electron_helpers_on_windows(self) -> None:

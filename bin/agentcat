@@ -79,7 +79,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.27.4")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.27.5")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -7109,6 +7109,8 @@ def classify_process(command: str) -> Optional[str]:
     ):
         return None
     if "/applications/claude.app/contents/" in normalized:
+        return None
+    if "/applications/antigravity.app/contents/" in normalized:
         return None
     if (
         "/windowsapps/openai.codex_" in normalized
