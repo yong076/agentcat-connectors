@@ -3793,5 +3793,103 @@ class PricingFeedTests(unittest.TestCase):
         )
 
 
+class AntigravityLiveLimitsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.saved = {
+            "ANTIGRAVITY_OAUTH_TOKEN": agentcat.ANTIGRAVITY_OAUTH_TOKEN,
+            "ANTIGRAVITY_CLIENT_CACHE": agentcat.ANTIGRAVITY_CLIENT_CACHE,
+            "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
+        }
+        agentcat.ANTIGRAVITY_OAUTH_TOKEN = self.root / "antigravity-oauth-token"
+        agentcat.ANTIGRAVITY_CLIENT_CACHE = self.root / "antigravity-oauth-client.json"
+        agentcat.LIVE_LIMITS_CACHE = self.root / "live-limits-cache.json"
+
+    def tearDown(self) -> None:
+        for name, value in self.saved.items():
+            setattr(agentcat, name, value)
+        self.tmp.cleanup()
+
+    def _write_token(self, expiry: str = "2020-01-01T00:00:00+00:00") -> None:
+        # Real antigravity-oauth-token shape: creds nested under "token".
+        agentcat.ANTIGRAVITY_OAUTH_TOKEN.write_text(
+            json.dumps(
+                {
+                    "token": {
+                        "access_token": "old-expired",
+                        "refresh_token": "rt-123",
+                        "token_type": "Bearer",
+                        "expiry": expiry,
+                    },
+                    "auth_method": "consumer",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_secret_regex_splits_back_to_back_secrets(self) -> None:
+        # Two secrets concatenated with no separator (the real binary layout) must
+        # still be recovered as two distinct matches, not one greedy blob.
+        blob = b"noise GOCSPX-AAAAAAAAAAAAAAAAAAAAAAAAAAAAGOCSPX-BBBBBBBBBBBBBBBBBBBBBBBBBBBB noise"
+        found = [m.decode() for m in agentcat.ANTIGRAVITY_OAUTH_CLIENT_SECRET_RE.findall(blob)]
+        self.assertEqual(len(found), 2)
+        self.assertTrue(all(s.startswith("GOCSPX-") for s in found))
+        self.assertNotIn("GOCSPX", found[0][7:])  # no second marker swallowed
+
+    def test_client_candidates_prefer_env_override(self) -> None:
+        with patch.dict("os.environ", {
+            "ANTIGRAVITY_OAUTH_CLIENT_ID": "envid.apps.googleusercontent.com",
+            "ANTIGRAVITY_OAUTH_CLIENT_SECRET": "GOCSPX-envsecret",
+        }):
+            cands = agentcat.antigravity_oauth_client_candidates()
+        self.assertEqual(cands, [("envid.apps.googleusercontent.com", "GOCSPX-envsecret")])
+
+    def test_refresh_tries_candidates_and_caches_winner(self) -> None:
+        self._write_token()
+        creds = agentcat.read_antigravity_oauth_credentials()
+        self.assertIsNotNone(creds)
+
+        good = ("goodid.apps.googleusercontent.com", "GOCSPX-good")
+        bad = ("badid.apps.googleusercontent.com", "GOCSPX-bad")
+
+        def fake_urlopen(req, timeout=0):
+            body = req.data.decode()
+            if "goodid" in body:
+                return closing(io.BytesIO(json.dumps({"access_token": "fresh", "expires_in": 3600}).encode()))
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b""))
+
+        with patch.object(agentcat, "antigravity_oauth_client_candidates", return_value=[bad, good]), \
+             patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen):
+            updated = agentcat.refresh_antigravity_access_token(creds)
+
+        self.assertEqual(updated["access_token"], "fresh")
+        cached = json.loads(agentcat.ANTIGRAVITY_CLIENT_CACHE.read_text())
+        self.assertEqual(cached["client_id"], "goodid.apps.googleusercontent.com")
+
+    def test_live_limits_parses_quota_and_is_independent_of_gemini(self) -> None:
+        self._write_token()
+        tier = {"currentTier": {"id": "free-tier"}, "cloudaicompanionProject": "proj-123"}
+        quota = {"buckets": [
+            {"modelId": "gemini-3-pro", "remainingFraction": 0.5, "resetTime": "2026-07-07T00:00:00Z", "tokenType": "REQUESTS"},
+            {"modelId": "gemini-3-flash", "remainingFraction": 1.0, "resetTime": "2026-07-07T00:00:00Z", "tokenType": "REQUESTS"},
+        ]}
+        with patch.object(agentcat, "antigravity_access_token", return_value="tok"), \
+             patch.object(agentcat, "gemini_code_assist_post", side_effect=[tier, quota]):
+            limits = agentcat.antigravity_live_limits(force=True)
+
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(len(limits["quotas"]), 2)
+        # cache written under the antigravity key, not gemini's
+        cache = json.loads(agentcat.LIVE_LIMITS_CACHE.read_text())
+        self.assertIn("antigravity", cache)
+
+    def test_live_limits_empty_without_token(self) -> None:
+        # No token file -> empty limits, no crash, no network.
+        limits = agentcat.antigravity_live_limits(force=True)
+        self.assertIn(limits["status"], {"not_configured", None})
+        self.assertFalse(limits.get("quotas"))
+
+
 if __name__ == "__main__":
     unittest.main()
