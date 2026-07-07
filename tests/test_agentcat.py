@@ -1427,6 +1427,38 @@ class AgentCatConnectorTests(unittest.TestCase):
             remaining = conn.execute("select count(*) from events").fetchone()[0]
         self.assertEqual(remaining, 1)
 
+    def test_http_live_overlay_is_cached_within_ttl(self) -> None:
+        # Audit #6: /v1/snapshot GET must not spawn ps + walk the desktop tree on every
+        # poll (~2-5s). The live overlay is cached for a couple of seconds.
+        from unittest.mock import patch as _p
+        agentcat._HTTP_LIVE_CACHE = None
+        calls = {"n": 0}
+
+        def act():
+            calls["n"] += 1
+            return {"status": "ok", "n": calls["n"]}
+
+        try:
+            with _p.object(agentcat, "terminal_activity_snapshot", side_effect=act), \
+                 _p.object(agentcat, "desktop_app_sources_snapshot", side_effect=lambda *a, **k: {}):
+                a1, _ = agentcat._live_activity_and_desktop()
+                a2, _ = agentcat._live_activity_and_desktop()
+            self.assertEqual(calls["n"], 1)  # computed once, second call served from cache
+            self.assertIs(a1, a2)
+        finally:
+            agentcat._HTTP_LIVE_CACHE = None
+
+    def test_terminal_activity_error_path_populates_runtime_modes(self) -> None:
+        # Audit #6: the wasted eager runtimeModes query was removed from the initializer;
+        # the ps-error path must still populate it (it's the only place it's needed there).
+        if agentcat.IS_WINDOWS:
+            self.skipTest("posix ps path")
+        from unittest.mock import patch as _p
+        with _p.object(agentcat.subprocess, "run", side_effect=RuntimeError("no ps")):
+            act = agentcat.terminal_activity_snapshot()
+        self.assertEqual(act["status"], "error")
+        self.assertIn("runtimeModes", act)
+
     def test_codexbar_cost_cache_floors_codex_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()
         cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"
