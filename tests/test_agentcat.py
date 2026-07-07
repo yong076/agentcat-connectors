@@ -37,6 +37,8 @@ class AgentCatConnectorTests(unittest.TestCase):
             "ANTIGRAVITY_CLI_DIR": agentcat.ANTIGRAVITY_CLI_DIR,
             "ANTIGRAVITY_TELEMETRY": agentcat.ANTIGRAVITY_TELEMETRY,
             "ANTIGRAVITY_USAGE_CACHE": agentcat.ANTIGRAVITY_USAGE_CACHE,
+            "ANTIGRAVITY_OAUTH_TOKEN": agentcat.ANTIGRAVITY_OAUTH_TOKEN,
+            "ANTIGRAVITY_CLIENT_CACHE": agentcat.ANTIGRAVITY_CLIENT_CACHE,
             "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
             "JOURNAL_CURSOR_FILE": agentcat.JOURNAL_CURSOR_FILE,
             "CODEX_SESSIONS_CURSOR_FILE": agentcat.CODEX_SESSIONS_CURSOR_FILE,
@@ -60,6 +62,8 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat.ANTIGRAVITY_CLI_DIR = home / ".gemini" / "antigravity-cli"
         agentcat.ANTIGRAVITY_TELEMETRY = agentcat_home / "gemini" / "antigravity-telemetry.log"
         agentcat.ANTIGRAVITY_USAGE_CACHE = agentcat_home / "antigravity-usage-cache.json"
+        agentcat.ANTIGRAVITY_OAUTH_TOKEN = agentcat.ANTIGRAVITY_CLI_DIR / "antigravity-oauth-token"
+        agentcat.ANTIGRAVITY_CLIENT_CACHE = agentcat_home / "antigravity-oauth-client.json"
         agentcat.LIVE_LIMITS_CACHE = agentcat_home / "live-limits-cache.json"
         agentcat.JOURNAL_CURSOR_FILE = agentcat_home / "jsonl-cursor.json"
         agentcat.CODEX_SESSIONS_CURSOR_FILE = agentcat_home / "codex-sessions-cursor.json"
@@ -494,7 +498,11 @@ class AgentCatConnectorTests(unittest.TestCase):
         with patch.object(agentcat.sys, "platform", "linux"):
             payload = agentcat.fetch_llm_usage_fresh()
         self.assertIn("generatedAt", payload)
-        self.assertEqual(set(payload["providers"]), {"claude", "codex", "gemini"})
+        self.assertEqual(set(payload["providers"]), {"claude", "codex", "gemini", "antigravity"})
+        # Antigravity rides the same on-demand path as the other OAuth providers
+        # (26.28.1) so the Live panel's manual refresh agrees with /v1/snapshot.
+        antigravity = payload["providers"]["antigravity"]
+        self.assertIsNone(antigravity["cost_usd"])
         claude = payload["providers"]["claude"]
         self.assertEqual(claude["reason"], "token_missing")
         self.assertIsNone(claude["cost_usd"])
@@ -3889,6 +3897,74 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         limits = agentcat.antigravity_live_limits(force=True)
         self.assertIn(limits["status"], {"not_configured", None})
         self.assertFalse(limits.get("quotas"))
+
+    def test_serve_stale_restamps_cache_to_throttle_reprobe(self) -> None:
+        # Audit H1: on probe failure we return the last-good numbers but MUST
+        # re-stamp the cache so the daemon does not re-probe (and re-refresh the
+        # OAuth token / re-scan the agy binary) on every 60s tick.
+        good = agentcat.empty_limits(status="auto")
+        good["quotas"] = [{"id": "gemini:pro", "label": "Pro", "remainingPercent": 90.0, "usedPercent": 10.0}]
+        agentcat.write_live_limits_cache("antigravity", good)
+        before = agentcat.cached_live_limits("antigravity", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
+        self.assertIsNotNone(before)
+        self.assertIsNone(before.get("liveError"))
+        served = agentcat.serve_stale_live_limits("antigravity", before, RuntimeError("boom"))
+        self.assertEqual(served["liveError"], "boom")
+        self.assertTrue(served.get("quotas"))
+        # serve_stale re-wrote the cache entry (fresh cachedAt + liveError), so the
+        # next tick short-circuits on the cache instead of re-probing the token.
+        after = agentcat.cached_live_limits("antigravity", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
+        self.assertIsNotNone(after)
+        self.assertEqual(after.get("liveError"), "boom")
+
+    def test_runtime_limits_antigravity_does_not_mirror_gemini(self) -> None:
+        # Audit H2 (#45 regression): a blank antigravity probe must NOT relabel
+        # gemini's quota as antigravity's.
+        from unittest.mock import patch as _patch
+        gem = agentcat.empty_limits(status="auto")
+        gem["quotas"] = [{"id": "gemini:pro", "label": "Pro", "remainingPercent": 55.0, "usedPercent": 45.0}]
+        empty = agentcat.empty_limits()
+        with _patch.object(agentcat, "gemini_live_limits", return_value=gem), \
+             _patch.object(agentcat, "antigravity_live_limits", return_value=agentcat.empty_limits()), \
+             _patch.object(agentcat, "codex_live_limits", return_value=empty), \
+             _patch.object(agentcat, "codex_runtime_limits", return_value=empty), \
+             _patch.object(agentcat, "claude_live_limits", return_value=empty), \
+             _patch.object(agentcat, "claude_runtime_limits", return_value=empty):
+            limits = agentcat.runtime_limits()
+        self.assertFalse(limits["antigravity"].get("quotas"))  # empty, not gemini's
+        self.assertEqual(limits["gemini"].get("quotas"), gem["quotas"])
+
+    def test_refresh_invalidates_stale_client_cache_and_rescans(self) -> None:
+        # Audit M2: a cached OAuth client that no longer works (agy rotated it, or
+        # the user re-logged in) must be dropped and the binary rescanned once,
+        # instead of pinning a dead client forever.
+        from unittest.mock import patch as _patch
+        self._write_token()
+        creds = agentcat.read_antigravity_oauth_credentials()
+        agentcat.write_json_atomic(
+            agentcat.ANTIGRAVITY_CLIENT_CACHE,
+            {"client_id": "stale.apps.googleusercontent.com", "client_secret": "GOCSPX-stale"},
+        )
+
+        def fake_urlopen(req, timeout=0):
+            if "good" in req.data.decode():
+                return closing(io.BytesIO(json.dumps({"access_token": "fresh", "expires_in": 3600}).encode()))
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b""))
+
+        calls = {"n": 0}
+
+        def fake_candidates():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [("stale.apps.googleusercontent.com", "GOCSPX-stale")]
+            return [("good.apps.googleusercontent.com", "GOCSPX-good")]
+
+        with _patch.object(agentcat, "antigravity_oauth_client_candidates", side_effect=fake_candidates), \
+             _patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen):
+            updated = agentcat.refresh_antigravity_access_token(creds)
+
+        self.assertEqual(updated["access_token"], "fresh")
+        self.assertEqual(calls["n"], 2)  # first pass failed → cache dropped → rescanned
 
 
 if __name__ == "__main__":

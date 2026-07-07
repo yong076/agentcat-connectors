@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.1")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -2090,6 +2090,21 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
         pass
 
 
+def serve_stale_live_limits(provider: str, stale: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
+    """Return the last-good live limits during a probe failure, re-stamping the
+    cache so the daemon does not re-probe (and re-refresh the OAuth token) on every
+    60s tick while the provider keeps failing. Without the re-stamp, `cachedAt`
+    never advances once the good entry goes stale, so one revoked/expired token
+    turns into a full refresh POST — and for Antigravity a ~140MB binary re-scan —
+    every tick. Re-stamping throttles re-probing to one attempt per max-age window.
+    """
+    stale = dict(stale)
+    stale["liveError"] = str(exc)
+    served = {k: v for k, v in stale.items() if k not in ("cacheAgeSeconds", "stale", "cachedAt")}
+    write_live_limits_cache(provider, served)
+    return stale
+
+
 def empty_limits(
     status: str = "not_configured",
     error: Optional[str] = None,
@@ -2660,8 +2675,7 @@ def codex_live_limits(force: bool = False) -> Dict[str, Any]:
             access_token = refreshed
     stale = cached_live_limits("codex", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
     if stale:
-        stale["liveError"] = str(last_error or RuntimeError("Codex usage API failed"))
-        return stale
+        return serve_stale_live_limits("codex", stale, last_error or RuntimeError("Codex usage API failed"))
     limits = live_limit_error(last_error or RuntimeError("Codex usage API failed"), "codex-usage-api")
     write_live_limits_cache("codex", limits)
     return limits
@@ -2932,8 +2946,7 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
     except Exception as exc:
         stale = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
         if stale:
-            stale["liveError"] = str(exc)
-            return stale
+            return serve_stale_live_limits("claude", stale, exc)
         limits = live_limit_error(exc, CLAUDE_USAGE_URL)
         write_live_limits_cache("claude", limits)
         return limits
@@ -3225,45 +3238,59 @@ def refresh_antigravity_access_token(creds: Dict[str, Any]) -> Dict[str, Any]:
     refresh_token = creds.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
         raise RuntimeError("No refresh token in antigravity-oauth-token")
-    candidates = antigravity_oauth_client_candidates()
-    if not candidates:
-        raise RuntimeError("Antigravity OAuth client credentials not found (agy binary missing?)")
     last_error: Optional[Exception] = None
-    for client_id, client_secret in candidates:
-        body = urllib.parse.urlencode(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": client_id,
-                "client_secret": client_secret,
-            }
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            GEMINI_OAUTH_TOKEN_URL,
-            data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            last_error = exc
+    env_client = bool(os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_ID") and os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_SECRET"))
+    # Two passes: first the env/cached client, then — if that fails — drop the cache
+    # and rescan the agy binary once. agy can rotate its OAuth client or the user can
+    # re-log-in under a different one, which would otherwise pin a dead cached client
+    # forever (audit M2).
+    for attempt in range(2):
+        candidates = antigravity_oauth_client_candidates()
+        if not candidates:
+            raise RuntimeError("Antigravity OAuth client credentials not found (agy binary missing?)")
+        had_cached_client = _read_cached_antigravity_client() is not None
+        for client_id, client_secret in candidates:
+            body = urllib.parse.urlencode(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                GEMINI_OAUTH_TOKEN_URL,
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                continue
+            access_token = payload.get("access_token")
+            if not access_token:
+                continue
+            # Persist the working client so subsequent refreshes skip the binary scan.
+            try:
+                write_json_atomic(ANTIGRAVITY_CLIENT_CACHE, {"client_id": client_id, "client_secret": client_secret})
+            except Exception:
+                pass
+            updated = dict(creds)
+            updated["access_token"] = access_token
+            updated["token_type"] = payload.get("token_type") or updated.get("token_type") or "Bearer"
+            updated["expiry_date"] = int(time.time() * 1000) + int(payload.get("expires_in") or 3600) * 1000
+            if payload.get("id_token"):
+                updated["id_token"] = payload.get("id_token")
+            return updated
+        if attempt == 0 and had_cached_client and not env_client:
+            try:
+                ANTIGRAVITY_CLIENT_CACHE.unlink()
+            except Exception:
+                pass
             continue
-        access_token = payload.get("access_token")
-        if not access_token:
-            continue
-        # Persist the working client so subsequent refreshes skip the binary scan.
-        try:
-            write_json_atomic(ANTIGRAVITY_CLIENT_CACHE, {"client_id": client_id, "client_secret": client_secret})
-        except Exception:
-            pass
-        updated = dict(creds)
-        updated["access_token"] = access_token
-        updated["token_type"] = payload.get("token_type") or updated.get("token_type") or "Bearer"
-        updated["expiry_date"] = int(time.time() * 1000) + int(payload.get("expires_in") or 3600) * 1000
-        if payload.get("id_token"):
-            updated["id_token"] = payload.get("id_token")
-        return updated
+        break
     raise RuntimeError(f"Antigravity token refresh failed for all client candidates: {last_error}")
 
 
@@ -3435,9 +3462,7 @@ def gemini_live_limits(force: bool = False) -> Dict[str, Any]:
     except Exception as exc:
         stale = cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
         if stale:
-            stale = normalize_gemini_limits(stale)
-            stale["liveError"] = str(exc)
-            return stale
+            return serve_stale_live_limits("gemini", normalize_gemini_limits(stale), exc)
         limits = live_limit_error(exc, GEMINI_CODE_ASSIST_URL)
         write_live_limits_cache("gemini", limits)
         return limits
@@ -3472,17 +3497,23 @@ def antigravity_live_limits(force: bool = False) -> Dict[str, Any]:
         )
         project_id = str(tier_payload.get("cloudaicompanionProject") or project_id or "")
         if not project_id:
-            return empty_limits(status="error", error="Antigravity Code Assist project ID unavailable")
+            limits = empty_limits(status="error", error="Antigravity Code Assist project ID unavailable")
+            write_live_limits_cache("antigravity", limits)
+            return limits
         quota_payload = gemini_code_assist_post("retrieveUserQuota", {"project": project_id}, token)
         limits = gemini_limits_from_quota_response(quota_payload, tier_payload, source=GEMINI_CODE_ASSIST_URL)
+        if limits.get("status") == "not_configured" and not limits.get("quotas"):
+            # An account with no Code Assist quota buckets — cache it as a definitive
+            # "not applicable" (short TTL) so we don't re-probe + re-refresh the token
+            # on every 60s tick. The refreshed access token is never persisted to
+            # agy's file, so an uncached empty result means a refresh POST every tick.
+            limits["reason"] = "not_applicable"
         write_live_limits_cache("antigravity", limits)
         return limits
     except Exception as exc:
         stale = cached_live_limits("antigravity", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
         if stale:
-            stale = normalize_gemini_limits(stale)
-            stale["liveError"] = str(exc)
-            return stale
+            return serve_stale_live_limits("antigravity", normalize_gemini_limits(stale), exc)
         limits = live_limit_error(exc, GEMINI_CODE_ASSIST_URL)
         write_live_limits_cache("antigravity", limits)
         return limits
@@ -3512,7 +3543,11 @@ def runtime_limits() -> Dict[str, Dict[str, Any]]:
         "codex": prefer_live_limits(codex_live_limits(), codex_fallback),
         "claude": prefer_live_limits(claude_live_limits(), claude_fallback),
         "gemini": gemini_limits,
-        "antigravity": prefer_live_limits(antigravity_live_limits(), copy.deepcopy(gemini_limits)),
+        # Antigravity probes its own Code Assist quota (26.28.0). Return it directly
+        # like gemini — do NOT fall back to a copy of the gemini limits, which would
+        # relabel Gemini's quota as Antigravity's (the exact #45 mirroring bug this
+        # provider was split out to fix).
+        "antigravity": antigravity_live_limits(),
     }
 
 
@@ -5594,6 +5629,7 @@ def fetch_llm_usage_fresh() -> Dict[str, Any]:
             "claude": live_usage_provider_from_limits(claude_live_limits(force=True)),
             "codex": live_usage_provider_from_limits(codex_live_limits(force=True)),
             "gemini": live_usage_provider_from_limits(gemini_live_limits(force=True)),
+            "antigravity": live_usage_provider_from_limits(antigravity_live_limits(force=True)),
         },
     }
 
