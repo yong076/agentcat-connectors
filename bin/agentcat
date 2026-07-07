@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.1")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.2")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -2112,7 +2112,7 @@ def empty_limits(
 ) -> Dict[str, Any]:
     limits: Dict[str, Any] = {
         "status": status,
-        "source": str(LIMITS_FILE),
+        "source": _tilde(LIMITS_FILE),
         "weeklyTokens": None,
         "monthlyTokens": None,
         "sessionTokens": None,
@@ -2218,11 +2218,20 @@ def latest_event_payload(provider: str, source: Optional[str] = None) -> Optiona
 
 def codex_runtime_limits() -> Dict[str, Any]:
     limits = empty_limits()
-    session_files = sorted(
-        (HOME / ".codex" / "sessions").glob("**/rollout-*.jsonl"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:30]
+
+    def _safe_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    try:
+        candidates = list((HOME / ".codex" / "sessions").glob("**/rollout-*.jsonl"))
+    except OSError:
+        candidates = []
+    # Safe mtime key: a session file deleted between glob and stat must not raise
+    # (it would propagate up through runtime_limits and freeze the whole snapshot).
+    session_files = sorted(candidates, key=_safe_mtime, reverse=True)[:30]
     for path in session_files:
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -2244,7 +2253,7 @@ def codex_runtime_limits() -> Dict[str, Any]:
                 continue
 
             limits = empty_limits(status="auto")
-            limits["source"] = str(path)
+            limits["source"] = _tilde(path)
             limits["planType"] = rate_limits.get("plan_type")
 
             secondary = rate_limits.get("secondary")
@@ -2967,12 +2976,18 @@ def gemini_display_name(model: Any) -> str:
 
 
 def read_gemini_auth_type() -> Optional[str]:
-    for path in (
-        Path.cwd() / ".gemini" / "settings.json",
+    paths = [
         HOME / ".gemini" / "settings.json",
         HOME / ".gemini" / "antigravity-cli" / "settings.json",
         HOME / ".antigravity" / "settings.json",
-    ):
+    ]
+    try:
+        # A project-local .gemini/settings.json wins, but cwd may have been deleted
+        # under the daemon — do not let that raise and freeze the snapshot.
+        paths.insert(0, Path.cwd() / ".gemini" / "settings.json")
+    except OSError:
+        pass
+    for path in paths:
         raw = read_json(path)
         if not isinstance(raw, dict) or raw.get("_agentcat_error"):
             continue
@@ -3015,20 +3030,14 @@ def unwrap_antigravity_oauth_token(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def read_gemini_oauth_credentials() -> Optional[Dict[str, Any]]:
-    # Antigravity (and Windows installs) may store the OAuth creds outside the
-    # standalone gemini-cli's ~/.gemini/oauth_creds.json — probe known siblings
-    # (agent-cat-releases#31: Antigravity-only users otherwise get zero quota).
-    for path in (
-        HOME / ".gemini" / "oauth_creds.json",
-        HOME / ".gemini" / "antigravity-cli" / "oauth_creds.json",
-        HOME / ".gemini" / "antigravity-cli" / "antigravity-oauth-token",
-        HOME / ".antigravity" / "oauth_creds.json",
-    ):
-        raw = read_json(path)
-        if isinstance(raw, dict) and not raw.get("_agentcat_error"):
-            if path.name == "antigravity-oauth-token":
-                raw = unwrap_antigravity_oauth_token(raw)
-            return raw
+    # Gemini CLI's own OAuth creds only. Antigravity is probed independently since
+    # 26.28.0 (read_antigravity_oauth_credentials / antigravity_live_limits). Reading
+    # Antigravity's token here would (a) double-count Antigravity's quota on the gemini
+    # tile and (b) POST Antigravity's refresh_token with the *gemini* client id/secret
+    # — a guaranteed failure repeated every probe cycle (audit M3, was agent-cat-releases#31).
+    raw = read_json(HOME / ".gemini" / "oauth_creds.json")
+    if isinstance(raw, dict) and not raw.get("_agentcat_error"):
+        return raw
     return None
 
 
@@ -3536,18 +3545,27 @@ def prefer_live_limits(live: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[s
 
 
 def runtime_limits() -> Dict[str, Dict[str, Any]]:
-    codex_fallback = codex_runtime_limits()
-    claude_fallback = claude_runtime_limits()
-    gemini_limits = gemini_live_limits()
+    def _safe(fn: Any) -> Dict[str, Any]:
+        # Per-provider isolation: one provider raising (e.g. a stat race on a deleted
+        # session file, or a deleted cwd) must not freeze the whole snapshot — it
+        # would be served with a fresh servedAt as if everything were current.
+        try:
+            return fn()
+        except Exception as exc:
+            return empty_limits(status="error", error=str(exc))
+
+    codex_fallback = _safe(codex_runtime_limits)
+    claude_fallback = _safe(claude_runtime_limits)
+    gemini_limits = _safe(gemini_live_limits)
     return {
-        "codex": prefer_live_limits(codex_live_limits(), codex_fallback),
-        "claude": prefer_live_limits(claude_live_limits(), claude_fallback),
+        "codex": prefer_live_limits(_safe(codex_live_limits), codex_fallback),
+        "claude": prefer_live_limits(_safe(claude_live_limits), claude_fallback),
         "gemini": gemini_limits,
         # Antigravity probes its own Code Assist quota (26.28.0). Return it directly
         # like gemini — do NOT fall back to a copy of the gemini limits, which would
         # relabel Gemini's quota as Antigravity's (the exact #45 mirroring bug this
         # provider was split out to fix).
-        "antigravity": antigravity_live_limits(),
+        "antigravity": _safe(antigravity_live_limits),
     }
 
 
