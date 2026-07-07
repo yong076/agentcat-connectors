@@ -985,7 +985,7 @@ def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
     return None
 
 
-CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot")
+CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot", "hermes")
 DESKTOP_APP_PROVIDER_IDS = ("claude", "codex")
 
 DESKTOP_APP_SPECS: Dict[str, Dict[str, Any]] = {
@@ -3863,6 +3863,133 @@ def opencode_message_metrics(data: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def hermes_snapshot() -> Dict[str, Any]:
+    env_roots = os.environ.get("HERMES_HOME")
+    db_paths: List[Path] = []
+    if env_roots:
+        for root_raw in env_roots.split(","):
+            root_text = root_raw.strip()
+            if root_text:
+                db_paths.append(Path(root_text).expanduser() / "state.db")
+    if not db_paths:
+        db_paths = [HOME / ".hermes" / "state.db"]
+
+    result = empty_provider_usage(source=",".join(str(path) for path in db_paths))
+    result["displayName"] = "Hermes"
+    existing_paths = [path for path in db_paths if path.is_file()]
+    if not existing_paths:
+        return result
+
+    result["status"] = "ok"
+    result["source"] = ",".join(str(path) for path in existing_paths)
+    events = 0
+    errors: List[str] = []
+    total_cost = 0.0
+    actual_cost = 0.0
+    estimated_cost = 0.0
+    repriced_cost = 0.0
+
+    query = """
+        select id, model, billing_provider, started_at, message_count,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+               reasoning_tokens, estimated_cost_usd, actual_cost_usd
+        from sessions
+        where model is not null and trim(model) != ''
+    """
+    for db_path in existing_paths:
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            rows = conn.execute(query).fetchall()
+        except Exception as exc:
+            errors.append(f"{db_path.name}: {exc}")
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        for (
+            _session_id,
+            model_raw,
+            _billing_provider,
+            started_at,
+            _message_count,
+            input_raw,
+            output_raw,
+            cache_read_raw,
+            cache_write_raw,
+            reasoning_raw,
+            estimated_raw,
+            actual_raw,
+        ) in rows:
+            model = normalized_model_name(model_raw)
+            if model is None:
+                continue
+            metrics = {
+                "inputTokens": nonnegative_int(input_raw) or 0,
+                "outputTokens": nonnegative_int(output_raw) or 0,
+                "cacheReadInputTokens": nonnegative_int(cache_read_raw) or 0,
+                "cacheCreationInputTokens": nonnegative_int(cache_write_raw) or 0,
+                "reasoningTokens": nonnegative_int(reasoning_raw) or 0,
+            }
+            token_total = usage_token_total(metrics)
+            actual = float_value(actual_raw)
+            estimated = float_value(estimated_raw)
+            row_cost = 0.0
+            cost_key: Optional[str] = None
+            if actual is not None:
+                if actual > 0:
+                    row_cost = actual
+                    actual_cost += row_cost
+                    cost_key = "actualCostUsd"
+            elif estimated is not None and estimated > 0:
+                row_cost = estimated
+                estimated_cost += row_cost
+                cost_key = "estimatedCostUsd"
+            if row_cost <= 0 and token_total > 0:
+                priced = estimate_cost(
+                    model,
+                    metrics["inputTokens"],
+                    metrics["outputTokens"],
+                    metrics["cacheReadInputTokens"],
+                    metrics["cacheCreationInputTokens"],
+                )
+                if priced is not None:
+                    row_cost = max(0.0, float(priced.get("total") or 0.0))
+                    repriced_cost += row_cost
+                    cost_key = "repricedCostUsd"
+
+            if token_total <= 0 and row_cost <= 0:
+                continue
+
+            when = parse_timestamp(started_at)
+            add_usage_metrics(result, model, metrics, when)
+            if row_cost > 0:
+                total_cost += row_cost
+                model_costs = result.setdefault("models", {}).setdefault(model, {})
+                model_costs["costUsd"] = float(model_costs.get("costUsd") or 0.0) + row_cost
+                if cost_key:
+                    model_costs[cost_key] = float(model_costs.get(cost_key) or 0.0) + row_cost
+            events += 1
+
+    if events == 0 and errors:
+        result["status"] = "error"
+        result["error"] = "; ".join(errors[:3])
+    elif errors:
+        result["warnings"] = errors[:3]
+    result["events"] = events
+    result["sessions"] = events
+    if total_cost > 0:
+        result["costUsd"] = total_cost
+        result["actualCostUsd"] = actual_cost
+        result["estimatedCostUsd"] = estimated_cost
+        result["repricedCostUsd"] = repriced_cost
+    return result
+
+
 def opencode_snapshot() -> Dict[str, Any]:
     data_dir = opencode_data_dir()
     result = empty_provider_usage(source=str(data_dir))
@@ -5251,6 +5378,11 @@ def attach_local_usage_coverage(provider: str, snapshot: Dict[str, Any], **extra
             "includedSources": ["copilot_legacy_events", "vscode_copilot_transcripts"],
             "privacy": "token_metadata_or_estimate",
             "note": "Uses explicit Copilot output tokens when present and local transcript estimates when the transcript lacks token fields.",
+        },
+        "hermes": {
+            "includedSources": ["hermes_state_sqlite"],
+            "privacy": "session_usage_metadata",
+            "note": "Reads Hermes local SQLite session token and cost metadata only. Prompts and transcripts are ignored.",
         },
     }
     descriptor = descriptors.get(provider)
@@ -8215,12 +8347,13 @@ def build_snapshot() -> Dict[str, Any]:
         "antigravity": antigravity_provider,
         "opencode": disabled_provider_snapshot("opencode") if (provider_config.get("opencode") or {}).get("enabled") is False else opencode_snapshot(),
         "copilot": disabled_provider_snapshot("copilot") if (provider_config.get("copilot") or {}).get("enabled") is False else copilot_snapshot(),
+        "hermes": disabled_provider_snapshot("hermes") if (provider_config.get("hermes") or {}).get("enabled") is False else hermes_snapshot(),
     }
     if (provider_config.get("gemini") or {}).get("enabled") is False:
         providers["gemini"] = disabled_provider_snapshot("gemini")
     if (provider_config.get("antigravity") or {}).get("enabled") is False:
         providers["antigravity"] = disabled_provider_snapshot("antigravity")
-    for provider in ("gemini", "antigravity", "opencode", "copilot"):
+    for provider in ("gemini", "antigravity", "opencode", "copilot", "hermes"):
         attach_local_usage_coverage(provider, providers.get(provider, {}))
     for provider, data in providers.items():
         if data.get("status") == "disabled":
