@@ -67,8 +67,11 @@ class AgentCatConnectorTests(unittest.TestCase):
         agentcat._GEMINI_CACHE_KEY = None
         agentcat._GEMINI_CACHE_VALUE = None
         agentcat._GEMINI_CACHE_LOADED_AT = 0.0
+        self.env_patcher = patch.dict(agentcat.os.environ, {"HERMES_HOME": str(home / ".hermes")})
+        self.env_patcher.start()
 
     def tearDown(self) -> None:
+        self.env_patcher.stop()
         for name, value in self.old_paths.items():
             setattr(agentcat, name, value)
         self.tmp.cleanup()
@@ -2496,6 +2499,104 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["week"], 160)
         self.assertEqual(snapshot["models"]["anthropic/claude-sonnet-4-6"]["inputTokens"], 100)
         self.assertEqual(snapshot["models"]["anthropic/claude-sonnet-4-6"]["week"], 160)
+
+    def test_hermes_snapshot_reads_sqlite_sessions_and_reprices_zero_cost(self) -> None:
+        hermes_home = self.root / "hermes-home"
+        hermes_home.mkdir(parents=True)
+        db_path = hermes_home / "state.db"
+        now_s = dt.datetime.now(dt.timezone.utc).timestamp()
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                create table sessions (
+                  id text primary key,
+                  model text,
+                  billing_provider text,
+                  started_at real,
+                  message_count integer,
+                  input_tokens integer,
+                  output_tokens integer,
+                  cache_read_tokens integer,
+                  cache_write_tokens integer,
+                  reasoning_tokens integer,
+                  estimated_cost_usd real,
+                  actual_cost_usd real
+                )
+                """
+            )
+            conn.executemany(
+                """
+                insert into sessions(
+                  id, model, billing_provider, started_at, message_count,
+                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                  reasoning_tokens, estimated_cost_usd, actual_cost_usd
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        "trusted-actual",
+                        "claude-sonnet-4-6",
+                        "anthropic",
+                        now_s,
+                        3,
+                        1200,
+                        300,
+                        50,
+                        20,
+                        10,
+                        0.12,
+                        0.34,
+                    ),
+                    (
+                        "must-skip-zero",
+                        "claude-sonnet-4-6",
+                        "anthropic",
+                        now_s,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ),
+                    (
+                        "subscription-reprice",
+                        "claude-sonnet-4-6",
+                        "anthropic",
+                        now_s,
+                        1,
+                        1_000_000,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ),
+                ],
+            )
+            conn.commit()
+
+        missing_home = self.root / "missing-hermes-home"
+        with patch.dict(agentcat.os.environ, {"HERMES_HOME": f"{missing_home},{hermes_home}"}):
+            snapshot = agentcat.hermes_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["displayName"], "Hermes")
+        self.assertEqual(snapshot["events"], 2)
+        self.assertEqual(snapshot["sessions"], 2)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 1_001_200)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 300)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 50)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 20)
+        self.assertEqual(snapshot["tokens"]["reasoningTokens"], 10)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 1_001_580)
+        self.assertAlmostEqual(snapshot["actualCostUsd"], 0.34)
+        self.assertAlmostEqual(snapshot["estimatedCostUsd"], 0.0)
+        self.assertAlmostEqual(snapshot["repricedCostUsd"], 3.0)
+        self.assertAlmostEqual(snapshot["costUsd"], 3.34)
 
     def test_copilot_snapshot_reads_legacy_and_vscode_transcript_tokens(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
