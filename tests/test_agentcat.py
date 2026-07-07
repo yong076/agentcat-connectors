@@ -1344,6 +1344,50 @@ class AgentCatConnectorTests(unittest.TestCase):
             mode = conn.execute("pragma journal_mode").fetchone()[0]
         self.assertEqual(str(mode).lower(), "wal")
 
+    def test_gemini_state_preserves_history_on_truncation(self) -> None:
+        # Audit #2: truncating/rotating the telemetry log (e.g. reclaiming disk from a
+        # multi-GB file) must NOT wipe accumulated week/month/all history.
+        tel = agentcat.GEMINI_TELEMETRY
+        cache = agentcat.GEMINI_USAGE_CACHE
+        tel.parent.mkdir(parents=True, exist_ok=True)
+        agentcat.save_gemini_usage_state(
+            {
+                "version": agentcat.GEMINI_USAGE_CACHE_VERSION,
+                "source": str(tel),
+                "offset": 5_000_000, "size": 5_000_000, "mtimeNs": 1,
+                "tokenClasses": {"input": 999},
+                "models": {"gemini-3-pro": {"input": 999}},
+                "dailyTokens": {"2026-07-01": 999}, "hourlyTokens": {}, "modelDailyTokens": {},
+                "events": 3, "identities": {"id1": {"amount": 999}},
+            },
+            cache_path=cache,
+        )
+        tel.write_text("x\n", encoding="utf-8")  # truncated to a much smaller file
+
+        state = agentcat.load_gemini_usage_state(tel.stat(), telemetry_path=tel, cache_path=cache)
+        self.assertEqual(state["tokenClasses"], {"input": 999})       # preserved, NOT wiped
+        self.assertEqual(state["identities"], {"id1": {"amount": 999}})  # dedup map kept
+        self.assertEqual(state["events"], 3)
+        self.assertEqual(state["offset"], 0)                          # re-scan from start
+
+    def test_codex_cursor_stops_at_incomplete_trailing_line(self) -> None:
+        # Audit #8: a torn final line (writer mid-append) must not be counted or its
+        # offset committed — else the turn is permanently skipped once completed.
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        path = self._write_codex_session(
+            "rollout-torn.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event({"input_tokens": 8, "cached_input_tokens": 0, "output_tokens": 4, "reasoning_output_tokens": 0}, now),
+            ],
+        )
+        torn = json.dumps(self._token_count_event({"input_tokens": 9999, "cached_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0}, now))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(torn)  # deliberately NO trailing newline
+
+        snap = agentcat.codex_sessions_snapshot()
+        self.assertEqual(snap["tokens"]["all"], 12)  # only the complete turn; 9999 ignored
+
     def test_codexbar_cost_cache_floors_codex_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()
         cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"

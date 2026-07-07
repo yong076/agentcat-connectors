@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.3")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.4")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -4777,6 +4777,12 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
             with path.open("rb") as fh:
                 fh.seek(prev_offset)
                 for raw_line in fh:
+                    if not raw_line.endswith(b"\n"):
+                        # Incomplete trailing line: the writer is mid-append. Do NOT
+                        # advance the cursor past it — committing this offset would
+                        # permanently skip the turn once the writer finishes it (codex
+                        # has no daily rebuild to recover, unlike claude — audit #8).
+                        break
                     new_offset += len(raw_line)
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
@@ -6032,6 +6038,12 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                 with path.open("rb") as fh:
                     fh.seek(stored_offset)
                     for raw_line in fh:
+                        if not raw_line.endswith(b"\n"):
+                            # Incomplete trailing line (writer mid-append): stop before
+                            # advancing the cursor past it (audit #8). Claude's midnight
+                            # rebuild would eventually recover, but not counting a torn
+                            # line is still the correct incremental behavior.
+                            break
                         new_offset += len(raw_line)
                         line = raw_line.decode("utf-8", errors="replace").strip()
                         if not line:
@@ -6859,7 +6871,15 @@ def load_gemini_usage_state(
         if cached_size == stat.st_size:
             raw["offset"] = int(stat.st_size)
         else:
-            return empty_gemini_usage_state(telemetry_path)
+            # The telemetry log was truncated/rotated (e.g. the user reclaimed disk from
+            # a multi-GB file, or our own cleaner ran). Do NOT discard the accumulated
+            # history (audit #2 — this was a full wipe of week/month/all). Keep the
+            # totals + the `identities` dedup map and re-scan from offset 0: dedup makes
+            # re-counting any records that survived truncation a no-op, so at worst we
+            # miss brand-new records in the truncated span, never lose confirmed history.
+            raw["offset"] = 0
+            raw["size"] = 0
+            raw["mtimeNs"] = 0
     return raw
 
 
