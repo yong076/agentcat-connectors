@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.5")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.6")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -7735,7 +7735,9 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
         "totalCPUPercent": 0,
         "totalMemoryBytes": 0,
         "motionStage": "sleeping",
-        "runtimeModes": safe_runtime_modes_snapshot(),
+        # Computed once below (or in the ps-error path) — NOT here, where it was a wasted
+        # events-DB query on every snapshot since the success path overwrites it (audit #6).
+        "runtimeModes": [],
         "countsByProvider": {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0},
         "memoryBytesByProvider": {"codex": 0, "claude": 0, "gemini": 0, "antigravity": 0},
         "processes": [],
@@ -7752,6 +7754,7 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
     except Exception as exc:
         result["status"] = "error"
         result["error"] = str(exc)
+        result["runtimeModes"] = safe_runtime_modes_snapshot()
         return result
 
     rows: List[Dict[str, Any]] = []
@@ -8414,14 +8417,37 @@ def build_snapshot() -> Dict[str, Any]:
     return snapshot
 
 
+_HTTP_LIVE_CACHE_LOCK = threading.Lock()
+_HTTP_LIVE_CACHE: Optional[Tuple[float, Dict[str, Any], Dict[str, Any]]] = None
+HTTP_LIVE_CACHE_TTL = float(os.environ.get("AGENTCAT_HTTP_LIVE_CACHE_SECONDS", "2.0"))
+
+
+def _live_activity_and_desktop() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The per-request live overlay (process scan + desktop-app walk), cached for a
+    couple of seconds. The app polls /v1/snapshot every ~2-5s, and each call otherwise
+    spawned `/bin/ps` (or WMI) and walked the desktop tree — 10-13% of a core steady
+    state (audit #6). The 60s background loop keeps the snapshot body fresh; this only
+    throttles the live overlay."""
+    global _HTTP_LIVE_CACHE
+    now = time.monotonic()
+    with _HTTP_LIVE_CACHE_LOCK:
+        if _HTTP_LIVE_CACHE is not None and (now - _HTTP_LIVE_CACHE[0]) < HTTP_LIVE_CACHE_TTL:
+            return _HTTP_LIVE_CACHE[1], _HTTP_LIVE_CACHE[2]
+    activity = terminal_activity_snapshot()
+    desktop_apps = desktop_app_sources_snapshot(agentcat_settings())
+    with _HTTP_LIVE_CACHE_LOCK:
+        _HTTP_LIVE_CACHE = (time.monotonic(), activity, desktop_apps)
+    return activity, desktop_apps
+
+
 def snapshot_for_http() -> Dict[str, Any]:
     cached = read_json(LATEST_SNAPSHOT)
     if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
         snapshot = copy.deepcopy(cached)
         snapshot["servedAt"] = now_iso()
         snapshot["update"] = auto_update_status_snapshot()
-        snapshot["activity"] = terminal_activity_snapshot()
-        desktop_apps = desktop_app_sources_snapshot(agentcat_settings())
+        activity, desktop_apps = _live_activity_and_desktop()
+        snapshot["activity"] = activity
         snapshot["desktopApps"] = desktop_apps
         providers = snapshot.get("providers")
         if isinstance(providers, dict):
