@@ -1296,6 +1296,54 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("sessions_jsonl", snapshot["usageCoverage"]["includedSources"])
         self.assertIn("state_sqlite", snapshot["usageCoverage"]["includedSources"])
 
+    def test_codex_sqlite_floors_all_but_does_not_inflate_today(self) -> None:
+        # Audit #1: state.sqlite holds each thread's LIFETIME total dated to its last
+        # update. It may floor `all`, but must NOT be booked into today/week/daily —
+        # doing so mis-dates a whole thread's history into one day (up to ~50x headline
+        # inflation). today/week come from the accurate per-message JSONL only.
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_codex_session(
+            "rollout-inflate.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    {"input_tokens": 8, "cached_input_tokens": 0, "output_tokens": 4, "reasoning_output_tokens": 0},
+                    now,
+                ),
+            ],
+        )
+        self._write_codex_state(9999, now)  # lifetime total dated today
+
+        snap = agentcat.codex_snapshot()
+        self.assertEqual(snap["tokens"]["all"], 9999)          # floored (correct)
+        self.assertEqual(snap["tokens"]["today"], 12)          # NOT 9999 (audit #1)
+        self.assertEqual(snap["tokens"]["week"], 12)
+        self.assertLessEqual(sum(snap["dailyTokens"].values()), snap["tokens"]["all"])  # audit #9
+
+    def test_pricing_prefix_requires_a_separator_boundary(self) -> None:
+        # Audit #13: "gpt-4" must not price an unrelated "gpt-45…".
+        table = {"gpt-4": {"input": 1.0, "output": 2.0}, "gpt-5.5": {"input": 3.0, "output": 4.0}}
+        self.assertIsNotNone(agentcat._lookup_pricing("gpt-4-0613", table))       # boundary "-"
+        self.assertIsNotNone(agentcat._lookup_pricing("gpt-5.5-codex", table))    # longest prefix
+        self.assertIsNone(agentcat._lookup_pricing("gpt-45-turbo", table))        # no boundary → no match
+
+    def test_build_snapshot_isolates_a_raising_provider(self) -> None:
+        # Audit #14: one provider reader raising must not fail the whole snapshot.
+        with patch.object(agentcat, "codex_snapshot", side_effect=RuntimeError("boom")):
+            snap = agentcat.build_snapshot()
+        self.assertEqual(snap["providers"]["codex"]["status"], "error")
+        self.assertIn("boom", snap["providers"]["codex"].get("error", ""))
+        # Other providers still present (not frozen out).
+        self.assertIn("claude", snap["providers"])
+        self.assertIn("gemini", snap["providers"])
+
+    def test_events_db_uses_wal(self) -> None:
+        # Audit #10: WAL so hook writers and the refresh-loop reader don't block/drop.
+        agentcat.init_db()
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
+            mode = conn.execute("pragma journal_mode").fetchone()[0]
+        self.assertEqual(str(mode).lower(), "wal")
+
     def test_codexbar_cost_cache_floors_codex_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()
         cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"

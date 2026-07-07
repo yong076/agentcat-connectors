@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.2")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.3")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -243,7 +243,15 @@ def _lookup_pricing(
     # "gpt-5.5-codex" prefers a "gpt-5.5" entry over "gpt-5".
     best_key: Optional[str] = None
     for key in table:
-        if trimmed.startswith(key) and (best_key is None or len(key) > len(best_key)):
+        if not trimmed.startswith(key):
+            continue
+        # Require a separator boundary after the prefix so "gpt-4" does not match an
+        # unrelated "gpt-45…": the char right after the key must be "-"/"." or the
+        # end of the string (audit #13).
+        rest = trimmed[len(key):]
+        if rest and rest[0] not in "-.":
+            continue
+        if best_key is None or len(key) > len(best_key):
             best_key = key
     if best_key is not None:
         return table[best_key]
@@ -1793,7 +1801,12 @@ def display_model(value: Any) -> Optional[str]:
 
 def init_db() -> None:
     ensure_dirs()
-    with closing(sqlite3.connect(EVENTS_DB)) as conn:
+    with closing(sqlite3.connect(EVENTS_DB, timeout=5.0)) as conn:
+        # WAL is a persistent DB property (set once, applies to every later connection):
+        # readers (the 60s refresh loop) no longer block the CLI-hook writers, so a
+        # store_event racing a snapshot build isn't dropped with "database is locked".
+        conn.execute("pragma journal_mode=WAL")
+        conn.execute("pragma busy_timeout=5000")
         conn.execute(
             """
             create table if not exists events (
@@ -1815,7 +1828,7 @@ def init_db() -> None:
 def store_event(provider: str, source: str, event_type: Optional[str], payload: Any) -> Dict[str, Any]:
     init_db()
     sanitized = sanitize_payload(payload)
-    with closing(sqlite3.connect(EVENTS_DB)) as conn:
+    with closing(sqlite3.connect(EVENTS_DB, timeout=5.0)) as conn:
         cur = conn.execute(
             "insert into events(ts, provider, source, event_type, payload_json) values (?, ?, ?, ?, ?)",
             (int(time.time()), provider, source, event_type, json.dumps(sanitized, ensure_ascii=False, sort_keys=True)),
@@ -5461,38 +5474,40 @@ def merge_codex_sessions_with_sqlite(sessions: Dict[str, Any], sqlite: Dict[str,
 
     session_tokens = merged.setdefault("tokens", empty_periods())
     sqlite_tokens = sqlite.get("tokens") if isinstance(sqlite.get("tokens"), dict) else {}
-    for key in ("today", "week", "month", "all"):
-        sqlite_value = int(sqlite_tokens.get(key) or 0)
-        if sqlite_value > int(session_tokens.get(key) or 0):
-            session_tokens[key] = sqlite_value
-            changed = True
+    # Codex state.sqlite only exposes each thread's LIFETIME cumulative `tokens_used`,
+    # booked to the single day of its `updated_at`. That is a valid all-time FLOOR, but
+    # feeding it into today/week/month/daily/hourly/per-model mis-dates an entire
+    # thread's history into one day and inflates the headline by orders of magnitude
+    # (audit #1). Use sqlite only to floor `all` (and totalTokens); trust the accurate
+    # per-message sessions-JSONL for every dated bucket. This also keeps
+    # sum(dailyTokens) <= all (audit #9), since dated buckets now come from one source.
+    sqlite_all = int(sqlite_tokens.get("all") or 0)
+    if sqlite_all > int(session_tokens.get("all") or 0):
+        session_tokens["all"] = sqlite_all
+        changed = True
     if int(session_tokens.get("all") or 0) > int(session_tokens.get("totalTokens") or 0):
         session_tokens["totalTokens"] = int(session_tokens.get("all") or 0)
         changed = True
 
-    daily = merged.setdefault("dailyTokens", {})
-    sqlite_daily = sqlite.get("dailyTokens") if isinstance(sqlite.get("dailyTokens"), dict) else {}
-    if isinstance(daily, dict):
-        changed = _merge_int_maps_by_max(daily, sqlite_daily) or changed
-
-    hourly = merged.setdefault("hourlyTokens", {})
-    sqlite_hourly = sqlite.get("hourlyTokens") if isinstance(sqlite.get("hourlyTokens"), dict) else {}
-    if isinstance(hourly, dict):
-        changed = _merge_int_maps_by_max(hourly, sqlite_hourly) or changed
-
+    # Preserve per-model ALL-TIME attribution from sqlite (a model only ever seen in a
+    # thread total should still show in the breakdown), but floor ONLY its `all` — never
+    # its dated buckets, for the same mis-dating reason as the headline above.
     models = merged.setdefault("models", {})
     sqlite_models = sqlite.get("models") if isinstance(sqlite.get("models"), dict) else {}
-    if isinstance(models, dict):
+    if isinstance(models, dict) and isinstance(sqlite_models, dict):
         for model, raw_periods in sqlite_models.items():
             if not isinstance(raw_periods, dict):
                 continue
-            target = models.setdefault(str(model), {})
+            model_all = int(raw_periods.get("all") or 0)
+            if model_all <= 0:
+                continue
+            target = models.setdefault(str(model), empty_periods())
             if not isinstance(target, dict):
                 continue
-            if _merge_int_maps_by_max(target, raw_periods):
-                total = int(target.get("all") or 0)
-                if total > int(target.get("totalTokens") or 0):
-                    target["totalTokens"] = total
+            if model_all > int(target.get("all") or 0):
+                target["all"] = model_all
+                if model_all > int(target.get("totalTokens") or 0):
+                    target["totalTokens"] = model_all
                 changed = True
 
     sqlite_projects = sqlite.get("projects") if isinstance(sqlite.get("projects"), dict) else {}
@@ -8256,19 +8271,43 @@ def build_snapshot() -> Dict[str, Any]:
         latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
     limits_by_provider = configured_limits()
     runtime_limits_by_provider = runtime_limits()
-    activity = terminal_activity_snapshot()
+    def _safe_provider(provider_id: str, fn: Any) -> Dict[str, Any]:
+        # Per-provider isolation: one provider's reader raising must NOT fail the whole
+        # build_snapshot. The refresh loop swallows the exception and then serves the
+        # previous snapshot with a fresh servedAt — so a single bad provider silently
+        # freezes ALL numbers as if current (audit #14). Degrade to an error entry.
+        try:
+            return fn()
+        except Exception as exc:
+            logging.debug("provider %s snapshot failed: %s", provider_id, exc)
+            snap = empty_provider_usage(status="error")
+            snap["error"] = str(exc)
+            return snap
+
+    try:
+        activity = terminal_activity_snapshot()
+    except Exception as exc:
+        logging.debug("terminal_activity_snapshot failed: %s", exc)
+        activity = {"status": "error", "error": str(exc)}
     if (provider_config.get("gemini") or {}).get("enabled") is False and (provider_config.get("antigravity") or {}).get("enabled") is False:
         gemini_provider = disabled_provider_snapshot("gemini")
         antigravity_provider = disabled_provider_snapshot("antigravity")
     else:
-        gemini_provider, antigravity_provider = split_google_cli_snapshots(gemini_snapshot(), activity)
+        try:
+            gemini_provider, antigravity_provider = split_google_cli_snapshots(gemini_snapshot(), activity)
+        except Exception as exc:
+            logging.debug("gemini/antigravity snapshot failed: %s", exc)
+            gemini_provider = empty_provider_usage(status="error")
+            gemini_provider["error"] = str(exc)
+            antigravity_provider = empty_provider_usage(status="error")
+            antigravity_provider["error"] = str(exc)
     providers = {
-        "codex": disabled_provider_snapshot("codex") if (provider_config.get("codex") or {}).get("enabled") is False else codex_snapshot(),
-        "claude": disabled_provider_snapshot("claude") if (provider_config.get("claude") or {}).get("enabled") is False else claude_snapshot(),
+        "codex": disabled_provider_snapshot("codex") if (provider_config.get("codex") or {}).get("enabled") is False else _safe_provider("codex", codex_snapshot),
+        "claude": disabled_provider_snapshot("claude") if (provider_config.get("claude") or {}).get("enabled") is False else _safe_provider("claude", claude_snapshot),
         "gemini": gemini_provider,
         "antigravity": antigravity_provider,
-        "opencode": disabled_provider_snapshot("opencode") if (provider_config.get("opencode") or {}).get("enabled") is False else opencode_snapshot(),
-        "copilot": disabled_provider_snapshot("copilot") if (provider_config.get("copilot") or {}).get("enabled") is False else copilot_snapshot(),
+        "opencode": disabled_provider_snapshot("opencode") if (provider_config.get("opencode") or {}).get("enabled") is False else _safe_provider("opencode", opencode_snapshot),
+        "copilot": disabled_provider_snapshot("copilot") if (provider_config.get("copilot") or {}).get("enabled") is False else _safe_provider("copilot", copilot_snapshot),
     }
     if (provider_config.get("gemini") or {}).get("enabled") is False:
         providers["gemini"] = disabled_provider_snapshot("gemini")
