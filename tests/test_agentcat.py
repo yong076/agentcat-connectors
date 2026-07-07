@@ -3992,10 +3992,13 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         # _tilde so the snapshot never carries an absolute /Users/<name>/… path.
         p = agentcat.HOME / ".agentcat" / "limits.json"
         rendered = agentcat._tilde(p)
-        self.assertEqual(rendered, "~/.agentcat/limits.json")
+        # Platform-agnostic (the separator is the OS's own): starts with ~, keeps the
+        # leaf, and never contains the absolute home path (the username).
+        self.assertTrue(rendered.startswith("~"))
+        self.assertIn("limits.json", rendered)
         self.assertNotIn(str(agentcat.HOME), rendered)
         # A sibling dir must not be mangled.
-        sibling = str(agentcat.HOME) + "-old/x"
+        sibling = str(agentcat.HOME) + "-old"
         self.assertEqual(agentcat._tilde(sibling), sibling)
 
 
