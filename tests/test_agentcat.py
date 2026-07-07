@@ -1459,6 +1459,49 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(act["status"], "error")
         self.assertIn("runtimeModes", act)
 
+    def test_build_snapshot_serializes_concurrent_builds(self) -> None:
+        # Audit #4: two interleaved builds re-book the same projectsDaily delta. The lock
+        # must guarantee only one build body runs at a time.
+        import threading
+        import time as _time
+        state = {"active": 0, "max": 0}
+        guard = threading.Lock()
+
+        def slow_impl() -> dict:
+            with guard:
+                state["active"] += 1
+                state["max"] = max(state["max"], state["active"])
+            _time.sleep(0.05)
+            with guard:
+                state["active"] -= 1
+            return {}
+
+        with patch.object(agentcat, "_build_snapshot_impl", side_effect=slow_impl):
+            threads = [threading.Thread(target=agentcat.build_snapshot) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(state["max"], 1)  # never two builds concurrently
+
+    def test_snapshot_for_http_serves_cache_without_rebuilding(self) -> None:
+        # Cold start (#3) relies on this: bind first, serve the cached latest-snapshot.json
+        # instantly instead of blocking a request on a fresh multi-GB build.
+        agentcat.write_json_atomic(
+            agentcat.LATEST_SNAPSHOT,
+            {"schemaVersion": 1, "providers": {"codex": {"status": "ok"}}},
+        )
+        agentcat._HTTP_LIVE_CACHE = None
+        try:
+            with patch.object(agentcat, "_build_snapshot_impl", side_effect=AssertionError("must not rebuild")), \
+                 patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}), \
+                 patch.object(agentcat, "desktop_app_sources_snapshot", return_value={}):
+                snap = agentcat.snapshot_for_http()
+            self.assertIn("servedAt", snap)
+            self.assertEqual(snap["providers"]["codex"]["status"], "ok")
+        finally:
+            agentcat._HTTP_LIVE_CACHE = None
+
     def test_codexbar_cost_cache_floors_codex_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()
         cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"

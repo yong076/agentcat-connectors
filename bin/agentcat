@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.6")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.7")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -8315,7 +8315,20 @@ def update_project_daily(
     return project_daily_snapshot_slice(days, today)
 
 
+_BUILD_SNAPSHOT_LOCK = threading.RLock()
+
+
 def build_snapshot() -> Dict[str, Any]:
+    # Serialize snapshot builds. build_snapshot() is invoked from the 60s refresh loop,
+    # the POST /v1/config handler, the `agentcat event` path, and the cold-start thread;
+    # update_project_daily books per-project *deltas* against a persisted baseline, so two
+    # interleaved builds re-book the same growth into today's projectsDaily (audit #4).
+    # An RLock keeps it safe even if a future caller nests a build.
+    with _BUILD_SNAPSHOT_LOCK:
+        return _build_snapshot_impl()
+
+
+def _build_snapshot_impl() -> Dict[str, Any]:
     ensure_dirs()
     settings = agentcat_settings()
     provider_config = configured_provider_entries(settings)
@@ -8722,8 +8735,24 @@ def run_daemon(args: argparse.Namespace) -> int:
     args.host = resolve_bind_host(getattr(args, "host", "127.0.0.1"))
     # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
     prune_events()
-    build_snapshot()
-    threading.Thread(target=snapshot_refresh_loop, args=(60.0,), daemon=True).start()
+    # Bind and start accepting connections BEFORE the initial snapshot build (audit #3).
+    # The first build_snapshot() streams the full local history — gigabytes, minutes, for
+    # the heaviest users — and previously ran before the port bind, so the app got
+    # connection-refused the whole time and reported the user "not detected". Since
+    # snapshot_for_http() already serves the cached latest-snapshot.json, we bind first
+    # and move the initial build into the background: returning users see their last
+    # snapshot instantly while it refreshes underneath them.
+    server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
+    print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
+
+    def _initial_build_then_refresh() -> None:
+        try:
+            build_snapshot()
+        except Exception as exc:
+            print(f"agentcatd initial snapshot build failed: {exc}", file=sys.stderr, flush=True)
+        snapshot_refresh_loop(60.0)
+
+    threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
     update_enabled, _update_reason = auto_update_enabled_status()
     if update_enabled and AUTO_UPDATE_INTERVAL_SECONDS > 0:
         threading.Thread(
@@ -8737,8 +8766,6 @@ def run_daemon(args: argparse.Namespace) -> int:
             args=(float(PRICING_FETCH_INTERVAL_SECONDS), float(PRICING_FETCH_INITIAL_DELAY_SECONDS)),
             daemon=True,
         ).start()
-    server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
-    print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
