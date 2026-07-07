@@ -645,7 +645,10 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertEqual(agentcat.unwrap_antigravity_oauth_token(raw), raw)
 
-    def test_gemini_oauth_credentials_unwrap_antigravity_token_file(self) -> None:
+    def test_gemini_ignores_antigravity_token_which_antigravity_reads(self) -> None:
+        # Since 26.28.0 Antigravity is probed independently. The gemini cred reader must
+        # NOT pick up Antigravity's token (audit M3 — double-count + wrong-client refresh);
+        # read_antigravity_oauth_credentials is the one that reads + unwraps it.
         token_path = agentcat.HOME / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
         token_path.parent.mkdir(parents=True)
         token_path.write_text(
@@ -663,40 +666,32 @@ class AgentCatConnectorTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        creds = agentcat.read_gemini_oauth_credentials()
+        self.assertIsNone(agentcat.read_gemini_oauth_credentials())
 
+        creds = agentcat.read_antigravity_oauth_credentials()
         self.assertIsNotNone(creds)
         self.assertEqual(creds["access_token"], "x")
         self.assertEqual(creds["refresh_token"], "y")
         self.assertEqual(creds["expiry"], "2026-06-12T00:00:00Z")
         self.assertNotIn("token", creds)
 
-    def test_gemini_oauth_credentials_probe_order(self) -> None:
+    def test_gemini_oauth_credentials_reads_only_gemini_creds(self) -> None:
+        # M3: gemini reads ONLY ~/.gemini/oauth_creds.json. Antigravity sibling paths
+        # are no longer probed here (Antigravity has its own reader).
         gemini_creds = agentcat.HOME / ".gemini" / "oauth_creds.json"
         antigravity_dir = agentcat.HOME / ".gemini" / "antigravity-cli"
         antigravity_dir.mkdir(parents=True)
-        gemini_creds.write_text(json.dumps({"access_token": "gemini"}), encoding="utf-8")
         (antigravity_dir / "oauth_creds.json").write_text(json.dumps({"access_token": "antigravity"}), encoding="utf-8")
         (antigravity_dir / "antigravity-oauth-token").write_text(
             json.dumps({"token": {"access_token": "wrapped"}}), encoding="utf-8"
         )
-        legacy_dir = agentcat.HOME / ".antigravity"
-        legacy_dir.mkdir(parents=True)
-        (legacy_dir / "oauth_creds.json").write_text(json.dumps({"access_token": "legacy"}), encoding="utf-8")
 
-        self.assertEqual(agentcat.read_gemini_oauth_credentials()["access_token"], "gemini")
-
-        gemini_creds.unlink()
-        self.assertEqual(agentcat.read_gemini_oauth_credentials()["access_token"], "antigravity")
-
-        (antigravity_dir / "oauth_creds.json").unlink()
-        self.assertEqual(agentcat.read_gemini_oauth_credentials()["access_token"], "wrapped")
-
-        (antigravity_dir / "antigravity-oauth-token").unlink()
-        self.assertEqual(agentcat.read_gemini_oauth_credentials()["access_token"], "legacy")
-
-        (legacy_dir / "oauth_creds.json").unlink()
+        # Only Antigravity creds present → gemini reader returns None.
         self.assertIsNone(agentcat.read_gemini_oauth_credentials())
+
+        # Gemini's own creds are read when present.
+        gemini_creds.write_text(json.dumps({"access_token": "gemini"}), encoding="utf-8")
+        self.assertEqual(agentcat.read_gemini_oauth_credentials()["access_token"], "gemini")
 
     def test_gemini_auth_type_reads_antigravity_settings_legacy_key(self) -> None:
         settings_path = agentcat.HOME / ".gemini" / "antigravity-cli" / "settings.json"
@@ -706,9 +701,12 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(agentcat.read_gemini_auth_type(), "oauth-personal")
 
     def test_gemini_auth_type_falls_back_to_oauth_personal_when_creds_exist(self) -> None:
-        token_path = agentcat.HOME / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-        token_path.parent.mkdir(parents=True)
-        token_path.write_text(json.dumps({"token": {"access_token": "x", "refresh_token": "y"}}), encoding="utf-8")
+        # The settings-less fallback fires on gemini's OWN creds (M3: no longer on the
+        # Antigravity token, which has its own probe).
+        (agentcat.HOME / ".gemini").mkdir(parents=True)
+        (agentcat.HOME / ".gemini" / "oauth_creds.json").write_text(
+            json.dumps({"access_token": "x", "refresh_token": "y"}), encoding="utf-8"
+        )
 
         env = {"GOOGLE_GENAI_USE_GCA": "", "GEMINI_API_KEY": "", "GOOGLE_GENAI_USE_VERTEXAI": ""}
         with patch.dict(agentcat.os.environ, env):
@@ -3965,6 +3963,43 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
 
         self.assertEqual(updated["access_token"], "fresh")
         self.assertEqual(calls["n"], 2)  # first pass failed → cache dropped → rescanned
+
+    def test_runtime_limits_isolates_a_raising_provider(self) -> None:
+        # Audit L3: one provider raising (e.g. a stat race on a deleted session file)
+        # must not freeze the whole snapshot — it becomes an error entry while the
+        # others still populate.
+        from unittest.mock import patch as _p
+        good = agentcat.empty_limits(status="auto")
+        good["quotas"] = [{"id": "g", "label": "7d", "remainingPercent": 80.0, "usedPercent": 20.0}]
+        empty = agentcat.empty_limits()
+
+        def boom() -> dict:
+            raise RuntimeError("stat race on a deleted session file")
+
+        with _p.object(agentcat, "codex_runtime_limits", side_effect=boom), \
+             _p.object(agentcat, "codex_live_limits", return_value=empty), \
+             _p.object(agentcat, "claude_runtime_limits", return_value=empty), \
+             _p.object(agentcat, "claude_live_limits", return_value=empty), \
+             _p.object(agentcat, "gemini_live_limits", return_value=good), \
+             _p.object(agentcat, "antigravity_live_limits", return_value=empty):
+            limits = agentcat.runtime_limits()
+
+        self.assertEqual(limits["codex"]["status"], "error")  # isolated, did not raise
+        self.assertEqual(limits["gemini"]["quotas"], good["quotas"])  # others unaffected
+
+    def test_tilde_collapses_home_so_source_never_leaks_username(self) -> None:
+        # Audit L5: limits.source (empty_limits / codex_runtime_limits) is run through
+        # _tilde so the snapshot never carries an absolute /Users/<name>/… path.
+        p = agentcat.HOME / ".agentcat" / "limits.json"
+        rendered = agentcat._tilde(p)
+        # Platform-agnostic (the separator is the OS's own): starts with ~, keeps the
+        # leaf, and never contains the absolute home path (the username).
+        self.assertTrue(rendered.startswith("~"))
+        self.assertIn("limits.json", rendered)
+        self.assertNotIn(str(agentcat.HOME), rendered)
+        # A sibling dir must not be mangled.
+        sibling = str(agentcat.HOME) + "-old"
+        self.assertEqual(agentcat._tilde(sibling), sibling)
 
 
 if __name__ == "__main__":
