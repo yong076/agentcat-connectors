@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.4")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.5")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -1671,7 +1671,7 @@ def claude_hook_storage_payload(payload: Any, runtime_mode: Optional[Dict[str, A
 
 
 def codex_config_reasoning_effort() -> Optional[str]:
-    path = HOME / ".codex" / "config.toml"
+    path = codex_home() / "config.toml"
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -1842,6 +1842,32 @@ def store_event(provider: str, source: str, event_type: Optional[str], payload: 
         "eventType": event_type,
         "tokens": extract_tokens(sanitized),
     }
+
+
+def prune_events(max_age_days: Optional[int] = None) -> int:
+    """Delete events older than the retention window, then VACUUM if any were removed.
+
+    events.sqlite is otherwise append-only forever (only the latest ~300 rows are ever
+    read for activity/runtime-modes), so it grows unbounded (audit #5). Historical rows
+    feed no token totals — those come from the provider files — so pruning is safe.
+    Best-effort: any failure is logged and swallowed so it never blocks the daemon.
+    Returns the number of rows deleted.
+    """
+    if max_age_days is None:
+        max_age_days = int(os.environ.get("AGENTCAT_EVENTS_RETENTION_DAYS", "45"))
+    try:
+        init_db()
+        cutoff = int(time.time()) - max(1, int(max_age_days)) * 86400
+        with closing(sqlite3.connect(EVENTS_DB, timeout=5.0)) as conn:
+            deleted = conn.execute("delete from events where ts < ?", (cutoff,)).rowcount
+            conn.commit()
+            if deleted and deleted > 0:
+                conn.execute("vacuum")
+                conn.commit()
+        return int(deleted or 0)
+    except Exception as exc:
+        logging.debug("prune_events failed: %s", exc)
+        return 0
 
 
 def parse_event_row(row: Tuple[Any, ...]) -> Dict[str, Any]:
@@ -2239,7 +2265,7 @@ def codex_runtime_limits() -> Dict[str, Any]:
             return 0.0
 
     try:
-        candidates = list((HOME / ".codex" / "sessions").glob("**/rollout-*.jsonl"))
+        candidates = list((codex_home() / "sessions").glob("**/rollout-*.jsonl"))
     except OSError:
         candidates = []
     # Safe mtime key: a session file deleted between glob and stat must not raise
@@ -2364,7 +2390,7 @@ def oauth_tokens(raw: Any) -> Dict[str, Any]:
 
 
 def read_codex_auth() -> Optional[Dict[str, Any]]:
-    raw = read_json(HOME / ".codex" / "auth.json")
+    raw = read_json(codex_home() / "auth.json")
     return raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else None
 
 
@@ -4148,7 +4174,12 @@ def infer_copilot_transcript_model(events: List[Dict[str, Any]]) -> str:
 def char_token_estimate(text: Any) -> int:
     if not isinstance(text, str) or not text:
         return 0
-    return max(1, int((len(text) + 3) / 4))
+    # ASCII BPE tokenizes at ~4 chars/token; CJK and other multibyte scripts tokenize
+    # far denser (~1.6 chars/token), so a flat len/4 undercounts CJK usage ~2-4x — a real
+    # error for Copilot in CJK markets, where this estimator is the fallback (audit #12).
+    ascii_count = sum(1 for ch in text if ord(ch) < 0x80)
+    wide_count = len(text) - ascii_count
+    return max(1, int(ascii_count / 4 + wide_count / 1.6))
 
 
 def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
@@ -8663,6 +8694,8 @@ def run_daemon(args: argparse.Namespace) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     args.host = resolve_bind_host(getattr(args, "host", "127.0.0.1"))
+    # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
+    prune_events()
     build_snapshot()
     threading.Thread(target=snapshot_refresh_loop, args=(60.0,), daemon=True).start()
     update_enabled, _update_reason = auto_update_enabled_status()

@@ -1388,6 +1388,45 @@ class AgentCatConnectorTests(unittest.TestCase):
         snap = agentcat.codex_sessions_snapshot()
         self.assertEqual(snap["tokens"]["all"], 12)  # only the complete turn; 9999 ignored
 
+    def test_codex_secondary_paths_honor_codex_home(self) -> None:
+        # Audit #11: reasoning-effort/auth readers ignored $CODEX_HOME (only the token
+        # path honored it), so a custom CODEX_HOME silently read the wrong dir.
+        home = self.root / "custom-codex"
+        home.mkdir()
+        (home / "config.toml").write_text('model_reasoning_effort = "high"\n', encoding="utf-8")
+        (home / "auth.json").write_text(json.dumps({"tokens": {"access_token": "x"}}), encoding="utf-8")
+        with patch.dict(agentcat.os.environ, {"CODEX_HOME": str(home)}):
+            self.assertEqual(agentcat.codex_config_reasoning_effort(), "high")
+            self.assertIsNotNone(agentcat.read_codex_auth())
+
+    def test_char_token_estimate_weights_cjk_higher_than_ascii(self) -> None:
+        # Audit #12: CJK tokenizes ~2-4x denser than ASCII; a flat len/4 undercounts it.
+        ascii_txt = "a" * 40
+        cjk_txt = "가" * 40
+        self.assertEqual(agentcat.char_token_estimate(ascii_txt), 10)  # 40/4
+        self.assertGreater(agentcat.char_token_estimate(cjk_txt), agentcat.char_token_estimate(ascii_txt))
+        self.assertGreaterEqual(agentcat.char_token_estimate(cjk_txt), 24)  # ~40/1.6
+
+    def test_prune_events_drops_old_rows_keeps_recent(self) -> None:
+        # Audit #5: events.sqlite is append-only otherwise.
+        agentcat.init_db()
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
+            conn.execute(
+                "insert into events(ts, provider, source, event_type, payload_json) values (?,?,?,?,?)",
+                (now - 100 * 86400, "claude", "hook", "x", "{}"),  # old
+            )
+            conn.execute(
+                "insert into events(ts, provider, source, event_type, payload_json) values (?,?,?,?,?)",
+                (now, "claude", "hook", "x", "{}"),  # recent
+            )
+            conn.commit()
+        deleted = agentcat.prune_events(max_age_days=45)
+        self.assertEqual(deleted, 1)
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
+            remaining = conn.execute("select count(*) from events").fetchone()[0]
+        self.assertEqual(remaining, 1)
+
     def test_codexbar_cost_cache_floors_codex_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()
         cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"
