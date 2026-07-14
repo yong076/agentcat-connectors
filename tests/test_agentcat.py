@@ -155,6 +155,32 @@ class AgentCatConnectorTests(unittest.TestCase):
                 {"desktopApps": {"codex": {"path": "Codex.app"}}}
             )
 
+    def test_codex_chatgpt_host_is_detected_without_creating_second_provider(self) -> None:
+        app_path = self.root / "home" / "Applications" / "ChatGPT.app"
+        info = app_path / "Contents" / "Info.plist"
+        info.parent.mkdir(parents=True)
+        info.write_text(
+            "<?xml version=\"1.0\"?><plist><dict>"
+            "<key>CFBundleIdentifier</key><string>com.openai.chat</string>"
+            "</dict></plist>",
+            encoding="utf-8",
+        )
+        data_root = self.root / "home" / "Library" / "Application Support" / "com.openai.chat"
+        data_root.mkdir(parents=True)
+        (data_root / "metadata.json").write_text("{}", encoding="utf-8")
+
+        source = agentcat.desktop_app_source_snapshot(
+            "codex", {"desktopApps": {"codex": {"path": str(app_path)}}}
+        )
+
+        self.assertEqual(source["path"], str(app_path))
+        self.assertEqual(source["bundleId"], "com.openai.chat")
+        self.assertEqual(source["hostApp"], "ChatGPT")
+        self.assertEqual(source["provider"], "codex")
+        self.assertEqual(source["usageImport"], "metadata_only")
+        self.assertFalse(source["tokensIncluded"])
+        self.assertEqual(source["status"], "installed_no_data")
+
     def test_build_snapshot_skips_disabled_provider_and_exposes_desktop_apps(self) -> None:
         app_path = self.root / "Applications" / "Codex.app"
         app_path.mkdir(parents=True)
@@ -2828,6 +2854,11 @@ class AgentCatConnectorTests(unittest.TestCase):
         )
 
     def test_classify_ignores_vscode_chatgpt_extension_codex_server(self) -> None:
+        self.assertIsNone(
+            agentcat.classify_process(
+                "/Applications/ChatGPT.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/codex"
+            )
+        )
         self.assertIsNone(
             agentcat.classify_process(
                 r"c:\Users\me\.vscode\extensions\openai.chatgpt-26.513.21555-win32-x64\bin\windows-x86_64\codex.exe app-server --analytics-default-enabled"

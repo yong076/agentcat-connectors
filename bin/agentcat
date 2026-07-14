@@ -1011,15 +1011,22 @@ DESKTOP_APP_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "codex": {
         "displayName": "Codex",
-        "expectedBundleIds": ("com.openai.codex", "com.openai.chatgpt.codex"),
+        # Codex is now a surface inside the ChatGPT macOS app for some
+        # installs. Keep the standalone bundle ids as a compatibility path,
+        # but prefer the ChatGPT host when both apps are present.
+        "expectedBundleIds": ("com.openai.chat", "com.openai.codex", "com.openai.chatgpt.codex"),
         "defaultPaths": (
+            "/Applications/ChatGPT.app",
+            "~/Applications/ChatGPT.app",
             "/Applications/Codex.app",
             "~/Applications/Codex.app",
         ),
         "dataRoots": (
             "~/Library/Application Support/Codex",
             "~/Library/Application Support/OpenAI/Codex",
+            "~/Library/Application Support/com.openai.chat",
             "~/Library/Containers/com.openai.codex/Data/Library/Application Support/Codex",
+            "~/Library/Containers/com.openai.chat/Data/Library/Application Support/com.openai.chat",
         ),
     },
 }
@@ -1128,6 +1135,22 @@ def desktop_app_bundle_id(path: Path) -> Optional[str]:
         return None
 
 
+def desktop_app_host_label(provider: str, path: Path, bundle_id: Optional[str]) -> Optional[str]:
+    """Return the host application without changing the provider identity.
+
+    ChatGPT and the standalone Codex app both expose the same account-level
+    Codex usage. The host label is therefore metadata only; it must never
+    create a second provider or a second quota.
+    """
+    if provider != "codex":
+        return None
+    if bundle_id == "com.openai.chat" or path.name.lower() == "chatgpt.app":
+        return "ChatGPT"
+    if bundle_id in {"com.openai.codex", "com.openai.chatgpt.codex"} or path.name.lower() == "codex.app":
+        return "Codex"
+    return None
+
+
 def desktop_app_data_roots(provider: str) -> List[Path]:
     spec = DESKTOP_APP_SPECS.get(provider) or {}
     roots: List[Path] = []
@@ -1196,6 +1219,7 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
     base: Dict[str, Any] = {
         "provider": provider,
         "displayName": spec.get("displayName") or provider,
+        "hostApp": None,
         "path": selected_path,
         "configured": configured,
         "detectedDefault": (not configured and default_path is not None),
@@ -1229,6 +1253,9 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
     bundle_id = desktop_app_bundle_id(path)
     if bundle_id:
         base["bundleId"] = bundle_id
+    host_app = desktop_app_host_label(provider, path, bundle_id)
+    if host_app:
+        base["hostApp"] = host_app
     expected = set(str(item) for item in (spec.get("expectedBundleIds") or ()))
     if bundle_id and expected and bundle_id not in expected:
         base["bundleMismatch"] = True
@@ -5451,7 +5478,7 @@ def attach_codex_usage_coverage(
         "desktopApp": {
             "usageImport": "metadata_only",
             "tokensIncluded": False,
-            "note": "Codex.app/profile files are detected for setup diagnostics only; local token totals come from ~/.codex sessions JSONL and state_*.sqlite.",
+            "note": "ChatGPT/Codex app profile files are detected for setup diagnostics only; local token totals come from ~/.codex sessions JSONL and state_*.sqlite.",
         },
         "accountUsage": {
             "status": "on_demand",
@@ -7421,6 +7448,10 @@ def classify_process(command: str) -> Optional[str]:
     ):
         return None
     if "/applications/claude.app/contents/" in normalized:
+        return None
+    # ChatGPT now hosts the Codex surface. Its bundled helpers are not a
+    # second CLI session and must not create a duplicate Codex process row.
+    if "/applications/chatgpt.app/contents/" in normalized:
         return None
     if "/applications/antigravity.app/contents/" in normalized:
         return None

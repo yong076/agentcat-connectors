@@ -173,7 +173,7 @@ On Windows, Agent Cat prefers PowerShell 7 (`pwsh`) when available, tries a fast
 
 Agent Cat reports remaining quota when a provider exposes it through the same local auth state used by its CLI:
 
-- Codex: reads `~/.codex/auth.json`, then calls the ChatGPT Codex usage endpoints for rolling 5-hour/7-day utilization, reset times, available reset credits, and Codex credit/spend-cap state. Reset credits are reported only as availability/metadata; this connector never redeems them.
+- Codex: reads `~/.codex/auth.json`, then calls the ChatGPT Codex usage endpoints for rolling 5-hour/7-day utilization, reset times, available reset credits, and Codex credit/spend-cap state. The macOS desktop source accepts both standalone `Codex.app` and the Codex surface hosted by `ChatGPT.app`; both remain one account-level Codex row. Reset credits are reported only as availability/metadata; this connector never redeems them.
 - Claude Code: reads Claude Code OAuth credentials from Keychain or `~/.claude`, then calls the Claude Code OAuth usage endpoint for 5-hour/7-day/model utilization plus monthly extra-usage credits.
 - Gemini CLI: reads `~/.gemini/oauth_creds.json` and `~/.gemini/settings.json`, then calls Gemini Code Assist `loadCodeAssist` and `retrieveUserQuota` for model request quota fractions and reset times.
 - Fallback: if live quota lookup fails, Codex/Claude still use the latest local status-line or session `token_count` event when available.

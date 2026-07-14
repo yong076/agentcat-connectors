@@ -134,7 +134,7 @@ Windows에서는 가능한 경우 PowerShell 7(`pwsh`)을 우선 사용하고, �
 
 Agent Cat은 각 CLI가 이미 로그인에 쓰는 로컬 인증 상태로 provider가 노출하는 남은 quota를 읽습니다.
 
-- Codex: `~/.codex/auth.json`을 읽고 ChatGPT Codex usage endpoint를 호출해 5시간/7일 rolling window 사용률과 reset 시간을 가져옵니다.
+- Codex: `~/.codex/auth.json`을 읽고 ChatGPT Codex usage endpoint를 호출해 5시간/7일 rolling window 사용률과 reset 시간을 가져옵니다. macOS 데스크톱 소스는 독립 `Codex.app`과 ChatGPT 앱 안의 Codex를 모두 인식하지만, 계정 단위 Codex 한 줄로 합칩니다.
 - Claude Code: macOS Keychain 또는 `~/.claude`의 Claude Code OAuth credential을 읽고 Claude Code OAuth usage endpoint를 호출해 5시간/7일/model 사용률과 월별 extra usage credit을 가져옵니다.
 - Gemini CLI: `~/.gemini/oauth_creds.json`과 `~/.gemini/settings.json`을 읽고 Gemini Code Assist `loadCodeAssist`, `retrieveUserQuota`를 호출해 모델별 request quota 남은 비율과 reset 시간을 가져옵니다.
 - Fallback: live quota 조회가 실패하면 Codex/Claude는 가능한 경우 최신 local status-line 또는 session `token_count` 이벤트를 사용합니다.
