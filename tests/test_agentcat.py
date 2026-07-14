@@ -290,6 +290,47 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertNotIn("profile_user_id", limits["resetCredits"][0])
         self.assertNotIn("profile_image_url", limits["resetCredits"][0])
 
+    def test_codex_weekly_only_primary_window_is_not_labeled_five_hours(self) -> None:
+        limits = agentcat.codex_limits_from_usage_response(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 24,
+                        "reset_at": 1770000000,
+                        "limit_window_seconds": 604800,
+                    }
+                },
+            }
+        )
+
+        self.assertEqual([quota["id"] for quota in limits["quotas"]], ["codex:7d"])
+        self.assertEqual(limits["quotas"][0]["label"], "7일")
+        self.assertEqual(limits["quotas"][0]["window"], "7d")
+        self.assertIsNone(limits["shortUsedPercent"])
+        self.assertEqual(limits["weeklyUsedPercent"], 24.0)
+
+    def test_codex_cache_relabels_pre_hotfix_weekly_primary(self) -> None:
+        cached = agentcat.empty_limits(status="auto")
+        cached["shortUsedPercent"] = 24.0
+        cached["quotas"] = [
+            {
+                "id": "codex:5h",
+                "label": "5시간",
+                "window": "168h",
+                "usedPercent": 24.0,
+                "remainingPercent": 76.0,
+                "resetAt": 1770000000,
+            }
+        ]
+
+        sanitized = agentcat.sanitize_codex_cached_limits(cached)
+
+        self.assertEqual(sanitized["quotas"][0]["id"], "codex:7d")
+        self.assertEqual(sanitized["quotas"][0]["label"], "7일")
+        self.assertIsNone(sanitized["shortUsedPercent"])
+        self.assertEqual(sanitized["weeklyUsedPercent"], 24.0)
+
     def test_codex_live_limits_tries_wham_before_refresh_after_codex_403(self) -> None:
         (agentcat.HOME / ".codex").mkdir(parents=True)
         (agentcat.HOME / ".codex" / "auth.json").write_text(

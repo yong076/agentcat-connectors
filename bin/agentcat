@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.8")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.9")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -2487,7 +2487,12 @@ def codex_window_quota(
     if used is None:
         return None
     seconds = int_limit(window.get("limit_window_seconds") or window.get("window_secs"))
-    window_label = f"{seconds // 3600}h" if seconds and seconds % 3600 == 0 else None
+    if seconds and seconds % 86400 == 0:
+        window_label = f"{seconds // 86400}d"
+    elif seconds and seconds % 3600 == 0:
+        window_label = f"{seconds // 3600}h"
+    else:
+        window_label = None
     return quota_entry(
         quota_id,
         label,
@@ -2497,6 +2502,85 @@ def codex_window_quota(
         model=model,
         source=source,
     )
+
+
+def codex_window_kind(window: Any, default: str) -> Optional[str]:
+    """Classify a Codex window without inferring a missing policy bucket.
+
+    OpenAI can remove the short window while keeping the weekly window. In that
+    response shape `primary_window` may contain a 7-day duration, so its field
+    position must not be treated as a synonym for the old 5-hour bucket.
+    """
+    if not isinstance(window, dict):
+        return None
+    seconds = int_limit(window.get("limit_window_seconds") or window.get("window_secs"))
+    if seconds is None:
+        return default
+    if seconds <= 12 * 60 * 60:
+        return "short"
+    if seconds >= 24 * 60 * 60:
+        return "weekly"
+    # An unfamiliar duration is not safe to display as either known bucket.
+    return None
+
+
+def codex_cached_window_kind(quota: Dict[str, Any]) -> Optional[str]:
+    """Recover a known bucket from the serialized cache window label."""
+    raw = quota.get("window")
+    if not isinstance(raw, str):
+        return None
+    match = re.fullmatch(r"(\d+)([hd])", raw.strip().lower())
+    if not match:
+        return None
+    value = int(match.group(1))
+    seconds = value * (86400 if match.group(2) == "d" else 3600)
+    return codex_window_kind({"limit_window_seconds": seconds}, "short")
+
+
+def sanitize_codex_cached_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Correct pre-hotfix cached Codex buckets when their duration is known."""
+    quotas = limits.get("quotas")
+    if not isinstance(quotas, list):
+        return limits
+
+    out = dict(limits)
+    sanitized: List[Dict[str, Any]] = []
+    for quota in quotas:
+        if not isinstance(quota, dict):
+            continue
+        item = dict(quota)
+        quota_id = str(item.get("id") or "")
+        cached_kind = codex_cached_window_kind(item)
+        if quota_id == "codex:5h" and cached_kind == "weekly":
+            item["id"] = "codex:7d"
+            item["label"] = "7일"
+        elif quota_id == "codex:7d" and cached_kind == "short":
+            item["id"] = "codex:5h"
+            item["label"] = "5시간"
+        sanitized.append(item)
+
+    out["quotas"] = sanitized
+    out["shortUsedPercent"] = None
+    out["shortResetAt"] = None
+    out["shortWindowMinutes"] = None
+    out["weeklyUsedPercent"] = None
+    out["weeklyResetAt"] = None
+    for quota in sanitized:
+        quota_id = str(quota.get("id") or "")
+        if quota_id == "codex:5h":
+            out["shortUsedPercent"] = quota.get("usedPercent")
+            out["shortResetAt"] = quota.get("resetAt")
+            cached_kind = codex_cached_window_kind(quota)
+            if cached_kind == "short":
+                raw = quota.get("window")
+                if isinstance(raw, str):
+                    match = re.fullmatch(r"(\d+)h", raw.strip().lower())
+                    if match:
+                        out["shortWindowMinutes"] = int(match.group(1)) * 60
+        elif quota_id == "codex:7d":
+            out["weeklyUsedPercent"] = quota.get("usedPercent")
+            out["weeklyResetAt"] = quota.get("resetAt")
+    return out
 
 
 def sum_intish_list(raw: Any) -> Optional[int]:
@@ -2645,21 +2729,37 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
     secondary = rate_limit.get("secondary_window") or rate_limit.get("secondary")
 
     quotas: List[Dict[str, Any]] = []
-    primary_quota = codex_window_quota("codex:5h", "5시간", primary, source=source)
-    if primary_quota:
-        quotas.append(primary_quota)
-        limits["shortUsedPercent"] = primary_quota.get("usedPercent")
-        limits["shortResetAt"] = primary_quota.get("resetAt")
-        if isinstance(primary, dict):
-            seconds = int_limit(primary.get("limit_window_seconds") or primary.get("window_secs"))
-            if seconds:
-                limits["shortWindowMinutes"] = seconds // 60
+    primary_kind = codex_window_kind(primary, "short")
+    if primary_kind == "short":
+        primary_quota = codex_window_quota("codex:5h", "5시간", primary, source=source)
+        if primary_quota:
+            quotas.append(primary_quota)
+            limits["shortUsedPercent"] = primary_quota.get("usedPercent")
+            limits["shortResetAt"] = primary_quota.get("resetAt")
+            if isinstance(primary, dict):
+                seconds = int_limit(primary.get("limit_window_seconds") or primary.get("window_secs"))
+                if seconds:
+                    limits["shortWindowMinutes"] = seconds // 60
+    elif primary_kind == "weekly":
+        primary_quota = codex_window_quota("codex:7d", "7일", primary, source=source)
+        if primary_quota:
+            quotas.append(primary_quota)
+            limits["weeklyUsedPercent"] = primary_quota.get("usedPercent")
+            limits["weeklyResetAt"] = primary_quota.get("resetAt")
 
-    secondary_quota = codex_window_quota("codex:7d", "7일", secondary, source=source)
-    if secondary_quota:
-        quotas.append(secondary_quota)
-        limits["weeklyUsedPercent"] = secondary_quota.get("usedPercent")
-        limits["weeklyResetAt"] = secondary_quota.get("resetAt")
+    secondary_kind = codex_window_kind(secondary, "weekly")
+    if secondary_kind == "short":
+        secondary_quota = codex_window_quota("codex:5h", "5시간", secondary, source=source)
+        if secondary_quota:
+            quotas.append(secondary_quota)
+            limits["shortUsedPercent"] = secondary_quota.get("usedPercent")
+            limits["shortResetAt"] = secondary_quota.get("resetAt")
+    elif secondary_kind == "weekly":
+        secondary_quota = codex_window_quota("codex:7d", "7일", secondary, source=source)
+        if secondary_quota:
+            quotas.append(secondary_quota)
+            limits["weeklyUsedPercent"] = secondary_quota.get("usedPercent")
+            limits["weeklyResetAt"] = secondary_quota.get("resetAt")
 
     additional = payload.get("additional_rate_limits")
     if isinstance(additional, list):
@@ -2668,22 +2768,26 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
                 continue
             name = str(item.get("limit_name") or item.get("name") or "model")
             sub_rate = item.get("rate_limit") if isinstance(item.get("rate_limit"), dict) else {}
+            primary_window = sub_rate.get("primary_window") or sub_rate.get("primary")
+            primary_kind = codex_window_kind(primary_window, "short")
             p = codex_window_quota(
-                f"codex:{name}:primary",
-                f"{name} 5시간",
-                sub_rate.get("primary_window") or sub_rate.get("primary"),
+                f"codex:{name}:{primary_kind}",
+                f"{name} {'5시간' if primary_kind == 'short' else '7일'}",
+                primary_window,
                 source=source,
                 model=name,
-            )
+            ) if primary_kind else None
             if p:
                 quotas.append(p)
+            secondary_window = sub_rate.get("secondary_window") or sub_rate.get("secondary")
+            secondary_kind = codex_window_kind(secondary_window, "weekly")
             s = codex_window_quota(
-                f"codex:{name}:secondary",
-                f"{name} 7일",
-                sub_rate.get("secondary_window") or sub_rate.get("secondary"),
+                f"codex:{name}:{secondary_kind}",
+                f"{name} {'5시간' if secondary_kind == 'short' else '7일'}",
+                secondary_window,
                 source=source,
                 model=name,
-            )
+            ) if secondary_kind else None
             if s:
                 quotas.append(s)
 
@@ -2707,7 +2811,7 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
 def codex_live_limits(force: bool = False) -> Dict[str, Any]:
     cached = None if force else cached_live_limits("codex", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
-        return cached
+        return sanitize_codex_cached_limits(cached)
     auth = read_codex_auth()
     if not auth:
         return empty_limits()
