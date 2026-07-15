@@ -3054,6 +3054,46 @@ def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
     return (order.get(quota_id, 100), quota_id)
 
 
+def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, str, str, Optional[str]]]:
+    """Return dynamic metadata for a scoped Claude limit row.
+
+    Claude's OAuth usage endpoint keeps newly introduced model capacities in
+    ``limits[]`` instead of adding a top-level field.  Do not enumerate model
+    names here: the API owns the set of scopes, so a model can appear or
+    disappear without an app release.
+    """
+    scope = item.get("scope")
+    if not isinstance(scope, dict):
+        return None
+    model_scope = scope.get("model")
+    surface = scope.get("surface")
+    if not isinstance(model_scope, dict) and not surface:
+        return None
+
+    display_name = ""
+    model_id = ""
+    if isinstance(model_scope, dict):
+        display_name = str(model_scope.get("display_name") or model_scope.get("displayName") or "").strip()
+        model_id = str(model_scope.get("id") or "").strip()
+    surface_name = str(surface or "").strip()
+    scope_name = display_name or model_id or surface_name
+    if not scope_name:
+        return None
+
+    group = str(item.get("group") or item.get("kind") or "").strip().lower()
+    if group in {"session", "five_hour", "5h"}:
+        window, window_label = "5h", "5시간"
+    elif group in {"daily", "day"}:
+        window, window_label = "1d", "1일"
+    elif group in {"monthly", "month"}:
+        window, window_label = "monthly", "월별"
+    else:
+        window, window_label = "7d", "7일"
+
+    normalized_model = model_id or display_name or surface_name
+    return normalized_model, f"{scope_name} {window_label}", window, group or None
+
+
 def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "claude-oauth-usage-api") -> Dict[str, Any]:
     limits = empty_limits(status="auto")
     limits["source"] = source
@@ -3109,6 +3149,34 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
         elif key == "seven_day":
             limits["weeklyUsedPercent"] = quota.get("usedPercent")
             limits["weeklyResetAt"] = quota.get("resetAt")
+
+    # New model/surface capacities are represented by Claude as scoped rows in
+    # ``limits[]``.  Keep these rows data-driven: if the service stops sending
+    # Fable (or introduces another scope), the next refresh naturally removes
+    # (or adds) the corresponding quota without a client-side feature flag.
+    scoped_limits = payload.get("limits")
+    if isinstance(scoped_limits, list):
+        for index, item in enumerate(scoped_limits):
+            if not isinstance(item, dict):
+                continue
+            used_percent = float_percent(item.get("percent"))
+            metadata = claude_scoped_quota_metadata(item)
+            if used_percent is None or metadata is None:
+                continue
+            model_key, label, window, group = metadata
+            scope_key = ":".join(
+                part for part in (group or "scoped", model_key, str(item.get("kind") or "")) if part
+            )
+            quota = quota_entry(
+                f"claude:scoped:{short_stable_hash(scope_key or str(index))}",
+                label,
+                used_percent=used_percent,
+                reset_at=item.get("resets_at"),
+                window=window,
+                model=model_key,
+                source=source,
+            )
+            quotas.append(quota)
 
     quotas.sort(key=claude_quota_sort_key)
     limits["quotas"] = quotas

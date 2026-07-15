@@ -444,6 +444,31 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertNotIn("omelette", limits["quotas"][4]["id"])
         self.assertNotIn("omelette", limits["quotas"][4]["label"])
 
+    def test_claude_usage_api_payload_keeps_dynamic_scoped_capacity(self) -> None:
+        limits = agentcat.claude_limits_from_usage_response(
+            {
+                "five_hour": {"utilization": 7.0, "resets_at": "2026-07-15T15:10:00Z"},
+                "seven_day": {"utilization": 61.0, "resets_at": "2026-07-17T07:00:00Z"},
+                "limits": [
+                    {
+                        "kind": "weekly_scoped",
+                        "group": "weekly",
+                        "percent": 100,
+                        "resets_at": "2026-07-17T07:00:00Z",
+                        "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                    }
+                ],
+            }
+        )
+
+        scoped = [q for q in limits["quotas"] if q["id"].startswith("claude:scoped:")]
+        self.assertEqual(len(scoped), 1)
+        self.assertEqual(scoped[0]["label"], "Fable 7일")
+        self.assertEqual(scoped[0]["model"], "Fable")
+        self.assertEqual(scoped[0]["window"], "7d")
+        self.assertEqual(scoped[0]["usedPercent"], 100.0)
+        self.assertEqual(scoped[0]["remainingPercent"], 0.0)
+
     def test_claude_cached_limits_sanitizes_unknown_internal_quota_names(self) -> None:
         limits = agentcat.empty_limits(status="auto")
         limits["quotas"] = [
