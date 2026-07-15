@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.10")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.11")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -205,6 +205,10 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     "claude-opus-4-5":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
     "claude-opus-4-6":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
     "claude-opus-4-7":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    # Claude Fable/Mythos 5: $10/M input, $50/M output, 90% cache-read
+    # discount ($1/M). LiteLLM's combined cache-write fallback is $12.50/M.
+    "claude-fable-5":    {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
+    "claude-mythos-5":   {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
     "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
     "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
     "claude-haiku-4-5":  {"input": 0.8,  "output": 4.0,  "cache_read": 0.08, "cache_write": 1.0},

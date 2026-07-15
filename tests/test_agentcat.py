@@ -3910,6 +3910,20 @@ class PricingTests(unittest.TestCase):
             places=4,
         )
 
+    def test_claude_fable_pricing_is_bundled_fallback(self) -> None:
+        cost = agentcat.estimate_cost(
+            "claude-fable-5",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            cache_write_tokens=1_000_000,
+        )
+        self.assertEqual(cost["input"], 10.0)
+        self.assertEqual(cost["output"], 50.0)
+        self.assertEqual(cost["cache_read"], 1.0)
+        self.assertEqual(cost["cache_write"], 12.5)
+        self.assertEqual(cost["total"], 73.5)
+
     def test_cache_read_is_cheaper_than_input(self) -> None:
         cost = agentcat.estimate_cost(
             "claude-opus-4-7",
