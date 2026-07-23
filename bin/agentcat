@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.30.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.30.1")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -5138,7 +5138,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
         }
 
     cursor["turns"] = int(cursor.get("turns") or 0) + new_turns
-    if changed:
+    if changed and (force_rebuild or not cursor_recently_saved(CODEX_SESSIONS_CURSOR_FILE)):
         saved = save_codex_sessions_cursor(cursor)
         if not saved:
             logging.debug("codex_sessions_snapshot: cursor save failed")
@@ -6032,6 +6032,27 @@ def load_journal_cursor() -> Dict[str, Any]:
     }
 
 
+CURSOR_SAVE_MIN_INTERVAL_SECONDS = float(
+    os.environ.get("AGENTCAT_CURSOR_SAVE_INTERVAL_SECONDS", "300")
+)
+
+
+def cursor_recently_saved(path: Path) -> bool:
+    """Debounce gate for multi-MB cursor writes on busy machines.
+
+    Serializing a large cursor costs seconds of CPU; while agents are
+    actively appending, every 60s cycle is dirty, so without this gate the
+    daemon pays that cost every cycle. Skipping a save only means the next
+    process re-parses the small unsaved journal tail — the cursor is a
+    resume cache, so nothing is lost. Keyed on the cursor file's mtime so
+    one-shot CLI runs and tests (fresh temp paths) are unaffected.
+    """
+    try:
+        return (time.time() - path.stat().st_mtime) < CURSOR_SAVE_MIN_INTERVAL_SECONDS
+    except OSError:
+        return False
+
+
 def save_journal_cursor(cursor: Dict[str, Any]) -> bool:
     tmp = unique_atomic_tmp_path(JOURNAL_CURSOR_FILE)
     try:
@@ -6267,6 +6288,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     # it every 60s cycle was the daemon's main steady-state CPU cost, so the
     # caller only persists it when this scan actually changed something.
     changed = False
+    rebuilt = False
     now_utc = dt.datetime.now(dt.timezone.utc)
     now_local = now_utc.astimezone().date()
     totals_as_of_str: Optional[str] = cursor.get("totals_as_of")
@@ -6286,6 +6308,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     usage_records: Dict[str, Dict[str, Any]] = cursor.setdefault("usageRecords", {})
     if cursor.pop("usage_needs_rebuild", False):
         changed = True
+        rebuilt = True
         offsets.clear()
         totals.clear()
         totals.update(_empty_journal_totals())
@@ -6300,6 +6323,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         # project totals from JSONL so historical project usage appears
         # without disturbing global totals or byte offsets.
         changed = True
+        rebuilt = True
         projects.clear()
         projects.update(rebuild_claude_journal_projects(now_utc))
     for root in project_roots:
@@ -6380,6 +6404,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         cursor["totals_as_of"] = now_utc.isoformat()
         cursor["version"] = CLAUDE_JOURNAL_CURSOR_VERSION
     cursor["_dirty"] = changed
+    cursor["_rebuilt"] = rebuilt
     return cursor
 
 
@@ -6624,7 +6649,11 @@ def claude_snapshot() -> Dict[str, Any]:
     # Per-class token data from JSONL journal (incremental scan)
     cursor = load_journal_cursor()
     cursor = scan_claude_journal(cursor)
-    if cursor.pop("_dirty", True):
+    rebuilt = bool(cursor.pop("_rebuilt", False))
+    # Rebuilds must persist immediately — a stale cursor on disk would
+    # trigger the full rebuild again next cycle. Ordinary appends are
+    # debounced: the unsaved tail just gets re-parsed by the next process.
+    if cursor.pop("_dirty", True) and (rebuilt or not cursor_recently_saved(JOURNAL_CURSOR_FILE)):
         saved = save_journal_cursor(cursor)
         if not saved:
             logging.debug("claude_snapshot: cursor save failed")
