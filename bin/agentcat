@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.28.7")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.30.1")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -205,6 +205,10 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     "claude-opus-4-5":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
     "claude-opus-4-6":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
     "claude-opus-4-7":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    # Claude Fable/Mythos 5: $10/M input, $50/M output, 90% cache-read
+    # discount ($1/M). LiteLLM's combined cache-write fallback is $12.50/M.
+    "claude-fable-5":    {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
+    "claude-mythos-5":   {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
     "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
     "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
     "claude-haiku-4-5":  {"input": 0.8,  "output": 4.0,  "cache_read": 0.08, "cache_write": 1.0},
@@ -1011,15 +1015,22 @@ DESKTOP_APP_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "codex": {
         "displayName": "Codex",
-        "expectedBundleIds": ("com.openai.codex", "com.openai.chatgpt.codex"),
+        # Codex is now a surface inside the ChatGPT macOS app for some
+        # installs. Keep the standalone bundle ids as a compatibility path,
+        # but prefer the ChatGPT host when both apps are present.
+        "expectedBundleIds": ("com.openai.chat", "com.openai.codex", "com.openai.chatgpt.codex"),
         "defaultPaths": (
+            "/Applications/ChatGPT.app",
+            "~/Applications/ChatGPT.app",
             "/Applications/Codex.app",
             "~/Applications/Codex.app",
         ),
         "dataRoots": (
             "~/Library/Application Support/Codex",
             "~/Library/Application Support/OpenAI/Codex",
+            "~/Library/Application Support/com.openai.chat",
             "~/Library/Containers/com.openai.codex/Data/Library/Application Support/Codex",
+            "~/Library/Containers/com.openai.chat/Data/Library/Application Support/com.openai.chat",
         ),
     },
 }
@@ -1128,6 +1139,22 @@ def desktop_app_bundle_id(path: Path) -> Optional[str]:
         return None
 
 
+def desktop_app_host_label(provider: str, path: Path, bundle_id: Optional[str]) -> Optional[str]:
+    """Return the host application without changing the provider identity.
+
+    ChatGPT and the standalone Codex app both expose the same account-level
+    Codex usage. The host label is therefore metadata only; it must never
+    create a second provider or a second quota.
+    """
+    if provider != "codex":
+        return None
+    if bundle_id == "com.openai.chat" or path.name.lower() == "chatgpt.app":
+        return "ChatGPT"
+    if bundle_id in {"com.openai.codex", "com.openai.chatgpt.codex"} or path.name.lower() == "codex.app":
+        return "Codex"
+    return None
+
+
 def desktop_app_data_roots(provider: str) -> List[Path]:
     spec = DESKTOP_APP_SPECS.get(provider) or {}
     roots: List[Path] = []
@@ -1196,6 +1223,7 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
     base: Dict[str, Any] = {
         "provider": provider,
         "displayName": spec.get("displayName") or provider,
+        "hostApp": None,
         "path": selected_path,
         "configured": configured,
         "detectedDefault": (not configured and default_path is not None),
@@ -1229,6 +1257,9 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
     bundle_id = desktop_app_bundle_id(path)
     if bundle_id:
         base["bundleId"] = bundle_id
+    host_app = desktop_app_host_label(provider, path, bundle_id)
+    if host_app:
+        base["hostApp"] = host_app
     expected = set(str(item) for item in (spec.get("expectedBundleIds") or ()))
     if bundle_id and expected and bundle_id not in expected:
         base["bundleMismatch"] = True
@@ -2460,7 +2491,12 @@ def codex_window_quota(
     if used is None:
         return None
     seconds = int_limit(window.get("limit_window_seconds") or window.get("window_secs"))
-    window_label = f"{seconds // 3600}h" if seconds and seconds % 3600 == 0 else None
+    if seconds and seconds % 86400 == 0:
+        window_label = f"{seconds // 86400}d"
+    elif seconds and seconds % 3600 == 0:
+        window_label = f"{seconds // 3600}h"
+    else:
+        window_label = None
     return quota_entry(
         quota_id,
         label,
@@ -2470,6 +2506,128 @@ def codex_window_quota(
         model=model,
         source=source,
     )
+
+
+def codex_window_descriptor(window: Any, default_kind: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Return a lossless display identity for a Codex rate-limit window.
+
+    The API has changed which bucket is primary before, and can do so again.
+    Duration is the source of truth: a 24-hour window is `1d`, not weekly.
+    ``default_kind`` is used only for old responses that omitted duration.
+    """
+    seconds = None
+    if isinstance(window, dict):
+        seconds = int_limit(window.get("limit_window_seconds") or window.get("window_secs"))
+    if seconds is None and default_kind:
+        seconds = {"short": 5 * 3600, "weekly": 7 * 86400}.get(default_kind)
+    if not seconds or seconds <= 0:
+        return None
+
+    if seconds % 86400 == 0:
+        amount, suffix, label = seconds // 86400, "d", f"{seconds // 86400}일"
+    elif seconds % 3600 == 0:
+        amount, suffix, label = seconds // 3600, "h", f"{seconds // 3600}시간"
+    elif seconds % 60 == 0:
+        amount, suffix, label = seconds // 60, "m", f"{seconds // 60}분"
+    else:
+        amount, suffix, label = seconds, "s", f"{seconds}초"
+
+    # Compatibility fields are populated only for the exact legacy buckets.
+    kind = "short" if seconds == 5 * 3600 else "weekly" if seconds == 7 * 86400 else None
+    return {"suffix": f"{amount}{suffix}", "label": label, "kind": kind, "seconds": seconds}
+
+
+def codex_window_kind(window: Any, default: str) -> Optional[str]:
+    """Classify a Codex window without inferring a missing policy bucket.
+
+    OpenAI can remove the short window while keeping the weekly window. In that
+    response shape `primary_window` may contain a 7-day duration, so its field
+    position must not be treated as a synonym for the old 5-hour bucket.
+    """
+    if not isinstance(window, dict):
+        return None
+    descriptor = codex_window_descriptor(window, default)
+    return descriptor.get("kind") if descriptor else None
+
+
+def codex_cached_window_kind(quota: Dict[str, Any]) -> Optional[str]:
+    """Recover a known bucket from the serialized cache window label."""
+    raw = quota.get("window")
+    if not isinstance(raw, str):
+        return None
+    match = re.fullmatch(r"(\d+)([hd])", raw.strip().lower())
+    if not match:
+        return None
+    value = int(match.group(1))
+    seconds = value * (86400 if match.group(2) == "d" else 3600)
+    return codex_window_descriptor({"limit_window_seconds": seconds}).get("kind")
+
+
+def codex_cached_window_descriptor(quota: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    raw = quota.get("window")
+    if not isinstance(raw, str):
+        return None
+    match = re.fullmatch(r"(\d+)([hdms])", raw.strip().lower())
+    if not match:
+        return None
+    value = int(match.group(1))
+    multiplier = {"d": 86400, "h": 3600, "m": 60, "s": 1}[match.group(2)]
+    return codex_window_descriptor({"limit_window_seconds": value * multiplier})
+
+
+def sanitize_codex_cached_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Correct pre-hotfix cached Codex buckets when their duration is known."""
+    quotas = limits.get("quotas")
+    if not isinstance(quotas, list):
+        return limits
+
+    out = dict(limits)
+    sanitized: List[Dict[str, Any]] = []
+    for quota in quotas:
+        if not isinstance(quota, dict):
+            continue
+        item = dict(quota)
+        quota_id = str(item.get("id") or "")
+        cached_descriptor = codex_cached_window_descriptor(item)
+        # A cached response from before the duration-aware parser may carry a
+        # stale id/label. Re-key only the aggregate Codex bucket; never infer
+        # a semantic window from array position.
+        if cached_descriptor and quota_id in {"codex:5h", "codex:7d"}:
+            expected_id = f"codex:{cached_descriptor['suffix']}"
+            item["id"] = expected_id
+            item["label"] = cached_descriptor["label"]
+            quota_id = expected_id
+        cached_kind = codex_cached_window_kind(item)
+        if quota_id == "codex:5h" and cached_kind == "weekly":
+            item["id"] = "codex:7d"
+            item["label"] = "7일"
+        elif quota_id == "codex:7d" and cached_kind == "short":
+            item["id"] = "codex:5h"
+            item["label"] = "5시간"
+        sanitized.append(item)
+
+    out["quotas"] = sanitized
+    out["shortUsedPercent"] = None
+    out["shortResetAt"] = None
+    out["shortWindowMinutes"] = None
+    out["weeklyUsedPercent"] = None
+    out["weeklyResetAt"] = None
+    for quota in sanitized:
+        quota_id = str(quota.get("id") or "")
+        if quota_id == "codex:5h":
+            out["shortUsedPercent"] = quota.get("usedPercent")
+            out["shortResetAt"] = quota.get("resetAt")
+            cached_kind = codex_cached_window_kind(quota)
+            if cached_kind == "short":
+                raw = quota.get("window")
+                if isinstance(raw, str):
+                    match = re.fullmatch(r"(\d+)h", raw.strip().lower())
+                    if match:
+                        out["shortWindowMinutes"] = int(match.group(1)) * 60
+        elif quota_id == "codex:7d":
+            out["weeklyUsedPercent"] = quota.get("usedPercent")
+            out["weeklyResetAt"] = quota.get("resetAt")
+    return out
 
 
 def sum_intish_list(raw: Any) -> Optional[int]:
@@ -2618,21 +2776,27 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
     secondary = rate_limit.get("secondary_window") or rate_limit.get("secondary")
 
     quotas: List[Dict[str, Any]] = []
-    primary_quota = codex_window_quota("codex:5h", "5시간", primary, source=source)
-    if primary_quota:
-        quotas.append(primary_quota)
-        limits["shortUsedPercent"] = primary_quota.get("usedPercent")
-        limits["shortResetAt"] = primary_quota.get("resetAt")
-        if isinstance(primary, dict):
-            seconds = int_limit(primary.get("limit_window_seconds") or primary.get("window_secs"))
-            if seconds:
-                limits["shortWindowMinutes"] = seconds // 60
 
-    secondary_quota = codex_window_quota("codex:7d", "7일", secondary, source=source)
-    if secondary_quota:
-        quotas.append(secondary_quota)
-        limits["weeklyUsedPercent"] = secondary_quota.get("usedPercent")
-        limits["weeklyResetAt"] = secondary_quota.get("resetAt")
+    def append_window(window: Any, default_kind: Optional[str]) -> None:
+        descriptor = codex_window_descriptor(window, default_kind)
+        if not descriptor:
+            return
+        quota = codex_window_quota(
+            f"codex:{descriptor['suffix']}", descriptor["label"], window, source=source
+        )
+        if not quota:
+            return
+        quotas.append(quota)
+        if descriptor["kind"] == "short":
+            limits["shortUsedPercent"] = quota.get("usedPercent")
+            limits["shortResetAt"] = quota.get("resetAt")
+            limits["shortWindowMinutes"] = descriptor["seconds"] // 60
+        elif descriptor["kind"] == "weekly":
+            limits["weeklyUsedPercent"] = quota.get("usedPercent")
+            limits["weeklyResetAt"] = quota.get("resetAt")
+
+    append_window(primary, "short")
+    append_window(secondary, "weekly")
 
     additional = payload.get("additional_rate_limits")
     if isinstance(additional, list):
@@ -2641,22 +2805,22 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
                 continue
             name = str(item.get("limit_name") or item.get("name") or "model")
             sub_rate = item.get("rate_limit") if isinstance(item.get("rate_limit"), dict) else {}
+            primary_window = sub_rate.get("primary_window") or sub_rate.get("primary")
+            primary_descriptor = codex_window_descriptor(primary_window, "short")
             p = codex_window_quota(
-                f"codex:{name}:primary",
-                f"{name} 5시간",
-                sub_rate.get("primary_window") or sub_rate.get("primary"),
-                source=source,
-                model=name,
-            )
+                f"codex:{name}:{primary_descriptor['suffix']}",
+                f"{name} {primary_descriptor['label']}",
+                primary_window, source=source, model=name,
+            ) if primary_descriptor else None
             if p:
                 quotas.append(p)
+            secondary_window = sub_rate.get("secondary_window") or sub_rate.get("secondary")
+            secondary_descriptor = codex_window_descriptor(secondary_window, "weekly")
             s = codex_window_quota(
-                f"codex:{name}:secondary",
-                f"{name} 7일",
-                sub_rate.get("secondary_window") or sub_rate.get("secondary"),
-                source=source,
-                model=name,
-            )
+                f"codex:{name}:{secondary_descriptor['suffix']}",
+                f"{name} {secondary_descriptor['label']}",
+                secondary_window, source=source, model=name,
+            ) if secondary_descriptor else None
             if s:
                 quotas.append(s)
 
@@ -2680,7 +2844,7 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
 def codex_live_limits(force: bool = False) -> Dict[str, Any]:
     cached = None if force else cached_live_limits("codex", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
-        return cached
+        return sanitize_codex_cached_limits(cached)
     auth = read_codex_auth()
     if not auth:
         return empty_limits()
@@ -2890,6 +3054,46 @@ def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
     return (order.get(quota_id, 100), quota_id)
 
 
+def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, str, str, Optional[str]]]:
+    """Return dynamic metadata for a scoped Claude limit row.
+
+    Claude's OAuth usage endpoint keeps newly introduced model capacities in
+    ``limits[]`` instead of adding a top-level field.  Do not enumerate model
+    names here: the API owns the set of scopes, so a model can appear or
+    disappear without an app release.
+    """
+    scope = item.get("scope")
+    if not isinstance(scope, dict):
+        return None
+    model_scope = scope.get("model")
+    surface = scope.get("surface")
+    if not isinstance(model_scope, dict) and not surface:
+        return None
+
+    display_name = ""
+    model_id = ""
+    if isinstance(model_scope, dict):
+        display_name = str(model_scope.get("display_name") or model_scope.get("displayName") or "").strip()
+        model_id = str(model_scope.get("id") or "").strip()
+    surface_name = str(surface or "").strip()
+    scope_name = display_name or model_id or surface_name
+    if not scope_name:
+        return None
+
+    group = str(item.get("group") or item.get("kind") or "").strip().lower()
+    if group in {"session", "five_hour", "5h"}:
+        window, window_label = "5h", "5시간"
+    elif group in {"daily", "day"}:
+        window, window_label = "1d", "1일"
+    elif group in {"monthly", "month"}:
+        window, window_label = "monthly", "월별"
+    else:
+        window, window_label = "7d", "7일"
+
+    normalized_model = model_id or display_name or surface_name
+    return normalized_model, f"{scope_name} {window_label}", window, group or None
+
+
 def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "claude-oauth-usage-api") -> Dict[str, Any]:
     limits = empty_limits(status="auto")
     limits["source"] = source
@@ -2945,6 +3149,34 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
         elif key == "seven_day":
             limits["weeklyUsedPercent"] = quota.get("usedPercent")
             limits["weeklyResetAt"] = quota.get("resetAt")
+
+    # New model/surface capacities are represented by Claude as scoped rows in
+    # ``limits[]``.  Keep these rows data-driven: if the service stops sending
+    # Fable (or introduces another scope), the next refresh naturally removes
+    # (or adds) the corresponding quota without a client-side feature flag.
+    scoped_limits = payload.get("limits")
+    if isinstance(scoped_limits, list):
+        for index, item in enumerate(scoped_limits):
+            if not isinstance(item, dict):
+                continue
+            used_percent = float_percent(item.get("percent"))
+            metadata = claude_scoped_quota_metadata(item)
+            if used_percent is None or metadata is None:
+                continue
+            model_key, label, window, group = metadata
+            scope_key = ":".join(
+                part for part in (group or "scoped", model_key, str(item.get("kind") or "")) if part
+            )
+            quota = quota_entry(
+                f"claude:scoped:{short_stable_hash(scope_key or str(index))}",
+                label,
+                used_percent=used_percent,
+                reset_at=item.get("resets_at"),
+                window=window,
+                model=model_key,
+                source=source,
+            )
+            quotas.append(quota)
 
     quotas.sort(key=claude_quota_sort_key)
     limits["quotas"] = quotas
@@ -4626,6 +4858,10 @@ def codex_session_files() -> List[Path]:
         return []
     files: List[Path] = []
     seen: Set[str] = set()
+    # resolve() exists to dedupe aliased paths across overlapping roots; with
+    # a single root plain string keys suffice and skip one realpath syscall
+    # chain per session file (thousands of files on heavy Codex machines).
+    dedupe_resolved = len(roots) > 1
     for root in roots:
         try:
             candidates = [p for p in root.glob("**/*.jsonl") if p.is_file()]
@@ -4633,10 +4869,11 @@ def codex_session_files() -> List[Path]:
             continue
         for path in candidates:
             key = str(path)
-            try:
-                key = str(path.resolve())
-            except OSError:
-                pass
+            if dedupe_resolved:
+                try:
+                    key = str(path.resolve())
+                except OSError:
+                    pass
             if key in seen:
                 continue
             seen.add(key)
@@ -4725,7 +4962,7 @@ def save_codex_sessions_cursor(cursor: Dict[str, Any]) -> bool:
     try:
         AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
         with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(cursor, fh, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            json.dump(cursor, fh, ensure_ascii=False, separators=(",", ":"))
             fh.write("\n")
         tmp.replace(CODEX_SESSIONS_CURSOR_FILE)
         return True
@@ -4772,6 +5009,9 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
     projects: Dict[str, Any] = cursor["projects"]
 
     new_turns = 0
+    # Persist the multi-MB cursor only when a file actually advanced; the
+    # unconditional 60s re-serialization was a steady daemon CPU cost.
+    changed = bool(force_rebuild)
 
     for path in files:
         path_str = str(path)
@@ -4885,6 +5125,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
             logging.warning("codex_sessions_snapshot: cannot read %s: %s", path_str, exc)
             continue
 
+        changed = True
         file_cursors[path_str] = {
             "offset": new_offset,
             "mtime": mtime,
@@ -4897,9 +5138,10 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
         }
 
     cursor["turns"] = int(cursor.get("turns") or 0) + new_turns
-    saved = save_codex_sessions_cursor(cursor)
-    if not saved:
-        logging.debug("codex_sessions_snapshot: cursor save failed")
+    if changed and (force_rebuild or not cursor_recently_saved(CODEX_SESSIONS_CURSOR_FILE)):
+        saved = save_codex_sessions_cursor(cursor)
+        if not saved:
+            logging.debug("codex_sessions_snapshot: cursor save failed")
 
     return _build_codex_sessions_snapshot(result, cursor)
 
@@ -5451,7 +5693,7 @@ def attach_codex_usage_coverage(
         "desktopApp": {
             "usageImport": "metadata_only",
             "tokensIncluded": False,
-            "note": "Codex.app/profile files are detected for setup diagnostics only; local token totals come from ~/.codex sessions JSONL and state_*.sqlite.",
+            "note": "ChatGPT/Codex app profile files are detected for setup diagnostics only; local token totals come from ~/.codex sessions JSONL and state_*.sqlite.",
         },
         "accountUsage": {
             "status": "on_demand",
@@ -5790,12 +6032,35 @@ def load_journal_cursor() -> Dict[str, Any]:
     }
 
 
+CURSOR_SAVE_MIN_INTERVAL_SECONDS = float(
+    os.environ.get("AGENTCAT_CURSOR_SAVE_INTERVAL_SECONDS", "300")
+)
+
+
+def cursor_recently_saved(path: Path) -> bool:
+    """Debounce gate for multi-MB cursor writes on busy machines.
+
+    Serializing a large cursor costs seconds of CPU; while agents are
+    actively appending, every 60s cycle is dirty, so without this gate the
+    daemon pays that cost every cycle. Skipping a save only means the next
+    process re-parses the small unsaved journal tail — the cursor is a
+    resume cache, so nothing is lost. Keyed on the cursor file's mtime so
+    one-shot CLI runs and tests (fresh temp paths) are unaffected.
+    """
+    try:
+        return (time.time() - path.stat().st_mtime) < CURSOR_SAVE_MIN_INTERVAL_SECONDS
+    except OSError:
+        return False
+
+
 def save_journal_cursor(cursor: Dict[str, Any]) -> bool:
     tmp = unique_atomic_tmp_path(JOURNAL_CURSOR_FILE)
     try:
         AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
         with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(cursor, fh, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            # No sort_keys: key order is irrelevant to a resume cursor and
+            # sorting a multi-MB dict measurably adds to each save.
+            json.dump(cursor, fh, ensure_ascii=False, separators=(",", ":"))
             fh.write("\n")
         tmp.replace(JOURNAL_CURSOR_FILE)
         return True
@@ -6017,7 +6282,13 @@ def rebuild_claude_journal_projects(now: "dt.datetime") -> Dict[str, Dict[str, A
 def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     project_roots = claude_journal_project_dirs()
     if not project_roots:
+        cursor["_dirty"] = False
         return cursor
+    # The cursor holds the full usage-record history (multi-MB); serializing
+    # it every 60s cycle was the daemon's main steady-state CPU cost, so the
+    # caller only persists it when this scan actually changed something.
+    changed = False
+    rebuilt = False
     now_utc = dt.datetime.now(dt.timezone.utc)
     now_local = now_utc.astimezone().date()
     totals_as_of_str: Optional[str] = cursor.get("totals_as_of")
@@ -6036,6 +6307,8 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     models: Dict[str, Dict[str, int]] = cursor.setdefault("models", _empty_journal_models())
     usage_records: Dict[str, Dict[str, Any]] = cursor.setdefault("usageRecords", {})
     if cursor.pop("usage_needs_rebuild", False):
+        changed = True
+        rebuilt = True
         offsets.clear()
         totals.clear()
         totals.update(_empty_journal_totals())
@@ -6049,6 +6322,8 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         # Existing cursors predate per-project attribution. Rebuild only
         # project totals from JSONL so historical project usage appears
         # without disturbing global totals or byte offsets.
+        changed = True
+        rebuilt = True
         projects.clear()
         projects.update(rebuild_claude_journal_projects(now_utc))
     for root in project_roots:
@@ -6116,11 +6391,20 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
             except OSError as exc:
                 logging.warning("scan_claude_journal: cannot read %s: %s", path_str, exc)
                 continue
+            if offsets.get(path_str) != new_offset:
+                changed = True
             offsets[path_str] = new_offset
             logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
                           path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
-    cursor["totals_as_of"] = now_utc.isoformat()
-    cursor["version"] = CLAUDE_JOURNAL_CURSOR_VERSION
+    if changed:
+        # Stamped only on change so an idle cursor stays byte-identical and
+        # the save can be skipped. The midnight rebuild check still fires:
+        # the first scan of a new day sees yesterday's stamp, rebuilds, and
+        # that rebuild marks the cursor changed.
+        cursor["totals_as_of"] = now_utc.isoformat()
+        cursor["version"] = CLAUDE_JOURNAL_CURSOR_VERSION
+    cursor["_dirty"] = changed
+    cursor["_rebuilt"] = rebuilt
     return cursor
 
 
@@ -6365,9 +6649,14 @@ def claude_snapshot() -> Dict[str, Any]:
     # Per-class token data from JSONL journal (incremental scan)
     cursor = load_journal_cursor()
     cursor = scan_claude_journal(cursor)
-    saved = save_journal_cursor(cursor)
-    if not saved:
-        logging.debug("claude_snapshot: cursor save failed")
+    rebuilt = bool(cursor.pop("_rebuilt", False))
+    # Rebuilds must persist immediately — a stale cursor on disk would
+    # trigger the full rebuild again next cycle. Ordinary appends are
+    # debounced: the unsaved tail just gets re-parsed by the next process.
+    if cursor.pop("_dirty", True) and (rebuilt or not cursor_recently_saved(JOURNAL_CURSOR_FILE)):
+        saved = save_journal_cursor(cursor)
+        if not saved:
+            logging.debug("claude_snapshot: cursor save failed")
     if cursor["totals"]:
         _merge_journal_totals(result["tokens"], cursor["totals"])
         if result["status"] == "not_found" and any(cursor["totals"].values()):
@@ -7421,6 +7710,10 @@ def classify_process(command: str) -> Optional[str]:
     ):
         return None
     if "/applications/claude.app/contents/" in normalized:
+        return None
+    # ChatGPT now hosts the Codex surface. Its bundled helpers are not a
+    # second CLI session and must not create a duplicate Codex process row.
+    if "/applications/chatgpt.app/contents/" in normalized:
         return None
     if "/applications/antigravity.app/contents/" in normalized:
         return None

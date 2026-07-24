@@ -155,6 +155,32 @@ class AgentCatConnectorTests(unittest.TestCase):
                 {"desktopApps": {"codex": {"path": "Codex.app"}}}
             )
 
+    def test_codex_chatgpt_host_is_detected_without_creating_second_provider(self) -> None:
+        app_path = self.root / "home" / "Applications" / "ChatGPT.app"
+        info = app_path / "Contents" / "Info.plist"
+        info.parent.mkdir(parents=True)
+        info.write_text(
+            "<?xml version=\"1.0\"?><plist><dict>"
+            "<key>CFBundleIdentifier</key><string>com.openai.chat</string>"
+            "</dict></plist>",
+            encoding="utf-8",
+        )
+        data_root = self.root / "home" / "Library" / "Application Support" / "com.openai.chat"
+        data_root.mkdir(parents=True)
+        (data_root / "metadata.json").write_text("{}", encoding="utf-8")
+
+        source = agentcat.desktop_app_source_snapshot(
+            "codex", {"desktopApps": {"codex": {"path": str(app_path)}}}
+        )
+
+        self.assertEqual(source["path"], str(app_path))
+        self.assertEqual(source["bundleId"], "com.openai.chat")
+        self.assertEqual(source["hostApp"], "ChatGPT")
+        self.assertEqual(source["provider"], "codex")
+        self.assertEqual(source["usageImport"], "metadata_only")
+        self.assertFalse(source["tokensIncluded"])
+        self.assertEqual(source["status"], "installed_no_data")
+
     def test_build_snapshot_skips_disabled_provider_and_exposes_desktop_apps(self) -> None:
         app_path = self.root / "Applications" / "Codex.app"
         app_path.mkdir(parents=True)
@@ -264,6 +290,104 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertNotIn("profile_user_id", limits["resetCredits"][0])
         self.assertNotIn("profile_image_url", limits["resetCredits"][0])
 
+    def test_codex_weekly_only_primary_window_is_not_labeled_five_hours(self) -> None:
+        limits = agentcat.codex_limits_from_usage_response(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 24,
+                        "reset_at": 1770000000,
+                        "limit_window_seconds": 604800,
+                    }
+                },
+            }
+        )
+
+        self.assertEqual([quota["id"] for quota in limits["quotas"]], ["codex:7d"])
+        self.assertEqual(limits["quotas"][0]["label"], "7일")
+        self.assertEqual(limits["quotas"][0]["window"], "7d")
+        self.assertIsNone(limits["shortUsedPercent"])
+        self.assertEqual(limits["weeklyUsedPercent"], 24.0)
+
+    def test_codex_daily_window_stays_daily_and_does_not_fill_weekly_compat_field(self) -> None:
+        limits = agentcat.codex_limits_from_usage_response(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 24,
+                        "reset_at": 1770000000,
+                        "limit_window_seconds": 86400,
+                    }
+                },
+            }
+        )
+
+        self.assertEqual([quota["id"] for quota in limits["quotas"]], ["codex:1d"])
+        self.assertEqual(limits["quotas"][0]["label"], "1일")
+        self.assertEqual(limits["quotas"][0]["window"], "1d")
+        self.assertIsNone(limits["shortUsedPercent"])
+        self.assertIsNone(limits["weeklyUsedPercent"])
+
+    def test_codex_unrecognized_duration_is_preserved_as_generic_quota(self) -> None:
+        limits = agentcat.codex_limits_from_usage_response(
+            {
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 12,
+                        "limit_window_seconds": 2592000,
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(limits["quotas"][0]["id"], "codex:30d")
+        self.assertEqual(limits["quotas"][0]["label"], "30일")
+        self.assertIsNone(limits["weeklyUsedPercent"])
+
+    def test_codex_cache_rekeys_stale_daily_bucket_without_calling_it_weekly(self) -> None:
+        cached = agentcat.empty_limits(status="auto")
+        cached["weeklyUsedPercent"] = 24.0
+        cached["quotas"] = [
+            {
+                "id": "codex:7d",
+                "label": "7일",
+                "window": "24h",
+                "usedPercent": 24.0,
+                "remainingPercent": 76.0,
+                "resetAt": 1770000000,
+            }
+        ]
+
+        sanitized = agentcat.sanitize_codex_cached_limits(cached)
+
+        self.assertEqual(sanitized["quotas"][0]["id"], "codex:1d")
+        self.assertEqual(sanitized["quotas"][0]["label"], "1일")
+        self.assertIsNone(sanitized["shortUsedPercent"])
+        self.assertIsNone(sanitized["weeklyUsedPercent"])
+
+    def test_codex_cache_relabels_pre_hotfix_weekly_primary(self) -> None:
+        cached = agentcat.empty_limits(status="auto")
+        cached["shortUsedPercent"] = 24.0
+        cached["quotas"] = [
+            {
+                "id": "codex:5h",
+                "label": "5시간",
+                "window": "168h",
+                "usedPercent": 24.0,
+                "remainingPercent": 76.0,
+                "resetAt": 1770000000,
+            }
+        ]
+
+        sanitized = agentcat.sanitize_codex_cached_limits(cached)
+
+        self.assertEqual(sanitized["quotas"][0]["id"], "codex:7d")
+        self.assertEqual(sanitized["quotas"][0]["label"], "7일")
+        self.assertIsNone(sanitized["shortUsedPercent"])
+        self.assertEqual(sanitized["weeklyUsedPercent"], 24.0)
+
     def test_codex_live_limits_tries_wham_before_refresh_after_codex_403(self) -> None:
         (agentcat.HOME / ".codex").mkdir(parents=True)
         (agentcat.HOME / ".codex" / "auth.json").write_text(
@@ -319,6 +443,31 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIsNone(limits["quotas"][4]["model"])
         self.assertNotIn("omelette", limits["quotas"][4]["id"])
         self.assertNotIn("omelette", limits["quotas"][4]["label"])
+
+    def test_claude_usage_api_payload_keeps_dynamic_scoped_capacity(self) -> None:
+        limits = agentcat.claude_limits_from_usage_response(
+            {
+                "five_hour": {"utilization": 7.0, "resets_at": "2026-07-15T15:10:00Z"},
+                "seven_day": {"utilization": 61.0, "resets_at": "2026-07-17T07:00:00Z"},
+                "limits": [
+                    {
+                        "kind": "weekly_scoped",
+                        "group": "weekly",
+                        "percent": 100,
+                        "resets_at": "2026-07-17T07:00:00Z",
+                        "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                    }
+                ],
+            }
+        )
+
+        scoped = [q for q in limits["quotas"] if q["id"].startswith("claude:scoped:")]
+        self.assertEqual(len(scoped), 1)
+        self.assertEqual(scoped[0]["label"], "Fable 7일")
+        self.assertEqual(scoped[0]["model"], "Fable")
+        self.assertEqual(scoped[0]["window"], "7d")
+        self.assertEqual(scoped[0]["usedPercent"], 100.0)
+        self.assertEqual(scoped[0]["remainingPercent"], 0.0)
 
     def test_claude_cached_limits_sanitizes_unknown_internal_quota_names(self) -> None:
         limits = agentcat.empty_limits(status="auto")
@@ -2830,6 +2979,11 @@ class AgentCatConnectorTests(unittest.TestCase):
     def test_classify_ignores_vscode_chatgpt_extension_codex_server(self) -> None:
         self.assertIsNone(
             agentcat.classify_process(
+                "/Applications/ChatGPT.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/codex"
+            )
+        )
+        self.assertIsNone(
+            agentcat.classify_process(
                 r"c:\Users\me\.vscode\extensions\openai.chatgpt-26.513.21555-win32-x64\bin\windows-x86_64\codex.exe app-server --analytics-default-enabled"
             )
         )
@@ -3780,6 +3934,20 @@ class PricingTests(unittest.TestCase):
             cost["input"] + cost["output"] + cost["cache_read"] + cost["cache_write"],
             places=4,
         )
+
+    def test_claude_fable_pricing_is_bundled_fallback(self) -> None:
+        cost = agentcat.estimate_cost(
+            "claude-fable-5",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            cache_write_tokens=1_000_000,
+        )
+        self.assertEqual(cost["input"], 10.0)
+        self.assertEqual(cost["output"], 50.0)
+        self.assertEqual(cost["cache_read"], 1.0)
+        self.assertEqual(cost["cache_write"], 12.5)
+        self.assertEqual(cost["total"], 73.5)
 
     def test_cache_read_is_cheaper_than_input(self) -> None:
         cost = agentcat.estimate_cost(
