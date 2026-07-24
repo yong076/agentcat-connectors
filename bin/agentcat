@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.30.1")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.30.2")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -997,7 +997,7 @@ def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
     return None
 
 
-CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot")
+CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot", "kimi", "grok")
 DESKTOP_APP_PROVIDER_IDS = ("claude", "codex")
 
 DESKTOP_APP_SPECS: Dict[str, Dict[str, Any]] = {
@@ -4187,6 +4187,218 @@ def opencode_message_metrics(data: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+KIMI_LOG_RESPONSE_RE = re.compile(r"\bllm response\b.*\boutputTokens=(\d+)\b")
+KIMI_LOG_MODEL_RE = re.compile(r"\bllm config\b.*\bmodel=([^\s]+)")
+KIMI_LOG_MODEL_ALIAS_RE = re.compile(r"\bllm config\b.*\bmodelAlias=([^\s]+)")
+
+
+def kimi_roots() -> List[Path]:
+    roots: List[Path] = []
+    for env_name in ("KIMI_CODE_DIR", "KIMI_DATA_DIR"):
+        raw = os.environ.get(env_name)
+        if not raw:
+            continue
+        for part in raw.split(","):
+            text = part.strip()
+            if text:
+                roots.append(Path(text).expanduser())
+    if not roots:
+        roots = [HOME / ".kimi-code", HOME / ".kimi"]
+    seen: Set[str] = set()
+    unique: List[Path] = []
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def kimi_code_log_files(root: Path) -> List[Path]:
+    sessions = root / "sessions"
+    try:
+        return [
+            path
+            for path in sessions.glob("*/session_*/logs/kimi-code.log")
+            if path.is_file()
+        ]
+    except OSError:
+        return []
+
+
+def kimi_wire_log_files(root: Path) -> List[Path]:
+    sessions = root / "sessions"
+    try:
+        candidates = [path for path in sessions.glob("*/*/wire.jsonl") if path.is_file()]
+    except OSError:
+        return []
+    out: List[Path] = []
+    for path in candidates:
+        try:
+            rel = path.relative_to(sessions)
+        except ValueError:
+            continue
+        if len(rel.parts) == 3 and rel.name == "wire.jsonl":
+            out.append(path)
+    return out
+
+
+def kimi_config_model(root: Path) -> str:
+    try:
+        payload = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        return "kimi-for-coding"
+    if isinstance(payload, dict):
+        return normalized_model_name(payload.get("model")) or "kimi-for-coding"
+    return "kimi-for-coding"
+
+
+def parse_kimi_code_log(path: Path, result: Dict[str, Any]) -> int:
+    text = read_text_limited(path)
+    if text is None:
+        return 0
+    current_model = "kimi-code"
+    events = 0
+    for line in text.splitlines():
+        model_match = KIMI_LOG_MODEL_ALIAS_RE.search(line) or KIMI_LOG_MODEL_RE.search(line)
+        if model_match:
+            current_model = normalized_model_name(model_match.group(1)) or current_model
+            continue
+        response_match = KIMI_LOG_RESPONSE_RE.search(line)
+        if not response_match:
+            continue
+        output_tokens = nonnegative_int(response_match.group(1)) or 0
+        if output_tokens <= 0:
+            continue
+        when = parse_timestamp(line.split(None, 1)[0] if line else None)
+        if add_usage_metrics(result, current_model, {"outputTokens": output_tokens}, when):
+            events += 1
+            update_breakdown(result["breakdown"], chat=1)
+    return events
+
+
+def kimi_wire_metrics(event: Dict[str, Any]) -> Dict[str, int]:
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    if message.get("type") == "metadata":
+        return {}
+    if message.get("type") != "StatusUpdate":
+        return {}
+    payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+    usage = payload.get("token_usage") if isinstance(payload.get("token_usage"), dict) else {}
+    input_tokens = nonnegative_int(usage.get("input_other")) or 0
+    output_tokens = nonnegative_int(usage.get("output")) or 0
+    cache_read = nonnegative_int(usage.get("input_cache_read")) or 0
+    cache_create = nonnegative_int(usage.get("input_cache_creation")) or 0
+    total = nonnegative_int(usage.get("total")) or 0
+    accounted = input_tokens + output_tokens + cache_read + cache_create
+    metrics = {
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "cacheReadInputTokens": cache_read,
+        "cacheCreationInputTokens": cache_create,
+    }
+    if total > accounted:
+        metrics["reasoningTokens"] = total - accounted
+    elif total > 0:
+        metrics["totalTokens"] = total
+    return metrics
+
+
+def parse_kimi_wire_log(path: Path, result: Dict[str, Any], model: str) -> int:
+    events = 0
+    for event in iter_jsonl_file(path):
+        metrics = kimi_wire_metrics(event)
+        if not metrics:
+            continue
+        if add_usage_metrics(result, model, metrics, parse_timestamp(event.get("timestamp"))):
+            events += 1
+            update_breakdown(result["breakdown"], chat=1)
+    return events
+
+
+def kimi_snapshot() -> Dict[str, Any]:
+    roots = kimi_roots()
+    result = empty_provider_usage(source=",".join(str(root) for root in roots))
+    result["displayName"] = "Kimi Code"
+    existing_roots = [root for root in roots if root.exists()]
+    if not existing_roots:
+        return result
+
+    events = 0
+    code_files: List[Path] = []
+    wire_files: List[Path] = []
+    for root in existing_roots:
+        code_files.extend(kimi_code_log_files(root))
+        wire_files.extend(kimi_wire_log_files(root))
+    code_files = recent_files(code_files)
+    wire_files = recent_files(wire_files)
+
+    for path in code_files:
+        events += parse_kimi_code_log(path, result)
+    for path in wire_files:
+        # The legacy Kimi wire format stores the configured model at the root.
+        root = path
+        for parent in path.parents:
+            if parent.name == "sessions":
+                root = parent.parent
+                break
+        events += parse_kimi_wire_log(path, result, kimi_config_model(root))
+
+    result["status"] = "ok" if events > 0 else "no_token_events_yet"
+    result["source"] = ",".join(str(path) for path in (code_files + wire_files)) or ",".join(str(root) for root in existing_roots)
+    result["events"] = events
+    result["sessions"] = len({str(path.parent.parent) for path in code_files} | {str(path.parent) for path in wire_files})
+    result["sources"] = {
+        "kimiCodeLogFiles": len(code_files),
+        "wireLogFiles": len(wire_files),
+        "parseMaxFiles": LOCAL_PROVIDER_MAX_FILES,
+    }
+    return result
+
+
+def grok_roots() -> List[Path]:
+    raw = os.environ.get("GROK_HOME") or os.environ.get("XAI_HOME")
+    roots: List[Path] = []
+    if raw:
+        for part in raw.split(","):
+            text = part.strip()
+            if text:
+                roots.append(Path(text).expanduser())
+    return roots or [HOME / ".grok", HOME / ".xai"]
+
+
+def grok_snapshot() -> Dict[str, Any]:
+    roots = grok_roots()
+    result = empty_provider_usage(source=",".join(str(root) for root in roots))
+    result["displayName"] = "Grok"
+    existing_roots = [root for root in roots if root.exists()]
+    if not existing_roots:
+        return result
+
+    hook_files: List[Path] = []
+    log_files: List[Path] = []
+    for root in existing_roots:
+        hook = root / "hooks" / "orca-status.json"
+        if hook.is_file():
+            hook_files.append(hook)
+        try:
+            log_files.extend(path for path in root.glob("**/*.log") if path.is_file())
+        except OSError:
+            pass
+
+    result["status"] = "no_token_events_yet"
+    result["source"] = ",".join(str(path) for path in (hook_files + recent_files(log_files))) or ",".join(str(root) for root in existing_roots)
+    result["events"] = 0
+    result["sources"] = {
+        "hookFiles": len(hook_files),
+        "logFiles": len(log_files),
+        "parseMaxFiles": LOCAL_PROVIDER_MAX_FILES,
+    }
+    if hook_files:
+        result["message"] = "Grok local hooks detected; usage tokens are not exposed yet"
+    return result
+
+
 def opencode_snapshot() -> Dict[str, Any]:
     data_dir = opencode_data_dir()
     result = empty_provider_usage(source=str(data_dir))
@@ -5596,6 +5808,16 @@ def attach_local_usage_coverage(provider: str, snapshot: Dict[str, Any], **extra
             "includedSources": ["copilot_legacy_events", "vscode_copilot_transcripts"],
             "privacy": "token_metadata_or_estimate",
             "note": "Uses explicit Copilot output tokens when present and local transcript estimates when the transcript lacks token fields.",
+        },
+        "kimi": {
+            "includedSources": ["kimi_code_logs", "kimi_wire_logs"],
+            "privacy": "usage_fields_only",
+            "note": "Reads Kimi Code token/model/timestamp log fields only. Prompt history, titles, workdirs, and transcript content are ignored.",
+        },
+        "grok": {
+            "includedSources": ["grok_local_hooks"],
+            "privacy": "hook_metadata_only",
+            "note": "Detects Grok local hooks and processes. Token totals and soft quota appear only when a local token source is available.",
         },
     }
     descriptor = descriptors.get(provider)
@@ -7751,6 +7973,10 @@ def classify_process(command: str) -> Optional[str]:
         or "@google/gemini" in normalized
     ):
         return "gemini"
+    if executable in {"kimi", "kimi.exe", "kimi.cmd", "kimi-code", "kimi-code.exe", "kimi-code.cmd"}:
+        return "kimi"
+    if executable in {"grok", "grok.exe", "grok.cmd", "grok-code", "grok-code.exe", "grok-code.cmd", "grock"}:
+        return "grok"
     return None
 
 
@@ -8668,12 +8894,14 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         "antigravity": antigravity_provider,
         "opencode": disabled_provider_snapshot("opencode") if (provider_config.get("opencode") or {}).get("enabled") is False else _safe_provider("opencode", opencode_snapshot),
         "copilot": disabled_provider_snapshot("copilot") if (provider_config.get("copilot") or {}).get("enabled") is False else _safe_provider("copilot", copilot_snapshot),
+        "kimi": disabled_provider_snapshot("kimi") if (provider_config.get("kimi") or {}).get("enabled") is False else _safe_provider("kimi", kimi_snapshot),
+        "grok": disabled_provider_snapshot("grok") if (provider_config.get("grok") or {}).get("enabled") is False else _safe_provider("grok", grok_snapshot),
     }
     if (provider_config.get("gemini") or {}).get("enabled") is False:
         providers["gemini"] = disabled_provider_snapshot("gemini")
     if (provider_config.get("antigravity") or {}).get("enabled") is False:
         providers["antigravity"] = disabled_provider_snapshot("antigravity")
-    for provider in ("gemini", "antigravity", "opencode", "copilot"):
+    for provider in ("gemini", "antigravity", "opencode", "copilot", "kimi", "grok"):
         attach_local_usage_coverage(provider, providers.get(provider, {}))
     for provider, data in providers.items():
         if data.get("status") == "disabled":
