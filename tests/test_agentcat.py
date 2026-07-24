@@ -2801,6 +2801,99 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(state["offset"], stat.st_size)
         self.assertEqual(state["tokenClasses"]["inputTokens"], 1)
 
+    def test_kimi_snapshot_reads_kimi_code_logs_without_prompt_files(self) -> None:
+        log_dir = (
+            agentcat.HOME
+            / ".kimi-code"
+            / "sessions"
+            / "wd_repo_abc"
+            / "session_123"
+            / "logs"
+        )
+        log_dir.mkdir(parents=True)
+        (log_dir / "kimi-code.log").write_text(
+            "\n".join(
+                [
+                    "2026-07-17T12:28:31.021Z INFO  llm config  turnStep=0.1 provider=kimi model=k3 modelAlias=kimi-code/k3 thinkingEffort=max systemPromptChars=29817 toolCount=25",
+                    "2026-07-17T12:28:54.138Z INFO  llm response  turnStep=0/1 ttftMs=3945 outputTokens=448",
+                    "2026-07-17T12:29:03.274Z INFO  llm response  turnStep=0/2 ttftMs=3952 outputTokens=174",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        history_dir = agentcat.HOME / ".kimi-code" / "user-history"
+        history_dir.mkdir(parents=True)
+        (history_dir / "prompt.jsonl").write_text('{"content":"must not be parsed"}\n', encoding="utf-8")
+
+        snapshot = agentcat.kimi_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 2)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 622)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 622)
+        self.assertEqual(snapshot["models"]["kimi-code/k3"]["outputTokens"], 622)
+        self.assertEqual(snapshot["sources"]["kimiCodeLogFiles"], 1)
+
+    def test_kimi_snapshot_reads_legacy_wire_logs(self) -> None:
+        root = agentcat.HOME / ".kimi"
+        session_dir = root / "sessions" / "group" / "session"
+        session_dir.mkdir(parents=True)
+        (root / "config.json").write_text('{"model":"kimi-for-coding"}', encoding="utf-8")
+        (session_dir / "wire.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"message": {"type": "metadata", "payload": {"token_usage": {"total": 999}}}}),
+                    json.dumps(
+                        {
+                            "timestamp": 1770983427.123,
+                            "message": {
+                                "type": "StatusUpdate",
+                                "payload": {
+                                    "token_usage": {
+                                        "input_other": 100,
+                                        "output": 50,
+                                        "input_cache_read": 10,
+                                        "input_cache_creation": 20,
+                                        "total": 180,
+                                    }
+                                },
+                            },
+                        }
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.kimi_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 100)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 50)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 10)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 20)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 180)
+        self.assertEqual(snapshot["sources"]["wireLogFiles"], 1)
+
+    def test_grok_snapshot_reports_local_hook_without_claiming_tokens(self) -> None:
+        hook_dir = agentcat.HOME / ".grok" / "hooks"
+        hook_dir.mkdir(parents=True)
+        (hook_dir / "orca-status.json").write_text('{"hooks":{}}', encoding="utf-8")
+
+        snapshot = agentcat.grok_snapshot()
+
+        self.assertEqual(snapshot["status"], "no_token_events_yet")
+        self.assertEqual(snapshot["events"], 0)
+        self.assertEqual(snapshot["tokens"]["all"], 0)
+        self.assertEqual(snapshot["sources"]["hookFiles"], 1)
+
+    def test_classify_kimi_and_grok_cli_processes(self) -> None:
+        self.assertEqual(agentcat.classify_process("kimi-code"), "kimi")
+        self.assertEqual(agentcat.classify_process("/Users/me/.kimi-code/bin/kimi-code"), "kimi")
+        self.assertEqual(agentcat.classify_process("grok --prompt hello"), "grok")
+        self.assertEqual(agentcat.classify_process("grock --prompt hello"), "grok")
+
     def test_opencode_snapshot_reads_sqlite_message_tokens(self) -> None:
         data_home = agentcat.HOME / ".local" / "share"
         opencode_dir = data_home / "opencode"
