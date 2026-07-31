@@ -1,5 +1,7 @@
 import importlib.util
 import io
+import hashlib
+import subprocess
 import datetime as dt
 import json
 import sqlite3
@@ -906,9 +908,11 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["update"]["channel"]["channel"], "public")
 
     def test_update_channel_manifest_validation_and_snapshot_status(self) -> None:
+        # Must be ahead of the running connector, otherwise the downgrade guard
+        # (correctly) reports "current" instead of scheduling an install.
         manifest = {
-            "version": "26.26.0",
-            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.26.0",
+            "version": "99.0.0",
+            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/99.0.0",
             "sha256": "a" * 64,
             "minAppVersion": "26.26.0",
             "channel": "pro",
@@ -920,9 +924,150 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(state["status"], "manifest_ready")
         self.assertEqual(state["installStatus"], "pending_install")
         self.assertEqual(status["channel"], "pro")
-        self.assertEqual(status["targetVersion"], "26.26.0")
+        self.assertEqual(status["targetVersion"], "99.0.0")
         self.assertEqual(status["installStatus"], "pending_install")
         self.assertTrue(agentcat.update_channel_state_file().exists())
+
+    def test_update_channel_refuses_to_pend_on_a_downgrade(self) -> None:
+        # The issue #40 case: backend served 26.27.0 while a newer connector was
+        # installed, and the channel parked on pending_install pointing back.
+        manifest = {
+            "version": "1.0.0",
+            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/1.0.0",
+            "sha256": "a" * 64,
+            "channel": "pro",
+        }
+
+        state = agentcat.write_update_channel_state("pro", manifest)
+
+        self.assertEqual(state["status"], "current")
+        self.assertEqual(state["installStatus"], "current")
+
+    def test_update_channel_treats_same_version_as_current(self) -> None:
+        manifest = {
+            "version": agentcat.CONNECTOR_VERSION,
+            "downloadUrl": f"https://api.agentcat.app/v1/pro/connector/download/{agentcat.CONNECTOR_VERSION}",
+            "sha256": "a" * 64,
+            "channel": "pro",
+        }
+
+        state = agentcat.write_update_channel_state("pro", manifest)
+
+        self.assertEqual(state["installStatus"], "current")
+
+    # --- Pro channel install handoff (issue #40) ---
+    #
+    # Before this, write_update_channel_state recorded pending_install and
+    # nothing ever downloaded the archive or ran the installer.
+
+    def _pro_manifest(self) -> dict:
+        return {
+            "version": "99.0.0",
+            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/99.0.0",
+            "sha256": "b" * 64,
+            "channel": "pro",
+        }
+
+    def _prepare_pro_channel(self) -> dict:
+        manifest = self._pro_manifest()
+        agentcat.write_update_channel_state("pro", manifest)
+        return manifest
+
+    def test_pro_install_reports_checksum_mismatch(self) -> None:
+        manifest = self._prepare_pro_channel()
+
+        def fake_download(_manifest, _token, destination):
+            destination.write_bytes(b"not the promised archive")
+
+        with patch.object(agentcat, "download_pro_connector_archive", fake_download):
+            state = agentcat.perform_pro_channel_install(manifest, "scoped-token")
+
+        self.assertEqual(state["installStatus"], "checksum_mismatch")
+        self.assertIn("checksum", state["installError"])
+
+    def test_pro_install_reports_download_failure(self) -> None:
+        manifest = self._prepare_pro_channel()
+
+        def fake_download(_manifest, _token, _destination):
+            raise urllib.error.HTTPError(manifest["downloadUrl"], 403, "Forbidden", None, None)
+
+        with patch.object(agentcat, "download_pro_connector_archive", fake_download):
+            state = agentcat.perform_pro_channel_install(manifest, "scoped-token")
+
+        self.assertEqual(state["installStatus"], "download_failed")
+        self.assertTrue(state["installError"])
+
+    def test_pro_install_reports_installer_failure_with_stderr(self) -> None:
+        manifest = self._prepare_pro_channel()
+        payload = b"archive"
+        manifest["sha256"] = hashlib.sha256(payload).hexdigest()
+
+        def fake_download(_manifest, _token, destination):
+            destination.write_bytes(payload)
+
+        completed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="swap refused")
+        with patch.object(agentcat, "download_pro_connector_archive", fake_download), \
+                patch.object(agentcat.subprocess, "run", return_value=completed):
+            state = agentcat.perform_pro_channel_install(manifest, "scoped-token")
+
+        self.assertEqual(state["installStatus"], "install_failed")
+        self.assertIn("swap refused", state["installError"])
+
+    def test_pro_install_success_records_version_and_restarts(self) -> None:
+        manifest = self._prepare_pro_channel()
+        payload = b"archive"
+        manifest["sha256"] = hashlib.sha256(payload).hexdigest()
+
+        def fake_download(_manifest, _token, destination):
+            destination.write_bytes(payload)
+
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="{}", stderr="")
+        restarted = []
+        with patch.object(agentcat, "download_pro_connector_archive", fake_download), \
+                patch.object(agentcat.subprocess, "run", return_value=completed), \
+                patch.object(agentcat, "restart_agentcatd", lambda: restarted.append(True) or True):
+            state = agentcat.perform_pro_channel_install(manifest, "scoped-token")
+
+        self.assertEqual(state["installStatus"], "installed")
+        self.assertEqual(state["installedVersion"], "99.0.0")
+        self.assertEqual(restarted, [True])
+        # The manifest must survive the status transition.
+        self.assertEqual(state["manifest"]["version"], "99.0.0")
+
+    def test_pro_install_download_sends_scoped_bearer(self) -> None:
+        manifest = self._pro_manifest()
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def read(self, *_args):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["auth"] = request.get_header("Authorization")
+            return FakeResponse()
+
+        with patch.object(agentcat.urllib.request, "urlopen", fake_urlopen), \
+                patch.object(agentcat.shutil, "copyfileobj", lambda *a, **k: None):
+            agentcat.download_pro_connector_archive(manifest, "scoped-token", self.root / "archive.tar.gz")
+
+        self.assertEqual(captured["auth"], "Bearer scoped-token")
+
+    def test_pro_install_status_appears_in_channel_snapshot(self) -> None:
+        self._prepare_pro_channel()
+        agentcat.update_pro_install_status("download_failed", installError="HTTP 403")
+
+        status = agentcat.update_channel_status_snapshot()
+
+        self.assertEqual(status["installStatus"], "download_failed")
+        self.assertEqual(status["installError"], "HTTP 403")
 
     def test_update_channel_rejects_insecure_or_bad_manifest(self) -> None:
         manifest = {
@@ -4042,6 +4187,44 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(cost["cache_write"], 12.5)
         self.assertEqual(cost["total"], 73.5)
 
+    def test_gpt_5_6_current_rates_aliases_and_long_context(self) -> None:
+        expected = {
+            "gpt-5.6": (5.0, 30.0, 0.5, 6.25),
+            "gpt-5.6-sol": (5.0, 30.0, 0.5, 6.25),
+            "gpt-5.6-terra": (2.0, 12.0, 0.2, 2.5),
+            "gpt-5.6-luna": (0.2, 1.2, 0.02, 0.25),
+        }
+        for model, rates in expected.items():
+            with self.subTest(model=model):
+                cost = agentcat.estimate_cost(
+                    model,
+                    input_tokens=1_000_000,
+                    output_tokens=1_000_000,
+                    cache_read_tokens=1_000_000,
+                    cache_write_tokens=1_000_000,
+                )
+                self.assertEqual(cost["input"], rates[0])
+                self.assertEqual(cost["output"], rates[1])
+                self.assertEqual(cost["cache_read"], rates[2])
+                self.assertEqual(cost["cache_write"], rates[3])
+
+        below = agentcat.estimate_cost(
+            "gpt-5.6-terra", 1_000_000, 1_000_000, 1_000_000, 1_000_000,
+            context_tokens=272_000,
+        )
+        self.assertEqual(
+            (below["input"], below["output"], below["cache_read"], below["cache_write"]),
+            expected["gpt-5.6-terra"],
+        )
+        above = agentcat.estimate_cost(
+            "gpt-5.6-terra", 1_000_000, 1_000_000, 1_000_000, 1_000_000,
+            context_tokens=272_001,
+        )
+        self.assertEqual(
+            (above["input"], above["output"], above["cache_read"], above["cache_write"]),
+            (4.0, 18.0, 0.4, 5.0),
+        )
+
     def test_cache_read_is_cheaper_than_input(self) -> None:
         cost = agentcat.estimate_cost(
             "claude-opus-4-7",
@@ -4198,6 +4381,31 @@ class PricingFeedTests(unittest.TestCase):
             table["claude-haiku-4-5"]["input"],
             agentcat.MODEL_PRICING["claude-haiku-4-5"]["input"],
         )
+
+    def test_official_price_cut_overrides_stale_litellm_rates(self) -> None:
+        payload = self._write_cache()
+        payload["models"]["gpt-5.6-terra"] = {
+            "input": 2.5,
+            "output": 15.0,
+            "cache_read": 0.25,
+            "cache_write": 3.125,
+        }
+        payload["models"]["gpt-5.6-luna"] = {
+            "input": 1.0,
+            "output": 6.0,
+            "cache_read": 0.1,
+            "cache_write": 1.25,
+        }
+        agentcat.write_json_atomic(self.cache_path, payload)
+        agentcat._PRICING_TABLE_MEMO = None
+
+        table, meta = agentcat.merged_pricing_table()
+
+        self.assertEqual(meta["source"], "litellm")
+        self.assertEqual(table["gpt-5.6-terra"]["input"], 2.0)
+        self.assertEqual(table["gpt-5.6-terra"]["output"], 12.0)
+        self.assertEqual(table["gpt-5.6-luna"]["input"], 0.2)
+        self.assertEqual(table["gpt-5.6-luna"]["output"], 1.2)
 
     def test_fetch_failure_keeps_existing_cache(self) -> None:
         stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat().replace("+00:00", "Z")
