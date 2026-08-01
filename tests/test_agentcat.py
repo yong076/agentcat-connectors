@@ -4042,6 +4042,44 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(cost["cache_write"], 12.5)
         self.assertEqual(cost["total"], 73.5)
 
+    def test_gpt_5_6_current_rates_aliases_and_long_context(self) -> None:
+        expected = {
+            "gpt-5.6": (5.0, 30.0, 0.5, 6.25),
+            "gpt-5.6-sol": (5.0, 30.0, 0.5, 6.25),
+            "gpt-5.6-terra": (2.0, 12.0, 0.2, 2.5),
+            "gpt-5.6-luna": (0.2, 1.2, 0.02, 0.25),
+        }
+        for model, rates in expected.items():
+            with self.subTest(model=model):
+                cost = agentcat.estimate_cost(
+                    model,
+                    input_tokens=1_000_000,
+                    output_tokens=1_000_000,
+                    cache_read_tokens=1_000_000,
+                    cache_write_tokens=1_000_000,
+                )
+                self.assertEqual(cost["input"], rates[0])
+                self.assertEqual(cost["output"], rates[1])
+                self.assertEqual(cost["cache_read"], rates[2])
+                self.assertEqual(cost["cache_write"], rates[3])
+
+        below = agentcat.estimate_cost(
+            "gpt-5.6-terra", 1_000_000, 1_000_000, 1_000_000, 1_000_000,
+            context_tokens=272_000,
+        )
+        self.assertEqual(
+            (below["input"], below["output"], below["cache_read"], below["cache_write"]),
+            expected["gpt-5.6-terra"],
+        )
+        above = agentcat.estimate_cost(
+            "gpt-5.6-terra", 1_000_000, 1_000_000, 1_000_000, 1_000_000,
+            context_tokens=272_001,
+        )
+        self.assertEqual(
+            (above["input"], above["output"], above["cache_read"], above["cache_write"]),
+            (4.0, 18.0, 0.4, 5.0),
+        )
+
     def test_cache_read_is_cheaper_than_input(self) -> None:
         cost = agentcat.estimate_cost(
             "claude-opus-4-7",
@@ -4198,6 +4236,31 @@ class PricingFeedTests(unittest.TestCase):
             table["claude-haiku-4-5"]["input"],
             agentcat.MODEL_PRICING["claude-haiku-4-5"]["input"],
         )
+
+    def test_official_price_cut_overrides_stale_litellm_rates(self) -> None:
+        payload = self._write_cache()
+        payload["models"]["gpt-5.6-terra"] = {
+            "input": 2.5,
+            "output": 15.0,
+            "cache_read": 0.25,
+            "cache_write": 3.125,
+        }
+        payload["models"]["gpt-5.6-luna"] = {
+            "input": 1.0,
+            "output": 6.0,
+            "cache_read": 0.1,
+            "cache_write": 1.25,
+        }
+        agentcat.write_json_atomic(self.cache_path, payload)
+        agentcat._PRICING_TABLE_MEMO = None
+
+        table, meta = agentcat.merged_pricing_table()
+
+        self.assertEqual(meta["source"], "litellm")
+        self.assertEqual(table["gpt-5.6-terra"]["input"], 2.0)
+        self.assertEqual(table["gpt-5.6-terra"]["output"], 12.0)
+        self.assertEqual(table["gpt-5.6-luna"]["input"], 0.2)
+        self.assertEqual(table["gpt-5.6-luna"]["output"], 1.2)
 
     def test_fetch_failure_keeps_existing_cache(self) -> None:
         stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat().replace("+00:00", "Z")
