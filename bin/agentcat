@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8535,14 +8536,222 @@ def write_update_channel_state(channel: str, manifest: Optional[Dict[str, Any]] 
     if channel == "pro":
         if manifest is None:
             raise ValueError("pro channel requires a connector manifest")
-        state["manifest"] = validate_pro_connector_manifest(manifest)
-        state["status"] = "manifest_ready"
-        state["installStatus"] = "pending_install"
+        normalized = validate_pro_connector_manifest(manifest)
+        state["manifest"] = normalized
+        # Never record a pending install for a target that isn't ahead of what
+        # is already running. The Pro backend has served a stale version before
+        # (26.27.0 against an installed 26.28.12), which parked the channel on
+        # `pending_install` pointing backwards with nothing able to clear it.
+        if connector_version_key(normalized["version"]) <= connector_version_key(CONNECTOR_VERSION):
+            state["status"] = "current"
+            state["installStatus"] = "current"
+        else:
+            state["status"] = "manifest_ready"
+            # `pending_install` now means an install is actually scheduled; the
+            # caller flips this to a running or terminal state.
+            state["installStatus"] = "pending_install"
     else:
         state["status"] = "public"
         state["installStatus"] = "current"
     write_json_atomic(update_channel_state_file(), state)
     return state
+
+
+# --- Pro channel install -----------------------------------------------------
+#
+# The app hands us an entitlement-gated manifest plus a short-lived, manifest-
+# scoped download token. We fetch the archive, verify it against the manifest
+# checksum, hand it to the safe-swap installer, and restart the daemon. The
+# token is used once and never written to disk or logs.
+
+PRO_INSTALL_TERMINAL_STATUSES = {
+    "installed",
+    "current",
+    "download_failed",
+    "checksum_mismatch",
+    "install_failed",
+    "install_blocked",
+}
+
+_pro_install_lock = threading.Lock()
+_pro_install_running = False
+
+
+def pro_channel_installer_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "scripts" / "pro_channel_install.py"
+
+
+def update_pro_install_status(install_status: str, **extra: Any) -> Dict[str, Any]:
+    """Patch install status onto the persisted channel state.
+
+    Deliberately merges rather than rewrites: the manifest and channel written
+    by write_update_channel_state must survive a status transition.
+    """
+    state = read_update_channel_state()
+    if not state:
+        return {}
+    state["installStatus"] = install_status
+    state["installUpdatedAt"] = now_iso()
+    for key, value in extra.items():
+        if value is None:
+            state.pop(key, None)
+        else:
+            state[key] = value
+    write_json_atomic(update_channel_state_file(), state)
+    return state
+
+
+def download_pro_connector_archive(
+    manifest: Dict[str, Any],
+    download_token: Optional[str],
+    destination: Path,
+) -> None:
+    """Fetch the archive to `destination`. Raises on transport failure.
+
+    The bearer never reaches a log line: urllib errors carry the URL, not the
+    headers, and we re-raise with our own message.
+    """
+    request = urllib.request.Request(manifest["downloadUrl"], method="GET")
+    request.add_header("Accept", "application/octet-stream")
+    request.add_header("User-Agent", f"agentcatd/{CONNECTOR_VERSION}")
+    if download_token:
+        request.add_header("Authorization", f"Bearer {download_token}")
+    with urllib.request.urlopen(request, timeout=120) as response:
+        status = getattr(response, "status", 200)
+        if status != 200:
+            raise ValueError(f"download returned HTTP {status}")
+        with destination.open("wb") as handle:
+            shutil.copyfileobj(response, handle, 1024 * 1024)
+
+
+def sha256_of_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def restart_agentcatd() -> bool:
+    """Ask launchd to restart us so the swapped-in code takes over.
+
+    Best-effort: a failure here leaves the new code installed and picked up on
+    the next natural start, so it must not fail the install.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        uid = os.getuid()
+        result = subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{uid}/com.trappist.agentcatd"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def perform_pro_channel_install(manifest: Dict[str, Any], download_token: Optional[str]) -> Dict[str, Any]:
+    """Download -> verify -> swap -> restart, recording a concrete state at
+    every failure so the channel can never sit on `pending_install` forever."""
+    installer = pro_channel_installer_path()
+    if not installer.exists():
+        return update_pro_install_status(
+            "install_blocked",
+            installError="pro_channel_install.py is missing from this connector",
+        )
+
+    workdir = Path(tempfile.mkdtemp(prefix="agentcat-pro-"))
+    archive = workdir / f"agentcat-connectors-v{manifest['version']}.tar.gz"
+    manifest_path = workdir / "manifest.json"
+    try:
+        update_pro_install_status("downloading", installError=None)
+        try:
+            download_pro_connector_archive(manifest, download_token, archive)
+        except Exception as exc:
+            return update_pro_install_status(
+                "download_failed",
+                installError=_redact_paths(str(exc))[:400],
+            )
+
+        actual = sha256_of_file(archive)
+        if actual != manifest["sha256"]:
+            return update_pro_install_status(
+                "checksum_mismatch",
+                installError="archive checksum did not match the manifest",
+            )
+
+        update_pro_install_status("installing")
+        write_json_atomic(manifest_path, manifest)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(installer),
+                    "--archive",
+                    str(archive),
+                    "--manifest",
+                    str(manifest_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except Exception as exc:
+            return update_pro_install_status(
+                "install_failed",
+                installError=_redact_paths(str(exc))[:400],
+            )
+
+        if result.returncode != 0:
+            return update_pro_install_status(
+                "install_failed",
+                installError=_redact_paths((result.stderr or "").strip())[:400] or
+                f"installer exited {result.returncode}",
+            )
+
+        state = update_pro_install_status(
+            "installed",
+            status="installed",
+            installedVersion=manifest["version"],
+            installError=None,
+        )
+        restart_agentcatd()
+        return state
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def schedule_pro_channel_install(manifest: Dict[str, Any], download_token: Optional[str]) -> bool:
+    """Run the install off the request thread. Returns False when one is
+    already in flight, so a repeated 'prepare' press can't start a second
+    swap over the first."""
+    global _pro_install_running
+    with _pro_install_lock:
+        if _pro_install_running:
+            return False
+        _pro_install_running = True
+
+    def run() -> None:
+        global _pro_install_running
+        try:
+            perform_pro_channel_install(manifest, download_token)
+        except Exception as exc:
+            try:
+                update_pro_install_status(
+                    "install_failed",
+                    installError=_redact_paths(str(exc))[:400],
+                )
+            except Exception:
+                pass
+        finally:
+            with _pro_install_lock:
+                _pro_install_running = False
+
+    threading.Thread(target=run, name="pro-channel-install", daemon=True).start()
+    return True
 
 
 def update_channel_status_snapshot() -> Dict[str, Any]:
@@ -8551,7 +8760,7 @@ def update_channel_status_snapshot() -> Dict[str, Any]:
     if channel == "pro":
         manifest = raw.get("manifest")
         if isinstance(manifest, dict):
-            return {
+            snapshot = {
                 "channel": "pro",
                 "status": raw.get("status") or "manifest_ready",
                 "installStatus": raw.get("installStatus") or "pending_install",
@@ -8560,6 +8769,12 @@ def update_channel_status_snapshot() -> Dict[str, Any]:
                 "minAppVersion": manifest.get("minAppVersion"),
                 "updatedAt": raw.get("updatedAt"),
             }
+            # Surface why an install stopped, so a failure is visible instead of
+            # looking like a permanent "pending".
+            for key in ("installUpdatedAt", "installedVersion", "installError"):
+                if raw.get(key):
+                    snapshot[key] = raw[key]
+            return snapshot
         return {
             "channel": "pro",
             "status": "invalid_manifest",
@@ -9260,7 +9475,32 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(500, {"error": "update_channel_failed", "message": str(exc)})
                 return
-            self.send_json(200, {"ok": True, "channel": update_channel_status_snapshot(), "state": state})
+            # Recording the manifest was never enough on its own: nothing
+            # downloaded it or ran the safe-swap installer, so the channel sat
+            # on `pending_install` forever. Start the install here.
+            scheduled = False
+            if state.get("installStatus") == "pending_install":
+                raw_token = payload.get("downloadToken")
+                token = raw_token.strip() if isinstance(raw_token, str) and raw_token.strip() else None
+                if token:
+                    scheduled = schedule_pro_channel_install(state["manifest"], token)
+                else:
+                    # The Pro archive is entitlement-gated, so without a scoped
+                    # download token there is nothing to try. Say that rather
+                    # than leaving the channel parked on `pending_install`.
+                    update_pro_install_status(
+                        "install_blocked",
+                        installError="download token required",
+                    )
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "channel": update_channel_status_snapshot(),
+                    "state": state,
+                    "installScheduled": scheduled,
+                },
+            )
             return
 
         if path != "/v1/events":
