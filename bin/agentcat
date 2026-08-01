@@ -89,7 +89,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.30.2")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.31.0")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -189,15 +189,66 @@ TOKEN_CLASS_KEYS = (
 #   cache_read   — tokens served from prompt cache (typically much cheaper)
 #   cache_write  — tokens written into prompt cache (≈ input or slightly more)
 #
-# Source: public provider pricing pages as of 2026-05. Estimates only —
+# Source: public provider pricing pages through 2026-07. Estimates only —
 # never bill from these. Unknown models intentionally return None so the
 # caller emits a `pricing_missing` finding instead of silently guessing.
-MODEL_PRICING: Dict[str, Dict[str, float]] = {
+_GPT_5_6_SOL_PRICING: Dict[str, Any] = {
+    "input": 5.0,
+    "output": 30.0,
+    "cache_read": 0.5,
+    "cache_write": 6.25,
+    "tiers": [{
+        "threshold": 272_001,
+        "input": 10.0,
+        "output": 45.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5,
+    }],
+}
+_GPT_5_6_TERRA_PRICING: Dict[str, Any] = {
+    "input": 2.0,
+    "output": 12.0,
+    "cache_read": 0.2,
+    "cache_write": 2.5,
+    "tiers": [{
+        "threshold": 272_001,
+        "input": 4.0,
+        "output": 18.0,
+        "cache_read": 0.4,
+        "cache_write": 5.0,
+    }],
+}
+_GPT_5_6_LUNA_PRICING: Dict[str, Any] = {
+    "input": 0.2,
+    "output": 1.2,
+    "cache_read": 0.02,
+    "cache_write": 0.25,
+    "tiers": [{
+        "threshold": 272_001,
+        "input": 0.4,
+        "output": 1.8,
+        "cache_read": 0.04,
+        "cache_write": 0.5,
+    }],
+}
+
+# The public LiteLLM feed can lag provider price cuts. Keep only the models
+# with a newer verified provider rate here and apply them after the feed.
+# `gpt-5.6` is OpenAI's alias for GPT-5.6 Sol.
+OFFICIAL_PRICING_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "gpt-5.6": _GPT_5_6_SOL_PRICING,
+    "gpt-5.6-sol": _GPT_5_6_SOL_PRICING,
+    "gpt-5.6-terra": _GPT_5_6_TERRA_PRICING,
+    "gpt-5.6-luna": _GPT_5_6_LUNA_PRICING,
+}
+
+MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # OpenAI / Codex
     "gpt-5":         {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": 1.25},
     "gpt-5-mini":    {"input": 0.25, "output": 2.0,  "cache_read": 0.025, "cache_write": 0.25},
     "gpt-5.5":       {"input": 2.5,  "output": 15.0, "cache_read": 0.25,  "cache_write": 2.5},
     "gpt-5.5-mini":  {"input": 0.3,  "output": 2.4,  "cache_read": 0.03,  "cache_write": 0.3},
+    **OFFICIAL_PRICING_OVERRIDES,
     "o3":            {"input": 4.0,  "output": 16.0, "cache_read": 0.4,   "cache_write": 4.0},
     "o3-mini":       {"input": 0.55, "output": 2.2,  "cache_read": 0.055, "cache_write": 0.55},
     "o4-mini":       {"input": 0.55, "output": 2.2,  "cache_read": 0.055, "cache_write": 0.55},
@@ -482,12 +533,12 @@ def refresh_litellm_pricing(force: bool = False) -> Dict[str, Any]:
 
 
 def merged_pricing_table() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """Bundled MODEL_PRICING overlaid with the cached LiteLLM feed.
+    """Bundled pricing overlaid with the feed and current official overrides.
 
-    LiteLLM rates win for models present in both (fresher data); bundled
-    entries remain as the override for models LiteLLM lacks. Memoized on the
-    cache file's (path, mtime, size) so per-snapshot cost estimation does not
-    re-parse the cache JSON.
+    LiteLLM rates normally win for models present in both. A small provider-
+    verified override set is applied last so a lagging community feed cannot
+    undo a newly announced price cut. Memoized on the cache file's (path,
+    mtime, size) so per-snapshot cost estimation does not re-parse the cache.
     """
     global _PRICING_TABLE_MEMO
     path = pricing_cache_file()
@@ -507,6 +558,7 @@ def merged_pricing_table() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
         meta = {"source": "litellm", "fetchedAt": cache.get("fetchedAt")}
     else:
         meta = {"source": "bundled", "fetchedAt": None}
+    table.update(OFFICIAL_PRICING_OVERRIDES)
     with _PRICING_TABLE_LOCK:
         _PRICING_TABLE_MEMO = (key, table, meta)
     return table, meta
