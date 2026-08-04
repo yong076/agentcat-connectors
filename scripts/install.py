@@ -24,7 +24,9 @@ BIN_PATH = LOCAL_BIN / ("agentcat.cmd" if IS_WINDOWS else "agentcat")
 PLIST_PATH = HOME / "Library" / "LaunchAgents" / "com.trappist.agentcatd.plist"
 LABEL = "com.trappist.agentcatd"
 WINDOWS_TASK_NAME = "AgentCatD"
-WINDOWS_STARTUP_SCRIPT = (
+WINDOWS_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+WINDOWS_RUN_VALUE = "AgentCatD"
+WINDOWS_LEGACY_STARTUP_SCRIPT = (
     Path(os.environ.get("APPDATA", HOME / "AppData" / "Roaming"))
     / "Microsoft"
     / "Windows"
@@ -275,6 +277,27 @@ Get-CimInstance Win32_Process |
     run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
 
 
+def remove_windows_run_entry() -> None:
+    result = run(
+        [
+            "reg.exe",
+            "delete",
+            WINDOWS_RUN_KEY,
+            "/v",
+            WINDOWS_RUN_VALUE,
+            "/f",
+        ]
+    )
+    if result.returncode == 0:
+        log(f"removed Windows startup entry {WINDOWS_RUN_VALUE}")
+
+
+def remove_legacy_windows_startup_script() -> None:
+    if WINDOWS_LEGACY_STARTUP_SCRIPT.exists():
+        WINDOWS_LEGACY_STARTUP_SCRIPT.unlink()
+        log(f"removed legacy Windows startup script {WINDOWS_LEGACY_STARTUP_SCRIPT}")
+
+
 def load_windows_daemon() -> None:
     task_command = f'cmd.exe /d /c ""{BIN_PATH}" daemon"'
     result = run(
@@ -292,15 +315,33 @@ def load_windows_daemon() -> None:
     )
     if result.returncode == 0:
         log(f"registered Windows startup task {WINDOWS_TASK_NAME}")
+        remove_windows_run_entry()
     else:
-        log(f"Windows startup task registration failed: {result.stderr.strip()}")
-        WINDOWS_STARTUP_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
-        WINDOWS_STARTUP_SCRIPT.write_text(
-            'Set shell = CreateObject("WScript.Shell")\r\n'
-            f'shell.Run """{BIN_PATH}"" daemon", 0, False\r\n',
-            encoding="utf-8",
+        task_error = result.stderr.strip() or f"exit code {result.returncode}"
+        log(f"Windows startup task registration failed: {task_error}")
+        run_command = f'cmd.exe /d /c ""{_windows_shim_path(BIN_PATH)}" daemon"'
+        fallback = run(
+            [
+                "reg.exe",
+                "add",
+                WINDOWS_RUN_KEY,
+                "/v",
+                WINDOWS_RUN_VALUE,
+                "/t",
+                "REG_EXPAND_SZ",
+                "/d",
+                run_command,
+                "/f",
+            ]
         )
-        log(f"registered Windows startup script {WINDOWS_STARTUP_SCRIPT}")
+        if fallback.returncode != 0:
+            fallback_error = fallback.stderr.strip() or f"exit code {fallback.returncode}"
+            raise RuntimeError(
+                "Could not register agentcatd for Windows startup. "
+                f"Scheduled Task: {task_error}; HKCU Run: {fallback_error}"
+            )
+        log(f"registered Windows startup entry {WINDOWS_RUN_VALUE}")
+    remove_legacy_windows_startup_script()
     stop_windows_daemon()
     start_windows_daemon()
 
@@ -308,10 +349,9 @@ def load_windows_daemon() -> None:
 def unload_windows_daemon() -> None:
     run(["schtasks.exe", "/End", "/TN", WINDOWS_TASK_NAME])
     run(["schtasks.exe", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
+    remove_windows_run_entry()
     stop_windows_daemon()
-    if WINDOWS_STARTUP_SCRIPT.exists():
-        WINDOWS_STARTUP_SCRIPT.unlink()
-        log(f"removed {WINDOWS_STARTUP_SCRIPT}")
+    remove_legacy_windows_startup_script()
 
 
 def unload_launch_agent() -> None:

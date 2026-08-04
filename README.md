@@ -124,7 +124,7 @@ agentcat setup-prompt
 ## What It Installs
 
 - `~/.local/bin/agentcat` or `%USERPROFILE%\.local\bin\agentcat.cmd`: local collector CLI
-- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` or Windows startup task `AgentCatD`: local daemon on `127.0.0.1:8765`
+- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` or Windows startup task `AgentCatD`: local daemon on `127.0.0.1:8765`. If task registration is unavailable, Windows uses the current user's `HKCU Run` entry instead; the installer no longer creates a VBS startup script.
 - `~/.agentcat/events.sqlite`: local event store
 - `~/.agentcat/latest-snapshot.json`: latest normalized usage snapshot
 - timestamped backups under `~/.agentcat/backups/`

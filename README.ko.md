@@ -85,7 +85,7 @@ agentcat setup-prompt
 ## 설치되는 항목
 
 - `~/.local/bin/agentcat` 또는 `%USERPROFILE%\.local\bin\agentcat.cmd`: 로컬 수집기 CLI
-- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` 또는 Windows 시작 작업 `AgentCatD`: `127.0.0.1:8765`에서 동작하는 로컬 daemon
+- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` 또는 Windows 시작 작업 `AgentCatD`: `127.0.0.1:8765`에서 동작하는 로컬 daemon. 작업 등록이 불가능하면 현재 사용자의 `HKCU Run` 항목을 대신 사용하며, 설치 프로그램은 더 이상 VBS 시작 스크립트를 만들지 않습니다.
 - `~/.agentcat/events.sqlite`: 로컬 이벤트 저장소
 - `~/.agentcat/latest-snapshot.json`: 최신 정규화 사용량 스냅샷
 - `~/.agentcat/backups/`: 설정 변경 전 timestamp 백업
