@@ -98,6 +98,30 @@ agentcat setup-prompt
 | Claude Code | 로컬 stats/hooks + Claude Code OAuth usage API | Claude Code OAuth credential이 있으면 5시간, 7일, 모델 quota, 월별 extra credit 남은 양을 표시합니다. |
 | Gemini CLI | 로컬 telemetry + Gemini Code Assist quota API | Google 로그인 Gemini CLI 세션에서 모델별 Code Assist request quota 남은 비율을 표시합니다. |
 
+## Provider 홈이 여러 개인 경우
+
+한 머신에서 provider 사용량이 여러 홈에 나뉘어 저장될 수 있습니다. `$CODEX_HOME`
+/ `$CLAUDE_CONFIG_DIR`로 분리한 두 번째 프로필이거나, 다른 로컬 도구가 기본 홈을
+미러링해 만든 런타임 홈인 경우입니다. 데몬은 실행 작업이 만들어질 때의 환경변수가
+가리키던 홈만 읽으므로 나머지는 보이지 않습니다. 특히 미러가 조용히 최신 세션을
+받지 못하게 되어도 누적 총합은 그럴듯하게 남아 있어서 알아채기 어렵습니다.
+
+`agentcat doctor`는 커넥터가 읽지 않는 홈에 사용량이 있으면 보고하며, 두 경우를
+구분합니다. `untracked_home`(두 번째 프로필)과 `stalled_home`(읽고 있는 홈은 조용해진
+반면 읽지 않는 홈은 계속 늘어나는 상태)입니다. 데몬 실행 작업이 고정한 경로가 현재
+셸과 더 이상 맞지 않으면 `env_drift`로 보고합니다.
+
+```
+agentcat homes                                   # 홈 목록과 읽는 중인 홈 표시
+agentcat homes --provider codex --adopt <경로>    # 해당 홈 집계 시작
+agentcat homes --provider codex --exclude <경로>  # 읽지도 제안하지도 않음
+agentcat homes --provider codex --forget <경로>   # 기본 상태로 되돌림
+```
+
+탐지는 자동이지만 채택은 수동입니다. 홈을 하나 더 읽으면 제품이 보여주는 모든 숫자가
+바뀌므로 명시적 선택으로 남겨 둡니다. 채택된 홈은 inode와 세션 식별자 기준으로 중복
+제거되므로, 세션을 하드링크하거나 복사해 둔 미러도 한 번만 집계됩니다.
+
 ## 개인정보
 
 커넥터는 local-first로 설계되어 있습니다.

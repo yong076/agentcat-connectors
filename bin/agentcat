@@ -131,6 +131,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.projects",
     "usage.coverage",
     "projects.daily",
+    "homes.discovery",
     "pricing.feed",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
@@ -1048,6 +1049,327 @@ def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
         if current is not None:
             return current
     return None
+
+
+# ---------------------------------------------------------------------------
+# Multi-home discovery
+#
+# A provider's usage can live under more than one home on the same machine: a
+# second profile ($CODEX_HOME / $CLAUDE_CONFIG_DIR pointed elsewhere), an
+# app-managed runtime home, or a mirror another tool created. The daemon reads
+# whichever home its environment named when launchd froze that environment at
+# install time, so every other home is invisible — and a mirror that silently
+# stops receiving new sessions looks fine, because the lifetime total it already
+# holds stays plausible.
+#
+# Discovery is automatic; adoption is not. A discovered home is reported by
+# `agentcat doctor` and only counted once the user adopts it. Auto-absorbing
+# would eventually swallow a backup dir or a test fixture and inflate every
+# number the product shows, which costs more trust than the gap it closes.
+# ---------------------------------------------------------------------------
+
+PROVIDER_HOME_SPECS: Dict[str, Dict[str, Any]] = {
+    "codex": {
+        "envVar": "CODEX_HOME",
+        "defaultName": ".codex",
+        "siblingGlob": ".codex*",
+        "usageGlobs": ("sessions/**/*.jsonl", "archived_sessions/**/*.jsonl"),
+        # Markers prove a directory really is a provider home, so a stray
+        # ~/.codex-notes folder never gets offered as a usage source.
+        "markers": ("sessions", "archived_sessions", "auth.json"),
+        # Homes other local tools create by mirroring ~/.codex.
+        "knownRuntimeHomes": ("Library/Application Support/orca/codex-runtime-home/home",),
+    },
+    "claude": {
+        "envVar": "CLAUDE_CONFIG_DIR",
+        "defaultName": ".claude",
+        "siblingGlob": ".claude*",
+        "usageGlobs": ("projects/**/*.jsonl",),
+        "markers": ("projects", "settings.json"),
+        "knownRuntimeHomes": (),
+    },
+}
+
+HOME_DISCOVERY_PROVIDER_IDS = tuple(PROVIDER_HOME_SPECS)
+
+# Discovery is advisory, so it is bounded rather than exhaustive: a home buried
+# under a 13th backup copy is not worth turning `doctor` into a directory walk.
+HOME_DISCOVERY_MAX_CANDIDATES = 12
+# Counting files in a candidate home stops here. Set high because the cap costs
+# accuracy, not just detail: stopping early also stops the newest-file search,
+# and "how recently was this home written to" is the signal that separates a
+# stalled mirror from a second profile. Measured ~100ms for 8.5k files, and the
+# snapshot path is memoized below rather than paying it every tick.
+HOME_DISCOVERY_FILE_CAP = 50000
+# Homes appear and disappear on the order of days, so the 60s snapshot tick must
+# not re-walk them. doctor and the CLI bypass this and always read fresh.
+HOME_DISCOVERY_CACHE_TTL_SECONDS = 600
+
+
+def _stat_quiet(path: Path, cache: Optional[Dict[str, Any]] = None) -> Optional[os.stat_result]:
+    """stat() a path, returning None instead of raising, memoized per scan."""
+    key = str(path)
+    if cache is not None and key in cache:
+        return cache[key]
+    try:
+        result: Optional[os.stat_result] = path.stat()
+    except OSError:
+        result = None
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+_SESSION_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+def _session_identity(path: Path) -> Optional[str]:
+    """Identify the session a usage file holds, from its filename alone.
+
+    Codex names rollouts ``rollout-<timestamp>-<uuid>.jsonl`` and Claude names
+    journals ``<sessionId>.jsonl``; both carry a UUID that is stable across
+    copies of the same session. Returns None when no UUID is present, which
+    means "cannot claim two files are the same session" — never a false match.
+    """
+    match = _SESSION_UUID_RE.search(path.name)
+    return match.group(0).lower() if match else None
+
+
+def dedupe_usage_paths(
+    paths: List[Path],
+    stat_cache: Optional[Dict[str, Any]] = None,
+    match_session_identity: bool = False,
+) -> List[Path]:
+    """Collapse usage files reachable through more than one home.
+
+    Layers, cheapest first:
+
+    1. ``realpath`` — catches symlinked homes.
+    2. ``(st_dev, st_ino)`` — catches hardlinked mirrors, which layer 1 cannot
+       see because both paths are equally real. This is the shape a local mirror
+       of ``~/.codex`` actually takes.
+    3. session identity from the filename — catches true copies (independent
+       inodes holding the same session). The longer file wins, because a stale
+       copy is a truncated snapshot of the live one.
+
+    Layers 1–2 always run: two paths to one inode are the same bytes, so
+    counting both is unambiguously wrong. Layer 3 is a judgement call about two
+    genuinely different files, so it only runs when more than one home is in
+    play (``match_session_identity``) — inside a single home, ``sessions/`` and
+    ``archived_sessions/`` holding the same UUID is a move in progress, not a
+    duplicate to resolve.
+
+    Input order is preserved for the survivors, so callers keep deterministic
+    cursor keys.
+    """
+    seen_identity: Set[Any] = set()
+    by_session: Dict[str, int] = {}
+    kept: List[Optional[Path]] = []
+
+    for path in paths:
+        try:
+            identity: Any = str(path.resolve())
+        except OSError:
+            identity = str(path)
+        stat_result = _stat_quiet(path, stat_cache)
+        if stat_result is not None:
+            identity = (stat_result.st_dev, stat_result.st_ino)
+        if identity in seen_identity:
+            continue
+        seen_identity.add(identity)
+
+        if match_session_identity:
+            session = _session_identity(path)
+            if session is not None:
+                previous_index = by_session.get(session)
+                if previous_index is not None:
+                    previous = kept[previous_index]
+                    previous_stat = _stat_quiet(previous, stat_cache) if previous else None
+                    previous_size = previous_stat.st_size if previous_stat else -1
+                    current_size = stat_result.st_size if stat_result else -1
+                    if current_size > previous_size:
+                        # The live file is longer than the stale copy: swap, keeping
+                        # the discarded one out of the result entirely.
+                        kept[previous_index] = None
+                        by_session[session] = len(kept)
+                        kept.append(path)
+                    continue
+                by_session[session] = len(kept)
+        kept.append(path)
+
+    return [path for path in kept if path is not None]
+
+
+def _home_has_marker(home: Path, spec: Dict[str, Any]) -> bool:
+    for marker in spec.get("markers") or ():
+        if (home / str(marker)).exists():
+            return True
+    return False
+
+
+def home_usage_stats(home: Path, spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Count usage files under a home and date the newest one.
+
+    Bounded by HOME_DISCOVERY_FILE_CAP: this answers "is this home in use, and
+    how recently" for diagnostics, not "how many tokens".
+    """
+    files = 0
+    newest: Optional[float] = None
+    capped = False
+    for pattern in spec.get("usageGlobs") or ():
+        try:
+            for path in home.glob(str(pattern)):
+                if not path.is_file():
+                    continue
+                files += 1
+                stat_result = _stat_quiet(path)
+                if stat_result is not None:
+                    if newest is None or stat_result.st_mtime > newest:
+                        newest = stat_result.st_mtime
+                if files >= HOME_DISCOVERY_FILE_CAP:
+                    capped = True
+                    break
+        except OSError:
+            continue
+        if capped:
+            break
+    return {"files": files, "newestMtime": newest, "capped": capped}
+
+
+def _home_settings(provider: str, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    resolved = agentcat_settings() if settings is None else settings
+    homes = resolved.get("homes")
+    if not isinstance(homes, dict):
+        return {}
+    entry = homes.get(provider)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _home_path_list(entry: Dict[str, Any], key: str) -> List[Path]:
+    raw = entry.get(key)
+    if not isinstance(raw, list):
+        return []
+    paths: List[Path] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            paths.append(Path(item).expanduser())
+    return paths
+
+
+def default_provider_home(provider: str) -> Path:
+    """The home the connector reads today, before any adoption.
+
+    Resolved at call time so it tracks both a swapped module HOME (tests) and an
+    env var injected into the daemon's launch environment.
+    """
+    spec = PROVIDER_HOME_SPECS.get(provider) or {}
+    env_var = spec.get("envVar")
+    override = os.environ.get(str(env_var)) if env_var else None
+    if override:
+        return Path(override).expanduser()
+    return HOME / str(spec.get("defaultName") or f".{provider}")
+
+
+def provider_home_candidates(provider: str) -> List[Dict[str, Any]]:
+    """Every home this provider might be storing usage in, with why we looked.
+
+    Sources, in precedence order: the default/env home the connector already
+    reads, known app-managed runtime homes, then a bounded sibling glob. Each
+    entry is ``{path, source, exists, tracked, excluded, stats}``; discovery
+    never changes what gets counted.
+    """
+    spec = PROVIDER_HOME_SPECS.get(provider)
+    if not spec:
+        return []
+
+    settings_entry = _home_settings(provider)
+    adopted = {str(p.resolve() if p.exists() else p) for p in _home_path_list(settings_entry, "adopted")}
+    excluded = {str(p.resolve() if p.exists() else p) for p in _home_path_list(settings_entry, "excluded")}
+
+    candidates: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    def add(home: Path, source: str) -> None:
+        if len(candidates) >= HOME_DISCOVERY_MAX_CANDIDATES:
+            return
+        try:
+            key = str(home.resolve())
+        except OSError:
+            key = str(home)
+        if key in seen:
+            return
+        exists = home.is_dir()
+        # A non-default candidate has to look like a real provider home; the
+        # default one is always listed so its absence is itself diagnosable.
+        if source != "default" and (not exists or not _home_has_marker(home, spec)):
+            return
+        seen.add(key)
+        candidates.append({
+            "path": home,
+            "source": source,
+            "exists": exists,
+            "tracked": source == "default" or key in adopted,
+            "excluded": key in excluded,
+            "stats": home_usage_stats(home, spec) if exists else {"files": 0, "newestMtime": None, "capped": False},
+        })
+
+    default_home = default_provider_home(provider)
+    add(default_home, "default")
+
+    for relative in spec.get("knownRuntimeHomes") or ():
+        add(HOME / str(relative), "known_runtime")
+
+    for home in _home_path_list(settings_entry, "adopted"):
+        add(home, "adopted")
+
+    sibling_glob = spec.get("siblingGlob")
+    if sibling_glob:
+        try:
+            siblings = sorted(HOME.glob(str(sibling_glob)))
+        except OSError:
+            siblings = []
+        for home in siblings:
+            if home.is_dir():
+                add(home, "sibling")
+
+    return candidates
+
+
+def tracked_provider_homes(provider: str) -> List[Path]:
+    """Homes the connector actually reads: the default one plus adopted ones.
+
+    Excluded homes are dropped even if adopted, so an exclusion is always the
+    stronger signal. With nothing adopted this returns exactly the single home
+    the connector read before multi-home support existed.
+    """
+    default_home = default_provider_home(provider)
+    settings_entry = _home_settings(provider)
+    excluded: Set[str] = set()
+    for home in _home_path_list(settings_entry, "excluded"):
+        try:
+            excluded.add(str(home.resolve()))
+        except OSError:
+            excluded.add(str(home))
+
+    homes: List[Path] = [default_home]
+    seen: Set[str] = set()
+    try:
+        seen.add(str(default_home.resolve()))
+    except OSError:
+        seen.add(str(default_home))
+
+    for home in _home_path_list(settings_entry, "adopted"):
+        try:
+            key = str(home.resolve())
+        except OSError:
+            key = str(home)
+        if key in seen or key in excluded or not home.is_dir():
+            continue
+        seen.add(key)
+        homes.append(home)
+    return homes
 
 
 CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot", "kimi", "grok")
@@ -4602,12 +4924,10 @@ def copilot_vscode_transcript_files() -> List[Path]:
     return out
 
 
-def recent_files(paths: List[Path]) -> List[Path]:
+def recent_files(paths: List[Path], stat_cache: Optional[Dict[str, Any]] = None) -> List[Path]:
     def mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
+        stat_result = _stat_quiet(path, stat_cache)
+        return stat_result.st_mtime if stat_result is not None else 0.0
 
     return sorted(paths, key=mtime, reverse=True)[: max(1, LOCAL_PROVIDER_MAX_FILES)]
 
@@ -4909,14 +5229,20 @@ def codex_home() -> Path:
 
 
 def codex_session_roots() -> List[Path]:
-    """CodexBar-compatible local session roots.
+    """CodexBar-compatible local session roots, across every tracked home.
 
     Codex keeps active logs under ``sessions`` and can move older logs to the
     sibling ``archived_sessions`` directory. Counting only ``sessions`` makes
     heavy users look like they used a tiny fraction of their real 30-day usage.
+
+    With no adopted homes this is the same two directories under the same single
+    home the connector has always read; adopted homes append their own pair.
     """
-    root = codex_home()
-    return [root / "sessions", root / "archived_sessions"]
+    roots: List[Path] = []
+    for home in tracked_provider_homes("codex"):
+        roots.append(home / "sessions")
+        roots.append(home / "archived_sessions")
+    return roots
 
 
 def _codex_empty_raw_totals() -> Dict[str, int]:
@@ -5118,15 +5444,12 @@ def codex_session_token_raw_delta(
 
 
 def codex_session_files() -> List[Path]:
+    homes = tracked_provider_homes("codex")
     roots = [root for root in codex_session_roots() if root.is_dir()]
     if not roots:
         return []
     files: List[Path] = []
     seen: Set[str] = set()
-    # resolve() exists to dedupe aliased paths across overlapping roots; with
-    # a single root plain string keys suffice and skip one realpath syscall
-    # chain per session file (thousands of files on heavy Codex machines).
-    dedupe_resolved = len(roots) > 1
     for root in roots:
         try:
             candidates = [p for p in root.glob("**/*.jsonl") if p.is_file()]
@@ -5134,19 +5457,20 @@ def codex_session_files() -> List[Path]:
             continue
         for path in candidates:
             key = str(path)
-            if dedupe_resolved:
-                try:
-                    key = str(path.resolve())
-                except OSError:
-                    pass
             if key in seen:
                 continue
             seen.add(key)
             files.append(path)
+    # Collapse files reachable through more than one root before anything counts
+    # them. A mirrored home hardlinks its sessions, so the same inode arrives
+    # under two paths and plain string keys would count both. Session-identity
+    # matching only turns on with multiple homes — see dedupe_usage_paths.
+    stat_cache: Dict[str, Any] = {}
+    files = dedupe_usage_paths(files, stat_cache, match_session_identity=len(homes) > 1)
     # Heavy Codex users can exceed the scan cap. Prefer the newest rollouts so
     # today/week windows do not get stranded on old history, then parse the
     # selected files in path order for deterministic cursor updates.
-    files = recent_files(files)
+    files = recent_files(files, stat_cache)
     files.sort(key=lambda p: str(p))
     return files
 
@@ -6434,6 +6758,11 @@ def claude_journal_project_dirs() -> List[Path]:
     agent mode keeps the same JSONL shape under its Application Support
     directory. We only add the nested `.claude/projects` roots; parsing remains
     field allowlisted in parse_claude_usage_line().
+
+    CLI roots come from tracked_provider_homes("claude") and are resolved at
+    call time, so this never audits a different directory than
+    claude_config_dir() reports for credentials under $CLAUDE_CONFIG_DIR. With
+    no adopted homes that is exactly the one root this returned before.
     """
     roots: List[Path] = []
     seen: Set[str] = set()
@@ -6450,7 +6779,8 @@ def claude_journal_project_dirs() -> List[Path]:
         seen.add(resolved)
         roots.append(root)
 
-    add(CLAUDE_PROJECTS_DIR)
+    for home in tracked_provider_homes("claude"):
+        add(home / "projects")
     added_desktop = 0
     for data_root in desktop_app_data_roots("claude"):
         if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
@@ -6466,6 +6796,51 @@ def claude_journal_project_dirs() -> List[Path]:
             if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
                 break
     return roots
+
+
+def claude_journal_files_by_root() -> List[Tuple[Path, List[Path]]]:
+    """Journal files grouped by root, deduped across all roots.
+
+    Every Claude scan walks the same roots, so the dedup has to happen once,
+    globally, and then be handed back per-root — each caller still needs to know
+    which root a file came from to classify it as CLI or desktop usage.
+
+    Session-identity matching (the layer that can drop a file the connector used
+    to count) turns on only when the user has adopted a second Claude home.
+    Desktop roots alone never enable it, so a stock install scans exactly what it
+    scanned before.
+    """
+    roots = claude_journal_project_dirs()
+    if not roots:
+        return []
+
+    ordered: List[Tuple[Path, Path]] = []
+    for root in roots:
+        try:
+            paths = sorted(root.rglob("*.jsonl"))
+        except OSError:
+            continue
+        for path in paths:
+            ordered.append((root, path))
+
+    if len(roots) > 1:
+        multi_home = len(tracked_provider_homes("claude")) > 1
+        survivors = {
+            str(path)
+            for path in dedupe_usage_paths(
+                [path for _root, path in ordered], {}, match_session_identity=multi_home
+            )
+        }
+        ordered = [(root, path) for root, path in ordered if str(path) in survivors]
+
+    grouped: Dict[str, Tuple[Path, List[Path]]] = {}
+    for root, path in ordered:
+        entry = grouped.get(str(root))
+        if entry is None:
+            grouped[str(root)] = (root, [path])
+        else:
+            entry[1].append(path)
+    return list(grouped.values())
 
 
 def _apply_record_to_totals(
@@ -6533,8 +6908,8 @@ def _apply_record_to_totals(
 def rebuild_claude_journal_projects(now: "dt.datetime") -> Dict[str, Dict[str, Any]]:
     projects: Dict[str, Dict[str, Any]] = {}
     scratch_totals = _empty_journal_totals()
-    for root in claude_journal_project_dirs():
-        for path in sorted(root.rglob("*.jsonl")):
+    for _root, paths in claude_journal_files_by_root():
+        for path in paths:
             try:
                 with path.open("rb") as fh:
                     for raw_line in fh:
@@ -6601,8 +6976,8 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         rebuilt = True
         projects.clear()
         projects.update(rebuild_claude_journal_projects(now_utc))
-    for root in project_roots:
-        for path in sorted(root.rglob("*.jsonl")):
+    for _root, paths in claude_journal_files_by_root():
+        for path in paths:
             path_str = str(path)
             try:
                 file_size = path.stat().st_size
@@ -6771,8 +7146,9 @@ def _classify_claude_journal_root(root: Path) -> str:
     ``desktop_app_data_roots("claude")`` path is the desktop app. CLI takes
     precedence when a path somehow matches both.
     """
-    if _path_is_within(root, CLAUDE_PROJECTS_DIR):
-        return "cli"
+    for home in tracked_provider_homes("claude"):
+        if _path_is_within(root, home / "projects"):
+            return "cli"
     for data_root in desktop_app_data_roots("claude"):
         if _path_is_within(root, data_root):
             return "app"
@@ -6823,12 +7199,8 @@ def _claude_journal_signature() -> Tuple:
     the full re-scan on the 60s snapshot tick unless a file actually changed.
     """
     entries = []
-    for root in claude_journal_project_dirs():
+    for root, paths in claude_journal_files_by_root():
         surface = _classify_claude_journal_root(root)
-        try:
-            paths = sorted(root.rglob("*.jsonl"))
-        except OSError:
-            continue
         for path in paths:
             try:
                 stat = path.stat()
@@ -6861,12 +7233,8 @@ def claude_usage_by_source() -> Dict[str, Any]:
             return dict(_CLAUDE_USAGE_BY_SOURCE_VALUE)
 
     per_source: Dict[str, int] = {"cli": 0, "app": 0}
-    for root in claude_journal_project_dirs():
+    for root, paths in claude_journal_files_by_root():
         surface = _classify_claude_journal_root(root)
-        try:
-            paths = sorted(root.rglob("*.jsonl"))
-        except OSError:
-            continue
         for path in paths:
             # A CLI-root journal whose session id was launched from the desktop
             # app is really desktop usage.
@@ -9193,6 +9561,13 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             "latestByProvider": latest_by_provider,
         },
     }
+    # Where each provider's usage lives, and which of those homes we read
+    # (capability "homes.discovery"). Diagnostic only — it never changes what
+    # gets counted — and additive, so older app builds simply ignore it.
+    try:
+        snapshot["homes"] = home_discovery_snapshot()
+    except Exception as exc:
+        logging.debug("home_discovery_snapshot failed: %s", exc)
     # Per-day per-project token deltas (capability "projects.daily").
     # Additive/optional: failure degrades to an absent field and must NOT
     # block the snapshot write.
@@ -9734,6 +10109,192 @@ def _doctor_check(
     return entry
 
 
+LAUNCHD_AGENT_PLIST = HOME / "Library" / "LaunchAgents" / "com.trappist.agentcatd.plist"
+
+# A tracked home whose newest usage file lags an untracked home's by more than
+# this is a stalled mirror, not a quiet week: the user is demonstrably still
+# working, just somewhere the daemon cannot see.
+STALLED_HOME_LAG_SECONDS = 24 * 3600
+
+
+def launchd_environment() -> Dict[str, str]:
+    """Environment variables frozen into the daemon's launchd job.
+
+    The installer captures the environment as it was at install time, so this is
+    what the daemon actually sees — which can differ from the user's current
+    shell for the rest of the machine's life.
+    """
+    if sys.platform != "darwin":
+        return {}
+    try:
+        import plistlib  # stdlib; only macOS diagnostics need it
+
+        with LAUNCHD_AGENT_PLIST.open("rb") as fh:
+            data = plistlib.load(fh)
+    except Exception:
+        return {}
+    env = data.get("EnvironmentVariables") if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    return {str(key): str(value) for key, value in env.items()}
+
+
+def _describe_home_age(newest: Optional[float], now: float) -> str:
+    if not newest:
+        return "no usage files"
+    age = max(0.0, now - newest)
+    if age < 3600:
+        return f"newest {int(age // 60)}m ago"
+    if age < 86400:
+        return f"newest {int(age // 3600)}h ago"
+    return f"newest {int(age // 86400)}d ago"
+
+
+def _describe_home(candidate: Dict[str, Any], now: float) -> str:
+    stats = candidate.get("stats") or {}
+    files = int(stats.get("files") or 0)
+    suffix = "+" if stats.get("capped") else ""
+    return (
+        f"{_tilde(candidate['path'])} ({files}{suffix} files, "
+        f"{_describe_home_age(stats.get('newestMtime'), now)})"
+    )
+
+
+def home_discovery_checks() -> List[Dict[str, Any]]:
+    """Report provider homes that hold usage the connector is not counting.
+
+    Two distinct findings, because they need different urgency:
+    ``untracked_home`` is a second profile we simply have not been told to read,
+    while ``stalled_home`` means the home we DO read has gone quiet while an
+    unread one keeps growing — the silent-leak shape, where the lifetime total
+    still looks plausible so nothing appears wrong.
+    """
+    checks: List[Dict[str, Any]] = []
+    now = time.time()
+
+    for provider in HOME_DISCOVERY_PROVIDER_IDS:
+        candidates = provider_home_candidates(provider)
+        if not candidates:
+            continue
+        active = [c for c in candidates if not c.get("excluded")]
+        tracked = [c for c in active if c.get("tracked")]
+        untracked = [c for c in active if not c.get("tracked") and (c.get("stats") or {}).get("files")]
+        check_id = f"{provider}.homes"
+
+        if not untracked:
+            checks.append(_doctor_check(
+                check_id, "ok",
+                detail=f"{len(tracked)} home(s) tracked, no unread homes found",
+            ))
+            continue
+
+        detail = "; ".join(_describe_home(c, now) for c in untracked[:3])
+        if len(untracked) > 3:
+            detail += f"; +{len(untracked) - 3} more"
+
+        tracked_newest = max((float((c.get("stats") or {}).get("newestMtime") or 0.0) for c in tracked), default=0.0)
+        untracked_newest = max(float((c.get("stats") or {}).get("newestMtime") or 0.0) for c in untracked)
+
+        if untracked_newest - tracked_newest > STALLED_HOME_LAG_SECONDS:
+            tracked_detail = "; ".join(_describe_home(c, now) for c in tracked[:2]) or "none"
+            checks.append(_doctor_check(
+                check_id, "warn", reason="stalled_home",
+                detail=(
+                    f"the home being read has gone quiet while an unread one keeps growing — "
+                    f"reading {tracked_detail}, not reading {detail}"
+                ),
+                fix="adopt_home",
+            ))
+        else:
+            tracked_detail = "; ".join(_describe_home(c, now) for c in tracked[:2]) or "none"
+            checks.append(_doctor_check(
+                check_id, "warn", reason="untracked_home",
+                detail=(
+                    f"usage found in home(s) the connector does not read: {detail} "
+                    f"(currently reading {tracked_detail})"
+                ),
+                fix="adopt_home",
+            ))
+
+    launch_env = launchd_environment()
+    if launch_env:
+        drifted: List[str] = []
+        for provider in HOME_DISCOVERY_PROVIDER_IDS:
+            env_var = (PROVIDER_HOME_SPECS.get(provider) or {}).get("envVar")
+            if not env_var:
+                continue
+            frozen = launch_env.get(str(env_var))
+            if frozen and frozen != (os.environ.get(str(env_var)) or ""):
+                drifted.append(f"{env_var}={_tilde(frozen)}")
+        if drifted:
+            checks.append(_doctor_check(
+                "daemon.env", "warn", reason="env_drift",
+                detail=(
+                    "the daemon's launchd job pins " + ", ".join(drifted)
+                    + " — captured at install time and never refreshed, so it may no "
+                    "longer be where this provider stores usage"
+                ),
+                fix="reinstall_daemon",
+            ))
+
+    return checks
+
+
+_HOME_DISCOVERY_SNAPSHOT_LOCK = threading.Lock()
+_HOME_DISCOVERY_SNAPSHOT_VALUE: Optional[Dict[str, Any]] = None
+_HOME_DISCOVERY_SNAPSHOT_AT = 0.0
+
+
+def home_discovery_snapshot(force: bool = False) -> Dict[str, Any]:
+    """Additive snapshot block describing where each provider's usage lives.
+
+    Purely diagnostic and tilde-relative. Consumers that predate it ignore the
+    key, so adding it cannot break an older app build.
+
+    Memoized for HOME_DISCOVERY_CACHE_TTL_SECONDS: walking every candidate home
+    costs ~100ms per 8.5k files, which is fine on demand but not on every 60s
+    snapshot tick.
+    """
+    global _HOME_DISCOVERY_SNAPSHOT_VALUE, _HOME_DISCOVERY_SNAPSHOT_AT
+    now_monotonic = time.time()
+    if not force:
+        with _HOME_DISCOVERY_SNAPSHOT_LOCK:
+            if (
+                _HOME_DISCOVERY_SNAPSHOT_VALUE is not None
+                and now_monotonic - _HOME_DISCOVERY_SNAPSHOT_AT < HOME_DISCOVERY_CACHE_TTL_SECONDS
+            ):
+                return copy.deepcopy(_HOME_DISCOVERY_SNAPSHOT_VALUE)
+
+    now = time.time()
+    block: Dict[str, Any] = {}
+    for provider in HOME_DISCOVERY_PROVIDER_IDS:
+        candidates = provider_home_candidates(provider)
+        if not candidates:
+            continue
+        block[provider] = {
+            "tracked": [_tilde(home) for home in tracked_provider_homes(provider)],
+            "discovered": [
+                {
+                    "path": _tilde(candidate["path"]),
+                    "source": candidate["source"],
+                    "tracked": bool(candidate.get("tracked")),
+                    "excluded": bool(candidate.get("excluded")),
+                    "files": int((candidate.get("stats") or {}).get("files") or 0),
+                    "newestAgeSeconds": (
+                        int(max(0.0, now - float((candidate.get("stats") or {}).get("newestMtime") or 0.0)))
+                        if (candidate.get("stats") or {}).get("newestMtime")
+                        else None
+                    ),
+                }
+                for candidate in candidates
+            ],
+        }
+    with _HOME_DISCOVERY_SNAPSHOT_LOCK:
+        _HOME_DISCOVERY_SNAPSHOT_VALUE = copy.deepcopy(block)
+        _HOME_DISCOVERY_SNAPSHOT_AT = now_monotonic
+    return block
+
+
 def doctor_report(check_network: bool = False) -> Dict[str, Any]:
     """Diagnose why providers are or aren't detected on this machine.
 
@@ -9838,6 +10399,9 @@ def doctor_report(check_network: bool = False) -> Dict[str, Any]:
     else:
         checks.append(_doctor_check("codex.sessions", "warn", reason="no_local_activity", detail="no Codex session logs yet"))
 
+    # Homes holding usage we are not reading (second profiles, stalled mirrors).
+    checks.extend(home_discovery_checks())
+
     # Gemini telemetry.
     try:
         gemini_size = GEMINI_TELEMETRY.stat().st_size
@@ -9927,6 +10491,154 @@ def write_support_bundle(path: Any, report: Dict[str, Any]) -> None:
     out.write_text(text, encoding="utf-8")
 
 
+def _update_home_settings(provider: str, key: str, home: Path, remove: bool = False) -> bool:
+    """Add or remove a home in ``settings.homes.<provider>.<adopted|excluded>``.
+
+    Returns True when the stored list actually changed, so callers can tell the
+    user "already adopted" instead of implying work happened.
+    """
+    settings = agentcat_settings()
+    homes = settings.get("homes")
+    if not isinstance(homes, dict):
+        homes = {}
+        settings["homes"] = homes
+    entry = homes.get(provider)
+    if not isinstance(entry, dict):
+        entry = {}
+        homes[provider] = entry
+    current = [item for item in (entry.get(key) or []) if isinstance(item, str)]
+
+    target = str(home)
+    normalized = {item: Path(item).expanduser() for item in current}
+    matches = [
+        item for item, path in normalized.items()
+        if str(path) == target or _same_path(path, home)
+    ]
+
+    if remove:
+        if not matches:
+            return False
+        entry[key] = [item for item in current if item not in matches]
+    else:
+        if matches:
+            return False
+        entry[key] = current + [target]
+    write_agentcat_settings(settings)
+    return True
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return str(left) == str(right)
+
+
+def command_homes(args: argparse.Namespace) -> int:
+    """List discovered provider homes, and adopt or exclude one.
+
+    Adoption is deliberately manual: reading an extra home changes every number
+    the product reports, so it is the user's call, not a heuristic's.
+    """
+    provider = getattr(args, "provider", None)
+    if provider and provider not in PROVIDER_HOME_SPECS:
+        print(
+            f"unknown provider '{provider}' (known: {', '.join(PROVIDER_HOME_SPECS)})",
+            file=sys.stderr,
+        )
+        return 2
+    providers = [provider] if provider else list(HOME_DISCOVERY_PROVIDER_IDS)
+
+    adopt = getattr(args, "adopt", None)
+    exclude = getattr(args, "exclude", None)
+    forget = getattr(args, "forget", None)
+    mutation = adopt or exclude or forget
+    if mutation:
+        if not provider:
+            print("--adopt/--exclude/--forget require --provider", file=sys.stderr)
+            return 2
+        home = Path(str(mutation)).expanduser()
+        spec = PROVIDER_HOME_SPECS[provider]
+        if adopt or exclude:
+            if not home.is_dir():
+                print(f"not a directory: {home}", file=sys.stderr)
+                return 2
+            if adopt and not _home_has_marker(home, spec):
+                markers = ", ".join(str(m) for m in spec.get("markers") or ())
+                print(
+                    f"{home} does not look like a {provider} home (expected one of: {markers})",
+                    file=sys.stderr,
+                )
+                return 2
+        if adopt:
+            # An adopted home must not stay on the exclusion list, or the
+            # stronger exclusion would silently cancel the adoption.
+            _update_home_settings(provider, "excluded", home, remove=True)
+            changed = _update_home_settings(provider, "adopted", home)
+            print(f"{'adopted' if changed else 'already adopted'}: {home}")
+        elif exclude:
+            _update_home_settings(provider, "adopted", home, remove=True)
+            changed = _update_home_settings(provider, "excluded", home)
+            print(f"{'excluded' if changed else 'already excluded'}: {home}")
+        else:
+            removed_adopted = _update_home_settings(provider, "adopted", home, remove=True)
+            removed_excluded = _update_home_settings(provider, "excluded", home, remove=True)
+            if removed_adopted or removed_excluded:
+                print(f"forgot: {home}")
+            else:
+                print(f"not adopted or excluded: {home}")
+        return 0
+
+    now = time.time()
+    report: Dict[str, Any] = {}
+    for name in providers:
+        candidates = provider_home_candidates(name)
+        report[name] = {
+            "tracked": [str(home) for home in tracked_provider_homes(name)],
+            "discovered": [
+                {
+                    "path": str(candidate["path"]),
+                    "source": candidate["source"],
+                    "tracked": bool(candidate.get("tracked")),
+                    "excluded": bool(candidate.get("excluded")),
+                    "exists": bool(candidate.get("exists")),
+                    "files": int((candidate.get("stats") or {}).get("files") or 0),
+                    "capped": bool((candidate.get("stats") or {}).get("capped")),
+                    "newestMtime": (candidate.get("stats") or {}).get("newestMtime"),
+                }
+                for candidate in candidates
+            ],
+        }
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    for name in providers:
+        entry = report[name]
+        print(f"{name}:")
+        if not entry["discovered"]:
+            print("  (no homes found)")
+            continue
+        for candidate in entry["discovered"]:
+            if candidate["excluded"]:
+                mark = "excluded"
+            elif candidate["tracked"]:
+                mark = "reading"
+            else:
+                mark = "NOT read"
+            age = _describe_home_age(candidate["newestMtime"], now)
+            files = f"{candidate['files']}{'+' if candidate['capped'] else ''}"
+            print(
+                f"  [{mark:>8}] {candidate['path']}  "
+                f"({files} files, {age}, via {candidate['source']})"
+            )
+        unread = [c for c in entry["discovered"] if not c["tracked"] and not c["excluded"] and c["files"]]
+        if unread:
+            print(f"  → adopt with: agentcat homes --provider {name} --adopt {unread[0]['path']}")
+    return 0
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     report = doctor_report(check_network=bool(getattr(args, "network", False)))
     bundle = getattr(args, "bundle", None)
@@ -10002,6 +10714,14 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--network", action="store_true")
     doctor.add_argument("--bundle")
     doctor.set_defaults(func=command_doctor)
+
+    homes = subparsers.add_parser("homes")
+    homes.add_argument("--provider", choices=sorted(PROVIDER_HOME_SPECS))
+    homes.add_argument("--adopt", help="start reading usage from this home")
+    homes.add_argument("--exclude", help="never read or suggest this home")
+    homes.add_argument("--forget", help="drop this home from both lists")
+    homes.add_argument("--json", action="store_true")
+    homes.set_defaults(func=command_homes)
 
     return parser
 
