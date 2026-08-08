@@ -27,7 +27,21 @@ import urllib.parse
 import urllib.request
 
 
-HOME = Path(os.environ.get("HOME") or str(Path.home())).expanduser().resolve()
+def resolve_user_home_env() -> str:
+    """The user's real home directory, as a string.
+
+    On Windows, Git Bash/MSYS set ``HOME`` to a POSIX-style shell home
+    (``/c/msys/home/alice``) that has none of the provider directories under it.
+    Trusting it there made every provider read as `not_found`, and disagreed
+    with the PowerShell verifier, which uses ``UserProfile``. So Windows prefers
+    ``USERPROFILE`` and only falls back to ``HOME``; POSIX is unchanged.
+    """
+    if os.name == "nt":
+        return os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(Path.home())
+    return os.environ.get("HOME") or str(Path.home())
+
+
+HOME = Path(resolve_user_home_env()).expanduser().resolve()
 AGENTCAT_HOME = Path(os.environ.get("AGENTCAT_HOME") or str(HOME / ".agentcat")).expanduser().resolve()
 IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -65,6 +79,12 @@ GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"""OAUTH_CLIENT_ID\s*[:=]\s*["']([^"']+)
 GEMINI_TELEMETRY_PARSE_BYTES = int(os.environ.get("AGENTCAT_GEMINI_PARSE_BYTES", str(64 * 1024 * 1024)))
 GEMINI_TELEMETRY_STREAM_CHUNK_BYTES = int(os.environ.get("AGENTCAT_GEMINI_STREAM_CHUNK_BYTES", str(4 * 1024 * 1024)))
 GEMINI_USAGE_CACHE_VERSION = 1
+# Truncate an OTEL telemetry log once it passes this size AND has been fully
+# read. Agent Cat owns these files' lifecycle; left alone they grow without
+# bound (8.9 GB observed). 0 disables rotation.
+TELEMETRY_LOG_MAX_BYTES = int(
+    os.environ.get("AGENTCAT_TELEMETRY_LOG_MAX_BYTES") or 512 * 1024 * 1024
+)
 GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECONDS", "10"))
 LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_BYTES", str(16 * 1024 * 1024)))
 LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
@@ -3293,6 +3313,38 @@ def _warn_keychain_once(message: str, *args: Any) -> None:
         _CLAUDE_KEYCHAIN_WARNED = True
 
 
+def claude_api_billing_mode() -> Optional[str]:
+    """Detect a Claude Code install billed through the API, not a subscription.
+
+    These users have no subscription quota to report — correctly so — but the
+    connector used to fold them into ``token_missing``, which reads as "we
+    failed to detect Claude" and is a known share of the "detection works for
+    some users, not others" reports.
+
+    The daemon's own environment is not enough: it inherits whatever the launch
+    job froze, so an ``ANTHROPIC_API_KEY`` exported in the user's shell is
+    invisible to it. Claude Code's own ``settings.json`` env block is checked
+    too, which is where a persistent setup actually lives.
+    """
+    def _from_env(source: Dict[str, Any]) -> Optional[str]:
+        if str(source.get("CLAUDE_CODE_USE_BEDROCK") or "").strip() not in ("", "0", "false"):
+            return "bedrock"
+        if str(source.get("CLAUDE_CODE_USE_VERTEX") or "").strip() not in ("", "0", "false"):
+            return "vertex"
+        if source.get("ANTHROPIC_API_KEY") or source.get("ANTHROPIC_AUTH_TOKEN"):
+            return "api_key"
+        return None
+
+    mode = _from_env(dict(os.environ))
+    if mode:
+        return mode
+    settings = read_json(claude_config_dir() / "settings.json")
+    env_block = settings.get("env") if isinstance(settings, dict) else None
+    if isinstance(env_block, dict):
+        return _from_env(env_block)
+    return None
+
+
 def read_claude_oauth_credentials() -> Dict[str, Any]:
     """Resolve Claude Code OAuth credentials with a machine-readable failure reason.
 
@@ -3300,6 +3352,10 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
     credentials are found, ``reason`` is one of:
       - ``keychain_denied``: the macOS Keychain refused the read (ACL deny,
         locked/headless session) — a distinct, diagnosable state, not "logged out".
+      - ``api_billing``: this install bills through the API (API key, Bedrock or
+        Vertex) rather than a subscription, so there is no subscription quota to
+        read. Not a failure — reporting it as one is what made these users look
+        like "Claude detection is broken".
       - ``token_missing``: no credentials on disk and no OAuth block present.
     """
     candidates: List[Any] = []
@@ -3340,7 +3396,12 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
         if item.get("accessToken") or item.get("access_token"):
             return {"oauth": item, "reason": None}
 
-    return {"oauth": None, "reason": "keychain_denied" if keychain_denied else "token_missing"}
+    if keychain_denied:
+        return {"oauth": None, "reason": "keychain_denied"}
+    billing = claude_api_billing_mode()
+    if billing:
+        return {"oauth": None, "reason": "api_billing", "billingMode": billing}
+    return {"oauth": None, "reason": "token_missing"}
 
 
 def claude_quota_label(key: str) -> str:
@@ -6320,6 +6381,44 @@ def attach_codex_usage_coverage(
     return snapshot
 
 
+def _codex_rebuild_state_file() -> Path:
+    return AGENTCAT_HOME / "codex-rebuild-state.json"
+
+
+def _codex_rebuild_key(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> List[int]:
+    return [_codex_tokens_all(sessions), _codex_tokens_all(sqlite)]
+
+
+def mark_codex_rebuild_ineffective(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> None:
+    """Record that a full rebuild did not close the sessions/sqlite gap.
+
+    The trigger below compares two numbers a rebuild cannot always reconcile: a
+    user who deleted old rollout JSONLs still has lifetime totals in
+    ``state_*.sqlite``, so the gap is permanent. Without this marker the daemon
+    re-parsed the entire sessions corpus (up to 10k files) every 60s forever.
+    """
+    try:
+        write_json_atomic(
+            _codex_rebuild_state_file(), {"ineffectiveKey": _codex_rebuild_key(sessions, sqlite)}
+        )
+    except Exception as exc:
+        logging.debug("could not persist codex rebuild marker: %s", exc)
+
+
+def _codex_rebuild_marked_ineffective(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> bool:
+    raw = read_json(_codex_rebuild_state_file())
+    if not isinstance(raw, dict):
+        return False
+    stored = raw.get("ineffectiveKey")
+    if not isinstance(stored, list):
+        return False
+    # Keyed on both totals: when either moves, the corpus changed and a rebuild
+    # is worth attempting again.
+    return [int(x) for x in stored if isinstance(x, (int, float))] == _codex_rebuild_key(
+        sessions, sqlite
+    )
+
+
 def _codex_sessions_need_rebuild(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> bool:
     if sessions.get("status") != "ok" or sqlite.get("status") != "ok":
         return False
@@ -6327,7 +6426,9 @@ def _codex_sessions_need_rebuild(sessions: Dict[str, Any], sqlite: Dict[str, Any
     sqlite_all = _codex_tokens_all(sqlite)
     if session_all <= 0 or sqlite_all < 10_000_000:
         return False
-    return sqlite_all > session_all * 5
+    if sqlite_all <= session_all * 5:
+        return False
+    return not _codex_rebuild_marked_ineffective(sessions, sqlite)
 
 
 def _merge_int_maps_by_max(primary: Dict[str, Any], fallback: Dict[str, Any]) -> bool:
@@ -6439,12 +6540,17 @@ def codex_snapshot() -> Dict[str, Any]:
     sqlite = codex_sqlite_snapshot()
 
     if _codex_sessions_need_rebuild(sessions, sqlite):
+        before = sessions
         try:
             rebuilt = codex_sessions_snapshot(force_rebuild=True)
             if rebuilt.get("status") == "ok":
                 sessions = rebuilt
         except Exception as exc:
             logging.debug("codex_sessions_snapshot rebuild failed: %s", exc)
+        # If the expensive rebuild left the gap exactly as wide, repeating it
+        # every tick cannot help — the missing tokens are in deleted rollouts.
+        if _codex_tokens_all(sessions) <= _codex_tokens_all(before):
+            mark_codex_rebuild_ineffective(sessions, sqlite)
 
     codexbar_cache = codexbar_cost_cache_snapshot("codex")
     if sessions.get("status") == "ok":
@@ -7538,6 +7644,7 @@ def gemini_snapshot() -> Dict[str, Any]:
                 stat = telemetry_path.stat()
                 state = load_gemini_usage_state(stat, telemetry_path=telemetry_path, cache_path=cache_path)
                 state = scan_gemini_telemetry_state(state, stat, telemetry_path=telemetry_path)
+                state = rotate_telemetry_log_if_oversized(state, telemetry_path)
                 save_gemini_usage_state(state, cache_path=cache_path)
                 usage = gemini_usage_result_from_state(state)
                 usages.append(usage)
@@ -8027,6 +8134,48 @@ def scan_gemini_telemetry_state(
     return state
 
 
+def rotate_telemetry_log_if_oversized(
+    state: Dict[str, Any], telemetry_path: Path
+) -> Dict[str, Any]:
+    """Reclaim the OTEL log once every byte of it has been read.
+
+    Agent Cat configures the CLI to append here, so it owns the file's
+    lifecycle — but nothing ever trimmed it (8.9 GB measured on a dev machine).
+
+    Truncating only when ``offset == size`` guarantees no unread record is
+    destroyed; an unread tail simply defers rotation to a later tick. The
+    accumulated totals are safe because they live in the cache state, not in the
+    log, and ``load_gemini_usage_state`` already treats "offset > size" as a
+    rotation — it rescans from zero, where the ``identities`` dedup map makes
+    recounting a no-op. So this reclaims disk without losing history or
+    double-counting it.
+    """
+    if TELEMETRY_LOG_MAX_BYTES <= 0:
+        return state
+    size = int(state.get("size") or 0)
+    if size < TELEMETRY_LOG_MAX_BYTES:
+        return state
+    if int(state.get("offset") or 0) < size:
+        return state
+    try:
+        with telemetry_path.open("r+b") as fh:
+            fh.truncate(0)
+        stat = telemetry_path.stat()
+    except OSError as exc:
+        # Losing a rotation is survivable; failing the usage scan is not.
+        logging.warning(
+            "agentcat: could not rotate %s: %s", _tilde(telemetry_path), type(exc).__name__
+        )
+        return state
+    logging.info(
+        "agentcat: rotated %s at %d MB (fully read)", _tilde(telemetry_path), size // (1024 * 1024)
+    )
+    state["offset"] = 0
+    state["size"] = int(stat.st_size)
+    state["mtimeNs"] = int(stat.st_mtime_ns)
+    return state
+
+
 def int_map(raw: Any) -> Dict[str, int]:
     out: Dict[str, int] = {}
     if not isinstance(raw, dict):
@@ -8109,117 +8258,6 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
             "size": int(state.get("size") or 0),
         },
     }
-
-
-def antigravity_history_days() -> set:
-    days = set()
-    path = ANTIGRAVITY_CLI_DIR / "history.jsonl"
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return days
-    for line in lines[-2000:]:
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        when = parse_timestamp(payload.get("timestamp"))
-        day = day_key_for_timestamp(when)
-        if day:
-            days.add(day)
-    return days
-
-
-def antigravity_inference_days(activity: Optional[Dict[str, Any]]) -> set:
-    days = antigravity_history_days()
-    counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
-    if isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0 and int(counts.get("gemini") or 0) <= 0:
-        now_utc = dt.datetime.now(dt.timezone.utc)
-        today_utc = day_key_for_timestamp(now_utc)
-        today_local = day_key_for_timestamp(now_utc.astimezone())
-        if today_utc:
-            days.add(today_utc)
-        if today_local:
-            days.add(today_local)
-    return days
-
-
-def _hour_day_key(raw: str) -> str:
-    return str(raw or "")[:10]
-
-
-def filter_google_usage_days(usage: Dict[str, Any], days: set, *, include: bool) -> Dict[str, Any]:
-    daily_tokens = {
-        day: amount
-        for day, amount in int_map(usage.get("dailyTokens")).items()
-        if (day in days) == include
-    }
-    hourly_tokens = {
-        hour: amount
-        for hour, amount in int_map(usage.get("hourlyTokens")).items()
-        if (_hour_day_key(hour) in days) == include
-    }
-    model_daily_raw = usage.get("modelDailyTokens") if isinstance(usage.get("modelDailyTokens"), dict) else {}
-    source_models = usage.get("models") if isinstance(usage.get("models"), dict) else {}
-    models: Dict[str, Dict[str, int]] = {}
-    model_daily_tokens: Dict[str, Dict[str, int]] = {}
-    for model, raw_days in model_daily_raw.items():
-        model_days = {
-            day: amount
-            for day, amount in int_map(raw_days).items()
-            if (day in days) == include
-        }
-        model_total = sum(model_days.values())
-        if model_total <= 0:
-            continue
-        source_model_tokens = int_map(source_models.get(model))
-        original_model_total = (
-            source_model_tokens.get("totalTokens")
-            or source_model_tokens.get("all")
-            or sum(source_model_tokens.get(key, 0) for key in TOKEN_CLASS_KEYS)
-        )
-        periods = periods_from_daily_tokens(model_days)
-        periods["all"] = model_total
-        model_tokens = {
-            key: _scaled_token_class(source_model_tokens.get(key, 0), model_total, original_model_total)
-            for key in TOKEN_CLASS_KEYS
-        }
-        for key, amount in periods.items():
-            if amount > 0:
-                model_tokens[key] = amount
-        models[str(model)] = {key: amount for key, amount in model_tokens.items() if amount > 0}
-        model_daily_tokens[str(model)] = model_days
-
-    total = sum(daily_tokens.values())
-    tokens: Dict[str, int] = {}
-    source_tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else {}
-    original_total = int(source_tokens.get("totalTokens") or source_tokens.get("all") or 0)
-    if total > 0:
-        for key in TOKEN_CLASS_KEYS:
-            amount = _scaled_token_class(int(source_tokens.get(key) or 0), total, original_total)
-            if amount > 0:
-                tokens[key] = amount
-        tokens["totalTokens"] = total
-        periods = periods_from_daily_tokens(daily_tokens)
-        periods["all"] = total
-        for key, amount in periods.items():
-            if amount > 0:
-                tokens[key] = amount
-
-    filtered = {
-        "tokens": tokens,
-        "models": models,
-        "dailyTokens": daily_tokens,
-        "hourlyTokens": hourly_tokens,
-        "modelDailyTokens": model_daily_tokens,
-        "events": int(usage.get("events") or 0) if total > 0 and total == original_total else 0,
-        "cache": copy.deepcopy(usage.get("cache") or {"source": "filtered"}),
-    }
-    if total > 0 and total != original_total:
-        filtered["cache"]["source"] = "filtered-by-antigravity-history"
-    return filtered
 
 
 def google_usage_total(usage: Optional[Dict[str, Any]]) -> int:
@@ -10344,7 +10382,13 @@ def doctor_report(check_network: bool = False) -> Dict[str, Any]:
         checks.append(_doctor_check("claude.credentials", "ok", detail="OAuth token present"))
     else:
         reason = creds.get("reason") or "token_missing"
-        if reason == "keychain_denied":
+        if reason == "api_billing":
+            mode = str(creds.get("billingMode") or "api_key").replace("_", " ")
+            checks.append(_doctor_check(
+                "claude.credentials", "ok", reason=reason,
+                detail=f"billed through the API ({mode}) — no subscription quota to read, which is expected",
+            ))
+        elif reason == "keychain_denied":
             checks.append(_doctor_check(
                 "claude.credentials", "warn", reason=reason,
                 detail="the daemon was denied Keychain access to the Claude Code token", fix="grant_keychain_access",
