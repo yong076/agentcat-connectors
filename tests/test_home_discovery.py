@@ -11,12 +11,16 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sandbox import block_network, redirect_module_paths, restore_module_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -40,46 +44,27 @@ class HomeDiscoveryTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.old = {
-            name: getattr(agentcat, name)
-            for name in (
-                "HOME",
-                "AGENTCAT_HOME",
-                "CLAUDE_PROJECTS_DIR",
-                "CLAUDE_CONFIG_DIR",
-                "JOURNAL_CURSOR_FILE",
-                "CODEX_SESSIONS_CURSOR_FILE",
-                "LAUNCHD_AGENT_PLIST",
-            )
-        }
-
         home = self.root / "home"
         agentcat_home = self.root / "agentcat"
         home.mkdir()
         agentcat_home.mkdir()
-        agentcat.HOME = home
-        agentcat.AGENTCAT_HOME = agentcat_home
-        agentcat.CLAUDE_CONFIG_DIR = home / ".claude"
-        agentcat.CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
-        agentcat.JOURNAL_CURSOR_FILE = agentcat_home / "jsonl-cursor.json"
-        agentcat.CODEX_SESSIONS_CURSOR_FILE = agentcat_home / "codex-sessions-cursor.json"
-        # Point the plist at the sandbox so a real launchd job on the developer's
-        # machine can never leak into an env-drift assertion.
-        agentcat.LAUNCHD_AGENT_PLIST = home / "Library" / "LaunchAgents" / "agentcatd.plist"
+        self.old = redirect_module_paths(agentcat, home, agentcat_home)
 
         # $CODEX_HOME / $CLAUDE_CONFIG_DIR in the developer's shell would silently
         # redirect every home resolution in this file.
         self.env_patch = patch.dict(os.environ, {}, clear=False)
         self.env_patch.start()
+        self.network_patch = block_network(agentcat)
+        self.network_patch.start()
         os.environ.pop("CODEX_HOME", None)
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
         self._reset_discovery_cache()
 
     def tearDown(self) -> None:
+        self.network_patch.stop()
         self.env_patch.stop()
-        for name, value in self.old.items():
-            setattr(agentcat, name, value)
+        restore_module_paths(agentcat, self.old)
         self._reset_discovery_cache()
         self.tmp.cleanup()
 

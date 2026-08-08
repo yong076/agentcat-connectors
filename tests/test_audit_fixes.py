@@ -7,11 +7,15 @@ regression back to a behaviour that was expensive to notice the first time.
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sandbox import redirect_module_paths, restore_module_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -26,19 +30,15 @@ class AuditFixTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.old = {
-            name: getattr(agentcat, name)
-            for name in ("HOME", "AGENTCAT_HOME", "TELEMETRY_LOG_MAX_BYTES")
-        }
         home = self.root / "home"
+        agentcat_home = self.root / "agentcat"
         home.mkdir()
-        agentcat.HOME = home
-        agentcat.AGENTCAT_HOME = self.root / "agentcat"
-        agentcat.AGENTCAT_HOME.mkdir()
+        agentcat_home.mkdir()
+        self.old = redirect_module_paths(agentcat, home, agentcat_home)
+        self.old["TELEMETRY_LOG_MAX_BYTES"] = agentcat.TELEMETRY_LOG_MAX_BYTES
 
     def tearDown(self) -> None:
-        for name, value in self.old.items():
-            setattr(agentcat, name, value)
+        restore_module_paths(agentcat, self.old)
         self.tmp.cleanup()
 
 
