@@ -137,6 +137,33 @@ agentcat setup-prompt
 | Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
 | Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
 
+## Multiple Provider Homes
+
+A provider's usage can live under more than one home on the same machine: a
+second profile via `$CODEX_HOME` / `$CLAUDE_CONFIG_DIR`, or a runtime home
+another local tool created by mirroring the default one. The daemon reads the
+home its environment named when the launch job was created, so anything else is
+invisible — and a mirror that quietly stops receiving new sessions still holds a
+plausible-looking lifetime total, which makes the gap hard to notice.
+
+`agentcat doctor` reports homes holding usage the connector is not reading, and
+distinguishes two cases: `untracked_home` (a second profile) and `stalled_home`
+(the home being read has gone quiet while an unread one keeps growing). It also
+reports `env_drift` when the daemon's launch job pins a path that no longer
+matches the current shell.
+
+```
+agentcat homes                                   # list homes and which are read
+agentcat homes --provider codex --adopt <path>   # start counting a home
+agentcat homes --provider codex --exclude <path> # never read or suggest it
+agentcat homes --provider codex --forget <path>  # back to the default state
+```
+
+Discovery is automatic, adoption is not: reading an extra home changes every
+number the product reports, so it stays an explicit choice. Adopted homes are
+deduplicated by inode and session identity, so a mirror that hardlinks or copies
+its sessions is counted once, never twice.
+
 ## Privacy
 
 The connector is local-first.

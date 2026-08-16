@@ -27,7 +27,21 @@ import urllib.parse
 import urllib.request
 
 
-HOME = Path(os.environ.get("HOME") or str(Path.home())).expanduser().resolve()
+def resolve_user_home_env() -> str:
+    """The user's real home directory, as a string.
+
+    On Windows, Git Bash/MSYS set ``HOME`` to a POSIX-style shell home
+    (``/c/msys/home/alice``) that has none of the provider directories under it.
+    Trusting it there made every provider read as `not_found`, and disagreed
+    with the PowerShell verifier, which uses ``UserProfile``. So Windows prefers
+    ``USERPROFILE`` and only falls back to ``HOME``; POSIX is unchanged.
+    """
+    if os.name == "nt":
+        return os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(Path.home())
+    return os.environ.get("HOME") or str(Path.home())
+
+
+HOME = Path(resolve_user_home_env()).expanduser().resolve()
 AGENTCAT_HOME = Path(os.environ.get("AGENTCAT_HOME") or str(HOME / ".agentcat")).expanduser().resolve()
 IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -59,12 +73,29 @@ CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing"
+GROK_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
+KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+GROK_MEDIA_TOOL_NAMES = {
+    "image_gen": "images",
+    "image_edit": "images",
+    "image_to_video": "videos",
+    "reference_to_video": "videos",
+}
 GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"""OAUTH_CLIENT_ID\s*[:=]\s*["']([^"']+)["']""")
 GEMINI_TELEMETRY_PARSE_BYTES = int(os.environ.get("AGENTCAT_GEMINI_PARSE_BYTES", str(64 * 1024 * 1024)))
 GEMINI_TELEMETRY_STREAM_CHUNK_BYTES = int(os.environ.get("AGENTCAT_GEMINI_STREAM_CHUNK_BYTES", str(4 * 1024 * 1024)))
 GEMINI_USAGE_CACHE_VERSION = 1
+# Truncate an OTEL telemetry log once it passes this size AND has been fully
+# read. Agent Cat owns these files' lifecycle; left alone they grow without
+# bound (8.9 GB observed). 0 disables rotation.
+TELEMETRY_LOG_MAX_BYTES = int(
+    os.environ.get("AGENTCAT_TELEMETRY_LOG_MAX_BYTES") or 512 * 1024 * 1024
+)
 GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECONDS", "10"))
 LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_BYTES", str(16 * 1024 * 1024)))
 LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
@@ -90,7 +121,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.31.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.32.4")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -131,6 +162,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.projects",
     "usage.coverage",
     "projects.daily",
+    "homes.discovery",
     "pricing.feed",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
@@ -142,6 +174,9 @@ CONNECTOR_CAPABILITIES = (
     "limits.claude.statusline",
     "limits.claude.statuslineQuotas",
     "limits.gemini.codeAssist",
+    "limits.grok.oauthUsage",
+    "limits.kimi.oauthUsage",
+    "usage.grok.sessions",
     "hooks.codexNotify",
     "hooks.claudeStatusline",
     "hooks.claudeHooks",
@@ -165,6 +200,8 @@ TOKEN_KEYS = {
     "thoughts_token_count": "thoughtTokens",
     "reasoning_tokens": "reasoningTokens",
     "reasoningtokens": "reasoningTokens",
+    "cachedreadtokens": "cacheReadInputTokens",
+    "cachecreationtokens": "cacheCreationInputTokens",
     "tool_token_count": "toolTokens",
     "total_token_count": "totalTokens",
     "total_input_tokens": "inputTokens",
@@ -1048,6 +1085,327 @@ def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
         if current is not None:
             return current
     return None
+
+
+# ---------------------------------------------------------------------------
+# Multi-home discovery
+#
+# A provider's usage can live under more than one home on the same machine: a
+# second profile ($CODEX_HOME / $CLAUDE_CONFIG_DIR pointed elsewhere), an
+# app-managed runtime home, or a mirror another tool created. The daemon reads
+# whichever home its environment named when launchd froze that environment at
+# install time, so every other home is invisible — and a mirror that silently
+# stops receiving new sessions looks fine, because the lifetime total it already
+# holds stays plausible.
+#
+# Discovery is automatic; adoption is not. A discovered home is reported by
+# `agentcat doctor` and only counted once the user adopts it. Auto-absorbing
+# would eventually swallow a backup dir or a test fixture and inflate every
+# number the product shows, which costs more trust than the gap it closes.
+# ---------------------------------------------------------------------------
+
+PROVIDER_HOME_SPECS: Dict[str, Dict[str, Any]] = {
+    "codex": {
+        "envVar": "CODEX_HOME",
+        "defaultName": ".codex",
+        "siblingGlob": ".codex*",
+        "usageGlobs": ("sessions/**/*.jsonl", "archived_sessions/**/*.jsonl"),
+        # Markers prove a directory really is a provider home, so a stray
+        # ~/.codex-notes folder never gets offered as a usage source.
+        "markers": ("sessions", "archived_sessions", "auth.json"),
+        # Homes other local tools create by mirroring ~/.codex.
+        "knownRuntimeHomes": ("Library/Application Support/orca/codex-runtime-home/home",),
+    },
+    "claude": {
+        "envVar": "CLAUDE_CONFIG_DIR",
+        "defaultName": ".claude",
+        "siblingGlob": ".claude*",
+        "usageGlobs": ("projects/**/*.jsonl",),
+        "markers": ("projects", "settings.json"),
+        "knownRuntimeHomes": (),
+    },
+}
+
+HOME_DISCOVERY_PROVIDER_IDS = tuple(PROVIDER_HOME_SPECS)
+
+# Discovery is advisory, so it is bounded rather than exhaustive: a home buried
+# under a 13th backup copy is not worth turning `doctor` into a directory walk.
+HOME_DISCOVERY_MAX_CANDIDATES = 12
+# Counting files in a candidate home stops here. Set high because the cap costs
+# accuracy, not just detail: stopping early also stops the newest-file search,
+# and "how recently was this home written to" is the signal that separates a
+# stalled mirror from a second profile. Measured ~100ms for 8.5k files, and the
+# snapshot path is memoized below rather than paying it every tick.
+HOME_DISCOVERY_FILE_CAP = 50000
+# Homes appear and disappear on the order of days, so the 60s snapshot tick must
+# not re-walk them. doctor and the CLI bypass this and always read fresh.
+HOME_DISCOVERY_CACHE_TTL_SECONDS = 600
+
+
+def _stat_quiet(path: Path, cache: Optional[Dict[str, Any]] = None) -> Optional[os.stat_result]:
+    """stat() a path, returning None instead of raising, memoized per scan."""
+    key = str(path)
+    if cache is not None and key in cache:
+        return cache[key]
+    try:
+        result: Optional[os.stat_result] = path.stat()
+    except OSError:
+        result = None
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+_SESSION_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+def _session_identity(path: Path) -> Optional[str]:
+    """Identify the session a usage file holds, from its filename alone.
+
+    Codex names rollouts ``rollout-<timestamp>-<uuid>.jsonl`` and Claude names
+    journals ``<sessionId>.jsonl``; both carry a UUID that is stable across
+    copies of the same session. Returns None when no UUID is present, which
+    means "cannot claim two files are the same session" — never a false match.
+    """
+    match = _SESSION_UUID_RE.search(path.name)
+    return match.group(0).lower() if match else None
+
+
+def dedupe_usage_paths(
+    paths: List[Path],
+    stat_cache: Optional[Dict[str, Any]] = None,
+    match_session_identity: bool = False,
+) -> List[Path]:
+    """Collapse usage files reachable through more than one home.
+
+    Layers, cheapest first:
+
+    1. ``realpath`` — catches symlinked homes.
+    2. ``(st_dev, st_ino)`` — catches hardlinked mirrors, which layer 1 cannot
+       see because both paths are equally real. This is the shape a local mirror
+       of ``~/.codex`` actually takes.
+    3. session identity from the filename — catches true copies (independent
+       inodes holding the same session). The longer file wins, because a stale
+       copy is a truncated snapshot of the live one.
+
+    Layers 1–2 always run: two paths to one inode are the same bytes, so
+    counting both is unambiguously wrong. Layer 3 is a judgement call about two
+    genuinely different files, so it only runs when more than one home is in
+    play (``match_session_identity``) — inside a single home, ``sessions/`` and
+    ``archived_sessions/`` holding the same UUID is a move in progress, not a
+    duplicate to resolve.
+
+    Input order is preserved for the survivors, so callers keep deterministic
+    cursor keys.
+    """
+    seen_identity: Set[Any] = set()
+    by_session: Dict[str, int] = {}
+    kept: List[Optional[Path]] = []
+
+    for path in paths:
+        try:
+            identity: Any = str(path.resolve())
+        except OSError:
+            identity = str(path)
+        stat_result = _stat_quiet(path, stat_cache)
+        if stat_result is not None:
+            identity = (stat_result.st_dev, stat_result.st_ino)
+        if identity in seen_identity:
+            continue
+        seen_identity.add(identity)
+
+        if match_session_identity:
+            session = _session_identity(path)
+            if session is not None:
+                previous_index = by_session.get(session)
+                if previous_index is not None:
+                    previous = kept[previous_index]
+                    previous_stat = _stat_quiet(previous, stat_cache) if previous else None
+                    previous_size = previous_stat.st_size if previous_stat else -1
+                    current_size = stat_result.st_size if stat_result else -1
+                    if current_size > previous_size:
+                        # The live file is longer than the stale copy: swap, keeping
+                        # the discarded one out of the result entirely.
+                        kept[previous_index] = None
+                        by_session[session] = len(kept)
+                        kept.append(path)
+                    continue
+                by_session[session] = len(kept)
+        kept.append(path)
+
+    return [path for path in kept if path is not None]
+
+
+def _home_has_marker(home: Path, spec: Dict[str, Any]) -> bool:
+    for marker in spec.get("markers") or ():
+        if (home / str(marker)).exists():
+            return True
+    return False
+
+
+def home_usage_stats(home: Path, spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Count usage files under a home and date the newest one.
+
+    Bounded by HOME_DISCOVERY_FILE_CAP: this answers "is this home in use, and
+    how recently" for diagnostics, not "how many tokens".
+    """
+    files = 0
+    newest: Optional[float] = None
+    capped = False
+    for pattern in spec.get("usageGlobs") or ():
+        try:
+            for path in home.glob(str(pattern)):
+                if not path.is_file():
+                    continue
+                files += 1
+                stat_result = _stat_quiet(path)
+                if stat_result is not None:
+                    if newest is None or stat_result.st_mtime > newest:
+                        newest = stat_result.st_mtime
+                if files >= HOME_DISCOVERY_FILE_CAP:
+                    capped = True
+                    break
+        except OSError:
+            continue
+        if capped:
+            break
+    return {"files": files, "newestMtime": newest, "capped": capped}
+
+
+def _home_settings(provider: str, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    resolved = agentcat_settings() if settings is None else settings
+    homes = resolved.get("homes")
+    if not isinstance(homes, dict):
+        return {}
+    entry = homes.get(provider)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _home_path_list(entry: Dict[str, Any], key: str) -> List[Path]:
+    raw = entry.get(key)
+    if not isinstance(raw, list):
+        return []
+    paths: List[Path] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            paths.append(Path(item).expanduser())
+    return paths
+
+
+def default_provider_home(provider: str) -> Path:
+    """The home the connector reads today, before any adoption.
+
+    Resolved at call time so it tracks both a swapped module HOME (tests) and an
+    env var injected into the daemon's launch environment.
+    """
+    spec = PROVIDER_HOME_SPECS.get(provider) or {}
+    env_var = spec.get("envVar")
+    override = os.environ.get(str(env_var)) if env_var else None
+    if override:
+        return Path(override).expanduser()
+    return HOME / str(spec.get("defaultName") or f".{provider}")
+
+
+def provider_home_candidates(provider: str) -> List[Dict[str, Any]]:
+    """Every home this provider might be storing usage in, with why we looked.
+
+    Sources, in precedence order: the default/env home the connector already
+    reads, known app-managed runtime homes, then a bounded sibling glob. Each
+    entry is ``{path, source, exists, tracked, excluded, stats}``; discovery
+    never changes what gets counted.
+    """
+    spec = PROVIDER_HOME_SPECS.get(provider)
+    if not spec:
+        return []
+
+    settings_entry = _home_settings(provider)
+    adopted = {str(p.resolve() if p.exists() else p) for p in _home_path_list(settings_entry, "adopted")}
+    excluded = {str(p.resolve() if p.exists() else p) for p in _home_path_list(settings_entry, "excluded")}
+
+    candidates: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    def add(home: Path, source: str) -> None:
+        if len(candidates) >= HOME_DISCOVERY_MAX_CANDIDATES:
+            return
+        try:
+            key = str(home.resolve())
+        except OSError:
+            key = str(home)
+        if key in seen:
+            return
+        exists = home.is_dir()
+        # A non-default candidate has to look like a real provider home; the
+        # default one is always listed so its absence is itself diagnosable.
+        if source != "default" and (not exists or not _home_has_marker(home, spec)):
+            return
+        seen.add(key)
+        candidates.append({
+            "path": home,
+            "source": source,
+            "exists": exists,
+            "tracked": source == "default" or key in adopted,
+            "excluded": key in excluded,
+            "stats": home_usage_stats(home, spec) if exists else {"files": 0, "newestMtime": None, "capped": False},
+        })
+
+    default_home = default_provider_home(provider)
+    add(default_home, "default")
+
+    for relative in spec.get("knownRuntimeHomes") or ():
+        add(HOME / str(relative), "known_runtime")
+
+    for home in _home_path_list(settings_entry, "adopted"):
+        add(home, "adopted")
+
+    sibling_glob = spec.get("siblingGlob")
+    if sibling_glob:
+        try:
+            siblings = sorted(HOME.glob(str(sibling_glob)))
+        except OSError:
+            siblings = []
+        for home in siblings:
+            if home.is_dir():
+                add(home, "sibling")
+
+    return candidates
+
+
+def tracked_provider_homes(provider: str) -> List[Path]:
+    """Homes the connector actually reads: the default one plus adopted ones.
+
+    Excluded homes are dropped even if adopted, so an exclusion is always the
+    stronger signal. With nothing adopted this returns exactly the single home
+    the connector read before multi-home support existed.
+    """
+    default_home = default_provider_home(provider)
+    settings_entry = _home_settings(provider)
+    excluded: Set[str] = set()
+    for home in _home_path_list(settings_entry, "excluded"):
+        try:
+            excluded.add(str(home.resolve()))
+        except OSError:
+            excluded.add(str(home))
+
+    homes: List[Path] = [default_home]
+    seen: Set[str] = set()
+    try:
+        seen.add(str(default_home.resolve()))
+    except OSError:
+        seen.add(str(default_home))
+
+    for home in _home_path_list(settings_entry, "adopted"):
+        try:
+            key = str(home.resolve())
+        except OSError:
+            key = str(home)
+        if key in seen or key in excluded or not home.is_dir():
+            continue
+        seen.add(key)
+        homes.append(home)
+    return homes
 
 
 CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot", "kimi", "grok")
@@ -2302,7 +2660,7 @@ def merge_limits(configured: Dict[str, Any], detected: Dict[str, Any]) -> Dict[s
 
 
 def configured_limits() -> Dict[str, Dict[str, Any]]:
-    base = {provider: empty_limits() for provider in ("codex", "claude", "gemini", "antigravity")}
+    base = {provider: empty_limits() for provider in ("codex", "claude", "gemini", "antigravity", "grok", "kimi")}
     raw = read_json(LIMITS_FILE)
     if raw is None:
         return base
@@ -2971,6 +3329,38 @@ def _warn_keychain_once(message: str, *args: Any) -> None:
         _CLAUDE_KEYCHAIN_WARNED = True
 
 
+def claude_api_billing_mode() -> Optional[str]:
+    """Detect a Claude Code install billed through the API, not a subscription.
+
+    These users have no subscription quota to report — correctly so — but the
+    connector used to fold them into ``token_missing``, which reads as "we
+    failed to detect Claude" and is a known share of the "detection works for
+    some users, not others" reports.
+
+    The daemon's own environment is not enough: it inherits whatever the launch
+    job froze, so an ``ANTHROPIC_API_KEY`` exported in the user's shell is
+    invisible to it. Claude Code's own ``settings.json`` env block is checked
+    too, which is where a persistent setup actually lives.
+    """
+    def _from_env(source: Dict[str, Any]) -> Optional[str]:
+        if str(source.get("CLAUDE_CODE_USE_BEDROCK") or "").strip() not in ("", "0", "false"):
+            return "bedrock"
+        if str(source.get("CLAUDE_CODE_USE_VERTEX") or "").strip() not in ("", "0", "false"):
+            return "vertex"
+        if source.get("ANTHROPIC_API_KEY") or source.get("ANTHROPIC_AUTH_TOKEN"):
+            return "api_key"
+        return None
+
+    mode = _from_env(dict(os.environ))
+    if mode:
+        return mode
+    settings = read_json(claude_config_dir() / "settings.json")
+    env_block = settings.get("env") if isinstance(settings, dict) else None
+    if isinstance(env_block, dict):
+        return _from_env(env_block)
+    return None
+
+
 def read_claude_oauth_credentials() -> Dict[str, Any]:
     """Resolve Claude Code OAuth credentials with a machine-readable failure reason.
 
@@ -2978,6 +3368,10 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
     credentials are found, ``reason`` is one of:
       - ``keychain_denied``: the macOS Keychain refused the read (ACL deny,
         locked/headless session) — a distinct, diagnosable state, not "logged out".
+      - ``api_billing``: this install bills through the API (API key, Bedrock or
+        Vertex) rather than a subscription, so there is no subscription quota to
+        read. Not a failure — reporting it as one is what made these users look
+        like "Claude detection is broken".
       - ``token_missing``: no credentials on disk and no OAuth block present.
     """
     candidates: List[Any] = []
@@ -3018,7 +3412,12 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
         if item.get("accessToken") or item.get("access_token"):
             return {"oauth": item, "reason": None}
 
-    return {"oauth": None, "reason": "keychain_denied" if keychain_denied else "token_missing"}
+    if keychain_denied:
+        return {"oauth": None, "reason": "keychain_denied"}
+    billing = claude_api_billing_mode()
+    if billing:
+        return {"oauth": None, "reason": "api_billing", "billingMode": billing}
+    return {"oauth": None, "reason": "token_missing"}
 
 
 def claude_quota_label(key: str) -> str:
@@ -3852,6 +4251,500 @@ def antigravity_live_limits(force: bool = False) -> Dict[str, Any]:
         return limits
 
 
+def grok_auth_path() -> Path:
+    roots = grok_roots()
+    for root in roots:
+        path = root / "auth.json"
+        if path.is_file():
+            return path
+    return (roots[0] if roots else HOME / ".grok") / "auth.json"
+
+
+def grok_billing_val(raw: Any) -> Optional[float]:
+    if isinstance(raw, dict) and "val" in raw:
+        return float_value(raw.get("val"))
+    return float_value(raw)
+
+
+def read_grok_access_token() -> Dict[str, Any]:
+    """Read the local Grok CLI session token. Never logs or returns PII fields."""
+    raw = read_json(grok_auth_path())
+    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+        return {"token": None, "reason": "token_missing"}
+    best_token: Optional[str] = None
+    best_expiry = -1.0
+    for entry in raw.values():
+        if not isinstance(entry, dict):
+            continue
+        token = entry.get("key") or entry.get("access_token") or entry.get("accessToken")
+        if not (isinstance(token, str) and token.strip()):
+            continue
+        expires = parse_timestamp(entry.get("expires_at") or entry.get("expiresAt"))
+        score = expires.timestamp() if expires else 0.0
+        if best_token is None or score >= best_expiry:
+            best_token = token.strip()
+            best_expiry = score
+    if not best_token:
+        return {"token": None, "reason": "token_missing"}
+    return {"token": best_token, "reason": None}
+
+
+def grok_period_window(period_type: Any) -> Tuple[str, str, str]:
+    text = str(period_type or "").upper()
+    if "HOUR" in text or "5H" in text or "SHORT" in text:
+        return "grok:5h", "5시간", "5h"
+    if "DAY" in text and "SEVEN" not in text and "WEEK" not in text:
+        return "grok:1d", "1일", "1d"
+    if "WEEK" in text or "7D" in text or "SEVEN" in text:
+        return "grok:7d", "7일", "7d"
+    return "grok:monthly", "월별 한도", "monthly"
+
+
+def grok_limits_from_credits_response(payload: Dict[str, Any], source: str = GROK_BILLING_CREDITS_URL) -> Dict[str, Any]:
+    """Map `/usage` credits billing — this is the weekly SuperGrok window."""
+    config = payload.get("config") if isinstance(payload.get("config"), dict) else payload
+    if not isinstance(config, dict):
+        return empty_limits(reason="not_applicable")
+
+    period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else {}
+    used_percent = grok_billing_val(config.get("creditUsagePercent"))
+    reset_at = (
+        (period or {}).get("end")
+        or config.get("billingPeriodEnd")
+        or config.get("billing_period_end")
+    )
+    if used_percent is None and reset_at is None and not isinstance(config.get("productUsage"), list):
+        return empty_limits(reason="not_applicable")
+
+    quota_id, label, window = grok_period_window((period or {}).get("type"))
+    remaining_percent = remaining_percent_from_used(used_percent) if used_percent is not None else None
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    limits["planType"] = "weekly" if window == "7d" else window
+    reset_epoch_value = reset_epoch(reset_at)
+    if window == "5h":
+        limits["shortUsedPercent"] = used_percent
+        limits["shortWindowMinutes"] = 300
+        limits["shortResetAt"] = reset_epoch_value
+    else:
+        limits["weeklyUsedPercent"] = used_percent
+        limits["weeklyResetAt"] = reset_epoch_value
+
+    quotas: List[Dict[str, Any]] = [
+        quota_entry(
+            quota_id,
+            label,
+            used_percent=used_percent,
+            remaining_percent=remaining_percent,
+            reset_at=reset_at,
+            unit="percent",
+            window=window,
+            source=source,
+        )
+    ]
+    for row in config.get("productUsage") or []:
+        if not isinstance(row, dict):
+            continue
+        product = str(row.get("product") or "").strip()
+        product_used = grok_billing_val(row.get("usagePercent"))
+        if not product or product_used is None:
+            continue
+        slug = product.lower().replace(" ", "")
+        if slug.startswith("grok") and len(slug) > 4:
+            slug = slug[4:]
+        product_window = "media" if "imagine" in slug else window
+        quotas.append(
+            quota_entry(
+                f"grok:{slug}",
+                product.replace("Grok", "Grok ").strip(),
+                used_percent=product_used,
+                remaining_percent=remaining_percent_from_used(product_used),
+                reset_at=reset_at,
+                unit="percent",
+                window=product_window,
+                model=slug,
+                source=source,
+            )
+        )
+    limits["quotas"] = quotas
+    return limits
+
+
+def grok_limits_from_billing_response(payload: Dict[str, Any], source: str = GROK_BILLING_URL) -> Dict[str, Any]:
+    """Map Grok billing. Prefer credits (`/usage`) weekly windows; fall back
+    to the calendar-month payload when credits are absent."""
+    config = payload.get("config") if isinstance(payload.get("config"), dict) else payload
+    if not isinstance(config, dict):
+        return empty_limits(reason="not_applicable")
+
+    if (
+        isinstance(config.get("currentPeriod"), dict)
+        or config.get("creditUsagePercent") is not None
+        or isinstance(config.get("productUsage"), list)
+    ):
+        credits = grok_limits_from_credits_response(payload, source=source)
+        if credits.get("status") == "auto":
+            return credits
+
+    used = grok_billing_val(config.get("used"))
+    limit = grok_billing_val(config.get("monthlyLimit") or config.get("monthly_limit"))
+    reset_at = config.get("billingPeriodEnd") or config.get("billing_period_end")
+    if used is None and limit is None and reset_at is None:
+        return empty_limits(reason="not_applicable")
+
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    limits["planType"] = "monthly"
+    if limit and limit > 0:
+        limits["monthlyTokens"] = int(limit)
+        if used is not None:
+            limits["weeklyUsedPercent"] = min(max((used / limit) * 100.0, 0.0), 100.0)
+    reset_epoch_value = reset_epoch(reset_at)
+    if reset_epoch_value:
+        limits["weeklyResetAt"] = reset_epoch_value
+
+    remaining = None
+    used_percent = None
+    remaining_percent = None
+    if limit and limit > 0:
+        remaining = max(limit - (used or 0.0), 0.0)
+        used_percent = min(max(((used or 0.0) / limit) * 100.0, 0.0), 100.0)
+        remaining_percent = remaining_percent_from_used(used_percent)
+
+    has_cap = bool(limit and limit > 0)
+    quotas = [
+        quota_entry(
+            "grok:monthly",
+            "월별 한도" if has_cap else "월별 초기화",
+            used_percent=used_percent,
+            remaining_percent=remaining_percent,
+            reset_at=reset_at,
+            unit="credits",
+            used=used,
+            remaining=remaining,
+            limit=limit if has_cap else None,
+            window="monthly",
+            source=source,
+        )
+    ]
+    limits["quotas"] = quotas
+    return limits
+
+
+def grok_live_limits(force: bool = False) -> Dict[str, Any]:
+    cached = None if force else cached_live_limits("grok", LIVE_LIMITS_MAX_AGE_SECONDS)
+    if cached:
+        return cached
+    creds = read_grok_access_token()
+    token = creds.get("token")
+    if not (isinstance(token, str) and token):
+        return empty_limits(reason=creds.get("reason") or "token_missing")
+    last_error: Optional[Exception] = None
+    for url in (GROK_BILLING_CREDITS_URL, GROK_BILLING_URL):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "User-Agent": "grok-cli/1.0.4",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            limits = grok_limits_from_billing_response(
+                payload if isinstance(payload, dict) else {},
+                source=url,
+            )
+            if limits.get("status") == "auto":
+                write_live_limits_cache("grok", limits)
+                return limits
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in {401, 403}:
+                break
+        except Exception as exc:
+            last_error = exc
+    stale = cached_live_limits("grok", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+    if stale and last_error is not None:
+        return serve_stale_live_limits("grok", stale, last_error)
+    if isinstance(last_error, urllib.error.HTTPError):
+        limits = live_limit_error(last_error, GROK_BILLING_CREDITS_URL)
+        if last_error.code in {401, 403}:
+            limits["reason"] = "token_expired"
+        write_live_limits_cache("grok", limits)
+        return limits
+    if last_error is not None:
+        limits = live_limit_error(last_error, GROK_BILLING_CREDITS_URL)
+        write_live_limits_cache("grok", limits)
+        return limits
+    return empty_limits(reason="not_applicable")
+
+
+def kimi_credentials_path() -> Path:
+    for root in kimi_roots():
+        path = root / "credentials" / "kimi-code.json"
+        if path.is_file():
+            return path
+    return HOME / ".kimi-code" / "credentials" / "kimi-code.json"
+
+
+def read_kimi_oauth_credentials() -> Dict[str, Any]:
+    raw = read_json(kimi_credentials_path())
+    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+        return {"access_token": None, "refresh_token": None, "reason": "token_missing"}
+    access = raw.get("access_token") or raw.get("accessToken")
+    refresh = raw.get("refresh_token") or raw.get("refreshToken")
+    if not (isinstance(access, str) and access.strip()) and not (isinstance(refresh, str) and refresh.strip()):
+        return {"access_token": None, "refresh_token": None, "reason": "token_missing"}
+    expires_at = int_limit(raw.get("expires_at") or raw.get("expiresAt"))
+    return {
+        "access_token": access.strip() if isinstance(access, str) else None,
+        "refresh_token": refresh.strip() if isinstance(refresh, str) else None,
+        "expires_at": expires_at,
+        "reason": None,
+    }
+
+
+def refresh_kimi_access_token(refresh_token: str) -> Optional[str]:
+    # In-memory only — never write Kimi's credentials file.
+    body = urllib.parse.urlencode(
+        {
+            "client_id": KIMI_OAUTH_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        KIMI_OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "kimi-code/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    return token.strip() if isinstance(token, str) and token.strip() else None
+
+
+def kimi_usage_number(raw: Any) -> Optional[float]:
+    if isinstance(raw, dict):
+        for key in ("used", "limit", "remaining", "val", "value"):
+            if key in raw:
+                return kimi_usage_number(raw.get(key))
+        return None
+    return float_value(raw)
+
+
+def kimi_window_label(window: Any) -> Tuple[str, str, str]:
+    if not isinstance(window, dict):
+        return "kimi:usage", "Kimi 한도", "week"
+    duration = int_limit(window.get("duration")) or 0
+    unit = str(window.get("timeUnit") or window.get("unit") or "").lower()
+    minutes = duration
+    if "hour" in unit:
+        minutes = duration * 60
+    elif "day" in unit:
+        minutes = duration * 24 * 60
+    elif "week" in unit:
+        minutes = duration * 7 * 24 * 60
+    if 0 < minutes <= 12 * 60:
+        return "kimi:5h", "5시간", "5h"
+    if minutes <= 36 * 60:
+        return "kimi:1d", "1일", "1d"
+    return "kimi:7d", "7일", "7d"
+
+
+def kimi_limits_from_usage_response(payload: Dict[str, Any], source: str = KIMI_USAGE_URL) -> Dict[str, Any]:
+    if payload.get("kind") == "error":
+        return empty_limits(status="error", error=str(payload.get("message") or "kimi usage error"))
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return empty_limits(reason="not_applicable")
+
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    quotas: List[Dict[str, Any]] = []
+
+    rows = data.get("limits") if isinstance(data.get("limits"), list) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        detail = row.get("detail") if isinstance(row.get("detail"), dict) else row
+        used = kimi_usage_number(detail.get("used"))
+        limit = kimi_usage_number(detail.get("limit"))
+        remaining = kimi_usage_number(detail.get("remaining"))
+        reset_at = detail.get("resetTime") or detail.get("reset_at") or row.get("reset_at")
+        if used is None and remaining is not None and limit is not None:
+            used = max(limit - remaining, 0.0)
+        if remaining is None and used is not None and limit is not None:
+            remaining = max(limit - used, 0.0)
+        if used is None and limit is None:
+            continue
+        quota_id, label, window = kimi_window_label(row.get("window"))
+        used_percent = None
+        remaining_percent = None
+        if limit and limit > 0 and used is not None:
+            used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
+            remaining_percent = remaining_percent_from_used(used_percent)
+            if window == "5h":
+                limits["shortUsedPercent"] = used_percent
+                limits["shortWindowMinutes"] = 300
+                limits["shortResetAt"] = reset_epoch(reset_at)
+            elif window == "7d":
+                limits["weeklyUsedPercent"] = used_percent
+                limits["weeklyResetAt"] = reset_epoch(reset_at)
+                limits["weeklyTokens"] = int(limit)
+        quotas.append(
+            quota_entry(
+                quota_id,
+                label,
+                used_percent=used_percent,
+                remaining_percent=remaining_percent,
+                reset_at=reset_at,
+                unit="requests",
+                used=used,
+                remaining=remaining,
+                limit=limit if limit and limit > 0 else None,
+                window=window,
+                source=source,
+            )
+        )
+
+    summary = data.get("usage") if isinstance(data.get("usage"), dict) else data.get("summary")
+    if isinstance(summary, dict):
+        used = kimi_usage_number(summary.get("used"))
+        limit = kimi_usage_number(summary.get("limit"))
+        remaining = kimi_usage_number(summary.get("remaining"))
+        reset_at = summary.get("resetTime") or summary.get("reset_at")
+        if used is None and remaining is not None and limit is not None:
+            used = max(limit - remaining, 0.0)
+        if remaining is None and used is not None and limit is not None:
+            remaining = max(limit - used, 0.0)
+        if limit and limit > 0 and used is not None:
+            used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
+            if limits.get("weeklyUsedPercent") is None:
+                limits["weeklyUsedPercent"] = used_percent
+                limits["weeklyResetAt"] = reset_epoch(reset_at)
+                limits["weeklyTokens"] = int(limit)
+            if not any(item.get("id") == "kimi:7d" for item in quotas):
+                quotas.append(
+                    quota_entry(
+                        "kimi:7d",
+                        "7일",
+                        used_percent=used_percent,
+                        remaining_percent=remaining_percent_from_used(used_percent),
+                        reset_at=reset_at,
+                        unit="requests",
+                        used=used,
+                        remaining=remaining,
+                        limit=limit,
+                        window="7d",
+                        source=source,
+                    )
+                )
+
+    extra = data.get("extra_usage") if isinstance(data.get("extra_usage"), dict) else None
+    if extra:
+        used_cents = kimi_usage_number(extra.get("monthly_used_cents"))
+        limit_cents = kimi_usage_number(extra.get("monthly_charge_limit_cents"))
+        if extra.get("monthly_charge_limit_enabled") and limit_cents and limit_cents > 0:
+            used = (used_cents or 0.0) / 100.0
+            limit = limit_cents / 100.0
+            used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
+            quotas.append(
+                quota_entry(
+                    "kimi:booster",
+                    "월별 크레딧",
+                    used_percent=used_percent,
+                    remaining_percent=remaining_percent_from_used(used_percent),
+                    unit="usd",
+                    used=used,
+                    remaining=max(limit - used, 0.0),
+                    limit=limit,
+                    window="monthly",
+                    source=source,
+                )
+            )
+
+    if not quotas:
+        return empty_limits(reason="not_applicable")
+    limits["quotas"] = quotas
+    return limits
+
+
+def kimi_usage_request(access_token: str) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        KIMI_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": "kimi-code/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def kimi_live_limits(force: bool = False) -> Dict[str, Any]:
+    cached = None if force else cached_live_limits("kimi", LIVE_LIMITS_MAX_AGE_SECONDS)
+    if cached:
+        return cached
+    creds = read_kimi_oauth_credentials()
+    access = creds.get("access_token")
+    refresh = creds.get("refresh_token")
+    if not access and not refresh:
+        return empty_limits(reason=creds.get("reason") or "token_missing")
+
+    last_error: Optional[Exception] = None
+    tokens: List[str] = []
+    expires_at = creds.get("expires_at")
+    expired = isinstance(expires_at, int) and expires_at > 0 and expires_at < int(time.time())
+    if isinstance(access, str) and access and not expired:
+        tokens.append(access)
+    if isinstance(refresh, str) and refresh:
+        try:
+            refreshed = refresh_kimi_access_token(refresh)
+        except Exception as exc:
+            last_error = exc
+            refreshed = None
+        if refreshed:
+            tokens.append(refreshed)
+    if isinstance(access, str) and access and access not in tokens:
+        tokens.append(access)
+
+    for token in tokens:
+        try:
+            payload = kimi_usage_request(token)
+            limits = kimi_limits_from_usage_response(payload, source=KIMI_USAGE_URL)
+            write_live_limits_cache("kimi", limits)
+            return limits
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in {401, 403}:
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            break
+
+    stale = cached_live_limits("kimi", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+    if stale:
+        return serve_stale_live_limits("kimi", stale, last_error or RuntimeError("Kimi usage API failed"))
+    if last_error is None:
+        return empty_limits(reason="token_expired" if expired else "token_missing")
+    limits = live_limit_error(last_error, KIMI_USAGE_URL)
+    if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403}:
+        limits["reason"] = "token_expired"
+    write_live_limits_cache("kimi", limits)
+    return limits
+
+
 def prefer_live_limits(live: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
     if live.get("status") in {"auto", "ok"} and (
         live.get("quotas") or any(live.get(key) is not None for key in ("weeklyUsedPercent", "shortUsedPercent"))
@@ -3890,6 +4783,8 @@ def runtime_limits() -> Dict[str, Dict[str, Any]]:
         # relabel Gemini's quota as Antigravity's (the exact #45 mirroring bug this
         # provider was split out to fix).
         "antigravity": _safe(antigravity_live_limits),
+        "grok": _safe(grok_live_limits),
+        "kimi": _safe(kimi_live_limits),
     }
 
 
@@ -3970,6 +4865,7 @@ SHELL_TOOL_NAMES = {
     "exec",
     "execute_command",
     "run_terminal_cmd",
+    "run_terminal_command",
     "shell_exec",
     "terminal",
     "run",
@@ -4420,6 +5316,147 @@ def grok_roots() -> List[Path]:
     return roots or [HOME / ".grok", HOME / ".xai"]
 
 
+def grok_session_project_path(updates_path: Path) -> Optional[str]:
+    """Project cwd is the URL-encoded session group folder, not file content."""
+    try:
+        group = updates_path.parent.parent.name
+    except Exception:
+        return None
+    if not group or group.startswith("."):
+        return None
+    decoded = urllib.parse.unquote(group).strip()
+    return decoded or None
+
+
+def grok_usage_metrics(usage: Any) -> Dict[str, int]:
+    if not isinstance(usage, dict):
+        return {}
+    metrics = {
+        "inputTokens": nonnegative_int(usage.get("inputTokens") or usage.get("input_tokens")) or 0,
+        "outputTokens": nonnegative_int(usage.get("outputTokens") or usage.get("output_tokens")) or 0,
+        "cacheReadInputTokens": nonnegative_int(
+            usage.get("cachedReadTokens") or usage.get("cacheReadInputTokens") or usage.get("cached_read_tokens")
+        ) or 0,
+        "cacheCreationInputTokens": nonnegative_int(
+            usage.get("cacheCreationTokens") or usage.get("cacheCreationInputTokens") or usage.get("cache_creation_tokens")
+        ) or 0,
+        "reasoningTokens": nonnegative_int(usage.get("reasoningTokens") or usage.get("reasoning_tokens")) or 0,
+    }
+    total = nonnegative_int(usage.get("totalTokens") or usage.get("total_tokens")) or 0
+    if total > usage_token_total(metrics):
+        metrics["totalTokens"] = total
+    return {key: amount for key, amount in metrics.items() if amount > 0}
+
+
+def grok_usage_model(usage: Dict[str, Any], fallback: Optional[str] = None) -> str:
+    model_usage = usage.get("modelUsage") if isinstance(usage.get("modelUsage"), dict) else {}
+    for name in model_usage.keys():
+        model = normalized_model_name(name)
+        if model:
+            return model
+    return normalized_model_name(fallback) or "grok"
+
+
+def grok_update_payload(event: Dict[str, Any]) -> Dict[str, Any]:
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    update = params.get("update") if isinstance(params.get("update"), dict) else {}
+    return update if isinstance(update, dict) else {}
+
+
+def grok_event_timestamp(event: Dict[str, Any], update: Dict[str, Any]) -> Optional[dt.datetime]:
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+    return parse_timestamp(
+        meta.get("agentTimestampMs")
+        or event.get("ts")
+        or event.get("timestamp")
+        or update.get("timestamp")
+    )
+
+
+def grok_prompt_id(event: Dict[str, Any], update: Dict[str, Any]) -> Optional[str]:
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+    for candidate in (
+        update.get("prompt_id"),
+        update.get("promptId"),
+        meta.get("promptId"),
+        meta.get("prompt_id"),
+        event.get("prompt_id"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def grok_tool_name(update: Dict[str, Any]) -> Optional[str]:
+    # Names only — titles/rawInput can carry prompt text and must not be read.
+    meta = update.get("_meta") if isinstance(update.get("_meta"), dict) else {}
+    namespaced = meta.get("x.ai/tool") if isinstance(meta.get("x.ai/tool"), dict) else {}
+    for candidate in (
+        namespaced.get("name"),
+        meta.get("x.ai/tool.name"),
+        update.get("name"),
+        update.get("toolName"),
+        update.get("tool_name"),
+        nested_dict_value(update, ["toolCall", "name"]),
+        nested_dict_value(update, ["tool_call", "name"]),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def grok_tool_call_id(update: Dict[str, Any]) -> Optional[str]:
+    for candidate in (
+        update.get("toolCallId"),
+        update.get("tool_call_id"),
+        nested_dict_value(update, ["toolCall", "toolCallId"]),
+        nested_dict_value(update, ["tool_call", "id"]),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def parse_grok_updates(path: Path) -> Dict[str, Any]:
+    """Read usage/tool metadata from one updates.jsonl. Ignores prompt text."""
+    usage_by_prompt: Dict[str, Dict[str, Any]] = {}
+    media_ids: Dict[str, Set[str]] = {"images": set(), "videos": set()}
+    tool_names: List[str] = []
+    fallback_index = 0
+    for event in iter_jsonl_file(path):
+        update = grok_update_payload(event)
+        if not update:
+            continue
+        session_update = str(update.get("sessionUpdate") or update.get("session_update") or "")
+        tool_name = grok_tool_name(update)
+        if session_update == "tool_call" and tool_name:
+            tool_names.append(tool_name)
+            media_kind = GROK_MEDIA_TOOL_NAMES.get(tool_name)
+            if media_kind:
+                call_id = grok_tool_call_id(update) or f"{path}:{fallback_index}"
+                media_ids[media_kind].add(call_id)
+        usage = update.get("usage")
+        metrics = grok_usage_metrics(usage)
+        if metrics:
+            prompt_id = grok_prompt_id(event, update) or f"{path}:{fallback_index}"
+            fallback_index += 1
+            previous = usage_by_prompt.get(prompt_id)
+            if previous is None or usage_token_total(metrics) >= usage_token_total(previous["metrics"]):
+                usage_by_prompt[prompt_id] = {
+                    "metrics": metrics,
+                    "when": grok_event_timestamp(event, update),
+                    "model": grok_usage_model(usage if isinstance(usage, dict) else {}, None),
+                }
+    return {
+        "usage": list(usage_by_prompt.values()),
+        "images": len(media_ids["images"]),
+        "videos": len(media_ids["videos"]),
+        "tool_names": tool_names,
+    }
+
+
 def grok_snapshot() -> Dict[str, Any]:
     roots = grok_roots()
     result = empty_provider_usage(source=",".join(str(root) for root in roots))
@@ -4429,26 +5466,74 @@ def grok_snapshot() -> Dict[str, Any]:
         return result
 
     hook_files: List[Path] = []
-    log_files: List[Path] = []
+    update_files: List[Path] = []
     for root in existing_roots:
         hook = root / "hooks" / "orca-status.json"
         if hook.is_file():
             hook_files.append(hook)
+        sessions_root = root / "sessions"
+        if not sessions_root.is_dir():
+            continue
         try:
-            log_files.extend(path for path in root.glob("**/*.log") if path.is_file())
+            update_files.extend(path for path in sessions_root.glob("*/*/updates.jsonl") if path.is_file())
         except OSError:
             pass
 
-    result["status"] = "no_token_events_yet"
-    result["source"] = ",".join(str(path) for path in (hook_files + recent_files(log_files))) or ",".join(str(root) for root in existing_roots)
-    result["events"] = 0
+    update_files = recent_files(update_files)
+    events = 0
+    images = 0
+    videos = 0
+    project_tokens: Dict[str, int] = {}
+    project_last: Dict[str, dt.datetime] = {}
+    for path in update_files:
+        parsed = parse_grok_updates(path)
+        images += int(parsed.get("images") or 0)
+        videos += int(parsed.get("videos") or 0)
+        project_path = grok_session_project_path(path)
+        for item in parsed.get("usage") or []:
+            metrics = item.get("metrics") if isinstance(item, dict) else None
+            if not isinstance(metrics, dict):
+                continue
+            when = item.get("when") if isinstance(item.get("when"), dt.datetime) else None
+            if add_usage_metrics(result, item.get("model"), metrics, when):
+                events += 1
+                update_breakdown(result["breakdown"], chat=1)
+                total = usage_token_total(metrics)
+                if project_path and total > 0:
+                    project_tokens[project_path] = project_tokens.get(project_path, 0) + total
+                    if when is not None:
+                        current = project_last.get(project_path)
+                        if current is None or when > current:
+                            project_last[project_path] = when
+        update_breakdown(result["breakdown"], tools=parsed.get("tool_names") or [])
+
+    result["status"] = "ok" if events > 0 else "no_token_events_yet"
+    result["source"] = ",".join(str(path) for path in (hook_files + update_files[:8])) or ",".join(
+        str(root) for root in existing_roots
+    )
+    result["events"] = events
+    result["sessions"] = len(update_files)
+    result["media"] = {"status": "ok" if (images or videos) else "empty", "images": images, "videos": videos}
     result["sources"] = {
         "hookFiles": len(hook_files),
-        "logFiles": len(log_files),
+        "sessionUpdateFiles": len(update_files),
         "parseMaxFiles": LOCAL_PROVIDER_MAX_FILES,
     }
-    if hook_files:
-        result["message"] = "Grok local hooks detected; usage tokens are not exposed yet"
+    if project_tokens:
+        items = []
+        for project_path, tokens in project_tokens.items():
+            last_active = project_last.get(project_path)
+            items.append({
+                "id": project_path,
+                "path": project_path,
+                "name": display_project_name(project_path),
+                "tokens": tokens,
+                "lastActive": last_active.isoformat().replace("+00:00", "Z") if last_active else None,
+            })
+        items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
+        result["projects"] = {"status": "ok", "items": items[:20]}
+    if hook_files and events == 0:
+        result["message"] = "Grok local hooks detected; no session token events yet"
     return result
 
 
@@ -4602,12 +5687,10 @@ def copilot_vscode_transcript_files() -> List[Path]:
     return out
 
 
-def recent_files(paths: List[Path]) -> List[Path]:
+def recent_files(paths: List[Path], stat_cache: Optional[Dict[str, Any]] = None) -> List[Path]:
     def mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
+        stat_result = _stat_quiet(path, stat_cache)
+        return stat_result.st_mtime if stat_result is not None else 0.0
 
     return sorted(paths, key=mtime, reverse=True)[: max(1, LOCAL_PROVIDER_MAX_FILES)]
 
@@ -4909,14 +5992,20 @@ def codex_home() -> Path:
 
 
 def codex_session_roots() -> List[Path]:
-    """CodexBar-compatible local session roots.
+    """CodexBar-compatible local session roots, across every tracked home.
 
     Codex keeps active logs under ``sessions`` and can move older logs to the
     sibling ``archived_sessions`` directory. Counting only ``sessions`` makes
     heavy users look like they used a tiny fraction of their real 30-day usage.
+
+    With no adopted homes this is the same two directories under the same single
+    home the connector has always read; adopted homes append their own pair.
     """
-    root = codex_home()
-    return [root / "sessions", root / "archived_sessions"]
+    roots: List[Path] = []
+    for home in tracked_provider_homes("codex"):
+        roots.append(home / "sessions")
+        roots.append(home / "archived_sessions")
+    return roots
 
 
 def _codex_empty_raw_totals() -> Dict[str, int]:
@@ -5118,15 +6207,12 @@ def codex_session_token_raw_delta(
 
 
 def codex_session_files() -> List[Path]:
+    homes = tracked_provider_homes("codex")
     roots = [root for root in codex_session_roots() if root.is_dir()]
     if not roots:
         return []
     files: List[Path] = []
     seen: Set[str] = set()
-    # resolve() exists to dedupe aliased paths across overlapping roots; with
-    # a single root plain string keys suffice and skip one realpath syscall
-    # chain per session file (thousands of files on heavy Codex machines).
-    dedupe_resolved = len(roots) > 1
     for root in roots:
         try:
             candidates = [p for p in root.glob("**/*.jsonl") if p.is_file()]
@@ -5134,19 +6220,20 @@ def codex_session_files() -> List[Path]:
             continue
         for path in candidates:
             key = str(path)
-            if dedupe_resolved:
-                try:
-                    key = str(path.resolve())
-                except OSError:
-                    pass
             if key in seen:
                 continue
             seen.add(key)
             files.append(path)
+    # Collapse files reachable through more than one root before anything counts
+    # them. A mirrored home hardlinks its sessions, so the same inode arrives
+    # under two paths and plain string keys would count both. Session-identity
+    # matching only turns on with multiple homes — see dedupe_usage_paths.
+    stat_cache: Dict[str, Any] = {}
+    files = dedupe_usage_paths(files, stat_cache, match_session_identity=len(homes) > 1)
     # Heavy Codex users can exceed the scan cap. Prefer the newest rollouts so
     # today/week windows do not get stranded on old history, then parse the
     # selected files in path order for deterministic cursor updates.
-    files = recent_files(files)
+    files = recent_files(files, stat_cache)
     files.sort(key=lambda p: str(p))
     return files
 
@@ -5863,14 +6950,14 @@ def attach_local_usage_coverage(provider: str, snapshot: Dict[str, Any], **extra
             "note": "Uses explicit Copilot output tokens when present and local transcript estimates when the transcript lacks token fields.",
         },
         "kimi": {
-            "includedSources": ["kimi_code_logs", "kimi_wire_logs"],
+            "includedSources": ["kimi_code_logs", "kimi_wire_logs", "kimi_billing_quota"],
             "privacy": "usage_fields_only",
-            "note": "Reads Kimi Code token/model/timestamp log fields only. Prompt history, titles, workdirs, and transcript content are ignored.",
+            "note": "Reads Kimi Code token/model/timestamp log fields only. Prompt history, titles, and transcript content are ignored. Quota/reset uses the local Kimi login when available.",
         },
         "grok": {
-            "includedSources": ["grok_local_hooks"],
-            "privacy": "hook_metadata_only",
-            "note": "Detects Grok local hooks and processes. Token totals and soft quota appear only when a local token source is available.",
+            "includedSources": ["grok_session_updates", "grok_billing_reset"],
+            "privacy": "usage_fields_only",
+            "note": "Reads Grok session usage/tool-name fields only. Prompts, chat history, and terminal logs are ignored. Billing is used for the monthly reset timestamp, not a remaining-credit count.",
         },
     }
     descriptor = descriptors.get(provider)
@@ -5996,6 +7083,44 @@ def attach_codex_usage_coverage(
     return snapshot
 
 
+def _codex_rebuild_state_file() -> Path:
+    return AGENTCAT_HOME / "codex-rebuild-state.json"
+
+
+def _codex_rebuild_key(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> List[int]:
+    return [_codex_tokens_all(sessions), _codex_tokens_all(sqlite)]
+
+
+def mark_codex_rebuild_ineffective(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> None:
+    """Record that a full rebuild did not close the sessions/sqlite gap.
+
+    The trigger below compares two numbers a rebuild cannot always reconcile: a
+    user who deleted old rollout JSONLs still has lifetime totals in
+    ``state_*.sqlite``, so the gap is permanent. Without this marker the daemon
+    re-parsed the entire sessions corpus (up to 10k files) every 60s forever.
+    """
+    try:
+        write_json_atomic(
+            _codex_rebuild_state_file(), {"ineffectiveKey": _codex_rebuild_key(sessions, sqlite)}
+        )
+    except Exception as exc:
+        logging.debug("could not persist codex rebuild marker: %s", exc)
+
+
+def _codex_rebuild_marked_ineffective(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> bool:
+    raw = read_json(_codex_rebuild_state_file())
+    if not isinstance(raw, dict):
+        return False
+    stored = raw.get("ineffectiveKey")
+    if not isinstance(stored, list):
+        return False
+    # Keyed on both totals: when either moves, the corpus changed and a rebuild
+    # is worth attempting again.
+    return [int(x) for x in stored if isinstance(x, (int, float))] == _codex_rebuild_key(
+        sessions, sqlite
+    )
+
+
 def _codex_sessions_need_rebuild(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> bool:
     if sessions.get("status") != "ok" or sqlite.get("status") != "ok":
         return False
@@ -6003,7 +7128,9 @@ def _codex_sessions_need_rebuild(sessions: Dict[str, Any], sqlite: Dict[str, Any
     sqlite_all = _codex_tokens_all(sqlite)
     if session_all <= 0 or sqlite_all < 10_000_000:
         return False
-    return sqlite_all > session_all * 5
+    if sqlite_all <= session_all * 5:
+        return False
+    return not _codex_rebuild_marked_ineffective(sessions, sqlite)
 
 
 def _merge_int_maps_by_max(primary: Dict[str, Any], fallback: Dict[str, Any]) -> bool:
@@ -6115,12 +7242,17 @@ def codex_snapshot() -> Dict[str, Any]:
     sqlite = codex_sqlite_snapshot()
 
     if _codex_sessions_need_rebuild(sessions, sqlite):
+        before = sessions
         try:
             rebuilt = codex_sessions_snapshot(force_rebuild=True)
             if rebuilt.get("status") == "ok":
                 sessions = rebuilt
         except Exception as exc:
             logging.debug("codex_sessions_snapshot rebuild failed: %s", exc)
+        # If the expensive rebuild left the gap exactly as wide, repeating it
+        # every tick cannot help — the missing tokens are in deleted rollouts.
+        if _codex_tokens_all(sessions) <= _codex_tokens_all(before):
+            mark_codex_rebuild_ineffective(sessions, sqlite)
 
     codexbar_cache = codexbar_cost_cache_snapshot("codex")
     if sessions.get("status") == "ok":
@@ -6217,6 +7349,8 @@ def fetch_llm_usage_fresh() -> Dict[str, Any]:
             "codex": live_usage_provider_from_limits(codex_live_limits(force=True)),
             "gemini": live_usage_provider_from_limits(gemini_live_limits(force=True)),
             "antigravity": live_usage_provider_from_limits(antigravity_live_limits(force=True)),
+            "grok": live_usage_provider_from_limits(grok_live_limits(force=True)),
+            "kimi": live_usage_provider_from_limits(kimi_live_limits(force=True)),
         },
     }
 
@@ -6434,6 +7568,11 @@ def claude_journal_project_dirs() -> List[Path]:
     agent mode keeps the same JSONL shape under its Application Support
     directory. We only add the nested `.claude/projects` roots; parsing remains
     field allowlisted in parse_claude_usage_line().
+
+    CLI roots come from tracked_provider_homes("claude") and are resolved at
+    call time, so this never audits a different directory than
+    claude_config_dir() reports for credentials under $CLAUDE_CONFIG_DIR. With
+    no adopted homes that is exactly the one root this returned before.
     """
     roots: List[Path] = []
     seen: Set[str] = set()
@@ -6450,7 +7589,8 @@ def claude_journal_project_dirs() -> List[Path]:
         seen.add(resolved)
         roots.append(root)
 
-    add(CLAUDE_PROJECTS_DIR)
+    for home in tracked_provider_homes("claude"):
+        add(home / "projects")
     added_desktop = 0
     for data_root in desktop_app_data_roots("claude"):
         if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
@@ -6466,6 +7606,51 @@ def claude_journal_project_dirs() -> List[Path]:
             if added_desktop >= CLAUDE_DESKTOP_PROJECT_DIR_MAX:
                 break
     return roots
+
+
+def claude_journal_files_by_root() -> List[Tuple[Path, List[Path]]]:
+    """Journal files grouped by root, deduped across all roots.
+
+    Every Claude scan walks the same roots, so the dedup has to happen once,
+    globally, and then be handed back per-root — each caller still needs to know
+    which root a file came from to classify it as CLI or desktop usage.
+
+    Session-identity matching (the layer that can drop a file the connector used
+    to count) turns on only when the user has adopted a second Claude home.
+    Desktop roots alone never enable it, so a stock install scans exactly what it
+    scanned before.
+    """
+    roots = claude_journal_project_dirs()
+    if not roots:
+        return []
+
+    ordered: List[Tuple[Path, Path]] = []
+    for root in roots:
+        try:
+            paths = sorted(root.rglob("*.jsonl"))
+        except OSError:
+            continue
+        for path in paths:
+            ordered.append((root, path))
+
+    if len(roots) > 1:
+        multi_home = len(tracked_provider_homes("claude")) > 1
+        survivors = {
+            str(path)
+            for path in dedupe_usage_paths(
+                [path for _root, path in ordered], {}, match_session_identity=multi_home
+            )
+        }
+        ordered = [(root, path) for root, path in ordered if str(path) in survivors]
+
+    grouped: Dict[str, Tuple[Path, List[Path]]] = {}
+    for root, path in ordered:
+        entry = grouped.get(str(root))
+        if entry is None:
+            grouped[str(root)] = (root, [path])
+        else:
+            entry[1].append(path)
+    return list(grouped.values())
 
 
 def _apply_record_to_totals(
@@ -6533,8 +7718,8 @@ def _apply_record_to_totals(
 def rebuild_claude_journal_projects(now: "dt.datetime") -> Dict[str, Dict[str, Any]]:
     projects: Dict[str, Dict[str, Any]] = {}
     scratch_totals = _empty_journal_totals()
-    for root in claude_journal_project_dirs():
-        for path in sorted(root.rglob("*.jsonl")):
+    for _root, paths in claude_journal_files_by_root():
+        for path in paths:
             try:
                 with path.open("rb") as fh:
                     for raw_line in fh:
@@ -6601,8 +7786,8 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         rebuilt = True
         projects.clear()
         projects.update(rebuild_claude_journal_projects(now_utc))
-    for root in project_roots:
-        for path in sorted(root.rglob("*.jsonl")):
+    for _root, paths in claude_journal_files_by_root():
+        for path in paths:
             path_str = str(path)
             try:
                 file_size = path.stat().st_size
@@ -6771,8 +7956,9 @@ def _classify_claude_journal_root(root: Path) -> str:
     ``desktop_app_data_roots("claude")`` path is the desktop app. CLI takes
     precedence when a path somehow matches both.
     """
-    if _path_is_within(root, CLAUDE_PROJECTS_DIR):
-        return "cli"
+    for home in tracked_provider_homes("claude"):
+        if _path_is_within(root, home / "projects"):
+            return "cli"
     for data_root in desktop_app_data_roots("claude"):
         if _path_is_within(root, data_root):
             return "app"
@@ -6823,12 +8009,8 @@ def _claude_journal_signature() -> Tuple:
     the full re-scan on the 60s snapshot tick unless a file actually changed.
     """
     entries = []
-    for root in claude_journal_project_dirs():
+    for root, paths in claude_journal_files_by_root():
         surface = _classify_claude_journal_root(root)
-        try:
-            paths = sorted(root.rglob("*.jsonl"))
-        except OSError:
-            continue
         for path in paths:
             try:
                 stat = path.stat()
@@ -6861,12 +8043,8 @@ def claude_usage_by_source() -> Dict[str, Any]:
             return dict(_CLAUDE_USAGE_BY_SOURCE_VALUE)
 
     per_source: Dict[str, int] = {"cli": 0, "app": 0}
-    for root in claude_journal_project_dirs():
+    for root, paths in claude_journal_files_by_root():
         surface = _classify_claude_journal_root(root)
-        try:
-            paths = sorted(root.rglob("*.jsonl"))
-        except OSError:
-            continue
         for path in paths:
             # A CLI-root journal whose session id was launched from the desktop
             # app is really desktop usage.
@@ -7170,6 +8348,7 @@ def gemini_snapshot() -> Dict[str, Any]:
                 stat = telemetry_path.stat()
                 state = load_gemini_usage_state(stat, telemetry_path=telemetry_path, cache_path=cache_path)
                 state = scan_gemini_telemetry_state(state, stat, telemetry_path=telemetry_path)
+                state = rotate_telemetry_log_if_oversized(state, telemetry_path)
                 save_gemini_usage_state(state, cache_path=cache_path)
                 usage = gemini_usage_result_from_state(state)
                 usages.append(usage)
@@ -7659,6 +8838,48 @@ def scan_gemini_telemetry_state(
     return state
 
 
+def rotate_telemetry_log_if_oversized(
+    state: Dict[str, Any], telemetry_path: Path
+) -> Dict[str, Any]:
+    """Reclaim the OTEL log once every byte of it has been read.
+
+    Agent Cat configures the CLI to append here, so it owns the file's
+    lifecycle — but nothing ever trimmed it (8.9 GB measured on a dev machine).
+
+    Truncating only when ``offset == size`` guarantees no unread record is
+    destroyed; an unread tail simply defers rotation to a later tick. The
+    accumulated totals are safe because they live in the cache state, not in the
+    log, and ``load_gemini_usage_state`` already treats "offset > size" as a
+    rotation — it rescans from zero, where the ``identities`` dedup map makes
+    recounting a no-op. So this reclaims disk without losing history or
+    double-counting it.
+    """
+    if TELEMETRY_LOG_MAX_BYTES <= 0:
+        return state
+    size = int(state.get("size") or 0)
+    if size < TELEMETRY_LOG_MAX_BYTES:
+        return state
+    if int(state.get("offset") or 0) < size:
+        return state
+    try:
+        with telemetry_path.open("r+b") as fh:
+            fh.truncate(0)
+        stat = telemetry_path.stat()
+    except OSError as exc:
+        # Losing a rotation is survivable; failing the usage scan is not.
+        logging.warning(
+            "agentcat: could not rotate %s: %s", _tilde(telemetry_path), type(exc).__name__
+        )
+        return state
+    logging.info(
+        "agentcat: rotated %s at %d MB (fully read)", _tilde(telemetry_path), size // (1024 * 1024)
+    )
+    state["offset"] = 0
+    state["size"] = int(stat.st_size)
+    state["mtimeNs"] = int(stat.st_mtime_ns)
+    return state
+
+
 def int_map(raw: Any) -> Dict[str, int]:
     out: Dict[str, int] = {}
     if not isinstance(raw, dict):
@@ -7741,117 +8962,6 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
             "size": int(state.get("size") or 0),
         },
     }
-
-
-def antigravity_history_days() -> set:
-    days = set()
-    path = ANTIGRAVITY_CLI_DIR / "history.jsonl"
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return days
-    for line in lines[-2000:]:
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        when = parse_timestamp(payload.get("timestamp"))
-        day = day_key_for_timestamp(when)
-        if day:
-            days.add(day)
-    return days
-
-
-def antigravity_inference_days(activity: Optional[Dict[str, Any]]) -> set:
-    days = antigravity_history_days()
-    counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
-    if isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0 and int(counts.get("gemini") or 0) <= 0:
-        now_utc = dt.datetime.now(dt.timezone.utc)
-        today_utc = day_key_for_timestamp(now_utc)
-        today_local = day_key_for_timestamp(now_utc.astimezone())
-        if today_utc:
-            days.add(today_utc)
-        if today_local:
-            days.add(today_local)
-    return days
-
-
-def _hour_day_key(raw: str) -> str:
-    return str(raw or "")[:10]
-
-
-def filter_google_usage_days(usage: Dict[str, Any], days: set, *, include: bool) -> Dict[str, Any]:
-    daily_tokens = {
-        day: amount
-        for day, amount in int_map(usage.get("dailyTokens")).items()
-        if (day in days) == include
-    }
-    hourly_tokens = {
-        hour: amount
-        for hour, amount in int_map(usage.get("hourlyTokens")).items()
-        if (_hour_day_key(hour) in days) == include
-    }
-    model_daily_raw = usage.get("modelDailyTokens") if isinstance(usage.get("modelDailyTokens"), dict) else {}
-    source_models = usage.get("models") if isinstance(usage.get("models"), dict) else {}
-    models: Dict[str, Dict[str, int]] = {}
-    model_daily_tokens: Dict[str, Dict[str, int]] = {}
-    for model, raw_days in model_daily_raw.items():
-        model_days = {
-            day: amount
-            for day, amount in int_map(raw_days).items()
-            if (day in days) == include
-        }
-        model_total = sum(model_days.values())
-        if model_total <= 0:
-            continue
-        source_model_tokens = int_map(source_models.get(model))
-        original_model_total = (
-            source_model_tokens.get("totalTokens")
-            or source_model_tokens.get("all")
-            or sum(source_model_tokens.get(key, 0) for key in TOKEN_CLASS_KEYS)
-        )
-        periods = periods_from_daily_tokens(model_days)
-        periods["all"] = model_total
-        model_tokens = {
-            key: _scaled_token_class(source_model_tokens.get(key, 0), model_total, original_model_total)
-            for key in TOKEN_CLASS_KEYS
-        }
-        for key, amount in periods.items():
-            if amount > 0:
-                model_tokens[key] = amount
-        models[str(model)] = {key: amount for key, amount in model_tokens.items() if amount > 0}
-        model_daily_tokens[str(model)] = model_days
-
-    total = sum(daily_tokens.values())
-    tokens: Dict[str, int] = {}
-    source_tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else {}
-    original_total = int(source_tokens.get("totalTokens") or source_tokens.get("all") or 0)
-    if total > 0:
-        for key in TOKEN_CLASS_KEYS:
-            amount = _scaled_token_class(int(source_tokens.get(key) or 0), total, original_total)
-            if amount > 0:
-                tokens[key] = amount
-        tokens["totalTokens"] = total
-        periods = periods_from_daily_tokens(daily_tokens)
-        periods["all"] = total
-        for key, amount in periods.items():
-            if amount > 0:
-                tokens[key] = amount
-
-    filtered = {
-        "tokens": tokens,
-        "models": models,
-        "dailyTokens": daily_tokens,
-        "hourlyTokens": hourly_tokens,
-        "modelDailyTokens": model_daily_tokens,
-        "events": int(usage.get("events") or 0) if total > 0 and total == original_total else 0,
-        "cache": copy.deepcopy(usage.get("cache") or {"source": "filtered"}),
-    }
-    if total > 0 and total != original_total:
-        filtered["cache"]["source"] = "filtered-by-antigravity-history"
-    return filtered
 
 
 def google_usage_total(usage: Optional[Dict[str, Any]]) -> int:
@@ -9193,6 +10303,13 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             "latestByProvider": latest_by_provider,
         },
     }
+    # Where each provider's usage lives, and which of those homes we read
+    # (capability "homes.discovery"). Diagnostic only — it never changes what
+    # gets counted — and additive, so older app builds simply ignore it.
+    try:
+        snapshot["homes"] = home_discovery_snapshot()
+    except Exception as exc:
+        logging.debug("home_discovery_snapshot failed: %s", exc)
     # Per-day per-project token deltas (capability "projects.daily").
     # Additive/optional: failure degrades to an absent field and must NOT
     # block the snapshot write.
@@ -9734,6 +10851,192 @@ def _doctor_check(
     return entry
 
 
+LAUNCHD_AGENT_PLIST = HOME / "Library" / "LaunchAgents" / "com.trappist.agentcatd.plist"
+
+# A tracked home whose newest usage file lags an untracked home's by more than
+# this is a stalled mirror, not a quiet week: the user is demonstrably still
+# working, just somewhere the daemon cannot see.
+STALLED_HOME_LAG_SECONDS = 24 * 3600
+
+
+def launchd_environment() -> Dict[str, str]:
+    """Environment variables frozen into the daemon's launchd job.
+
+    The installer captures the environment as it was at install time, so this is
+    what the daemon actually sees — which can differ from the user's current
+    shell for the rest of the machine's life.
+    """
+    if sys.platform != "darwin":
+        return {}
+    try:
+        import plistlib  # stdlib; only macOS diagnostics need it
+
+        with LAUNCHD_AGENT_PLIST.open("rb") as fh:
+            data = plistlib.load(fh)
+    except Exception:
+        return {}
+    env = data.get("EnvironmentVariables") if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    return {str(key): str(value) for key, value in env.items()}
+
+
+def _describe_home_age(newest: Optional[float], now: float) -> str:
+    if not newest:
+        return "no usage files"
+    age = max(0.0, now - newest)
+    if age < 3600:
+        return f"newest {int(age // 60)}m ago"
+    if age < 86400:
+        return f"newest {int(age // 3600)}h ago"
+    return f"newest {int(age // 86400)}d ago"
+
+
+def _describe_home(candidate: Dict[str, Any], now: float) -> str:
+    stats = candidate.get("stats") or {}
+    files = int(stats.get("files") or 0)
+    suffix = "+" if stats.get("capped") else ""
+    return (
+        f"{_tilde(candidate['path'])} ({files}{suffix} files, "
+        f"{_describe_home_age(stats.get('newestMtime'), now)})"
+    )
+
+
+def home_discovery_checks() -> List[Dict[str, Any]]:
+    """Report provider homes that hold usage the connector is not counting.
+
+    Two distinct findings, because they need different urgency:
+    ``untracked_home`` is a second profile we simply have not been told to read,
+    while ``stalled_home`` means the home we DO read has gone quiet while an
+    unread one keeps growing — the silent-leak shape, where the lifetime total
+    still looks plausible so nothing appears wrong.
+    """
+    checks: List[Dict[str, Any]] = []
+    now = time.time()
+
+    for provider in HOME_DISCOVERY_PROVIDER_IDS:
+        candidates = provider_home_candidates(provider)
+        if not candidates:
+            continue
+        active = [c for c in candidates if not c.get("excluded")]
+        tracked = [c for c in active if c.get("tracked")]
+        untracked = [c for c in active if not c.get("tracked") and (c.get("stats") or {}).get("files")]
+        check_id = f"{provider}.homes"
+
+        if not untracked:
+            checks.append(_doctor_check(
+                check_id, "ok",
+                detail=f"{len(tracked)} home(s) tracked, no unread homes found",
+            ))
+            continue
+
+        detail = "; ".join(_describe_home(c, now) for c in untracked[:3])
+        if len(untracked) > 3:
+            detail += f"; +{len(untracked) - 3} more"
+
+        tracked_newest = max((float((c.get("stats") or {}).get("newestMtime") or 0.0) for c in tracked), default=0.0)
+        untracked_newest = max(float((c.get("stats") or {}).get("newestMtime") or 0.0) for c in untracked)
+
+        if untracked_newest - tracked_newest > STALLED_HOME_LAG_SECONDS:
+            tracked_detail = "; ".join(_describe_home(c, now) for c in tracked[:2]) or "none"
+            checks.append(_doctor_check(
+                check_id, "warn", reason="stalled_home",
+                detail=(
+                    f"the home being read has gone quiet while an unread one keeps growing — "
+                    f"reading {tracked_detail}, not reading {detail}"
+                ),
+                fix="adopt_home",
+            ))
+        else:
+            tracked_detail = "; ".join(_describe_home(c, now) for c in tracked[:2]) or "none"
+            checks.append(_doctor_check(
+                check_id, "warn", reason="untracked_home",
+                detail=(
+                    f"usage found in home(s) the connector does not read: {detail} "
+                    f"(currently reading {tracked_detail})"
+                ),
+                fix="adopt_home",
+            ))
+
+    launch_env = launchd_environment()
+    if launch_env:
+        drifted: List[str] = []
+        for provider in HOME_DISCOVERY_PROVIDER_IDS:
+            env_var = (PROVIDER_HOME_SPECS.get(provider) or {}).get("envVar")
+            if not env_var:
+                continue
+            frozen = launch_env.get(str(env_var))
+            if frozen and frozen != (os.environ.get(str(env_var)) or ""):
+                drifted.append(f"{env_var}={_tilde(frozen)}")
+        if drifted:
+            checks.append(_doctor_check(
+                "daemon.env", "warn", reason="env_drift",
+                detail=(
+                    "the daemon's launchd job pins " + ", ".join(drifted)
+                    + " — captured at install time and never refreshed, so it may no "
+                    "longer be where this provider stores usage"
+                ),
+                fix="reinstall_daemon",
+            ))
+
+    return checks
+
+
+_HOME_DISCOVERY_SNAPSHOT_LOCK = threading.Lock()
+_HOME_DISCOVERY_SNAPSHOT_VALUE: Optional[Dict[str, Any]] = None
+_HOME_DISCOVERY_SNAPSHOT_AT = 0.0
+
+
+def home_discovery_snapshot(force: bool = False) -> Dict[str, Any]:
+    """Additive snapshot block describing where each provider's usage lives.
+
+    Purely diagnostic and tilde-relative. Consumers that predate it ignore the
+    key, so adding it cannot break an older app build.
+
+    Memoized for HOME_DISCOVERY_CACHE_TTL_SECONDS: walking every candidate home
+    costs ~100ms per 8.5k files, which is fine on demand but not on every 60s
+    snapshot tick.
+    """
+    global _HOME_DISCOVERY_SNAPSHOT_VALUE, _HOME_DISCOVERY_SNAPSHOT_AT
+    now_monotonic = time.time()
+    if not force:
+        with _HOME_DISCOVERY_SNAPSHOT_LOCK:
+            if (
+                _HOME_DISCOVERY_SNAPSHOT_VALUE is not None
+                and now_monotonic - _HOME_DISCOVERY_SNAPSHOT_AT < HOME_DISCOVERY_CACHE_TTL_SECONDS
+            ):
+                return copy.deepcopy(_HOME_DISCOVERY_SNAPSHOT_VALUE)
+
+    now = time.time()
+    block: Dict[str, Any] = {}
+    for provider in HOME_DISCOVERY_PROVIDER_IDS:
+        candidates = provider_home_candidates(provider)
+        if not candidates:
+            continue
+        block[provider] = {
+            "tracked": [_tilde(home) for home in tracked_provider_homes(provider)],
+            "discovered": [
+                {
+                    "path": _tilde(candidate["path"]),
+                    "source": candidate["source"],
+                    "tracked": bool(candidate.get("tracked")),
+                    "excluded": bool(candidate.get("excluded")),
+                    "files": int((candidate.get("stats") or {}).get("files") or 0),
+                    "newestAgeSeconds": (
+                        int(max(0.0, now - float((candidate.get("stats") or {}).get("newestMtime") or 0.0)))
+                        if (candidate.get("stats") or {}).get("newestMtime")
+                        else None
+                    ),
+                }
+                for candidate in candidates
+            ],
+        }
+    with _HOME_DISCOVERY_SNAPSHOT_LOCK:
+        _HOME_DISCOVERY_SNAPSHOT_VALUE = copy.deepcopy(block)
+        _HOME_DISCOVERY_SNAPSHOT_AT = now_monotonic
+    return block
+
+
 def doctor_report(check_network: bool = False) -> Dict[str, Any]:
     """Diagnose why providers are or aren't detected on this machine.
 
@@ -9783,7 +11086,13 @@ def doctor_report(check_network: bool = False) -> Dict[str, Any]:
         checks.append(_doctor_check("claude.credentials", "ok", detail="OAuth token present"))
     else:
         reason = creds.get("reason") or "token_missing"
-        if reason == "keychain_denied":
+        if reason == "api_billing":
+            mode = str(creds.get("billingMode") or "api_key").replace("_", " ")
+            checks.append(_doctor_check(
+                "claude.credentials", "ok", reason=reason,
+                detail=f"billed through the API ({mode}) — no subscription quota to read, which is expected",
+            ))
+        elif reason == "keychain_denied":
             checks.append(_doctor_check(
                 "claude.credentials", "warn", reason=reason,
                 detail="the daemon was denied Keychain access to the Claude Code token", fix="grant_keychain_access",
@@ -9837,6 +11146,9 @@ def doctor_report(check_network: bool = False) -> Dict[str, Any]:
         checks.append(_doctor_check("codex.sessions", "ok", detail="session logs present"))
     else:
         checks.append(_doctor_check("codex.sessions", "warn", reason="no_local_activity", detail="no Codex session logs yet"))
+
+    # Homes holding usage we are not reading (second profiles, stalled mirrors).
+    checks.extend(home_discovery_checks())
 
     # Gemini telemetry.
     try:
@@ -9927,6 +11239,154 @@ def write_support_bundle(path: Any, report: Dict[str, Any]) -> None:
     out.write_text(text, encoding="utf-8")
 
 
+def _update_home_settings(provider: str, key: str, home: Path, remove: bool = False) -> bool:
+    """Add or remove a home in ``settings.homes.<provider>.<adopted|excluded>``.
+
+    Returns True when the stored list actually changed, so callers can tell the
+    user "already adopted" instead of implying work happened.
+    """
+    settings = agentcat_settings()
+    homes = settings.get("homes")
+    if not isinstance(homes, dict):
+        homes = {}
+        settings["homes"] = homes
+    entry = homes.get(provider)
+    if not isinstance(entry, dict):
+        entry = {}
+        homes[provider] = entry
+    current = [item for item in (entry.get(key) or []) if isinstance(item, str)]
+
+    target = str(home)
+    normalized = {item: Path(item).expanduser() for item in current}
+    matches = [
+        item for item, path in normalized.items()
+        if str(path) == target or _same_path(path, home)
+    ]
+
+    if remove:
+        if not matches:
+            return False
+        entry[key] = [item for item in current if item not in matches]
+    else:
+        if matches:
+            return False
+        entry[key] = current + [target]
+    write_agentcat_settings(settings)
+    return True
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return str(left) == str(right)
+
+
+def command_homes(args: argparse.Namespace) -> int:
+    """List discovered provider homes, and adopt or exclude one.
+
+    Adoption is deliberately manual: reading an extra home changes every number
+    the product reports, so it is the user's call, not a heuristic's.
+    """
+    provider = getattr(args, "provider", None)
+    if provider and provider not in PROVIDER_HOME_SPECS:
+        print(
+            f"unknown provider '{provider}' (known: {', '.join(PROVIDER_HOME_SPECS)})",
+            file=sys.stderr,
+        )
+        return 2
+    providers = [provider] if provider else list(HOME_DISCOVERY_PROVIDER_IDS)
+
+    adopt = getattr(args, "adopt", None)
+    exclude = getattr(args, "exclude", None)
+    forget = getattr(args, "forget", None)
+    mutation = adopt or exclude or forget
+    if mutation:
+        if not provider:
+            print("--adopt/--exclude/--forget require --provider", file=sys.stderr)
+            return 2
+        home = Path(str(mutation)).expanduser()
+        spec = PROVIDER_HOME_SPECS[provider]
+        if adopt or exclude:
+            if not home.is_dir():
+                print(f"not a directory: {home}", file=sys.stderr)
+                return 2
+            if adopt and not _home_has_marker(home, spec):
+                markers = ", ".join(str(m) for m in spec.get("markers") or ())
+                print(
+                    f"{home} does not look like a {provider} home (expected one of: {markers})",
+                    file=sys.stderr,
+                )
+                return 2
+        if adopt:
+            # An adopted home must not stay on the exclusion list, or the
+            # stronger exclusion would silently cancel the adoption.
+            _update_home_settings(provider, "excluded", home, remove=True)
+            changed = _update_home_settings(provider, "adopted", home)
+            print(f"{'adopted' if changed else 'already adopted'}: {home}")
+        elif exclude:
+            _update_home_settings(provider, "adopted", home, remove=True)
+            changed = _update_home_settings(provider, "excluded", home)
+            print(f"{'excluded' if changed else 'already excluded'}: {home}")
+        else:
+            removed_adopted = _update_home_settings(provider, "adopted", home, remove=True)
+            removed_excluded = _update_home_settings(provider, "excluded", home, remove=True)
+            if removed_adopted or removed_excluded:
+                print(f"forgot: {home}")
+            else:
+                print(f"not adopted or excluded: {home}")
+        return 0
+
+    now = time.time()
+    report: Dict[str, Any] = {}
+    for name in providers:
+        candidates = provider_home_candidates(name)
+        report[name] = {
+            "tracked": [str(home) for home in tracked_provider_homes(name)],
+            "discovered": [
+                {
+                    "path": str(candidate["path"]),
+                    "source": candidate["source"],
+                    "tracked": bool(candidate.get("tracked")),
+                    "excluded": bool(candidate.get("excluded")),
+                    "exists": bool(candidate.get("exists")),
+                    "files": int((candidate.get("stats") or {}).get("files") or 0),
+                    "capped": bool((candidate.get("stats") or {}).get("capped")),
+                    "newestMtime": (candidate.get("stats") or {}).get("newestMtime"),
+                }
+                for candidate in candidates
+            ],
+        }
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    for name in providers:
+        entry = report[name]
+        print(f"{name}:")
+        if not entry["discovered"]:
+            print("  (no homes found)")
+            continue
+        for candidate in entry["discovered"]:
+            if candidate["excluded"]:
+                mark = "excluded"
+            elif candidate["tracked"]:
+                mark = "reading"
+            else:
+                mark = "NOT read"
+            age = _describe_home_age(candidate["newestMtime"], now)
+            files = f"{candidate['files']}{'+' if candidate['capped'] else ''}"
+            print(
+                f"  [{mark:>8}] {candidate['path']}  "
+                f"({files} files, {age}, via {candidate['source']})"
+            )
+        unread = [c for c in entry["discovered"] if not c["tracked"] and not c["excluded"] and c["files"]]
+        if unread:
+            print(f"  → adopt with: agentcat homes --provider {name} --adopt {unread[0]['path']}")
+    return 0
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     report = doctor_report(check_network=bool(getattr(args, "network", False)))
     bundle = getattr(args, "bundle", None)
@@ -10002,6 +11462,14 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--network", action="store_true")
     doctor.add_argument("--bundle")
     doctor.set_defaults(func=command_doctor)
+
+    homes = subparsers.add_parser("homes")
+    homes.add_argument("--provider", choices=sorted(PROVIDER_HOME_SPECS))
+    homes.add_argument("--adopt", help="start reading usage from this home")
+    homes.add_argument("--exclude", help="never read or suggest this home")
+    homes.add_argument("--forget", help="drop this home from both lists")
+    homes.add_argument("--json", action="store_true")
+    homes.set_defaults(func=command_homes)
 
     return parser
 

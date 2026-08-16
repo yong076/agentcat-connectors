@@ -8,11 +8,13 @@ import sqlite3
 import tempfile
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import unittest
 from contextlib import closing, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from typing import List
 from unittest.mock import patch
 
 
@@ -649,7 +651,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         with patch.object(agentcat.sys, "platform", "linux"):
             payload = agentcat.fetch_llm_usage_fresh()
         self.assertIn("generatedAt", payload)
-        self.assertEqual(set(payload["providers"]), {"claude", "codex", "gemini", "antigravity"})
+        self.assertEqual(set(payload["providers"]), {"claude", "codex", "gemini", "antigravity", "grok", "kimi"})
         # Antigravity rides the same on-demand path as the other OAuth providers
         # (26.28.1) so the Live panel's manual refresh agrees with /v1/snapshot.
         antigravity = payload["providers"]["antigravity"]
@@ -3032,6 +3034,227 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["events"], 0)
         self.assertEqual(snapshot["tokens"]["all"], 0)
         self.assertEqual(snapshot["sources"]["hookFiles"], 1)
+
+    def _write_grok_updates(self, cwd: str, session_id: str, lines: List[str]) -> Path:
+        encoded = urllib.parse.quote(cwd, safe="")
+        session_dir = agentcat.HOME / ".grok" / "sessions" / encoded / session_id
+        session_dir.mkdir(parents=True)
+        path = session_dir / "updates.jsonl"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_grok_snapshot_reads_session_usage_and_media(self) -> None:
+        self._write_grok_updates(
+            "/Users/me/project",
+            "session-a",
+            [
+                json.dumps({
+                    "params": {
+                        "_meta": {"agentTimestampMs": 1_780_000_000_000, "promptId": "p1"},
+                        "update": {
+                            "sessionUpdate": "turn_completed",
+                            "prompt_id": "p1",
+                            "usage": {
+                                "inputTokens": 100,
+                                "outputTokens": 20,
+                                "cachedReadTokens": 10,
+                                "cacheCreationTokens": 5,
+                                "reasoningTokens": 7,
+                                "totalTokens": 142,
+                                "modelUsage": {"grok-4.5-build": {"totalTokens": 142}},
+                            },
+                        },
+                    }
+                }),
+                json.dumps({
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": "img-1",
+                            "title": "must not be parsed as usage",
+                            "_meta": {"x.ai/tool": {"name": "image_gen", "kind": "generate"}},
+                        }
+                    }
+                }),
+                json.dumps({
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": "img-1",
+                            "_meta": {"x.ai/tool.name": "image_gen"},
+                        }
+                    }
+                }),
+                json.dumps({
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": "vid-1",
+                            "_meta": {"x.ai/tool.name": "image_to_video"},
+                        }
+                    }
+                }),
+                json.dumps({"role": "user", "content": "secret prompt must be ignored"}),
+            ],
+        )
+
+        snapshot = agentcat.grok_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 100)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 20)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 10)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 5)
+        self.assertEqual(snapshot["tokens"]["reasoningTokens"], 7)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 142)
+        self.assertEqual(snapshot["models"]["grok-4.5-build"]["totalTokens"], 142)
+        self.assertEqual(snapshot["media"]["images"], 1)
+        self.assertEqual(snapshot["media"]["videos"], 1)
+        self.assertEqual(snapshot["projects"]["items"][0]["name"], "project")
+        self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 142)
+        self.assertEqual(snapshot["breakdown"]["status"], "ok")
+
+    def test_grok_snapshot_dedupes_prompt_usage(self) -> None:
+        self._write_grok_updates(
+            "/tmp/app",
+            "session-b",
+            [
+                json.dumps({
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "turn_completed",
+                            "prompt_id": "same",
+                            "usage": {"inputTokens": 50, "outputTokens": 5, "totalTokens": 55},
+                        }
+                    }
+                }),
+                json.dumps({
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "turn_completed",
+                            "prompt_id": "same",
+                            "usage": {"inputTokens": 80, "outputTokens": 9, "totalTokens": 89},
+                        }
+                    }
+                }),
+            ],
+        )
+
+        snapshot = agentcat.grok_snapshot()
+
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 89)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 80)
+
+    def test_grok_limits_from_credits_weekly_window(self) -> None:
+        limits = agentcat.grok_limits_from_billing_response(
+            {
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-08-11T06:32:59.329225+00:00",
+                        "end": "2026-08-18T06:32:59.329225+00:00",
+                    },
+                    "creditUsagePercent": 94.0,
+                    "productUsage": [
+                        {"product": "GrokBuild", "usagePercent": 79.0},
+                        {"product": "GrokImagine", "usagePercent": 14.0},
+                    ],
+                    "billingPeriodEnd": "2026-08-18T06:32:59.329225+00:00",
+                }
+            }
+        )
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["planType"], "weekly")
+        self.assertAlmostEqual(limits["weeklyUsedPercent"], 94.0)
+        self.assertEqual(limits["weeklyResetAt"], agentcat.reset_epoch("2026-08-18T06:32:59.329225+00:00"))
+        ids = [row["id"] for row in limits["quotas"]]
+        self.assertEqual(ids[0], "grok:7d")
+        self.assertIn("grok:build", ids)
+        self.assertIn("grok:imagine", ids)
+        weekly = next(row for row in limits["quotas"] if row["id"] == "grok:7d")
+        self.assertEqual(weekly["label"], "7일")
+        self.assertAlmostEqual(weekly["usedPercent"], 94.0)
+        self.assertAlmostEqual(weekly["remainingPercent"], 6.0)
+
+    def test_grok_limits_from_billing_unlimited_still_exposes_reset(self) -> None:
+        limits = agentcat.grok_limits_from_billing_response(
+            {
+                "config": {
+                    "monthlyLimit": {"val": 0},
+                    "used": {"val": 219},
+                    "billingPeriodStart": "2026-08-01T00:00:00+00:00",
+                    "billingPeriodEnd": "2026-09-01T00:00:00+00:00",
+                }
+            }
+        )
+        self.assertEqual(limits["status"], "auto")
+        self.assertIsNone(limits["monthlyTokens"])
+        self.assertIsNone(limits["weeklyUsedPercent"])
+        self.assertEqual(limits["weeklyResetAt"], 1788220800)
+        self.assertEqual(limits["quotas"][0]["id"], "grok:monthly")
+        self.assertEqual(limits["quotas"][0]["label"], "월별 초기화")
+        self.assertEqual(limits["quotas"][0]["used"], 219)
+        self.assertIsNone(limits["quotas"][0]["limit"])
+        self.assertEqual(limits["quotas"][0]["resetAt"], 1788220800)
+
+    def test_grok_limits_from_billing_with_cap(self) -> None:
+        limits = agentcat.grok_limits_from_billing_response(
+            {
+                "config": {
+                    "monthlyLimit": {"val": 1000},
+                    "used": {"val": 250},
+                    "billingPeriodEnd": "2026-09-01T00:00:00+00:00",
+                }
+            }
+        )
+        self.assertEqual(limits["monthlyTokens"], 1000)
+        self.assertEqual(limits["weeklyUsedPercent"], 25.0)
+        self.assertEqual(limits["quotas"][0]["remaining"], 750)
+        self.assertEqual(limits["quotas"][0]["usedPercent"], 25.0)
+        self.assertEqual(limits["quotas"][0]["label"], "월별 한도")
+        self.assertEqual(limits["weeklyResetAt"], 1788220800)
+
+    def test_grok_live_limits_token_missing(self) -> None:
+        limits = agentcat.grok_live_limits(force=True)
+        self.assertEqual(limits.get("reason"), "token_missing")
+
+    def test_kimi_limits_from_usages_maps_windows_and_reset(self) -> None:
+        limits = agentcat.kimi_limits_from_usage_response(
+            {
+                "usage": {
+                    "limit": "100",
+                    "used": "7",
+                    "remaining": "93",
+                    "resetTime": "2026-08-21T12:24:01.604251Z",
+                },
+                "limits": [
+                    {
+                        "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                        "detail": {
+                            "limit": "100",
+                            "remaining": "100",
+                            "resetTime": "2026-08-16T12:24:01.604251Z",
+                        },
+                    }
+                ],
+            }
+        )
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["shortWindowMinutes"], 300)
+        self.assertAlmostEqual(limits["weeklyUsedPercent"], 7.0, places=5)
+        ids = [row["id"] for row in limits["quotas"]]
+        self.assertIn("kimi:5h", ids)
+        self.assertIn("kimi:7d", ids)
+        weekly = next(row for row in limits["quotas"] if row["id"] == "kimi:7d")
+        self.assertEqual(weekly["used"], 7)
+        self.assertEqual(weekly["remaining"], 93)
+        self.assertEqual(weekly["resetAt"], agentcat.reset_epoch("2026-08-21T12:24:01.604251Z"))
+
+    def test_kimi_live_limits_token_missing(self) -> None:
+        limits = agentcat.kimi_live_limits(force=True)
+        self.assertEqual(limits.get("reason"), "token_missing")
 
     def test_classify_kimi_and_grok_cli_processes(self) -> None:
         self.assertEqual(agentcat.classify_process("kimi-code"), "kimi")
