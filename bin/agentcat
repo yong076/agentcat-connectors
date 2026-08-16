@@ -73,6 +73,16 @@ CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing"
+KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
+KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+GROK_MEDIA_TOOL_NAMES = {
+    "image_gen": "images",
+    "image_edit": "images",
+    "image_to_video": "videos",
+    "reference_to_video": "videos",
+}
 GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"""OAUTH_CLIENT_ID\s*[:=]\s*["']([^"']+)["']""")
@@ -110,7 +120,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.31.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.32.0")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -163,6 +173,9 @@ CONNECTOR_CAPABILITIES = (
     "limits.claude.statusline",
     "limits.claude.statuslineQuotas",
     "limits.gemini.codeAssist",
+    "limits.grok.oauthUsage",
+    "limits.kimi.oauthUsage",
+    "usage.grok.sessions",
     "hooks.codexNotify",
     "hooks.claudeStatusline",
     "hooks.claudeHooks",
@@ -186,6 +199,8 @@ TOKEN_KEYS = {
     "thoughts_token_count": "thoughtTokens",
     "reasoning_tokens": "reasoningTokens",
     "reasoningtokens": "reasoningTokens",
+    "cachedreadtokens": "cacheReadInputTokens",
+    "cachecreationtokens": "cacheCreationInputTokens",
     "tool_token_count": "toolTokens",
     "total_token_count": "totalTokens",
     "total_input_tokens": "inputTokens",
@@ -2644,7 +2659,7 @@ def merge_limits(configured: Dict[str, Any], detected: Dict[str, Any]) -> Dict[s
 
 
 def configured_limits() -> Dict[str, Dict[str, Any]]:
-    base = {provider: empty_limits() for provider in ("codex", "claude", "gemini", "antigravity")}
+    base = {provider: empty_limits() for provider in ("codex", "claude", "gemini", "antigravity", "grok", "kimi")}
     raw = read_json(LIMITS_FILE)
     if raw is None:
         return base
@@ -4235,6 +4250,401 @@ def antigravity_live_limits(force: bool = False) -> Dict[str, Any]:
         return limits
 
 
+def grok_auth_path() -> Path:
+    roots = grok_roots()
+    for root in roots:
+        path = root / "auth.json"
+        if path.is_file():
+            return path
+    return (roots[0] if roots else HOME / ".grok") / "auth.json"
+
+
+def grok_billing_val(raw: Any) -> Optional[float]:
+    if isinstance(raw, dict) and "val" in raw:
+        return float_value(raw.get("val"))
+    return float_value(raw)
+
+
+def read_grok_access_token() -> Dict[str, Any]:
+    """Read the local Grok CLI session token. Never logs or returns PII fields."""
+    raw = read_json(grok_auth_path())
+    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+        return {"token": None, "reason": "token_missing"}
+    best_token: Optional[str] = None
+    best_expiry = -1.0
+    for entry in raw.values():
+        if not isinstance(entry, dict):
+            continue
+        token = entry.get("key") or entry.get("access_token") or entry.get("accessToken")
+        if not (isinstance(token, str) and token.strip()):
+            continue
+        expires = parse_timestamp(entry.get("expires_at") or entry.get("expiresAt"))
+        score = expires.timestamp() if expires else 0.0
+        if best_token is None or score >= best_expiry:
+            best_token = token.strip()
+            best_expiry = score
+    if not best_token:
+        return {"token": None, "reason": "token_missing"}
+    return {"token": best_token, "reason": None}
+
+
+def grok_limits_from_billing_response(payload: Dict[str, Any], source: str = GROK_BILLING_URL) -> Dict[str, Any]:
+    config = payload.get("config") if isinstance(payload.get("config"), dict) else payload
+    if not isinstance(config, dict):
+        return empty_limits(reason="not_applicable")
+
+    used = grok_billing_val(config.get("used"))
+    limit = grok_billing_val(config.get("monthlyLimit") or config.get("monthly_limit"))
+    reset_at = config.get("billingPeriodEnd") or config.get("billing_period_end")
+    if used is None and limit is None and reset_at is None:
+        return empty_limits(reason="not_applicable")
+
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    limits["planType"] = "monthly"
+    if limit and limit > 0:
+        limits["monthlyTokens"] = int(limit)
+        if used is not None:
+            limits["weeklyUsedPercent"] = min(max((used / limit) * 100.0, 0.0), 100.0)
+    reset_epoch_value = reset_epoch(reset_at)
+    if reset_epoch_value:
+        limits["weeklyResetAt"] = reset_epoch_value
+
+    remaining = None
+    used_percent = None
+    remaining_percent = None
+    if limit and limit > 0:
+        remaining = max(limit - (used or 0.0), 0.0)
+        used_percent = min(max(((used or 0.0) / limit) * 100.0, 0.0), 100.0)
+        remaining_percent = remaining_percent_from_used(used_percent)
+
+    quotas = [
+        quota_entry(
+            "grok:monthly",
+            "월별 크레딧",
+            used_percent=used_percent,
+            remaining_percent=remaining_percent,
+            reset_at=reset_at,
+            unit="credits",
+            used=used,
+            remaining=remaining,
+            limit=limit if limit and limit > 0 else None,
+            window="monthly",
+            source=source,
+        )
+    ]
+    limits["quotas"] = quotas
+    return limits
+
+
+def grok_live_limits(force: bool = False) -> Dict[str, Any]:
+    cached = None if force else cached_live_limits("grok", LIVE_LIMITS_MAX_AGE_SECONDS)
+    if cached:
+        return cached
+    creds = read_grok_access_token()
+    token = creds.get("token")
+    if not (isinstance(token, str) and token):
+        return empty_limits(reason=creds.get("reason") or "token_missing")
+    req = urllib.request.Request(
+        GROK_BILLING_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "grok-cli/1.0.4",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        limits = grok_limits_from_billing_response(
+            payload if isinstance(payload, dict) else {},
+            source=GROK_BILLING_URL,
+        )
+        write_live_limits_cache("grok", limits)
+        return limits
+    except urllib.error.HTTPError as exc:
+        reason = "token_expired" if exc.code in {401, 403} else None
+        stale = cached_live_limits("grok", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+        if stale:
+            return serve_stale_live_limits("grok", stale, exc)
+        limits = live_limit_error(exc, GROK_BILLING_URL)
+        if reason:
+            limits["reason"] = reason
+        write_live_limits_cache("grok", limits)
+        return limits
+    except Exception as exc:
+        stale = cached_live_limits("grok", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+        if stale:
+            return serve_stale_live_limits("grok", stale, exc)
+        limits = live_limit_error(exc, GROK_BILLING_URL)
+        write_live_limits_cache("grok", limits)
+        return limits
+
+
+def kimi_credentials_path() -> Path:
+    for root in kimi_roots():
+        path = root / "credentials" / "kimi-code.json"
+        if path.is_file():
+            return path
+    return HOME / ".kimi-code" / "credentials" / "kimi-code.json"
+
+
+def read_kimi_oauth_credentials() -> Dict[str, Any]:
+    raw = read_json(kimi_credentials_path())
+    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+        return {"access_token": None, "refresh_token": None, "reason": "token_missing"}
+    access = raw.get("access_token") or raw.get("accessToken")
+    refresh = raw.get("refresh_token") or raw.get("refreshToken")
+    if not (isinstance(access, str) and access.strip()) and not (isinstance(refresh, str) and refresh.strip()):
+        return {"access_token": None, "refresh_token": None, "reason": "token_missing"}
+    expires_at = int_limit(raw.get("expires_at") or raw.get("expiresAt"))
+    return {
+        "access_token": access.strip() if isinstance(access, str) else None,
+        "refresh_token": refresh.strip() if isinstance(refresh, str) else None,
+        "expires_at": expires_at,
+        "reason": None,
+    }
+
+
+def refresh_kimi_access_token(refresh_token: str) -> Optional[str]:
+    # In-memory only — never write Kimi's credentials file.
+    body = urllib.parse.urlencode(
+        {
+            "client_id": KIMI_OAUTH_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        KIMI_OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "kimi-code/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    return token.strip() if isinstance(token, str) and token.strip() else None
+
+
+def kimi_usage_number(raw: Any) -> Optional[float]:
+    if isinstance(raw, dict):
+        for key in ("used", "limit", "remaining", "val", "value"):
+            if key in raw:
+                return kimi_usage_number(raw.get(key))
+        return None
+    return float_value(raw)
+
+
+def kimi_window_label(window: Any) -> Tuple[str, str, str]:
+    if not isinstance(window, dict):
+        return "kimi:usage", "Kimi 한도", "week"
+    duration = int_limit(window.get("duration")) or 0
+    unit = str(window.get("timeUnit") or window.get("unit") or "").lower()
+    minutes = duration
+    if "hour" in unit:
+        minutes = duration * 60
+    elif "day" in unit:
+        minutes = duration * 24 * 60
+    elif "week" in unit:
+        minutes = duration * 7 * 24 * 60
+    if 0 < minutes <= 12 * 60:
+        return "kimi:5h", "5시간", "5h"
+    if minutes <= 36 * 60:
+        return "kimi:1d", "1일", "1d"
+    return "kimi:7d", "7일", "7d"
+
+
+def kimi_limits_from_usage_response(payload: Dict[str, Any], source: str = KIMI_USAGE_URL) -> Dict[str, Any]:
+    if payload.get("kind") == "error":
+        return empty_limits(status="error", error=str(payload.get("message") or "kimi usage error"))
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return empty_limits(reason="not_applicable")
+
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    quotas: List[Dict[str, Any]] = []
+
+    rows = data.get("limits") if isinstance(data.get("limits"), list) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        detail = row.get("detail") if isinstance(row.get("detail"), dict) else row
+        used = kimi_usage_number(detail.get("used"))
+        limit = kimi_usage_number(detail.get("limit"))
+        remaining = kimi_usage_number(detail.get("remaining"))
+        reset_at = detail.get("resetTime") or detail.get("reset_at") or row.get("reset_at")
+        if used is None and remaining is not None and limit is not None:
+            used = max(limit - remaining, 0.0)
+        if remaining is None and used is not None and limit is not None:
+            remaining = max(limit - used, 0.0)
+        if used is None and limit is None:
+            continue
+        quota_id, label, window = kimi_window_label(row.get("window"))
+        used_percent = None
+        remaining_percent = None
+        if limit and limit > 0 and used is not None:
+            used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
+            remaining_percent = remaining_percent_from_used(used_percent)
+            if window == "5h":
+                limits["shortUsedPercent"] = used_percent
+                limits["shortWindowMinutes"] = 300
+                limits["shortResetAt"] = reset_epoch(reset_at)
+            elif window == "7d":
+                limits["weeklyUsedPercent"] = used_percent
+                limits["weeklyResetAt"] = reset_epoch(reset_at)
+                limits["weeklyTokens"] = int(limit)
+        quotas.append(
+            quota_entry(
+                quota_id,
+                label,
+                used_percent=used_percent,
+                remaining_percent=remaining_percent,
+                reset_at=reset_at,
+                unit="requests",
+                used=used,
+                remaining=remaining,
+                limit=limit if limit and limit > 0 else None,
+                window=window,
+                source=source,
+            )
+        )
+
+    summary = data.get("usage") if isinstance(data.get("usage"), dict) else data.get("summary")
+    if isinstance(summary, dict):
+        used = kimi_usage_number(summary.get("used"))
+        limit = kimi_usage_number(summary.get("limit"))
+        remaining = kimi_usage_number(summary.get("remaining"))
+        reset_at = summary.get("resetTime") or summary.get("reset_at")
+        if used is None and remaining is not None and limit is not None:
+            used = max(limit - remaining, 0.0)
+        if remaining is None and used is not None and limit is not None:
+            remaining = max(limit - used, 0.0)
+        if limit and limit > 0 and used is not None:
+            used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
+            if limits.get("weeklyUsedPercent") is None:
+                limits["weeklyUsedPercent"] = used_percent
+                limits["weeklyResetAt"] = reset_epoch(reset_at)
+                limits["weeklyTokens"] = int(limit)
+            if not any(item.get("id") == "kimi:7d" for item in quotas):
+                quotas.append(
+                    quota_entry(
+                        "kimi:7d",
+                        "7일",
+                        used_percent=used_percent,
+                        remaining_percent=remaining_percent_from_used(used_percent),
+                        reset_at=reset_at,
+                        unit="requests",
+                        used=used,
+                        remaining=remaining,
+                        limit=limit,
+                        window="7d",
+                        source=source,
+                    )
+                )
+
+    extra = data.get("extra_usage") if isinstance(data.get("extra_usage"), dict) else None
+    if extra:
+        used_cents = kimi_usage_number(extra.get("monthly_used_cents"))
+        limit_cents = kimi_usage_number(extra.get("monthly_charge_limit_cents"))
+        if extra.get("monthly_charge_limit_enabled") and limit_cents and limit_cents > 0:
+            used = (used_cents or 0.0) / 100.0
+            limit = limit_cents / 100.0
+            used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
+            quotas.append(
+                quota_entry(
+                    "kimi:booster",
+                    "월별 크레딧",
+                    used_percent=used_percent,
+                    remaining_percent=remaining_percent_from_used(used_percent),
+                    unit="usd",
+                    used=used,
+                    remaining=max(limit - used, 0.0),
+                    limit=limit,
+                    window="monthly",
+                    source=source,
+                )
+            )
+
+    if not quotas:
+        return empty_limits(reason="not_applicable")
+    limits["quotas"] = quotas
+    return limits
+
+
+def kimi_usage_request(access_token: str) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        KIMI_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": "kimi-code/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def kimi_live_limits(force: bool = False) -> Dict[str, Any]:
+    cached = None if force else cached_live_limits("kimi", LIVE_LIMITS_MAX_AGE_SECONDS)
+    if cached:
+        return cached
+    creds = read_kimi_oauth_credentials()
+    access = creds.get("access_token")
+    refresh = creds.get("refresh_token")
+    if not access and not refresh:
+        return empty_limits(reason=creds.get("reason") or "token_missing")
+
+    last_error: Optional[Exception] = None
+    tokens: List[str] = []
+    expires_at = creds.get("expires_at")
+    expired = isinstance(expires_at, int) and expires_at > 0 and expires_at < int(time.time())
+    if isinstance(access, str) and access and not expired:
+        tokens.append(access)
+    if isinstance(refresh, str) and refresh:
+        try:
+            refreshed = refresh_kimi_access_token(refresh)
+        except Exception as exc:
+            last_error = exc
+            refreshed = None
+        if refreshed:
+            tokens.append(refreshed)
+    if isinstance(access, str) and access and access not in tokens:
+        tokens.append(access)
+
+    for token in tokens:
+        try:
+            payload = kimi_usage_request(token)
+            limits = kimi_limits_from_usage_response(payload, source=KIMI_USAGE_URL)
+            write_live_limits_cache("kimi", limits)
+            return limits
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in {401, 403}:
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            break
+
+    stale = cached_live_limits("kimi", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+    if stale:
+        return serve_stale_live_limits("kimi", stale, last_error or RuntimeError("Kimi usage API failed"))
+    if last_error is None:
+        return empty_limits(reason="token_expired" if expired else "token_missing")
+    limits = live_limit_error(last_error, KIMI_USAGE_URL)
+    if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403}:
+        limits["reason"] = "token_expired"
+    write_live_limits_cache("kimi", limits)
+    return limits
+
+
 def prefer_live_limits(live: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
     if live.get("status") in {"auto", "ok"} and (
         live.get("quotas") or any(live.get(key) is not None for key in ("weeklyUsedPercent", "shortUsedPercent"))
@@ -4273,6 +4683,8 @@ def runtime_limits() -> Dict[str, Dict[str, Any]]:
         # relabel Gemini's quota as Antigravity's (the exact #45 mirroring bug this
         # provider was split out to fix).
         "antigravity": _safe(antigravity_live_limits),
+        "grok": _safe(grok_live_limits),
+        "kimi": _safe(kimi_live_limits),
     }
 
 
@@ -4353,6 +4765,7 @@ SHELL_TOOL_NAMES = {
     "exec",
     "execute_command",
     "run_terminal_cmd",
+    "run_terminal_command",
     "shell_exec",
     "terminal",
     "run",
@@ -4803,6 +5216,186 @@ def grok_roots() -> List[Path]:
     return roots or [HOME / ".grok", HOME / ".xai"]
 
 
+def grok_session_project_path(updates_path: Path) -> Optional[str]:
+    """Project cwd is the URL-encoded session group folder, not file content."""
+    try:
+        group = updates_path.parent.parent.name
+    except Exception:
+        return None
+    if not group or group.startswith("."):
+        return None
+    decoded = urllib.parse.unquote(group).strip()
+    return decoded or None
+
+
+def grok_usage_metrics(usage: Any) -> Dict[str, int]:
+    if not isinstance(usage, dict):
+        return {}
+    metrics = {
+        "inputTokens": nonnegative_int(usage.get("inputTokens") or usage.get("input_tokens")) or 0,
+        "outputTokens": nonnegative_int(usage.get("outputTokens") or usage.get("output_tokens")) or 0,
+        "cacheReadInputTokens": nonnegative_int(
+            usage.get("cachedReadTokens") or usage.get("cacheReadInputTokens") or usage.get("cached_read_tokens")
+        ) or 0,
+        "cacheCreationInputTokens": nonnegative_int(
+            usage.get("cacheCreationTokens") or usage.get("cacheCreationInputTokens") or usage.get("cache_creation_tokens")
+        ) or 0,
+        "reasoningTokens": nonnegative_int(usage.get("reasoningTokens") or usage.get("reasoning_tokens")) or 0,
+    }
+    total = nonnegative_int(usage.get("totalTokens") or usage.get("total_tokens")) or 0
+    if total > usage_token_total(metrics):
+        metrics["totalTokens"] = total
+    return {key: amount for key, amount in metrics.items() if amount > 0}
+
+
+def grok_usage_model(usage: Dict[str, Any], fallback: Optional[str] = None) -> str:
+    model_usage = usage.get("modelUsage") if isinstance(usage.get("modelUsage"), dict) else {}
+    for name in model_usage.keys():
+        model = normalized_model_name(name)
+        if model:
+            return model
+    return normalized_model_name(fallback) or "grok"
+
+
+def grok_update_payload(event: Dict[str, Any]) -> Dict[str, Any]:
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    update = params.get("update") if isinstance(params.get("update"), dict) else {}
+    return update if isinstance(update, dict) else {}
+
+
+def grok_event_timestamp(event: Dict[str, Any], update: Dict[str, Any]) -> Optional[dt.datetime]:
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+    return parse_timestamp(
+        meta.get("agentTimestampMs")
+        or event.get("ts")
+        or event.get("timestamp")
+        or update.get("timestamp")
+    )
+
+
+def grok_prompt_id(event: Dict[str, Any], update: Dict[str, Any]) -> Optional[str]:
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+    for candidate in (
+        update.get("prompt_id"),
+        update.get("promptId"),
+        meta.get("promptId"),
+        meta.get("prompt_id"),
+        event.get("prompt_id"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def grok_tool_name(update: Dict[str, Any]) -> Optional[str]:
+    # Names only — titles/rawInput can carry prompt text and must not be read.
+    meta = update.get("_meta") if isinstance(update.get("_meta"), dict) else {}
+    namespaced = meta.get("x.ai/tool") if isinstance(meta.get("x.ai/tool"), dict) else {}
+    for candidate in (
+        namespaced.get("name"),
+        meta.get("x.ai/tool.name"),
+        update.get("name"),
+        update.get("toolName"),
+        update.get("tool_name"),
+        nested_dict_value(update, ["toolCall", "name"]),
+        nested_dict_value(update, ["tool_call", "name"]),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def grok_tool_call_id(update: Dict[str, Any]) -> Optional[str]:
+    for candidate in (
+        update.get("toolCallId"),
+        update.get("tool_call_id"),
+        nested_dict_value(update, ["toolCall", "toolCallId"]),
+        nested_dict_value(update, ["tool_call", "id"]),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def parse_grok_updates(path: Path) -> Dict[str, Any]:
+    """Read usage/tool metadata from one updates.jsonl. Ignores prompt text."""
+    usage_by_prompt: Dict[str, Dict[str, Any]] = {}
+    media_ids: Dict[str, Set[str]] = {"images": set(), "videos": set()}
+    tool_names: List[str] = []
+    fallback_index = 0
+    for event in iter_jsonl_file(path):
+        update = grok_update_payload(event)
+        if not update:
+            continue
+        session_update = str(update.get("sessionUpdate") or update.get("session_update") or "")
+        tool_name = grok_tool_name(update)
+        if session_update == "tool_call" and tool_name:
+            tool_names.append(tool_name)
+            media_kind = GROK_MEDIA_TOOL_NAMES.get(tool_name)
+            if media_kind:
+                call_id = grok_tool_call_id(update) or f"{path}:{fallback_index}"
+                media_ids[media_kind].add(call_id)
+        usage = update.get("usage")
+        metrics = grok_usage_metrics(usage)
+        if metrics:
+            prompt_id = grok_prompt_id(event, update) or f"{path}:{fallback_index}"
+            fallback_index += 1
+            previous = usage_by_prompt.get(prompt_id)
+            if previous is None or usage_token_total(metrics) >= usage_token_total(previous["metrics"]):
+                usage_by_prompt[prompt_id] = {
+                    "metrics": metrics,
+                    "when": grok_event_timestamp(event, update),
+                    "model": grok_usage_model(usage if isinstance(usage, dict) else {}, None),
+                }
+    return {
+        "usage": list(usage_by_prompt.values()),
+        "images": len(media_ids["images"]),
+        "videos": len(media_ids["videos"]),
+        "tool_names": tool_names,
+    }
+
+
+def attach_grok_local_quotas(snapshot: Dict[str, Any]) -> None:
+    media = snapshot.get("media") if isinstance(snapshot.get("media"), dict) else {}
+    limits = snapshot.get("limits") if isinstance(snapshot.get("limits"), dict) else None
+    if not isinstance(limits, dict):
+        return
+    quotas = [item for item in (limits.get("quotas") or []) if isinstance(item, dict)]
+    existing = {str(item.get("id")) for item in quotas}
+    images = nonnegative_int(media.get("images")) or 0
+    videos = nonnegative_int(media.get("videos")) or 0
+    if images > 0 and "grok:images" not in existing:
+        quotas.append(
+            quota_entry(
+                "grok:images",
+                "이미지",
+                used=images,
+                unit="images",
+                window="media",
+                model="image",
+                source="grok_session_updates",
+            )
+        )
+    if videos > 0 and "grok:videos" not in existing:
+        quotas.append(
+            quota_entry(
+                "grok:videos",
+                "영상",
+                used=videos,
+                unit="videos",
+                window="media",
+                model="video",
+                source="grok_session_updates",
+            )
+        )
+    if quotas:
+        limits["quotas"] = quotas
+        if limits.get("status") in {None, "not_configured"}:
+            limits["status"] = "ok"
+
+
 def grok_snapshot() -> Dict[str, Any]:
     roots = grok_roots()
     result = empty_provider_usage(source=",".join(str(root) for root in roots))
@@ -4812,26 +5405,74 @@ def grok_snapshot() -> Dict[str, Any]:
         return result
 
     hook_files: List[Path] = []
-    log_files: List[Path] = []
+    update_files: List[Path] = []
     for root in existing_roots:
         hook = root / "hooks" / "orca-status.json"
         if hook.is_file():
             hook_files.append(hook)
+        sessions_root = root / "sessions"
+        if not sessions_root.is_dir():
+            continue
         try:
-            log_files.extend(path for path in root.glob("**/*.log") if path.is_file())
+            update_files.extend(path for path in sessions_root.glob("*/*/updates.jsonl") if path.is_file())
         except OSError:
             pass
 
-    result["status"] = "no_token_events_yet"
-    result["source"] = ",".join(str(path) for path in (hook_files + recent_files(log_files))) or ",".join(str(root) for root in existing_roots)
-    result["events"] = 0
+    update_files = recent_files(update_files)
+    events = 0
+    images = 0
+    videos = 0
+    project_tokens: Dict[str, int] = {}
+    project_last: Dict[str, dt.datetime] = {}
+    for path in update_files:
+        parsed = parse_grok_updates(path)
+        images += int(parsed.get("images") or 0)
+        videos += int(parsed.get("videos") or 0)
+        project_path = grok_session_project_path(path)
+        for item in parsed.get("usage") or []:
+            metrics = item.get("metrics") if isinstance(item, dict) else None
+            if not isinstance(metrics, dict):
+                continue
+            when = item.get("when") if isinstance(item.get("when"), dt.datetime) else None
+            if add_usage_metrics(result, item.get("model"), metrics, when):
+                events += 1
+                update_breakdown(result["breakdown"], chat=1)
+                total = usage_token_total(metrics)
+                if project_path and total > 0:
+                    project_tokens[project_path] = project_tokens.get(project_path, 0) + total
+                    if when is not None:
+                        current = project_last.get(project_path)
+                        if current is None or when > current:
+                            project_last[project_path] = when
+        update_breakdown(result["breakdown"], tools=parsed.get("tool_names") or [])
+
+    result["status"] = "ok" if events > 0 else "no_token_events_yet"
+    result["source"] = ",".join(str(path) for path in (hook_files + update_files[:8])) or ",".join(
+        str(root) for root in existing_roots
+    )
+    result["events"] = events
+    result["sessions"] = len(update_files)
+    result["media"] = {"status": "ok" if (images or videos) else "empty", "images": images, "videos": videos}
     result["sources"] = {
         "hookFiles": len(hook_files),
-        "logFiles": len(log_files),
+        "sessionUpdateFiles": len(update_files),
         "parseMaxFiles": LOCAL_PROVIDER_MAX_FILES,
     }
-    if hook_files:
-        result["message"] = "Grok local hooks detected; usage tokens are not exposed yet"
+    if project_tokens:
+        items = []
+        for project_path, tokens in project_tokens.items():
+            last_active = project_last.get(project_path)
+            items.append({
+                "id": project_path,
+                "path": project_path,
+                "name": display_project_name(project_path),
+                "tokens": tokens,
+                "lastActive": last_active.isoformat().replace("+00:00", "Z") if last_active else None,
+            })
+        items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
+        result["projects"] = {"status": "ok", "items": items[:20]}
+    if hook_files and events == 0:
+        result["message"] = "Grok local hooks detected; no session token events yet"
     return result
 
 
@@ -6248,14 +6889,14 @@ def attach_local_usage_coverage(provider: str, snapshot: Dict[str, Any], **extra
             "note": "Uses explicit Copilot output tokens when present and local transcript estimates when the transcript lacks token fields.",
         },
         "kimi": {
-            "includedSources": ["kimi_code_logs", "kimi_wire_logs"],
+            "includedSources": ["kimi_code_logs", "kimi_wire_logs", "kimi_billing_quota"],
             "privacy": "usage_fields_only",
-            "note": "Reads Kimi Code token/model/timestamp log fields only. Prompt history, titles, workdirs, and transcript content are ignored.",
+            "note": "Reads Kimi Code token/model/timestamp log fields only. Prompt history, titles, and transcript content are ignored. Quota/reset uses the local Kimi login when available.",
         },
         "grok": {
-            "includedSources": ["grok_local_hooks"],
-            "privacy": "hook_metadata_only",
-            "note": "Detects Grok local hooks and processes. Token totals and soft quota appear only when a local token source is available.",
+            "includedSources": ["grok_session_updates", "grok_billing_quota"],
+            "privacy": "usage_fields_only",
+            "note": "Reads Grok session usage/tool-name fields only. Prompts, chat history, and terminal logs are ignored. Monthly credit reset uses the local Grok login when available.",
         },
     }
     descriptor = descriptors.get(provider)
@@ -6647,6 +7288,8 @@ def fetch_llm_usage_fresh() -> Dict[str, Any]:
             "codex": live_usage_provider_from_limits(codex_live_limits(force=True)),
             "gemini": live_usage_provider_from_limits(gemini_live_limits(force=True)),
             "antigravity": live_usage_provider_from_limits(antigravity_live_limits(force=True)),
+            "grok": live_usage_provider_from_limits(grok_live_limits(force=True)),
+            "kimi": live_usage_provider_from_limits(kimi_live_limits(force=True)),
         },
     }
 
@@ -9584,6 +10227,8 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             limits_by_provider.get(provider, empty_limits()),
             runtime_limits_by_provider.get(provider, empty_limits()),
         )
+        if provider == "grok":
+            attach_grok_local_quotas(data)
     desktop_apps = desktop_app_sources_snapshot(settings)
     attach_desktop_app_sources(providers, desktop_apps)
     snapshot = {
