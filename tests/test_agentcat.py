@@ -3147,6 +3147,37 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["totalTokens"], 89)
         self.assertEqual(snapshot["tokens"]["inputTokens"], 80)
 
+    def test_grok_limits_from_credits_weekly_window(self) -> None:
+        limits = agentcat.grok_limits_from_billing_response(
+            {
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-08-11T06:32:59.329225+00:00",
+                        "end": "2026-08-18T06:32:59.329225+00:00",
+                    },
+                    "creditUsagePercent": 94.0,
+                    "productUsage": [
+                        {"product": "GrokBuild", "usagePercent": 79.0},
+                        {"product": "GrokImagine", "usagePercent": 14.0},
+                    ],
+                    "billingPeriodEnd": "2026-08-18T06:32:59.329225+00:00",
+                }
+            }
+        )
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["planType"], "weekly")
+        self.assertAlmostEqual(limits["weeklyUsedPercent"], 94.0)
+        self.assertEqual(limits["weeklyResetAt"], agentcat.reset_epoch("2026-08-18T06:32:59.329225+00:00"))
+        ids = [row["id"] for row in limits["quotas"]]
+        self.assertEqual(ids[0], "grok:7d")
+        self.assertIn("grok:build", ids)
+        self.assertIn("grok:imagine", ids)
+        weekly = next(row for row in limits["quotas"] if row["id"] == "grok:7d")
+        self.assertEqual(weekly["label"], "7일")
+        self.assertAlmostEqual(weekly["usedPercent"], 94.0)
+        self.assertAlmostEqual(weekly["remainingPercent"], 6.0)
+
     def test_grok_limits_from_billing_unlimited_still_exposes_reset(self) -> None:
         limits = agentcat.grok_limits_from_billing_response(
             {
@@ -3160,7 +3191,10 @@ class AgentCatConnectorTests(unittest.TestCase):
         )
         self.assertEqual(limits["status"], "auto")
         self.assertIsNone(limits["monthlyTokens"])
+        self.assertIsNone(limits["weeklyUsedPercent"])
+        self.assertEqual(limits["weeklyResetAt"], 1788220800)
         self.assertEqual(limits["quotas"][0]["id"], "grok:monthly")
+        self.assertEqual(limits["quotas"][0]["label"], "월별 초기화")
         self.assertEqual(limits["quotas"][0]["used"], 219)
         self.assertIsNone(limits["quotas"][0]["limit"])
         self.assertEqual(limits["quotas"][0]["resetAt"], 1788220800)
@@ -3179,6 +3213,8 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["weeklyUsedPercent"], 25.0)
         self.assertEqual(limits["quotas"][0]["remaining"], 750)
         self.assertEqual(limits["quotas"][0]["usedPercent"], 25.0)
+        self.assertEqual(limits["quotas"][0]["label"], "월별 한도")
+        self.assertEqual(limits["weeklyResetAt"], 1788220800)
 
     def test_grok_live_limits_token_missing(self) -> None:
         limits = agentcat.grok_live_limits(force=True)
@@ -3219,16 +3255,6 @@ class AgentCatConnectorTests(unittest.TestCase):
     def test_kimi_live_limits_token_missing(self) -> None:
         limits = agentcat.kimi_live_limits(force=True)
         self.assertEqual(limits.get("reason"), "token_missing")
-
-    def test_attach_grok_local_quotas_adds_media_rows(self) -> None:
-        snapshot = {
-            "media": {"images": 3, "videos": 2},
-            "limits": agentcat.empty_limits(),
-        }
-        agentcat.attach_grok_local_quotas(snapshot)
-        ids = [row["id"] for row in snapshot["limits"]["quotas"]]
-        self.assertEqual(ids, ["grok:images", "grok:videos"])
-        self.assertEqual(snapshot["limits"]["status"], "ok")
 
     def test_classify_kimi_and_grok_cli_processes(self) -> None:
         self.assertEqual(agentcat.classify_process("kimi-code"), "kimi")
