@@ -1371,7 +1371,7 @@ class AgentCatConnectorTests(unittest.TestCase):
                 {"type": "session_meta", "payload": {"model_provider": "openai"}},
                 {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
                 # input 100 (30 cached -> cacheRead, 70 uncached input),
-                # output 40 + reasoning 10 -> 50 output
+                # output 40, of which 10 are reasoning -> 40 output
                 self._token_count_event(
                     {
                         "input_tokens": 100,
@@ -1403,17 +1403,22 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertTrue(source.endswith("/sessions/**/*.jsonl"))
         # uncached input: (100-30) + 50 = 120
         self.assertEqual(snapshot["tokens"]["inputTokens"], 120)
-        # output incl reasoning: (40+10) + 20 = 70
-        self.assertEqual(snapshot["tokens"]["outputTokens"], 70)
+        # output: 40 + 20 = 60. reasoning_output_tokens is a *breakdown* of
+        # output_tokens, not a sibling — every real token_count event satisfies
+        # total_tokens == input_tokens + output_tokens. Adding the 10 reasoning
+        # tokens again would double-count them, which is what this file used to
+        # assert.
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 60)
         # cacheRead == cached_input: 30 + 0 = 30
         self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 30)
-        # all-time total == sum of classes
-        self.assertEqual(snapshot["tokens"]["all"], 120 + 70 + 30)
-        self.assertEqual(snapshot["tokens"]["totalTokens"], 120 + 70 + 30)
+        # all-time total == sum of classes == input_tokens + output_tokens,
+        # matching the total_tokens Codex writes for the same turns.
+        self.assertEqual(snapshot["tokens"]["all"], 120 + 60 + 30)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 120 + 60 + 30)
         # model attributed from the preceding turn_context
         model = snapshot["models"]["gpt-5.4"]
         self.assertEqual(model["inputTokens"], 120)
-        self.assertEqual(model["outputTokens"], 70)
+        self.assertEqual(model["outputTokens"], 60)
         self.assertEqual(model["cacheReadInputTokens"], 30)
         self.assertNotIn("unknown", snapshot["models"])
         # project attributed via cwd
@@ -1422,7 +1427,97 @@ class AgentCatConnectorTests(unittest.TestCase):
         # breakdown chat == token_count turns
         self.assertEqual(snapshot["breakdown"]["chat"], 2)
         # hourly buckets sum to all-time total
-        self.assertEqual(sum(snapshot["hourlyTokens"].values()), 120 + 70 + 30)
+        self.assertEqual(sum(snapshot["hourlyTokens"].values()), 120 + 60 + 30)
+
+    def test_codex_totals_match_the_total_tokens_codex_itself_reports(self) -> None:
+        """The connector's `all` must equal Codex's own `total_tokens`.
+
+        This is the invariant that caught a 2x over-count in the field: Codex
+        writes total_tokens == input_tokens + output_tokens, with
+        cached_input_tokens a slice of input and reasoning_output_tokens a slice
+        of output. Summing the connector's three classes has to land on the same
+        number, so any future "add another sub-field" change fails here rather
+        than silently doubling a user's reported usage.
+        """
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        usage = {
+            "input_tokens": 1000,
+            "cached_input_tokens": 950,
+            "output_tokens": 80,
+            "reasoning_output_tokens": 60,
+            "total_tokens": 1080,
+        }
+        self._write_codex_session(
+            "rollout-invariant.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(usage, now),
+            ],
+        )
+
+        snapshot = agentcat.codex_snapshot()
+        tokens = snapshot["tokens"]
+
+        self.assertEqual(tokens["all"], usage["total_tokens"])
+        self.assertEqual(
+            tokens["inputTokens"] + tokens["cacheReadInputTokens"] + tokens["outputTokens"],
+            usage["total_tokens"],
+        )
+        # cached is a slice of input, so uncached input is the remainder.
+        self.assertEqual(tokens["cacheReadInputTokens"], 950)
+        self.assertEqual(tokens["inputTokens"], 50)
+        # reasoning is a slice of output, never added on top of it.
+        self.assertEqual(tokens["outputTokens"], 80)
+
+    def test_stale_cursor_version_discards_persisted_rollups(self) -> None:
+        """A cursor from an older version must not survive a counting fix.
+
+        The cursor keeps accumulated totals *and* a per-file byte offset, so a
+        file already read to EOF is never re-parsed. When the hardlink dedup
+        shipped without bumping the version, affected users kept serving a
+        permanently doubled total from cursor state that no code path could
+        correct. Bumping the version is the only thing that rebuilds it.
+        """
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        path = self._write_codex_session(
+            "rollout-stale.jsonl",
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+                self._token_count_event(
+                    {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 5},
+                    now,
+                ),
+            ],
+        )
+        # A previous-version cursor claiming the file is fully consumed, with an
+        # inflated rollup attached.
+        agentcat.CODEX_SESSIONS_CURSOR_FILE.write_text(
+            json.dumps(
+                {
+                    "version": agentcat.CODEX_SESSIONS_CURSOR_VERSION - 1,
+                    "files": {
+                        str(path): {
+                            "offset": path.stat().st_size,
+                            "size": path.stat().st_size,
+                            "mtime": path.stat().st_mtime,
+                            "turns": 1,
+                        }
+                    },
+                    "daily": {"2026-06-18": 999_999},
+                    "hourly": {},
+                    "modelDaily": {},
+                    "modelClasses": {"gpt-5.4": {"inputTokens": 999_999}},
+                    "projects": {},
+                    "turns": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.codex_snapshot()
+
+        self.assertEqual(snapshot["tokens"]["all"], 15)
+        self.assertNotIn(999_999, snapshot["dailyTokens"].values())
 
     def test_codex_sessions_jsonl_attributes_per_model_across_turn_contexts(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -1449,9 +1544,10 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "ok")
         self.assertEqual(snapshot["models"]["gpt-5.4"]["inputTokens"], 10)
         self.assertEqual(snapshot["models"]["gpt-5.4"]["outputTokens"], 5)
-        # second turn switched model: uncached 5, output 3+1=4, cacheRead 2
+        # second turn switched model: uncached 5, output 3 (1 of it reasoning,
+        # already counted inside output_tokens), cacheRead 2
         self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["inputTokens"], 5)
-        self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["outputTokens"], 4)
+        self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["outputTokens"], 3)
         self.assertEqual(snapshot["models"]["gpt-5.4-mini"]["cacheReadInputTokens"], 2)
 
     def test_codex_sessions_snapshot_reads_archived_sessions_like_codexbar(self) -> None:

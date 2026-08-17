@@ -487,6 +487,9 @@ class DoctorCheckTests(HomeDiscoveryTestCase):
 
         self.assertEqual(self._checks_by_id()["codex.homes"]["status"], "ok")
 
+    # `launchd_environment()` returns {} off darwin, so the check these two
+    # assert on is never emitted there — writing a plist cannot conjure it.
+    @unittest.skipUnless(sys.platform == "darwin", "launchd env drift is macOS-only")
     def test_env_drift_between_launchd_and_shell_is_reported(self) -> None:
         self._write_plist({"CODEX_HOME": str(agentcat.HOME / "frozen-at-install")})
 
