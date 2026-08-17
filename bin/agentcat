@@ -10823,13 +10823,15 @@ def _tilde(path: Any) -> str:
     text = str(path)
     home = str(HOME)
     if home and home != "/" and (text == home or text.startswith(home + os.sep)):
-        text = "~" + text[len(home):]
-    # These strings are identifiers as much as prose: they key the snapshot's
-    # home block and are read by the app, the server, and support bundles. A
-    # Windows install must not report ~\.codex where every other install
-    # reports ~/.codex. Safe because nothing turns the result back into a path,
-    # and a backslash cannot appear in a Windows filename.
-    return text.replace("\\", "/")
+        # Home-relative output is an identifier as much as prose: it keys the
+        # snapshot's home block and is read by the app, the server, and support
+        # bundles. A Windows install must not report ~\.codex where every other
+        # install reports ~/.codex. Safe because nothing turns the result back
+        # into a path, and a backslash cannot appear in a Windows filename.
+        return ("~" + text[len(home):]).replace("\\", "/")
+    # Anything outside the home is left byte-for-byte alone, so the boundary
+    # check above stays observable: /Users/alice-old must not come back rewritten.
+    return text
 
 
 def _redact_paths(text: str) -> str:
