@@ -147,6 +147,9 @@ class WindowsHomeResolutionTests(AuditFixTestCase):
         ):
             self.assertEqual(agentcat.resolve_user_home_env(), "/home/alice")
 
+    # Faking os.name='posix' does not make pathlib able to build a PosixPath on
+    # a Windows host, and Path.home() is exactly what this asserts on.
+    @unittest.skipIf(os.name == "nt", "cannot instantiate PosixPath on Windows")
     def test_no_env_falls_back_to_path_home(self) -> None:
         with patch.object(agentcat.os, "name", "posix"), patch.dict(
             os.environ, {}, clear=True

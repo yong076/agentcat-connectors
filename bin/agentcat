@@ -10823,8 +10823,13 @@ def _tilde(path: Any) -> str:
     text = str(path)
     home = str(HOME)
     if home and home != "/" and (text == home or text.startswith(home + os.sep)):
-        return "~" + text[len(home):]
-    return text
+        text = "~" + text[len(home):]
+    # These strings are identifiers as much as prose: they key the snapshot's
+    # home block and are read by the app, the server, and support bundles. A
+    # Windows install must not report ~\.codex where every other install
+    # reports ~/.codex. Safe because nothing turns the result back into a path,
+    # and a backslash cannot appear in a Windows filename.
+    return text.replace("\\", "/")
 
 
 def _redact_paths(text: str) -> str:
