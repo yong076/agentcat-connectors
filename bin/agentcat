@@ -70,6 +70,9 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/api/codex/usage",
 )
 CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+# 7 days. Any rate-limit window at least this long is the weekly quota,
+# whichever slot Codex happens to put it in.
+CODEX_WEEKLY_WINDOW_MINUTES = 10080
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -127,7 +130,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.1")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -2743,16 +2746,35 @@ def codex_runtime_limits() -> Dict[str, Any]:
             limits["source"] = _tilde(path)
             limits["planType"] = rate_limits.get("plan_type")
 
-            secondary = rate_limits.get("secondary")
-            if isinstance(secondary, dict):
-                limits["weeklyUsedPercent"] = float_percent(secondary.get("used_percent"))
-                limits["weeklyResetAt"] = int_limit(secondary.get("resets_at"))
-
-            primary = rate_limits.get("primary")
-            if isinstance(primary, dict):
-                limits["shortUsedPercent"] = float_percent(primary.get("used_percent"))
-                limits["shortWindowMinutes"] = int_limit(primary.get("window_minutes"))
-                limits["shortResetAt"] = int_limit(primary.get("resets_at"))
+            # Classify by window length, not by slot name. Codex used to send
+            # the 5-hour window as `primary` and the weekly one as `secondary`,
+            # but it now sends a single `primary` with window_minutes=10080 and
+            # leaves `secondary` null. Keying off the slot dropped the weekly
+            # percent entirely and filed it as a short window — the fallback
+            # served a blank weekly number whenever the live usage API failed.
+            for slot in ("primary", "secondary"):
+                window = rate_limits.get(slot)
+                if not isinstance(window, dict):
+                    continue
+                minutes = int_limit(window.get("window_minutes"))
+                used = float_percent(window.get("used_percent"))
+                resets = int_limit(window.get("resets_at"))
+                # Length decides when Codex states it. The older payload omits
+                # window_minutes on the weekly slot, so fall back to the slot
+                # name there rather than guessing.
+                is_weekly = (
+                    minutes >= CODEX_WEEKLY_WINDOW_MINUTES
+                    if minutes is not None
+                    else slot == "secondary"
+                )
+                if is_weekly:
+                    if limits.get("weeklyUsedPercent") is None:
+                        limits["weeklyUsedPercent"] = used
+                        limits["weeklyResetAt"] = resets
+                elif limits.get("shortUsedPercent") is None:
+                    limits["shortUsedPercent"] = used
+                    limits["shortWindowMinutes"] = minutes
+                    limits["shortResetAt"] = resets
 
             if isinstance(info, dict):
                 limits["sessionTokens"] = int_limit(info.get("model_context_window"))
@@ -10367,6 +10389,41 @@ def _live_activity_and_desktop() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return activity, desktop_apps
 
 
+# Cheap envelope keys that always ride along: a caller filtering for one
+# section still needs to know which schema and connector produced it.
+_SNAPSHOT_ENVELOPE_KEYS = ("schemaVersion", "connectorVersion", "generatedAt", "servedAt")
+
+
+def filter_snapshot_sections(payload: Dict[str, Any], requested: str) -> Dict[str, Any]:
+    """Narrow /v1/snapshot to the sections a caller actually reads.
+
+    The full snapshot is ~180KB on a machine with real history, and `providers`
+    alone is ~65% of it. The menu bar app polls every couple of seconds but only
+    consumes `activity` (~5%), so it was paying a full decode of the other 95%
+    on every tick — the app's largest sustained CPU cost.
+
+    Unknown or empty input returns the payload untouched, which keeps this
+    backwards compatible in both directions: an old app gets everything, and a
+    new app asking an old connector simply receives the full payload and
+    ignores the extra.
+    """
+    if not requested:
+        return payload
+    keep = {name.strip() for name in requested.split(",") if name.strip()}
+    if not keep:
+        return payload
+    filtered = {
+        key: value
+        for key, value in payload.items()
+        if key in keep or key in _SNAPSHOT_ENVELOPE_KEYS
+    }
+    # Never answer with only envelope keys — that would look like a healthy
+    # response carrying no data at all.
+    if not any(key in keep for key in filtered):
+        return payload
+    return filtered
+
+
 def snapshot_for_http() -> Dict[str, Any]:
     cached = read_json(LATEST_SNAPSHOT)
     if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
@@ -10558,7 +10615,11 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/snapshot":
             try:
-                self.send_json(200, snapshot_for_http())
+                payload = snapshot_for_http()
+                requested = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query
+                ).get("sections", [""])[0]
+                self.send_json(200, filter_snapshot_sections(payload, requested))
             except Exception as exc:
                 self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return

@@ -1241,6 +1241,43 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["weeklyResetAt"], 1770000200)
         self.assertEqual(limits["planType"], "pro")
 
+    def test_codex_runtime_limits_reads_a_weekly_window_sent_as_primary(self) -> None:
+        """Codex now sends one weekly window in `primary`, with `secondary` null.
+
+        Keying off the slot name filed that 97% as a *short* window and left the
+        weekly percent empty, so whenever the live usage API was unavailable the
+        menu bar had no weekly number to show at all.
+        """
+        session_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "08" / "18"
+        session_dir.mkdir(parents=True)
+        (session_dir / "rollout-weekly-primary.jsonl").write_text(
+            json.dumps(
+                {
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"model_context_window": 258400},
+                        "rate_limits": {
+                            "plan_type": "pro",
+                            "primary": {
+                                "used_percent": 97,
+                                "window_minutes": 10080,
+                                "resets_at": 1787196544,
+                            },
+                            "secondary": None,
+                        },
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        limits = agentcat.codex_runtime_limits()
+
+        self.assertEqual(limits["weeklyUsedPercent"], 97.0)
+        self.assertEqual(limits["weeklyResetAt"], 1787196544)
+        self.assertIsNone(limits["shortUsedPercent"])
+
     def test_codex_snapshot_counts_today_week_month_and_all_tokens(self) -> None:
         codex_dir = agentcat.HOME / ".codex"
         codex_dir.mkdir(parents=True)
@@ -1818,6 +1855,48 @@ class AgentCatConnectorTests(unittest.TestCase):
         with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
             remaining = conn.execute("select count(*) from events").fetchone()[0]
         self.assertEqual(remaining, 1)
+
+    def test_snapshot_sections_filter_drops_what_the_caller_did_not_ask_for(self) -> None:
+        """The menu bar polls every couple of seconds but only reads `activity`.
+
+        The full payload is ~180KB on a machine with real history and
+        `providers` is ~65% of it, so serving everything made the app decode 95%
+        it never looked at — its largest sustained CPU cost. Envelope keys still
+        ride along so the caller can tell which connector answered.
+        """
+        payload = {
+            "schemaVersion": 1,
+            "connectorVersion": "26.34.0",
+            "generatedAt": "t",
+            "servedAt": "t",
+            "activity": {"status": "ok"},
+            "events": {"n": 1},
+            "providers": {"codex": {"tokens": {}}},
+            "insights": {"a": 1},
+        }
+
+        slim = agentcat.filter_snapshot_sections(payload, "activity,events")
+
+        self.assertIn("activity", slim)
+        self.assertIn("events", slim)
+        self.assertNotIn("providers", slim)
+        self.assertNotIn("insights", slim)
+        self.assertEqual(slim["connectorVersion"], "26.34.0")
+        self.assertEqual(slim["schemaVersion"], 1)
+
+    def test_snapshot_sections_filter_falls_back_to_the_full_payload(self) -> None:
+        """Both directions of the version skew have to keep working.
+
+        An old app sends no `sections` and must still get everything; a new app
+        asking an old connector gets the full payload and ignores the extra. A
+        request naming only unknown sections would otherwise return a
+        200 carrying no data at all, which reads as a healthy empty machine.
+        """
+        payload = {"schemaVersion": 1, "activity": {"status": "ok"}, "providers": {"codex": {}}}
+
+        self.assertEqual(agentcat.filter_snapshot_sections(payload, ""), payload)
+        self.assertEqual(agentcat.filter_snapshot_sections(payload, "   "), payload)
+        self.assertEqual(agentcat.filter_snapshot_sections(payload, "nonexistent"), payload)
 
     def test_http_live_overlay_is_cached_within_ttl(self) -> None:
         # Audit #6: /v1/snapshot GET must not spawn ps + walk the desktop tree on every
