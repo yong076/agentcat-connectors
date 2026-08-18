@@ -1856,6 +1856,48 @@ class AgentCatConnectorTests(unittest.TestCase):
             remaining = conn.execute("select count(*) from events").fetchone()[0]
         self.assertEqual(remaining, 1)
 
+    def test_snapshot_sections_filter_drops_what_the_caller_did_not_ask_for(self) -> None:
+        """The menu bar polls every couple of seconds but only reads `activity`.
+
+        The full payload is ~180KB on a machine with real history and
+        `providers` is ~65% of it, so serving everything made the app decode 95%
+        it never looked at — its largest sustained CPU cost. Envelope keys still
+        ride along so the caller can tell which connector answered.
+        """
+        payload = {
+            "schemaVersion": 1,
+            "connectorVersion": "26.34.0",
+            "generatedAt": "t",
+            "servedAt": "t",
+            "activity": {"status": "ok"},
+            "events": {"n": 1},
+            "providers": {"codex": {"tokens": {}}},
+            "insights": {"a": 1},
+        }
+
+        slim = agentcat.filter_snapshot_sections(payload, "activity,events")
+
+        self.assertIn("activity", slim)
+        self.assertIn("events", slim)
+        self.assertNotIn("providers", slim)
+        self.assertNotIn("insights", slim)
+        self.assertEqual(slim["connectorVersion"], "26.34.0")
+        self.assertEqual(slim["schemaVersion"], 1)
+
+    def test_snapshot_sections_filter_falls_back_to_the_full_payload(self) -> None:
+        """Both directions of the version skew have to keep working.
+
+        An old app sends no `sections` and must still get everything; a new app
+        asking an old connector gets the full payload and ignores the extra. A
+        request naming only unknown sections would otherwise return a
+        200 carrying no data at all, which reads as a healthy empty machine.
+        """
+        payload = {"schemaVersion": 1, "activity": {"status": "ok"}, "providers": {"codex": {}}}
+
+        self.assertEqual(agentcat.filter_snapshot_sections(payload, ""), payload)
+        self.assertEqual(agentcat.filter_snapshot_sections(payload, "   "), payload)
+        self.assertEqual(agentcat.filter_snapshot_sections(payload, "nonexistent"), payload)
+
     def test_http_live_overlay_is_cached_within_ttl(self) -> None:
         # Audit #6: /v1/snapshot GET must not spawn ps + walk the desktop tree on every
         # poll (~2-5s). The live overlay is cached for a couple of seconds.

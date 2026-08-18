@@ -10389,6 +10389,41 @@ def _live_activity_and_desktop() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return activity, desktop_apps
 
 
+# Cheap envelope keys that always ride along: a caller filtering for one
+# section still needs to know which schema and connector produced it.
+_SNAPSHOT_ENVELOPE_KEYS = ("schemaVersion", "connectorVersion", "generatedAt", "servedAt")
+
+
+def filter_snapshot_sections(payload: Dict[str, Any], requested: str) -> Dict[str, Any]:
+    """Narrow /v1/snapshot to the sections a caller actually reads.
+
+    The full snapshot is ~180KB on a machine with real history, and `providers`
+    alone is ~65% of it. The menu bar app polls every couple of seconds but only
+    consumes `activity` (~5%), so it was paying a full decode of the other 95%
+    on every tick — the app's largest sustained CPU cost.
+
+    Unknown or empty input returns the payload untouched, which keeps this
+    backwards compatible in both directions: an old app gets everything, and a
+    new app asking an old connector simply receives the full payload and
+    ignores the extra.
+    """
+    if not requested:
+        return payload
+    keep = {name.strip() for name in requested.split(",") if name.strip()}
+    if not keep:
+        return payload
+    filtered = {
+        key: value
+        for key, value in payload.items()
+        if key in keep or key in _SNAPSHOT_ENVELOPE_KEYS
+    }
+    # Never answer with only envelope keys — that would look like a healthy
+    # response carrying no data at all.
+    if not any(key in keep for key in filtered):
+        return payload
+    return filtered
+
+
 def snapshot_for_http() -> Dict[str, Any]:
     cached = read_json(LATEST_SNAPSHOT)
     if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
@@ -10580,7 +10615,11 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/snapshot":
             try:
-                self.send_json(200, snapshot_for_http())
+                payload = snapshot_for_http()
+                requested = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query
+                ).get("sections", [""])[0]
+                self.send_json(200, filter_snapshot_sections(payload, requested))
             except Exception as exc:
                 self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return
