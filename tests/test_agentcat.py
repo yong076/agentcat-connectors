@@ -1241,6 +1241,43 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["weeklyResetAt"], 1770000200)
         self.assertEqual(limits["planType"], "pro")
 
+    def test_codex_runtime_limits_reads_a_weekly_window_sent_as_primary(self) -> None:
+        """Codex now sends one weekly window in `primary`, with `secondary` null.
+
+        Keying off the slot name filed that 97% as a *short* window and left the
+        weekly percent empty, so whenever the live usage API was unavailable the
+        menu bar had no weekly number to show at all.
+        """
+        session_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "08" / "18"
+        session_dir.mkdir(parents=True)
+        (session_dir / "rollout-weekly-primary.jsonl").write_text(
+            json.dumps(
+                {
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"model_context_window": 258400},
+                        "rate_limits": {
+                            "plan_type": "pro",
+                            "primary": {
+                                "used_percent": 97,
+                                "window_minutes": 10080,
+                                "resets_at": 1787196544,
+                            },
+                            "secondary": None,
+                        },
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        limits = agentcat.codex_runtime_limits()
+
+        self.assertEqual(limits["weeklyUsedPercent"], 97.0)
+        self.assertEqual(limits["weeklyResetAt"], 1787196544)
+        self.assertIsNone(limits["shortUsedPercent"])
+
     def test_codex_snapshot_counts_today_week_month_and_all_tokens(self) -> None:
         codex_dir = agentcat.HOME / ".codex"
         codex_dir.mkdir(parents=True)
