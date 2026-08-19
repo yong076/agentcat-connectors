@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import hashlib
+import os
 import subprocess
 import datetime as dt
 import json
@@ -826,6 +827,54 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertEqual(normalized["quotas"][0]["model"], "gemini-3-flash-preview")
         self.assertEqual(normalized["quotas"][1]["model"], "gemini-3.1-flash-lite")
+
+    def test_gemini_local_project_id_prefers_env(self) -> None:
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "env-proj-1"}, clear=False):
+            self.assertEqual(agentcat.gemini_local_project_id(), "env-proj-1")
+
+    def test_gemini_local_project_id_reads_antigravity_cache_file(self) -> None:
+        path = agentcat.antigravity_local_project_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("agyproj123456789", encoding="utf-8")
+        env = {key: "" for key in ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID")}
+        with patch.dict(os.environ, env, clear=False):
+            self.assertEqual(agentcat.gemini_local_project_id(path), "agyproj123456789")
+
+    def test_gemini_live_limits_fetches_quota_without_project(self) -> None:
+        # Consumer Code Assist no longer returns cloudaicompanionProject.
+        # retrieveUserQuota({}) still has remainingFraction + resetTime.
+        quota = {
+            "buckets": [
+                {
+                    "modelId": "gemini-2.5-pro",
+                    "remainingFraction": 0.4,
+                    "resetTime": "2026-08-20T09:36:27Z",
+                    "tokenType": "REQUESTS",
+                }
+            ]
+        }
+        calls: list = []
+
+        def fake_post(method, payload, token):
+            calls.append((method, payload))
+            if method == "loadCodeAssist":
+                return {"allowedTiers": [{"id": "standard-tier"}]}
+            if method == "retrieveUserQuota":
+                self.assertEqual(payload, {})
+                return quota
+            raise AssertionError(method)
+
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "", "GOOGLE_CLOUD_PROJECT_ID": ""}, clear=False), \
+             patch.object(agentcat, "read_gemini_auth_type", return_value="oauth-personal"), \
+             patch.object(agentcat, "gemini_access_token", return_value="tok"), \
+             patch.object(agentcat, "gemini_code_assist_post", side_effect=fake_post):
+            limits = agentcat.gemini_live_limits(force=True)
+
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 40.0)
+        self.assertEqual(limits["quotas"][0]["usedPercent"], 60.0)
+        self.assertEqual(limits["quotas"][0]["resetAt"], agentcat.reset_epoch("2026-08-20T09:36:27Z"))
+        self.assertEqual([method for method, _ in calls], ["loadCodeAssist", "retrieveUserQuota"])
 
     def test_unwrap_antigravity_oauth_token_flattens_nested_token(self) -> None:
         flat = agentcat.unwrap_antigravity_oauth_token(
@@ -5006,6 +5055,36 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         # cache written under the antigravity key, not gemini's
         cache = json.loads(agentcat.LIVE_LIMITS_CACHE.read_text())
         self.assertIn("antigravity", cache)
+
+    def test_live_limits_falls_back_when_project_missing(self) -> None:
+        self._write_token()
+        quota = {
+            "buckets": [
+                {
+                    "modelId": "gemini-2.5-flash",
+                    "remainingFraction": 0.75,
+                    "resetTime": "2026-08-20T09:36:27Z",
+                    "tokenType": "REQUESTS",
+                }
+            ]
+        }
+
+        def fake_post(method, payload, token):
+            if method == "loadCodeAssist":
+                return {"allowedTiers": [{"id": "standard-tier"}]}
+            if method == "retrieveUserQuota":
+                self.assertEqual(payload, {})
+                return quota
+            raise AssertionError(method)
+
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "", "GOOGLE_CLOUD_PROJECT_ID": ""}, clear=False), \
+             patch.object(agentcat, "antigravity_access_token", return_value="tok"), \
+             patch.object(agentcat, "gemini_code_assist_post", side_effect=fake_post):
+            limits = agentcat.antigravity_live_limits(force=True)
+
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 75.0)
+        self.assertIsNone(limits.get("error"))
 
     def test_live_limits_empty_without_token(self) -> None:
         # No token file -> empty limits, no crash, no network.

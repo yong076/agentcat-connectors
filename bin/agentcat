@@ -130,7 +130,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.2")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.3")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -3734,6 +3734,7 @@ def gemini_display_name(model: Any) -> str:
         "gemini-2.5-flash-lite": "Gemini Flash Lite",
         "gemini-3-pro-preview": "Gemini 3 Pro",
         "gemini-3-flash-preview": "Gemini 3 Flash",
+        "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
         "gemini-3.1-flash-lite-preview": "Gemini 3.1 Flash Lite",
         "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
     }
@@ -4203,6 +4204,69 @@ def gemini_quota_compact_sort_key(quota: Dict[str, Any]) -> Tuple[float, int, st
     )
 
 
+def gemini_local_project_id(*extra_paths: Path) -> str:
+    """Best-effort Code Assist project. Consumer Gemini no longer auto-provisions one."""
+    for key in ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID"):
+        value = os.environ.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for path in extra_paths:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text and 4 <= len(text) <= 64 and all(ch.isalnum() or ch in "-_" for ch in text):
+            return text
+    return ""
+
+
+def antigravity_local_project_path() -> Path:
+    return ANTIGRAVITY_CLI_DIR / "cache" / "default_project_id.txt"
+
+
+def fetch_code_assist_quota(access_token: str, project_id: str = "") -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """loadCodeAssist + retrieveUserQuota.
+
+    After the 2026-06-18 consumer Code Assist cutover, loadCodeAssist often
+    returns no `cloudaicompanionProject`. retrieveUserQuota still answers
+    `{}` with remainingFraction + resetTime, so do not abort on a missing
+    project — that was why Gemini/Antigravity tiles showed no 한도.
+    """
+    project_id = str(project_id or "")
+    metadata = {
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI",
+    }
+    load_payload: Dict[str, Any] = {"metadata": metadata}
+    if project_id:
+        metadata["duetProject"] = project_id
+        load_payload["cloudaicompanionProject"] = project_id
+    try:
+        tier_payload = gemini_code_assist_post("loadCodeAssist", load_payload, access_token)
+    except Exception:
+        tier_payload = {}
+    if not isinstance(tier_payload, dict):
+        tier_payload = {}
+    project_id = str(tier_payload.get("cloudaicompanionProject") or project_id or "")
+
+    quota_payload: Dict[str, Any] = {}
+    if project_id:
+        try:
+            quota_payload = gemini_code_assist_post(
+                "retrieveUserQuota",
+                {"project": project_id},
+                access_token,
+            )
+        except Exception:
+            quota_payload = {}
+    if not (isinstance(quota_payload, dict) and quota_payload.get("buckets")):
+        quota_payload = gemini_code_assist_post("retrieveUserQuota", {}, access_token)
+    if not isinstance(quota_payload, dict):
+        quota_payload = {}
+    return tier_payload, quota_payload
+
+
 def gemini_live_limits(force: bool = False) -> Dict[str, Any]:
     cached = None if force else cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
@@ -4214,23 +4278,8 @@ def gemini_live_limits(force: bool = False) -> Dict[str, Any]:
         token = gemini_access_token()
         if not token:
             return empty_limits()
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
-        metadata = {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI",
-        }
-        if project_id:
-            metadata["duetProject"] = project_id
-        tier_payload = gemini_code_assist_post(
-            "loadCodeAssist",
-            {"cloudaicompanionProject": project_id, "metadata": metadata},
-            token,
-        )
-        project_id = str(tier_payload.get("cloudaicompanionProject") or project_id or "")
-        if not project_id:
-            return empty_limits(status="error", error="Gemini Code Assist project ID unavailable")
-        quota_payload = gemini_code_assist_post("retrieveUserQuota", {"project": project_id}, token)
+        project_id = gemini_local_project_id()
+        tier_payload, quota_payload = fetch_code_assist_quota(token, project_id)
         limits = gemini_limits_from_quota_response(quota_payload, tier_payload, source=GEMINI_CODE_ASSIST_URL)
         write_live_limits_cache("gemini", limits)
         return limits
@@ -4257,25 +4306,8 @@ def antigravity_live_limits(force: bool = False) -> Dict[str, Any]:
         token = antigravity_access_token()
         if not token:
             return empty_limits()
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
-        metadata = {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI",
-        }
-        if project_id:
-            metadata["duetProject"] = project_id
-        tier_payload = gemini_code_assist_post(
-            "loadCodeAssist",
-            {"cloudaicompanionProject": project_id, "metadata": metadata},
-            token,
-        )
-        project_id = str(tier_payload.get("cloudaicompanionProject") or project_id or "")
-        if not project_id:
-            limits = empty_limits(status="error", error="Antigravity Code Assist project ID unavailable")
-            write_live_limits_cache("antigravity", limits)
-            return limits
-        quota_payload = gemini_code_assist_post("retrieveUserQuota", {"project": project_id}, token)
+        project_id = gemini_local_project_id(antigravity_local_project_path())
+        tier_payload, quota_payload = fetch_code_assist_quota(token, project_id)
         limits = gemini_limits_from_quota_response(quota_payload, tier_payload, source=GEMINI_CODE_ASSIST_URL)
         if limits.get("status") == "not_configured" and not limits.get("quotas"):
             # An account with no Code Assist quota buckets — cache it as a definitive
