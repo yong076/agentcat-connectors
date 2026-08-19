@@ -130,7 +130,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.1")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.2")
 SCHEMA_VERSION = 4
 AUTO_UPDATE_VERSION_URL = os.environ.get(
     "AGENTCAT_AUTO_UPDATE_VERSION_URL",
@@ -3611,12 +3611,27 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
         used = float_percent(first_present(entry.get("utilization"), entry.get("used_percentage")))
         if used is None:
             continue
+        window = "5h" if key == "five_hour" else "7d" if key.startswith("seven_day") else None
+        # The usage endpoint also carries codenamed placeholders for features
+        # that are not live for this account — nimbus_quill, amber_ladder,
+        # iguana_necktie and friends, all `utilization: 0.0` with a null
+        # `resets_at`. Those were rendered as a generic "Claude 한도" row
+        # reading 100% remaining, directly contradicting the real seven-day
+        # number sitting next to it at 2%.
+        #
+        # Gate on shape rather than on a name allowlist: a row the client
+        # cannot place in a window *and* that has no reset time is not a quota
+        # a user can act on. This keeps genuinely new limits (Anthropic keeps
+        # adding `seven_day_*` scopes) flowing through without a client update,
+        # while placeholders stay hidden.
+        if window is None and not entry.get("resets_at"):
+            continue
         quota = quota_entry(
             claude_quota_id(key),
             claude_quota_label(key),
             used_percent=used,
             reset_at=entry.get("resets_at"),
-            window="5h" if key == "five_hour" else "7d" if key.startswith("seven_day") else None,
+            window=window,
             model=claude_quota_model(key),
             source=source,
         )

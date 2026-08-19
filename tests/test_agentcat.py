@@ -448,6 +448,50 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertNotIn("omelette", limits["quotas"][4]["id"])
         self.assertNotIn("omelette", limits["quotas"][4]["label"])
 
+    def test_claude_usage_api_drops_codenamed_placeholder_rows(self) -> None:
+        """Unreleased features arrive as codenames with no window and no reset.
+
+        The live endpoint sends ~14 usage keys, most of them placeholders for
+        features this account cannot use: `nimbus_quill`, `amber_ladder`,
+        `iguana_necktie`, all `utilization: 0.0` with `resets_at: null`. Those
+        were rendered as a generic "Claude 한도" row reading 100% remaining,
+        sitting directly beside a real seven-day limit at 2% remaining — the
+        opposite reading, from the same card.
+        """
+        limits = agentcat.claude_limits_from_usage_response(
+            {
+                "five_hour": {"utilization": 5.0, "resets_at": "2026-08-19T09:09:59Z"},
+                "seven_day": {"utilization": 98.0, "resets_at": "2026-08-21T06:59:59Z"},
+                "nimbus_quill": {"utilization": 0.0, "resets_at": None},
+                "amber_ladder": {"utilization": 0.0, "resets_at": None},
+                "tangelo": {"utilization": 0.0, "resets_at": None},
+            }
+        )
+
+        ids = [q["id"] for q in limits["quotas"]]
+        self.assertEqual(ids, ["claude:five_hour", "claude:seven_day"])
+        self.assertEqual(limits["weeklyUsedPercent"], 98.0)
+        # The real remaining figure must be the only one on offer.
+        self.assertEqual([q["remainingPercent"] for q in limits["quotas"]], [95.0, 2.0])
+
+    def test_claude_usage_api_keeps_unknown_keys_that_carry_a_reset(self) -> None:
+        """A new limit is not a placeholder — shape decides, not a name list.
+
+        Anthropic keeps adding scopes, so gating on a known-name allowlist would
+        silently hide real limits until the client shipped an update. A reset
+        time (or a placeable window) is what makes a row actionable.
+        """
+        limits = agentcat.claude_limits_from_usage_response(
+            {
+                "seven_day": {"utilization": 40.0, "resets_at": "2026-08-21T06:59:59Z"},
+                "brand_new_limit": {"utilization": 12.0, "resets_at": "2026-08-22T06:59:59Z"},
+            }
+        )
+
+        ids = [q["id"] for q in limits["quotas"]]
+        self.assertEqual(len(ids), 2)
+        self.assertTrue(any(i.startswith("claude:quota:") for i in ids))
+
     def test_claude_usage_api_payload_keeps_dynamic_scoped_capacity(self) -> None:
         limits = agentcat.claude_limits_from_usage_response(
             {
