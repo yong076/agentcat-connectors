@@ -8,6 +8,7 @@ twice.
 """
 
 import datetime as dt
+import base64
 import importlib.util
 import json
 import os
@@ -107,6 +108,22 @@ class HomeDiscoveryTestCase(unittest.TestCase):
             encoding="utf-8",
         )
         return path
+
+    def _codex_auth(self, home: Path, account_id, plan: str = "pro") -> None:
+        home.mkdir(parents=True, exist_ok=True)
+        claims = {
+            "https://api.openai.com/auth": {"chatgpt_plan_type": plan},
+            # Must never be copied into the providerInstances surface.
+            "email": f"{plan}@example.test",
+        }
+        encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        tokens = {
+            "access_token": "fixture-access-token",
+            "id_token": f"header.{encoded}.signature",
+        }
+        if account_id is not None:
+            tokens["account_id"] = account_id
+        (home / "auth.json").write_text(json.dumps({"tokens": tokens}), encoding="utf-8")
 
     def _claude_journal(self, home: Path, session_id: str, project: str = "-tmp-proj") -> Path:
         project_dir = home / "projects" / project
@@ -550,6 +567,82 @@ class SnapshotBlockTests(HomeDiscoveryTestCase):
 
     def test_capability_is_advertised(self) -> None:
         self.assertIn("homes.discovery", agentcat.CONNECTOR_CAPABILITIES)
+
+
+class ProviderInstanceTests(HomeDiscoveryTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.limits_patch = patch.object(
+            agentcat,
+            "codex_live_limits_for_auth",
+            side_effect=lambda auth, cache_key, force=False: {
+                "status": "auto",
+                "planType": agentcat.codex_auth_identity(auth).get("planType"),
+                "quotas": [],
+            },
+        )
+        self.limits_mock = self.limits_patch.start()
+
+    def tearDown(self) -> None:
+        self.limits_patch.stop()
+        super().tearDown()
+
+    def test_two_accounts_collapse_same_account_runtime_mirror(self) -> None:
+        account_a = "acct-native-a"
+        account_b = "acct-native-b"
+        default = agentcat.HOME / ".codex"
+        second = agentcat.HOME / ".codex-2"
+        mirror = agentcat.HOME / "Library" / "Application Support" / "orca" / "codex-runtime-home" / "home"
+        self._codex_auth(default, account_a, "pro")
+        self._codex_auth(mirror, account_a, "pro")
+        self._codex_auth(second, account_b, "prolite")
+
+        instances = agentcat.codex_provider_instances({"status": "auto", "quotas": []})
+
+        self.assertEqual(len(instances), 2)
+        self.assertEqual(sorted(item["profileCount"] for item in instances), [1, 2])
+        self.assertEqual({item["planType"] for item in instances}, {"pro", "prolite"})
+        self.assertEqual(sum(1 for item in instances if item["active"]), 1)
+        encoded = json.dumps(instances)
+        self.assertNotIn(account_a, encoded)
+        self.assertNotIn(account_b, encoded)
+        self.assertNotIn(str(agentcat.HOME), encoded)
+        self.assertNotIn("@example.test", encoded)
+
+    def test_profile_only_candidates_never_false_merge(self) -> None:
+        self._codex_auth(agentcat.HOME / ".codex", None, "pro")
+        self._codex_auth(agentcat.HOME / ".codex-2", None, "pro")
+
+        instances = agentcat.codex_provider_instances({"status": "auto", "quotas": []})
+
+        self.assertEqual(len(instances), 2)
+        self.assertEqual({item["identityConfidence"] for item in instances}, {"profile_only"})
+        self.assertEqual(len({item["id"] for item in instances}), 2)
+
+    def test_instance_count_is_not_capped_at_two(self) -> None:
+        for index in range(5):
+            suffix = "" if index == 0 else f"-{index + 1}"
+            self._codex_auth(agentcat.HOME / f".codex{suffix}", f"acct-{index}", "pro")
+
+        instances = agentcat.codex_provider_instances({"status": "auto", "quotas": []})
+
+        self.assertEqual(len(instances), 5)
+        self.assertEqual(len({item["id"] for item in instances}), 5)
+
+    def test_inactive_accounts_use_distinct_quota_cache_keys(self) -> None:
+        for index in range(3):
+            suffix = "" if index == 0 else f"-{index + 1}"
+            self._codex_auth(agentcat.HOME / f".codex{suffix}", f"acct-{index}", "pro")
+
+        agentcat.codex_provider_instances({"status": "auto", "quotas": []})
+
+        keys = [call.args[1] for call in self.limits_mock.mock_calls]
+        self.assertEqual(len(keys), 2)  # active account reuses the provider-level result
+        self.assertEqual(len(set(keys)), 2)
+        self.assertTrue(all(key.startswith("codex-instance:") for key in keys))
+
+    def test_provider_instances_capability_is_advertised(self) -> None:
+        self.assertIn("providerInstances.v1", agentcat.CONNECTOR_CAPABILITIES)
 
 
 class SnapshotBackCompatTests(HomeDiscoveryTestCase):
