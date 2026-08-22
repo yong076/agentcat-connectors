@@ -64,27 +64,20 @@ Development from a cloned checkout:
 
 ### Connector archive integrity
 
-When the connector is fetched as a tarball (the archive download and the clone
-fallback in `install.sh`), `install.sh` verifies the archive against a
-known-good SHA256 when one is available, gating the swap exactly like the Pro
-channel (`scripts/pro_channel_install.py`). Note: an existing install created
-via `git clone` updates through `git pull --ff-only` (HTTPS git object
-integrity is the trust boundary there) and does not pass through this archive
-gate yet — routing that path through verification is part of the release-infra
-follow-up below. Supply a digest via either:
+The public installers fetch `connector-manifest.json` from the latest GitHub
+release, download its versioned archive, and verify the manifest SHA-256 before
+extracting or executing connector code. They then use
+`scripts/public_channel_install.py` to validate the contract, stage the new
+source beside the active source, run the installer, and validate the live
+daemon. A failed health check restores the previous source and daemon.
 
-- `AGENTCAT_CONNECTORS_SHA256` — a 64 lowercase hex digest passed by the caller
-  (for an app-led update, or local QA), or
-- `AGENTCAT_CONNECTORS_SHA256_URL` — a sidecar digest published next to the
-  tarball.
-- `AGENTCAT_CONNECTORS_ARCHIVE_URL` — a pinned archive URL supplied by release
-  automation or local QA. When omitted, the installer keeps using the public
-  `main` branch archive.
-
-When no digest is supplied (the current default), the install proceeds as
-before so existing installs keep updating. Publishing a per-release digest and
-wiring it into the auto-update path is the remaining step to make verification
-mandatory on the public channel.
+A dirty legacy git checkout is never force-checked out or deleted. The updater
+stores its tracked patch, untracked-file copies, and status under
+`~/.agentcat/backups/connector-source/legacy-dirty-*`, then stops so the user can
+port or review those changes. App-led/local QA installs may pin a different
+archive only when URL, version, and SHA-256 are supplied together via
+`AGENTCAT_CONNECTORS_ARCHIVE_URL`, `AGENTCAT_CONNECTORS_VERSION`, and
+`AGENTCAT_CONNECTORS_SHA256`.
 
 Pro connector safe-swap QA (local/private builds only):
 
@@ -124,7 +117,7 @@ agentcat setup-prompt
 ## What It Installs
 
 - `~/.local/bin/agentcat` or `%USERPROFILE%\.local\bin\agentcat.cmd`: local collector CLI
-- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` or Windows startup task `AgentCatD`: local daemon on `127.0.0.1:8765`
+- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` or Windows startup task `AgentCatD`: local daemon on `127.0.0.1:8765`. If task registration is unavailable, Windows uses the current user's `HKCU Run` entry instead; the installer no longer creates a VBS startup script.
 - `~/.agentcat/events.sqlite`: local event store
 - `~/.agentcat/latest-snapshot.json`: latest normalized usage snapshot
 - timestamped backups under `~/.agentcat/backups/`
@@ -136,6 +129,7 @@ agentcat setup-prompt
 | Codex | local SQLite token totals + Codex OAuth usage API | Shows remaining 5-hour, 7-day, exposed model/review quota percentages, available reset credits, and Codex credit/spend-cap state when `~/.codex/auth.json` is present. |
 | Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
 | Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
+| Antigravity | dedicated telemetry or read-only local conversation SQLite | Keeps Antigravity separate from Gemini CLI. On Windows, reads defensive per-generation token metadata and falls back to quota/activity only if the upstream local schema changes. |
 
 ## Multiple Provider Homes
 
@@ -178,7 +172,13 @@ The connector is local-first.
 ```bash
 curl http://127.0.0.1:8765/healthz
 curl http://127.0.0.1:8765/v1/snapshot
+curl http://127.0.0.1:8765/v1/contract
 ```
+
+`/v1/contract` is the connector-owned compatibility contract for both apps. It
+declares the snapshot schema, shared and platform-specific capabilities,
+compatibility aliases, and safe fallback behavior. Golden app fixtures live in
+`contracts/fixtures/`.
 
 Agent Cat can read `~/.agentcat/latest-snapshot.json` or call the local API. The snapshot includes usage plus `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, `activity.totalMemoryBytes`, `activity.memoryBytesByProvider`, `activity.runnableProcessCount`, `activity.activityScore`, and `activity.motionStage` so sandboxed Mac builds can use the connector instead of direct process scanning.
 

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentcat.app/schemas/daemon-status-v1.json",
+  "title": "Agent Cat daemon status v1",
+  "type": "object",
+  "required": ["platform", "status", "persistent", "registration"],
+  "properties": {
+    "platform": {
+      "type": "string",
+      "enum": ["macos", "windows", "linux", "other"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["registered", "fallback", "manual", "missing", "error"]
+    },
+    "persistent": { "type": "boolean" },
+    "registration": {
+      "type": "string",
+      "enum": ["launch_agent", "scheduled_task", "run_key", "legacy_startup", "manual", "none"]
+    },
+    "taskRegistered": { "type": "boolean" },
+    "runEntryRegistered": { "type": "boolean" },
+    "legacyStartupPresent": { "type": "boolean" }
+  },
+  "additionalProperties": true
+}

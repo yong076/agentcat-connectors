@@ -1,0 +1,84 @@
+{
+  "contractVersion": 1,
+  "snapshotSchemaVersion": 4,
+  "capabilityRegistry": {
+    "connector.contract.v1": {
+      "owner": "shared",
+      "fields": ["contractVersion"],
+      "fallback": "reject snapshots with an unknown newer contract version"
+    },
+    "connector.daemon.status.v1": {
+      "owner": "shared",
+      "fields": ["daemon.platform", "daemon.status", "daemon.persistent", "daemon.registration"],
+      "fallback": "show connector health as unknown without invalidating provider usage"
+    },
+    "activity.windowsProcessScan": {
+      "owner": "windows",
+      "fields": ["activity.scanSource"],
+      "fallback": "use the Windows app process fallback and mark the snapshot partial"
+    },
+    "providerInstances.v1": {
+      "owner": "shared",
+      "fields": ["providerInstances"],
+      "fallback": "render the aggregate providers map as one connection per provider"
+    },
+    "usage.antigravity.sqlite": {
+      "owner": "shared",
+      "fields": ["providers.antigravity.tokens", "providers.antigravity.sourceAttribution"],
+      "fallback": "show Antigravity quota and activity without borrowing Gemini CLI token usage"
+    }
+  },
+  "sharedRequired": [
+    "snapshot.metadata",
+    "activity.memory",
+    "usage.coverage",
+    "limits.errorBackoff",
+    "limits.quotaFallbackOn429",
+    "limits.codex.oauthUsage",
+    "limits.claude.oauthUsage",
+    "limits.claude.statuslineQuotas",
+    "limits.grok.oauthUsage",
+    "limits.kimi.oauthUsage",
+    "providerInstances.v1"
+  ],
+  "apps": {
+    "macos": {
+      "minimumAppVersion": "26.34.6",
+      "required": [
+        "snapshot.metadata",
+        "activity.memory",
+        "limits.errorBackoff",
+        "limits.quotaFallbackOn429",
+        "limits.claude.statuslineQuotas",
+        "limits.grok.oauthUsage",
+        "limits.kimi.oauthUsage",
+        "providerInstances.v1"
+      ],
+      "platformRequired": []
+    },
+    "windows": {
+      "minimumAppVersion": "26.28.4",
+      "required": [
+        "snapshot.metadata",
+        "connector.daemon.status.v1",
+        "activity.memory",
+        "usage.coverage",
+        "limits.errorBackoff",
+        "limits.quotaFallbackOn429",
+        "limits.codex.oauthUsage",
+        "limits.claude.oauthUsage",
+        "limits.claude.statuslineQuotas",
+        "limits.grok.oauthUsage",
+        "limits.kimi.oauthUsage",
+        "providerInstances.v1"
+      ],
+      "platformRequired": [
+        "activity.windowsProcessScan",
+        "usage.antigravity.sqlite"
+      ]
+    }
+  },
+  "compatibilityAliases": {
+    "connector.daemon": "connector.daemon.status.v1"
+  }
+}

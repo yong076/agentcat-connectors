@@ -1,0 +1,18 @@
+{
+  "scenario": "partial",
+  "expectation": "one failed provider remains isolated while healthy providers continue to render",
+  "snapshot": {
+    "schemaVersion": 4,
+    "contractVersion": 1,
+    "connectorVersion": "26.34.5",
+    "generatedAt": "2026-08-22T00:00:00Z",
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
+    "providers": {
+      "codex": {"status": "ok", "tokens": {"today": 400}},
+      "claude": {"status": "error", "error": "credential_unavailable", "usageCoverage": {"status": "partial"}}
+    },
+    "providerInstances": [],
+    "activity": {"status": "partial", "scanSource": "fallback", "processes": [], "countsByProvider": {}},
+    "daemon": {"platform": "windows", "status": "fallback", "persistent": true, "registration": "run_key"}
+  }
+}
