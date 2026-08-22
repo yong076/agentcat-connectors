@@ -27,6 +27,53 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(agentcat)
 
 
+def _encode_varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _pb_uint_field(number: int, value: int) -> bytes:
+    return _encode_varint(number << 3) + _encode_varint(value)
+
+
+def _pb_bytes_field(number: int, value: bytes) -> bytes:
+    return _encode_varint((number << 3) | 2) + _encode_varint(len(value)) + value
+
+
+def _antigravity_fixture_blob(
+    *,
+    timestamp: int,
+    input_tokens: int = 100,
+    output_tokens: int = 30,
+    cache_tokens: int = 7,
+    thought_tokens: int = 5,
+    model: str = "gemini-3-pro-high",
+) -> bytes:
+    usage = b"".join(
+        (
+            _pb_uint_field(1, cache_tokens),
+            _pb_uint_field(2, input_tokens),
+            _pb_uint_field(3, output_tokens),
+            _pb_uint_field(9, thought_tokens),
+        )
+    )
+    timestamp_message = _pb_uint_field(1, timestamp)
+    generation = _pb_bytes_field(4, timestamp_message)
+    message = b"".join(
+        (
+            _pb_bytes_field(4, usage),
+            _pb_bytes_field(9, generation),
+            _pb_bytes_field(21, model.encode("utf-8")),
+        )
+    )
+    return _pb_bytes_field(1, message)
+
+
 class AgentCatConnectorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -992,9 +1039,13 @@ class AgentCatConnectorTests(unittest.TestCase):
         snapshot = agentcat.build_snapshot()
 
         self.assertEqual(snapshot["schemaVersion"], 4)
+        self.assertEqual(snapshot["contractVersion"], 1)
         self.assertEqual(snapshot["connectorVersion"], agentcat.CONNECTOR_VERSION)
         self.assertIn("update", snapshot)
+        self.assertIn("daemon", snapshot)
         self.assertIn("activity.memory", snapshot["capabilities"])
+        self.assertIn("connector.contract.v1", snapshot["capabilities"])
+        self.assertIn("connector.daemon.status.v1", snapshot["capabilities"])
         self.assertIn("connector.autoUpdate", snapshot["capabilities"])
         self.assertIn("connector.channel", snapshot["capabilities"])
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
@@ -1233,13 +1284,14 @@ class AgentCatConnectorTests(unittest.TestCase):
 
     def test_auto_update_check_starts_installer_for_new_managed_version(self) -> None:
         install_dir = (agentcat.AGENTCAT_HOME / "connectors").resolve()
+        install_dir.mkdir(parents=True)
+        (install_dir / ("install.ps1" if agentcat.IS_WINDOWS else "install.sh")).write_text("trusted", encoding="utf-8")
         proc = type("Proc", (), {"pid": 12345})()
 
         with patch.dict(agentcat.os.environ, {
             "AGENTCAT_AUTO_UPDATE": "1",
             "AGENTCAT_CONNECTOR_VERSION": "",
             "AGENTCAT_CONNECTORS_DIR": str(install_dir),
-            "AGENTCAT_INSTALL_SH_SHA256": "a" * 64,
         }), \
                 patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
                 patch.object(agentcat, "fetch_remote_connector_version", return_value="99.0.0"), \
@@ -1256,7 +1308,6 @@ class AgentCatConnectorTests(unittest.TestCase):
             "AGENTCAT_AUTO_UPDATE": "1",
             "AGENTCAT_CONNECTOR_VERSION": "",
             "AGENTCAT_CONNECTORS_DIR": str(agentcat.AGENTCAT_HOME / "connectors"),
-            "AGENTCAT_INSTALL_SH_SHA256": "a" * 64,
         }), \
                 patch.object(agentcat, "current_connector_repo_dir", return_value=self.root / "dev"):
             state = agentcat.check_auto_update_once(apply_update=True)
@@ -3033,6 +3084,103 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(antigravity_provider["events"], 0)
         self.assertNotEqual(antigravity_provider["sourceAttribution"], "inferred-from-gemini-telemetry")
 
+    def test_antigravity_gen_metadata_parser_is_defensive(self) -> None:
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        parsed = agentcat._antigravity_gen_metrics(_antigravity_fixture_blob(timestamp=now))
+
+        self.assertIsNotNone(parsed)
+        model, when, metrics = parsed
+        self.assertEqual(model, "gemini-3-pro-high")
+        self.assertEqual(int(when.timestamp()), now)
+        self.assertEqual(
+            metrics,
+            {
+                "inputTokens": 100,
+                "outputTokens": 30,
+                "cacheReadInputTokens": 7,
+                "thoughtTokens": 5,
+            },
+        )
+        self.assertIsNone(agentcat._antigravity_gen_metrics(b"\x0a\xff"))
+        self.assertIsNone(
+            agentcat._antigravity_gen_metrics(
+                _antigravity_fixture_blob(
+                    timestamp=now,
+                    input_tokens=agentcat._ANTIGRAVITY_TOKEN_SANITY_MAX,
+                )
+            )
+        )
+
+    def test_antigravity_sqlite_usage_reads_real_generation_rows(self) -> None:
+        conversations = agentcat.antigravity_conversations_dir()
+        conversations.mkdir(parents=True)
+        database = conversations / "conversation.db"
+        now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("create table gen_metadata (data blob)")
+            connection.execute(
+                "insert into gen_metadata(data) values (?)",
+                (_antigravity_fixture_blob(timestamp=int(now.timestamp())),),
+            )
+            connection.execute("insert into gen_metadata(data) values (?)", (b"schema-drift",))
+            connection.commit()
+
+        usage = agentcat.antigravity_sqlite_usage()
+
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage["status"], "ok")
+        self.assertEqual(usage["events"], 1)
+        self.assertEqual(usage["tokens"]["totalTokens"], 142)
+        self.assertEqual(usage["tokens"]["inputTokens"], 100)
+        self.assertEqual(usage["dailyTokens"][agentcat.day_key_for_timestamp(now)], 142)
+        self.assertEqual(usage["models"]["gemini-3-pro-high"]["totalTokens"], 142)
+
+    def test_split_google_cli_snapshots_prefers_antigravity_sqlite(self) -> None:
+        conversations = agentcat.antigravity_conversations_dir()
+        conversations.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        with closing(sqlite3.connect(conversations / "conversation.db")) as connection:
+            connection.execute("create table gen_metadata (data blob)")
+            connection.execute(
+                "insert into gen_metadata(data) values (?)",
+                (_antigravity_fixture_blob(timestamp=int(now.timestamp())),),
+            )
+            connection.commit()
+        common_usage = {
+            "tokens": {"inputTokens": 210, "outputTokens": 90, "totalTokens": 300, "all": 300},
+            "models": {},
+            "dailyTokens": {agentcat.day_key_for_timestamp(now): 300},
+            "hourlyTokens": {},
+            "events": 2,
+            "cache": {"source": "full-log-index"},
+        }
+        gemini = {
+            "status": "ok",
+            "sources": {
+                "geminiCli": {"source": "gemini-telemetry", "installed": True},
+                "antigravityCli": {"installed": True},
+            },
+            "_sourceUsages": {"geminiCli": common_usage},
+            "tokens": common_usage["tokens"],
+            "models": {},
+            "dailyTokens": common_usage["dailyTokens"],
+            "hourlyTokens": {},
+            "events": 2,
+            "cache": {"source": "full-log-index"},
+            "breakdown": agentcat.empty_breakdown(),
+        }
+
+        gemini_provider, antigravity_provider = agentcat.split_google_cli_snapshots(gemini, None)
+
+        self.assertEqual(gemini_provider["tokens"]["totalTokens"], 300)
+        self.assertEqual(gemini_provider["sources"], {"geminiCli": {"source": "gemini-telemetry", "installed": True}})
+        self.assertEqual(antigravity_provider["tokens"]["totalTokens"], 142)
+        self.assertEqual(antigravity_provider["sourceAttribution"], "local-sqlite-trajectory")
+        self.assertEqual(
+            antigravity_provider["sources"]["antigravityCli"]["collectionMethod"],
+            "local_sqlite_trajectory",
+        )
+
     def test_gemini_snapshot_distributes_cumulative_counter_deltas_by_day(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
         # Local noon, not UTC noon: the product buckets on the local calendar date,
@@ -4196,63 +4344,58 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertIn("off by default", reason)
 
-    def test_free_channel_opt_in_requires_pinned_digest(self) -> None:
+    def test_free_channel_opt_in_requires_managed_trusted_installer(self) -> None:
         install_dir = (agentcat.AGENTCAT_HOME / "connectors").resolve()
+        install_dir.mkdir(parents=True)
         with patch.dict(agentcat.os.environ, {
             "AGENTCAT_AUTO_UPDATE": "1",
             "AGENTCAT_CONNECTOR_VERSION": "",
             "AGENTCAT_CONNECTORS_DIR": str(install_dir),
         }), patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir):
-            agentcat.os.environ.pop("AGENTCAT_INSTALL_SH_SHA256", None)
             enabled, reason = agentcat.auto_update_enabled_status()
             self.assertFalse(enabled)
-            self.assertIn("pinned install.sh digest", reason)
+            self.assertIn("trusted public-channel installer", reason)
 
-            agentcat.os.environ["AGENTCAT_INSTALL_SH_SHA256"] = "a" * 64
+            (install_dir / ("install.ps1" if agentcat.IS_WINDOWS else "install.sh")).write_text(
+                "trusted", encoding="utf-8"
+            )
             enabled_ok, _ = agentcat.auto_update_enabled_status()
             self.assertTrue(enabled_ok)
 
-    def test_start_auto_update_install_verifies_digest_before_exec(self) -> None:
-        body = b"#!/bin/sh\necho hardened\n"
-        good = agentcat.hashlib.sha256(body).hexdigest()
-
-        class FakeResp:
-            def __enter__(self_inner):
-                return self_inner
-
-            def __exit__(self_inner, *exc):
-                return False
-
-            def read(self_inner, _n=None):
-                return body
-
-        with patch.dict(agentcat.os.environ, {"AGENTCAT_INSTALL_SH_SHA256": "b" * 64}), \
-                patch.object(agentcat.urllib.request, "urlopen", return_value=FakeResp()):
-            with self.assertRaises(ValueError) as ctx:
-                agentcat.start_auto_update_install("99.0.0")
-            self.assertIn("digest mismatch", str(ctx.exception))
-
+    def test_start_auto_update_install_executes_only_local_trusted_bootstrap(self) -> None:
+        install_dir = agentcat.agentcat_connectors_dir()
+        install_dir.mkdir(parents=True)
+        script_name = "install.ps1" if agentcat.IS_WINDOWS else "install.sh"
+        script_path = install_dir / script_name
+        script_path.write_bytes(b"#!/bin/sh\necho hardened\n")
         captured = {}
 
         def fake_popen(cmd, **kwargs):
             captured["cmd"] = cmd
             return type("Proc", (), {"pid": 4242})()
 
-        with patch.dict(agentcat.os.environ, {"AGENTCAT_INSTALL_SH_SHA256": good}), \
-                patch.object(agentcat.urllib.request, "urlopen", return_value=FakeResp()), \
+        with patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
                 patch.object(agentcat.subprocess, "Popen", side_effect=fake_popen):
             proc = agentcat.start_auto_update_install("99.0.0")
 
         self.assertEqual(proc.pid, 4242)
-        # Verified bytes are executed from a local file, never piped from curl.
-        script_name = "auto-update-install.ps1" if agentcat.IS_WINDOWS else "auto-update-install.sh"
-        script_path = agentcat.AGENTCAT_HOME / script_name
-        self.assertTrue(script_path.exists())
-        self.assertEqual(script_path.read_bytes(), body)
+        self.assertIn(str(script_path), [str(part) for part in captured["cmd"]])
         command_text = " ".join(str(part) for part in captured["cmd"]).lower()
         self.assertNotIn("curl", command_text)
         self.assertNotIn("irm", command_text)
         self.assertNotIn("iex", command_text)
+
+    def test_public_update_manifest_requires_release_url_and_digest(self) -> None:
+        manifest = {
+            "version": "26.34.5",
+            "contractVersion": 1,
+            "archiveUrl": "https://github.com/yong076/agentcat-connectors/releases/download/v26.34.5/agentcat-connectors-v26.34.5.zip",
+            "sha256": "a" * 64,
+        }
+        self.assertEqual(agentcat.validate_public_connector_manifest(manifest)["version"], "26.34.5")
+        manifest["archiveUrl"] = "https://evil.invalid/connector.zip"
+        with self.assertRaises(ValueError):
+            agentcat.validate_public_connector_manifest(manifest)
 
     def test_sanitize_payload_redacts_path_and_secret_values(self) -> None:
         sanitized = agentcat.sanitize_payload(

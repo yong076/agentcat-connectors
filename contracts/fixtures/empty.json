@@ -1,0 +1,15 @@
+{
+  "scenario": "empty",
+  "expectation": "apps render setup guidance without treating an empty provider map as a connector failure",
+  "snapshot": {
+    "schemaVersion": 4,
+    "contractVersion": 1,
+    "connectorVersion": "26.34.5",
+    "generatedAt": "2026-08-22T00:00:00Z",
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
+    "providers": {},
+    "providerInstances": [],
+    "activity": {"status": "ok", "processes": [], "countsByProvider": {}},
+    "daemon": {"platform": "windows", "status": "missing", "persistent": false, "registration": "none"}
+  }
+}

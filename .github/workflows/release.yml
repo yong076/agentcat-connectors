@@ -1,0 +1,44 @@
+name: Release connector
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify tag matches connector version
+        shell: bash
+        run: |
+          version="$(python bin/agentcat version)"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+
+      - name: Run release tests
+        env:
+          CODEX_HOME: ""
+          CLAUDE_CONFIG_DIR: ""
+        run: python -m unittest discover -s tests -p '*test*.py'
+
+      - name: Build checksum-bound release assets
+        run: python scripts/build_public_release.py --output dist --source-ref "${GITHUB_REF_NAME}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release create "${GITHUB_REF_NAME}" dist/agentcat-connectors-*.zip dist/connector-manifest.json --verify-tag --generate-notes

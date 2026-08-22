@@ -1,0 +1,17 @@
+{
+  "scenario": "stale",
+  "expectation": "apps retain the last provider values while labeling the snapshot stale",
+  "snapshot": {
+    "schemaVersion": 4,
+    "contractVersion": 1,
+    "connectorVersion": "26.34.5",
+    "generatedAt": "2026-08-20T00:00:00Z",
+    "servedAt": "2026-08-22T00:00:00Z",
+    "snapshotFreshness": {"status": "stale", "ageSeconds": 172800},
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
+    "providers": {"claude": {"status": "ok", "tokens": {"all": 9000}}},
+    "providerInstances": [{"id": "claude:default", "provider": "claude", "label": "Claude", "status": "ok"}],
+    "activity": {"status": "stale", "processes": [], "countsByProvider": {}},
+    "daemon": {"platform": "windows", "status": "registered", "persistent": true, "registration": "scheduled_task"}
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "scenario": "multi-account",
+  "expectation": "apps render two account-scoped instances without double-counting the aggregate provider",
+  "snapshot": {
+    "schemaVersion": 4,
+    "contractVersion": 1,
+    "connectorVersion": "26.34.5",
+    "generatedAt": "2026-08-22T00:00:00Z",
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
+    "providers": {"codex": {"status": "ok", "tokens": {"all": 3000}}},
+    "providerInstances": [
+      {"id": "codex:account-a", "provider": "codex", "label": "Work", "status": "ok", "tokens": {"all": 1800}},
+      {"id": "codex:account-b", "provider": "codex", "label": "Personal", "status": "ok", "tokens": {"all": 1200}}
+    ],
+    "activity": {"status": "ok", "processes": [], "countsByProvider": {"codex": 2}},
+    "daemon": {"platform": "macos", "status": "registered", "persistent": true, "registration": "launch_agent"}
+  }
+}

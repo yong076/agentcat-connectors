@@ -63,6 +63,19 @@ curl -fsSL https://raw.githubusercontent.com/yong076/agentcat-connectors/main/in
 ./install.sh
 ```
 
+### 커넥터 아카이브 무결성
+
+공개 설치 프로그램은 최신 GitHub Release의 `connector-manifest.json`을 읽고,
+버전이 고정된 ZIP을 내려받아 SHA-256이 정확히 일치할 때만 압축을 풉니다. 새
+소스는 기존 경로 바깥에서 계약과 Python 구문을 검증한 뒤 교체하고, daemon
+health/버전/계약 확인이 실패하면 이전 소스와 daemon으로 롤백합니다.
+
+기존 커넥터 git checkout에 로컬 수정이 있으면 강제 checkout이나 삭제를 하지
+않습니다. tracked patch, untracked 파일 복사본, 상태를
+`~/.agentcat/backups/connector-source/legacy-dirty-*`에 보존하고 업데이트를
+중단합니다. 앱이 특정 빌드를 설치할 때는 archive URL, version, SHA-256을 함께
+고정해야 합니다.
+
 Windows에서 개발용 체크아웃을 실행할 때:
 
 ```powershell
@@ -85,7 +98,7 @@ agentcat setup-prompt
 ## 설치되는 항목
 
 - `~/.local/bin/agentcat` 또는 `%USERPROFILE%\.local\bin\agentcat.cmd`: 로컬 수집기 CLI
-- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` 또는 Windows 시작 작업 `AgentCatD`: `127.0.0.1:8765`에서 동작하는 로컬 daemon
+- `~/Library/LaunchAgents/com.trappist.agentcatd.plist` 또는 Windows 시작 작업 `AgentCatD`: `127.0.0.1:8765`에서 동작하는 로컬 daemon. 작업 등록이 불가능하면 현재 사용자의 `HKCU Run` 항목을 대신 사용하며, 설치 프로그램은 더 이상 VBS 시작 스크립트를 만들지 않습니다.
 - `~/.agentcat/events.sqlite`: 로컬 이벤트 저장소
 - `~/.agentcat/latest-snapshot.json`: 최신 정규화 사용량 스냅샷
 - `~/.agentcat/backups/`: 설정 변경 전 timestamp 백업
@@ -97,6 +110,7 @@ agentcat setup-prompt
 | Codex | 로컬 SQLite token 합계 + Codex OAuth usage API | `~/.codex/auth.json`이 있으면 5시간, 7일, 노출된 모델/리뷰 quota의 남은 비율을 표시합니다. |
 | Claude Code | 로컬 stats/hooks + Claude Code OAuth usage API | Claude Code OAuth credential이 있으면 5시간, 7일, 모델 quota, 월별 extra credit 남은 양을 표시합니다. |
 | Gemini CLI | 로컬 telemetry + Gemini Code Assist quota API | Google 로그인 Gemini CLI 세션에서 모델별 Code Assist request quota 남은 비율을 표시합니다. |
+| Antigravity | 전용 telemetry 또는 read-only 로컬 대화 SQLite | Gemini CLI 사용량을 빌리지 않고 별도 표시합니다. Windows에서는 generation별 실제 token metadata를 방어적으로 읽고, 로컬 스키마가 달라지면 quota/activity만 표시합니다. |
 
 ## Provider 홈이 여러 개인 경우
 
@@ -136,7 +150,12 @@ agentcat homes --provider codex --forget <경로>   # 기본 상태로 되돌림
 ```bash
 curl http://127.0.0.1:8765/healthz
 curl http://127.0.0.1:8765/v1/snapshot
+curl http://127.0.0.1:8765/v1/contract
 ```
+
+`/v1/contract`는 Mac과 Windows 앱이 함께 사용하는 커넥터 소유 호환성 계약입니다.
+snapshot schema, 공통/플랫폼별 capability, 호환 alias, 안전한 fallback 의미를
+선언합니다. 앱 검증용 고정 fixture는 `contracts/fixtures/`에 있습니다.
 
 Agent Cat은 `~/.agentcat/latest-snapshot.json`을 읽거나 로컬 API를 호출할 수 있습니다. 스냅샷에는 provider별 사용량과 함께 `activity.processes`, `activity.countsByProvider`, `activity.totalCPUPercent`, `activity.totalMemoryBytes`, `activity.memoryBytesByProvider`, `activity.runnableProcessCount`, `activity.activityScore`, `activity.motionStage`가 들어 있습니다. 그래서 sandboxed Mac 빌드도 직접 process scan을 하지 않고 커넥터를 통해 활동 상태를 받을 수 있습니다.
 

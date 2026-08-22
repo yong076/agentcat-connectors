@@ -133,19 +133,24 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.4")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.5")
 SCHEMA_VERSION = 4
-AUTO_UPDATE_VERSION_URL = os.environ.get(
-    "AGENTCAT_AUTO_UPDATE_VERSION_URL",
-    "https://raw.githubusercontent.com/yong076/agentcat-connectors/main/bin/agentcat",
+CONTRACT_VERSION = 1
+WINDOWS_TASK_NAME = "AgentCatD"
+WINDOWS_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+WINDOWS_RUN_VALUE = "AgentCatD"
+WINDOWS_LEGACY_STARTUP_SCRIPT = (
+    Path(os.environ.get("APPDATA", str(HOME / "AppData" / "Roaming")))
+    / "Microsoft"
+    / "Windows"
+    / "Start Menu"
+    / "Programs"
+    / "Startup"
+    / "AgentCatD.vbs"
 )
-AUTO_UPDATE_INSTALL_SH_URL = os.environ.get(
-    "AGENTCAT_AUTO_UPDATE_INSTALL_SH_URL",
-    "https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.sh",
-)
-AUTO_UPDATE_INSTALL_PS1_URL = os.environ.get(
-    "AGENTCAT_AUTO_UPDATE_INSTALL_PS1_URL",
-    "https://raw.githubusercontent.com/yong076/agentcat-connectors/main/install.ps1",
+AUTO_UPDATE_MANIFEST_URL = os.environ.get(
+    "AGENTCAT_CONNECTORS_MANIFEST_URL",
+    "https://github.com/yong076/agentcat-connectors/releases/latest/download/connector-manifest.json",
 )
 AUTO_UPDATE_INTERVAL_SECONDS = int(os.environ.get("AGENTCAT_AUTO_UPDATE_INTERVAL_SECONDS", "3600"))
 AUTO_UPDATE_INITIAL_DELAY_SECONDS = int(os.environ.get("AGENTCAT_AUTO_UPDATE_INITIAL_DELAY_SECONDS", "300"))
@@ -160,8 +165,14 @@ PRICING_FETCH_INITIAL_DELAY_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH
 PRICING_FETCH_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AGENTCAT_PRICING_FETCH_HTTP_TIMEOUT_SECONDS", "10"))
 CONNECTOR_CAPABILITIES = (
     "snapshot.metadata",
+    "connector.contract.v1",
     "connector.autoUpdate",
     "connector.channel",
+    # Compatibility alias consumed by released Windows builds. New clients
+    # should key off connector.daemon.status.v1 and the documented daemon
+    # object instead of treating daemon support as an unversioned boolean.
+    "connector.daemon",
+    "connector.daemon.status.v1",
     "activity.terminal",
     "activity.memory",
     "activity.runtimeModes",
@@ -178,6 +189,7 @@ CONNECTOR_CAPABILITIES = (
     "providerInstances.v1",
     "pricing.feed",
     "usage.opencode.sqlite",
+    "usage.antigravity.sqlite",
     "usage.copilot.localLogs",
     "limits.liveCache",
     "limits.errorBackoff",
@@ -200,6 +212,12 @@ _GEMINI_CACHE_LOCK = threading.Lock()
 _GEMINI_CACHE_KEY: Optional[Tuple[int, int]] = None
 _GEMINI_CACHE_VALUE: Optional[Dict[str, Any]] = None
 _GEMINI_CACHE_LOADED_AT = 0.0
+_DAEMON_STATUS_LOCK = threading.Lock()
+_DAEMON_STATUS_VALUE: Optional[Dict[str, Any]] = None
+_DAEMON_STATUS_AT = 0.0
+DAEMON_STATUS_TTL_SECONDS = 30.0
+_PROVIDER_INSTANCE_SECRET_LOCK = threading.Lock()
+_PROVIDER_INSTANCE_SECRET_CACHE: Optional[Tuple[str, bytes]] = None
 GEMINI_OAUTH_CLIENT_SECRET_RE = re.compile(r"""OAUTH_CLIENT_SECRET\s*[:=]\s*["']([^"']+)["']""")
 
 TOKEN_KEYS = {
@@ -1730,10 +1748,130 @@ def attach_desktop_app_sources(
 def connector_config_payload(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     resolved = settings if isinstance(settings, dict) else agentcat_settings()
     return {
+        "contractVersion": CONTRACT_VERSION,
         "providers": configured_provider_entries(resolved),
         "desktopApps": desktop_app_sources_snapshot(resolved),
         "capabilities": list(CONNECTOR_CAPABILITIES),
     }
+
+
+def connector_contract_payload() -> Dict[str, Any]:
+    """Return the connector-owned compatibility manifest.
+
+    The file ships with the connector package and is deliberately separate
+    from either app repository. Both presentation shells can pin this exact
+    document in CI instead of growing independent capability interpretations.
+    """
+    path = Path(__file__).resolve().parent.parent / "contracts" / "connector-v1.json"
+    raw = read_json(path)
+    if not isinstance(raw, dict):
+        raise ValueError("connector contract is missing or invalid")
+    if int(raw.get("contractVersion") or 0) != CONTRACT_VERSION:
+        raise ValueError("connector contract version does not match the runtime")
+    if int(raw.get("snapshotSchemaVersion") or 0) != SCHEMA_VERSION:
+        raise ValueError("connector contract schema version does not match the runtime")
+    return raw
+
+
+def _status_command(args: List[str]) -> Optional[subprocess.CompletedProcess]:
+    try:
+        return subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return None
+
+
+def _daemon_status_snapshot_uncached() -> Dict[str, Any]:
+    """Return path-free daemon persistence metadata for both app shells.
+
+    This intentionally exposes booleans and registration kinds, never a task
+    command, executable path, username, PID, or raw OS error. Snapshot and
+    support bundles are therefore useful without becoming a path disclosure.
+    """
+    if IS_WINDOWS:
+        task = _status_command(
+            ["schtasks.exe", "/Query", "/TN", WINDOWS_TASK_NAME, "/FO", "LIST"]
+        )
+        run_entry = _status_command(
+            ["reg.exe", "query", WINDOWS_RUN_KEY, "/v", WINDOWS_RUN_VALUE]
+        )
+        task_registered = bool(task is not None and task.returncode == 0)
+        run_registered = bool(run_entry is not None and run_entry.returncode == 0)
+        legacy_present = False
+        if WINDOWS_LEGACY_STARTUP_SCRIPT.is_file():
+            try:
+                legacy_present = "daemon" in WINDOWS_LEGACY_STARTUP_SCRIPT.read_text(
+                    encoding="utf-8", errors="ignore"
+                ).lower()
+            except OSError:
+                legacy_present = False
+
+        if task_registered:
+            registration = "scheduled_task"
+            status = "registered"
+        elif run_registered:
+            registration = "run_key"
+            status = "fallback"
+        elif legacy_present:
+            registration = "legacy_startup"
+            status = "fallback"
+        else:
+            registration = "none"
+            status = "error" if task is None and run_entry is None else "missing"
+        return {
+            "platform": "windows",
+            "status": status,
+            "persistent": task_registered or run_registered or legacy_present,
+            "registration": registration,
+            "taskRegistered": task_registered,
+            "runEntryRegistered": run_registered,
+            "legacyStartupPresent": legacy_present,
+        }
+
+    if sys.platform == "darwin":
+        registered = LAUNCHD_AGENT_PLIST.is_file()
+        return {
+            "platform": "macos",
+            "status": "registered" if registered else "missing",
+            "persistent": registered,
+            "registration": "launch_agent" if registered else "none",
+        }
+
+    if sys.platform.startswith("linux"):
+        return {
+            "platform": "linux",
+            "status": "manual",
+            "persistent": False,
+            "registration": "manual",
+        }
+    return {
+        "platform": "other",
+        "status": "manual",
+        "persistent": False,
+        "registration": "manual",
+    }
+
+
+def daemon_status_snapshot(force: bool = False) -> Dict[str, Any]:
+    global _DAEMON_STATUS_AT, _DAEMON_STATUS_VALUE
+    now = time.monotonic()
+    with _DAEMON_STATUS_LOCK:
+        if (
+            not force
+            and _DAEMON_STATUS_VALUE is not None
+            and now - _DAEMON_STATUS_AT < DAEMON_STATUS_TTL_SECONDS
+        ):
+            return copy.deepcopy(_DAEMON_STATUS_VALUE)
+        value = _daemon_status_snapshot_uncached()
+        _DAEMON_STATUS_VALUE = copy.deepcopy(value)
+        _DAEMON_STATUS_AT = now
+        return value
 
 
 def merge_connector_config_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2915,32 +3053,39 @@ def codex_auth_identity(auth: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
 def _provider_instance_secret() -> bytes:
     """Load/create the device-local key used to pseudonymize provider IDs."""
-    try:
-        value = PROVIDER_INSTANCE_SECRET.read_bytes()
-        if len(value) >= 32:
-            return value
-    except OSError:
-        pass
-    ensure_dirs()
-    value = os.urandom(32)
-    try:
-        fd = os.open(PROVIDER_INSTANCE_SECRET, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    global _PROVIDER_INSTANCE_SECRET_CACHE
+    cache_key = str(PROVIDER_INSTANCE_SECRET)
+    with _PROVIDER_INSTANCE_SECRET_LOCK:
+        if _PROVIDER_INSTANCE_SECRET_CACHE is not None and _PROVIDER_INSTANCE_SECRET_CACHE[0] == cache_key:
+            return _PROVIDER_INSTANCE_SECRET_CACHE[1]
         try:
-            os.write(fd, value)
-        finally:
-            os.close(fd)
-    except FileExistsError:
-        # Another snapshot/CLI process won the first-run race.
-        try:
-            existing = PROVIDER_INSTANCE_SECRET.read_bytes()
-            if len(existing) >= 32:
-                return existing
+            value = PROVIDER_INSTANCE_SECRET.read_bytes()
+            if len(value) >= 32:
+                _PROVIDER_INSTANCE_SECRET_CACHE = (cache_key, value)
+                return value
         except OSError:
             pass
-    except OSError:
-        # A read-only install may still render stable IDs for this daemon run.
-        pass
-    return value
+        ensure_dirs()
+        value = os.urandom(32)
+        try:
+            fd = os.open(PROVIDER_INSTANCE_SECRET, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, value)
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            # Another process won the first-run race; use exactly its key.
+            try:
+                existing = PROVIDER_INSTANCE_SECRET.read_bytes()
+                if len(existing) >= 32:
+                    value = existing
+            except OSError:
+                pass
+        except OSError:
+            # A read-only install may still render stable IDs for this daemon run.
+            pass
+        _PROVIDER_INSTANCE_SECRET_CACHE = (cache_key, value)
+        return value
 
 
 def provider_instance_id(provider: str, identity: str) -> str:
@@ -9264,20 +9409,192 @@ def apply_google_usage(snapshot: Dict[str, Any], usage: Optional[Dict[str, Any]]
     return out
 
 
+# --- Antigravity local usage via its conversation SQLite store ------------------
+# agy does not emit an OTEL token stream on Windows, but it persists each
+# generation in ~/.gemini/antigravity-cli/conversations/*.db. gen_metadata is an
+# unversioned protobuf blob, so this reader deliberately parses only known fields,
+# rejects implausible values, and fails soft if the upstream schema changes.
+
+def _pb_varint(blob: bytes, index: int) -> Tuple[Optional[int], int]:
+    shift = 0
+    value = 0
+    while index < len(blob):
+        byte = blob[index]
+        index += 1
+        value |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return value, index
+        shift += 7
+        if shift > 63:
+            return None, index
+    return None, index
+
+
+def _pb_parse(blob: bytes) -> Dict[int, List[Tuple[int, Any]]]:
+    """Parse one protobuf message level, stopping safely on malformed input."""
+    fields: Dict[int, List[Tuple[int, Any]]] = {}
+    index = 0
+    while index < len(blob):
+        key, index = _pb_varint(blob, index)
+        if key is None:
+            break
+        field_number, wire_type = key >> 3, key & 7
+        if field_number <= 0:
+            break
+        if wire_type == 0:
+            value, index = _pb_varint(blob, index)
+            if value is None:
+                break
+        elif wire_type == 1:
+            if index + 8 > len(blob):
+                break
+            value = int.from_bytes(blob[index:index + 8], "little")
+            index += 8
+        elif wire_type == 2:
+            length, index = _pb_varint(blob, index)
+            if length is None or index + length > len(blob):
+                break
+            value = blob[index:index + length]
+            index += length
+        elif wire_type == 5:
+            if index + 4 > len(blob):
+                break
+            value = int.from_bytes(blob[index:index + 4], "little")
+            index += 4
+        else:
+            break
+        fields.setdefault(field_number, []).append((wire_type, value))
+    return fields
+
+
+def _pb_submsg(fields: Dict[int, List[Tuple[int, Any]]], number: int) -> Optional[Dict[int, List[Tuple[int, Any]]]]:
+    for wire_type, value in fields.get(number, []):
+        if wire_type == 2 and isinstance(value, (bytes, bytearray)):
+            return _pb_parse(bytes(value))
+    return None
+
+
+def _pb_uint(fields: Dict[int, List[Tuple[int, Any]]], number: int) -> Optional[int]:
+    for wire_type, value in fields.get(number, []):
+        if wire_type == 0 and isinstance(value, int):
+            return value
+    return None
+
+
+def _pb_str(fields: Dict[int, List[Tuple[int, Any]]], number: int) -> Optional[str]:
+    for wire_type, value in fields.get(number, []):
+        if wire_type == 2 and isinstance(value, (bytes, bytearray)):
+            try:
+                return bytes(value).decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+    return None
+
+
+# Reverse-engineered agy 1.0.x gen_metadata fields:
+#   .1.4.(1,2,3,9) cache/input/output/thought tokens
+#   .1.9.4.1 timestamp, .1.(21|19) model label/id
+_ANTIGRAVITY_TOKEN_SANITY_MAX = 5_000_000
+
+
+def _antigravity_gen_metrics(blob: bytes) -> Optional[Tuple[str, Optional[dt.datetime], Dict[str, int]]]:
+    message = _pb_submsg(_pb_parse(blob), 1) if blob else None
+    usage = _pb_submsg(message, 4) if message else None
+    if not usage:
+        return None
+    cache = _pb_uint(usage, 1) or 0
+    input_tokens = _pb_uint(usage, 2) or 0
+    output_tokens = _pb_uint(usage, 3) or 0
+    thought_tokens = _pb_uint(usage, 9) or 0
+    values = (cache, input_tokens, output_tokens, thought_tokens)
+    if any(value < 0 or value >= _ANTIGRAVITY_TOKEN_SANITY_MAX for value in values):
+        return None
+    if input_tokens == 0 and output_tokens == 0:
+        return None
+
+    model = _pb_str(message, 21) or _pb_str(message, 19) or "Antigravity"
+    when: Optional[dt.datetime] = None
+    generation = _pb_submsg(message, 9)
+    timestamp_message = _pb_submsg(generation, 4) if generation else None
+    timestamp_value = _pb_uint(timestamp_message, 1) if timestamp_message else None
+    if isinstance(timestamp_value, int) and 1_600_000_000 < timestamp_value < 4_000_000_000:
+        when = dt.datetime.fromtimestamp(timestamp_value, dt.timezone.utc)
+    return model, when, {
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "cacheReadInputTokens": cache,
+        "thoughtTokens": thought_tokens,
+    }
+
+
+def antigravity_conversations_dir() -> Path:
+    return ANTIGRAVITY_CLI_DIR / "conversations"
+
+
+def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
+    """Return real Antigravity usage from local read-only trajectory databases."""
+    conversations = antigravity_conversations_dir()
+    if not conversations.exists():
+        return None
+    try:
+        databases = sorted(path for path in conversations.glob("*.db") if path.is_file())
+    except OSError:
+        return None
+    result = empty_provider_usage(source=str(conversations))
+    events = 0
+    for database in databases:
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            rows = connection.execute(
+                "select data from gen_metadata where length(data) < 100000 order by rowid"
+            ).fetchall()
+        except (OSError, sqlite3.Error):
+            continue
+        finally:
+            if connection is not None:
+                connection.close()
+        for (blob,) in rows:
+            if not isinstance(blob, (bytes, bytearray)):
+                continue
+            parsed = _antigravity_gen_metrics(bytes(blob))
+            if parsed is None:
+                continue
+            model, when, metrics = parsed
+            if add_usage_metrics(result, model, metrics, when):
+                events += 1
+    if events == 0:
+        return None
+    result["status"] = "ok"
+    result["events"] = events
+    result["source"] = str(conversations)
+    return result
+
+
 def antigravity_provider_snapshot(
     gemini_snapshot_data: Dict[str, Any],
     usage: Optional[Dict[str, Any]],
     *,
     status_if_empty: str,
     source_note: str,
+    source_status_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    source_status = copy.deepcopy((gemini_snapshot_data.get("sources") or {}).get("antigravityCli") or {})
-    if usage and google_usage_total(usage) > 0:
+    source_status = copy.deepcopy(
+        source_status_override
+        if isinstance(source_status_override, dict)
+        else (gemini_snapshot_data.get("sources") or {}).get("antigravityCli") or {}
+    )
+    has_usage = google_usage_total(usage) > 0
+    if usage and has_usage:
         # Antigravity only reports real tokens when it has its own dedicated
         # telemetry outfile; Gemini-CLI tokens are never borrowed.
         source_status["status"] = "ok"
         source_status["tokens"] = google_usage_total(usage)
         source_status["events"] = int(usage.get("events") or source_status.get("events") or 0)
+    source_status.setdefault(
+        "collectionMethod",
+        "dedicated_otel_token_metrics" if has_usage else "server_side_only_no_local_token_stream",
+    )
     out = {
         "status": "ok" if google_usage_total(usage) > 0 else status_if_empty,
         "source": source_status.get("source") or str(ANTIGRAVITY_TELEMETRY),
@@ -9304,6 +9621,13 @@ def split_google_cli_snapshots(
     source_usages = gemini_snapshot_data.pop("_sourceUsages", {})
     common_usage = source_usages.get("geminiCli") if isinstance(source_usages, dict) else None
     antigravity_usage = source_usages.get("antigravityCli") if isinstance(source_usages, dict) else None
+    source_statuses = gemini_snapshot_data.get("sources") if isinstance(gemini_snapshot_data.get("sources"), dict) else {}
+    gemini_source_status = copy.deepcopy(source_statuses.get("geminiCli") or {})
+    antigravity_source_status = copy.deepcopy(source_statuses.get("antigravityCli") or {})
+    gemini_snapshot_data["sources"] = {"geminiCli": gemini_source_status} if gemini_source_status else {}
+    gemini_source_path = gemini_source_status.get("source")
+    if gemini_source_path:
+        gemini_snapshot_data["source"] = gemini_source_path
 
     # Tier 1: Antigravity has its own dedicated local telemetry outfile. This is
     # the only honest source of Antigravity tokens, so the gemini provider keeps
@@ -9315,6 +9639,24 @@ def split_google_cli_snapshots(
             antigravity_usage,
             status_if_empty="no_token_events_yet",
             source_note="dedicated-telemetry",
+            source_status_override=antigravity_source_status,
+        )
+        return gemini_provider, antigravity_provider
+
+    # Tier 1.5: the local trajectory DB is the honest Antigravity token source on
+    # Windows. Schema drift or an unreadable DB fails soft to the empty fallback.
+    sqlite_usage = antigravity_sqlite_usage()
+    if google_usage_total(sqlite_usage) > 0:
+        gemini_provider = apply_google_usage(gemini_snapshot_data, common_usage, status_if_empty="no_token_events_yet")
+        sqlite_source_status = dict(antigravity_source_status)
+        sqlite_source_status["collectionMethod"] = "local_sqlite_trajectory"
+        sqlite_source_status["source"] = str(antigravity_conversations_dir())
+        antigravity_provider = antigravity_provider_snapshot(
+            gemini_snapshot_data,
+            sqlite_usage,
+            status_if_empty="no_token_events_yet",
+            source_note="local-sqlite-trajectory",
+            source_status_override=sqlite_source_status,
         )
         return gemini_provider, antigravity_provider
 
@@ -9322,7 +9664,7 @@ def split_google_cli_snapshots(
     # there is no honest way to attribute Gemini-CLI tokens to it. Emit Antigravity
     # as its own provider with empty tokens rather than borrowing Gemini's usage.
     counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
-    antigravity_installed = bool(((gemini_snapshot_data.get("sources") or {}).get("antigravityCli") or {}).get("installed"))
+    antigravity_installed = bool(antigravity_source_status.get("installed"))
     antigravity_active = isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0
     status_if_empty = "no_telemetry_yet" if (antigravity_installed or antigravity_active) else "not_found"
     antigravity_provider = antigravity_provider_snapshot(
@@ -9330,6 +9672,7 @@ def split_google_cli_snapshots(
         None,
         status_if_empty=status_if_empty,
         source_note="no-antigravity-telemetry",
+        source_status_override=antigravity_source_status,
     )
     return gemini_snapshot_data, antigravity_provider
 
@@ -9828,20 +10171,10 @@ def is_newer_connector_version(remote_version: str, current_version: str = CONNE
     return connector_version_key(remote_version) > connector_version_key(current_version)
 
 
-def free_channel_install_digest() -> Optional[str]:
-    raw = os.environ.get("AGENTCAT_INSTALL_SH_SHA256")
-    if not raw:
-        settings = agentcat_settings()
-        raw = settings_value(settings, ("autoUpdate", "installSha256"), ("installSha256",))
-    digest = str(raw or "").strip().lower()
-    return digest if PRO_CONNECTOR_SHA256_RE.match(digest) else None
-
-
 def auto_update_enabled_status() -> Tuple[bool, str]:
-    # The free (public) channel pipes install.sh straight into bash, so it stays
-    # OFF by default. It only turns on when the operator explicitly opts in
-    # (AGENTCAT_AUTO_UPDATE / settings) AND a pinned install.sh digest is present
-    # to verify the script before it executes.
+    # Public auto-update remains opt-in. When enabled it executes the trusted
+    # installer already present in the managed checkout; that installer accepts
+    # only a release manifest whose archive matches a mandatory SHA-256.
     explicit_env = os.environ.get("AGENTCAT_AUTO_UPDATE")
     if explicit_env is not None and not env_flag("AGENTCAT_AUTO_UPDATE", True):
         return False, "disabled by AGENTCAT_AUTO_UPDATE"
@@ -9856,14 +10189,15 @@ def auto_update_enabled_status() -> Tuple[bool, str]:
     )
     if not opted_in:
         return False, "free-channel auto-update is off by default; opt in via AGENTCAT_AUTO_UPDATE or settings.autoUpdate.enabled"
-    if free_channel_install_digest() is None:
-        return False, "free-channel auto-update requires a pinned install.sh digest (AGENTCAT_INSTALL_SH_SHA256 or settings.autoUpdate.installSha256)"
     repo_dir = current_connector_repo_dir()
     install_dir = agentcat_connectors_dir()
     if repo_dir is None:
         return False, "current connector path is not a managed install"
     if repo_dir != install_dir and not env_flag("AGENTCAT_AUTO_UPDATE_ALLOW_DEV", False):
         return False, f"current connector path is outside managed install: {repo_dir}"
+    installer = repo_dir / ("install.ps1" if IS_WINDOWS else "install.sh")
+    if not installer.is_file():
+        return False, "managed install is missing its trusted public-channel installer"
     return True, "enabled"
 
 
@@ -10200,63 +10534,55 @@ def auto_update_status_snapshot() -> Dict[str, Any]:
     return status
 
 
+def validate_public_connector_manifest(manifest: Any) -> Dict[str, Any]:
+    if not isinstance(manifest, dict):
+        raise ValueError("public connector manifest must be an object")
+    version = str(manifest.get("version") or "").strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ValueError("public connector manifest version is invalid")
+    contract_version = int(manifest.get("contractVersion") or 0)
+    if contract_version < 1:
+        raise ValueError("public connector manifest contractVersion is invalid")
+    archive_url = str(manifest.get("archiveUrl") or "").strip()
+    if not archive_url.startswith("https://github.com/yong076/agentcat-connectors/"):
+        raise ValueError("public connector manifest archive URL is not approved")
+    digest = str(manifest.get("sha256") or "").strip()
+    if not PRO_CONNECTOR_SHA256_RE.fullmatch(digest):
+        raise ValueError("public connector manifest SHA-256 is invalid")
+    return dict(manifest)
+
+
+def fetch_public_connector_manifest() -> Dict[str, Any]:
+    request = urllib.request.Request(
+        AUTO_UPDATE_MANIFEST_URL,
+        headers={"User-Agent": f"AgentCat/{CONNECTOR_VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=AUTO_UPDATE_HTTP_TIMEOUT_SECONDS) as response:
+        body = response.read(512 * 1024)
+    return validate_public_connector_manifest(json.loads(body.decode("utf-8")))
+
+
 def fetch_remote_connector_version() -> str:
-    request = urllib.request.Request(
-        AUTO_UPDATE_VERSION_URL,
-        headers={"User-Agent": f"AgentCat/{CONNECTOR_VERSION}"},
-    )
-    with urllib.request.urlopen(request, timeout=AUTO_UPDATE_HTTP_TIMEOUT_SECONDS) as response:
-        text = response.read(512 * 1024).decode("utf-8", "replace")
-    version = parse_connector_version_from_text(text)
-    if not version:
-        raise ValueError("remote connector version was not found")
-    return version
-
-
-def fetch_verified_install_script(url: str, expected_sha256: str) -> bytes:
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": f"AgentCat/{CONNECTOR_VERSION}"},
-    )
-    with urllib.request.urlopen(request, timeout=AUTO_UPDATE_HTTP_TIMEOUT_SECONDS) as response:
-        body = response.read(2 * 1024 * 1024)
-    actual = hashlib.sha256(body).hexdigest()
-    if actual != expected_sha256:
-        raise ValueError(
-            f"install.sh digest mismatch: expected {expected_sha256}, got {actual}"
-        )
-    return body
-
-
-def fetch_verified_install_sh(expected_sha256: str) -> bytes:
-    return fetch_verified_install_script(AUTO_UPDATE_INSTALL_SH_URL, expected_sha256)
+    return str(fetch_public_connector_manifest()["version"])
 
 
 def start_auto_update_install(remote_version: str) -> subprocess.Popen:
     ensure_dirs()
     env = os.environ.copy()
     env["AGENTCAT_CONNECTORS_DIR"] = str(agentcat_connectors_dir())
-    # install.sh verifies the downloaded connector archive against a SHA256 when
-    # one is available (AGENTCAT_CONNECTORS_SHA256 / *_SHA256_URL). The env is
-    # forwarded as-is, so once releases publish a per-version digest the daemon
-    # can populate it here to gate the swap; absent a digest the install path is
-    # unchanged and existing installs keep updating.
+    env["AGENTCAT_CONNECTORS_MANIFEST_URL"] = AUTO_UPDATE_MANIFEST_URL
     stdout_path = AGENTCAT_HOME / "auto-update.out.log"
     stderr_path = AGENTCAT_HOME / "auto-update.err.log"
     stdout = stdout_path.open("ab")
     stderr = stderr_path.open("ab")
     try:
-        expected = free_channel_install_digest()
-        if expected is None:
-            raise ValueError("refusing to run install script without a pinned digest")
+        repo_dir = current_connector_repo_dir()
+        if repo_dir is None or repo_dir != agentcat_connectors_dir():
+            raise ValueError("refusing to update outside the managed connector install")
         if IS_WINDOWS:
-            # Keep the Windows path as strict as the Unix path: download once,
-            # verify the pinned digest, then execute the local bytes. This avoids
-            # `irm | iex` and guarantees a mismatch cannot spawn PowerShell.
-            body = fetch_verified_install_script(AUTO_UPDATE_INSTALL_PS1_URL, expected)
-            script_path = AGENTCAT_HOME / "auto-update-install.ps1"
-            with script_path.open("wb") as fh:
-                fh.write(body)
+            script_path = repo_dir / "install.ps1"
+            if not script_path.is_file():
+                raise ValueError("trusted Windows installer is missing")
             return subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
                 cwd=str(HOME),
@@ -10266,15 +10592,9 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
                 creationflags=CREATE_NO_WINDOW,
             )
         bash = shutil.which("bash") or "/bin/bash"
-        # Never pipe an unverified network script into bash. auto_update_enabled_status
-        # already requires a pinned digest, so download install.sh, verify its
-        # SHA256, persist the verified bytes, and execute that local file. This
-        # avoids the TOCTOU window of re-downloading at execution time.
-        body = fetch_verified_install_sh(expected)
-        script_path = AGENTCAT_HOME / "auto-update-install.sh"
-        with script_path.open("wb") as fh:
-            fh.write(body)
-        os.chmod(script_path, 0o600)
+        script_path = repo_dir / "install.sh"
+        if not script_path.is_file():
+            raise ValueError("trusted POSIX installer is missing")
         return subprocess.Popen(
             [bash, str(script_path)],
             cwd=str(HOME),
@@ -10572,10 +10892,12 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     attach_desktop_app_sources(providers, desktop_apps)
     snapshot = {
         "schemaVersion": SCHEMA_VERSION,
+        "contractVersion": CONTRACT_VERSION,
         "connectorVersion": CONNECTOR_VERSION,
         "capabilities": list(CONNECTOR_CAPABILITIES),
         "generatedAt": now_iso(),
         "update": auto_update_status_snapshot(),
+        "daemon": daemon_status_snapshot(),
         "activity": activity,
         "providers": providers,
         "desktopApps": desktop_apps,
@@ -10647,7 +10969,13 @@ def _live_activity_and_desktop() -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
 # Cheap envelope keys that always ride along: a caller filtering for one
 # section still needs to know which schema and connector produced it.
-_SNAPSHOT_ENVELOPE_KEYS = ("schemaVersion", "connectorVersion", "generatedAt", "servedAt")
+_SNAPSHOT_ENVELOPE_KEYS = (
+    "schemaVersion",
+    "contractVersion",
+    "connectorVersion",
+    "generatedAt",
+    "servedAt",
+)
 
 
 def filter_snapshot_sections(payload: Dict[str, Any], requested: str) -> Dict[str, Any]:
@@ -10868,6 +11196,12 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 self.send_json(200, connector_config_payload())
             except Exception as exc:
                 self.send_json(500, {"error": "config_failed", "message": str(exc)})
+            return
+        if path == "/v1/contract":
+            try:
+                self.send_json(200, connector_contract_payload())
+            except Exception:
+                self.send_json(500, {"error": "contract_failed"})
             return
         if path == "/v1/snapshot":
             try:
@@ -11111,6 +11445,7 @@ def command_version(args: argparse.Namespace) -> int:
                 {
                     "connectorVersion": CONNECTOR_VERSION,
                     "schemaVersion": SCHEMA_VERSION,
+                    "contractVersion": CONTRACT_VERSION,
                     "capabilities": list(CONNECTOR_CAPABILITIES),
                 },
                 ensure_ascii=False,

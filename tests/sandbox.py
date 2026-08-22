@@ -38,6 +38,7 @@ def _redirect(home: Path, agentcat_home: Path) -> dict:
         "ANTIGRAVITY_CLIENT_CACHE": agentcat_home / "antigravity-oauth-client.json",
         "PRICING_CACHE_FILE": agentcat_home / "pricing-cache.json",
         "LAUNCHD_AGENT_PLIST": home / "Library" / "LaunchAgents" / "agentcatd.plist",
+        "WINDOWS_LEGACY_STARTUP_SCRIPT": home / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "AgentCatD.vbs",
     }
 
 

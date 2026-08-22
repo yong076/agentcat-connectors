@@ -1,0 +1,16 @@
+{
+  "scenario": "update-required",
+  "expectation": "apps show an actionable update without discarding the current snapshot",
+  "snapshot": {
+    "schemaVersion": 4,
+    "contractVersion": 1,
+    "connectorVersion": "26.34.4",
+    "generatedAt": "2026-08-22T00:00:00Z",
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
+    "providers": {"gemini": {"status": "ok", "tokens": {"today": 800}}},
+    "providerInstances": [],
+    "activity": {"status": "ok", "processes": [], "countsByProvider": {}},
+    "daemon": {"platform": "windows", "status": "registered", "persistent": true, "registration": "scheduled_task"},
+    "update": {"status": "update_available", "currentVersion": "26.34.4", "remoteVersion": "26.34.5", "channel": "public"}
+  }
+}
