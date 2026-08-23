@@ -3439,6 +3439,79 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["totalTokens"], 180)
         self.assertEqual(snapshot["sources"]["wireLogFiles"], 1)
 
+    def test_kimi_snapshot_reads_modern_agent_wire_logs_without_legacy_double_count(self) -> None:
+        root = agentcat.HOME / ".kimi-code"
+        session_dir = root / "sessions" / "wd_repo_abc" / "session_123"
+        (root / "config.json").parent.mkdir(parents=True)
+        (root / "config.json").write_text('{"model":"kimi-code/k3"}', encoding="utf-8")
+
+        def write_wire(agent: str, usage: dict) -> None:
+            wire = session_dir / "agents" / agent / "wire.jsonl"
+            wire.parent.mkdir(parents=True)
+            wire.write_text(
+                json.dumps(
+                    {
+                        "type": "usage.record",
+                        "time": 1770983427123,
+                        "usageScope": "turn",
+                        "usage": usage,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        write_wire(
+            "main",
+            {
+                "inputOther": 100,
+                "output": 50,
+                "inputCacheRead": 10,
+                "inputCacheCreation": 20,
+            },
+        )
+        write_wire(
+            "agent-1",
+            {
+                "inputOther": 40,
+                "output": 30,
+                "inputCacheRead": 5,
+                "inputCacheCreation": 5,
+            },
+        )
+        code_log = session_dir / "logs" / "kimi-code.log"
+        code_log.parent.mkdir(parents=True)
+        code_log.write_text(
+            "2026-07-17T12:28:54.138Z INFO llm response turnStep=0/1 outputTokens=500\n",
+            encoding="utf-8",
+        )
+        (session_dir / "wire.jsonl").write_text(
+            json.dumps(
+                {
+                    "timestamp": 1770983427.123,
+                    "message": {
+                        "type": "StatusUpdate",
+                        "payload": {"token_usage": {"input_other": 999, "total": 999}},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = agentcat.kimi_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 2)
+        self.assertEqual(snapshot["sessions"], 1)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 140)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 80)
+        self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 15)
+        self.assertEqual(snapshot["tokens"]["cacheCreationInputTokens"], 25)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 260)
+        self.assertEqual(snapshot["sources"]["kimiCodeLogFiles"], 0)
+        self.assertEqual(snapshot["sources"]["wireLogFiles"], 2)
+
     def test_grok_snapshot_reports_local_hook_without_claiming_tokens(self) -> None:
         hook_dir = agentcat.HOME / ".grok" / "hooks"
         hook_dir.mkdir(parents=True)
@@ -4387,12 +4460,12 @@ class AgentCatConnectorTests(unittest.TestCase):
 
     def test_public_update_manifest_requires_release_url_and_digest(self) -> None:
         manifest = {
-            "version": "26.34.5",
+            "version": "26.34.6",
             "contractVersion": 1,
-            "archiveUrl": "https://github.com/yong076/agentcat-connectors/releases/download/v26.34.5/agentcat-connectors-v26.34.5.zip",
+            "archiveUrl": "https://github.com/yong076/agentcat-connectors/releases/download/v26.34.6/agentcat-connectors-v26.34.6.zip",
             "sha256": "a" * 64,
         }
-        self.assertEqual(agentcat.validate_public_connector_manifest(manifest)["version"], "26.34.5")
+        self.assertEqual(agentcat.validate_public_connector_manifest(manifest)["version"], "26.34.6")
         manifest["archiveUrl"] = "https://evil.invalid/connector.zip"
         with self.assertRaises(ValueError):
             agentcat.validate_public_connector_manifest(manifest)

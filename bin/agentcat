@@ -133,7 +133,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.5")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.6")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -5600,18 +5600,43 @@ def kimi_code_log_files(root: Path) -> List[Path]:
 def kimi_wire_log_files(root: Path) -> List[Path]:
     sessions = root / "sessions"
     try:
-        candidates = [path for path in sessions.glob("*/*/wire.jsonl") if path.is_file()]
+        legacy = [path for path in sessions.glob("*/*/wire.jsonl") if path.is_file()]
+        modern = [path for path in sessions.glob("*/*/agents/*/wire.jsonl") if path.is_file()]
     except OSError:
         return []
+    modern_session_keys: Set[Tuple[str, str]] = set()
     out: List[Path] = []
-    for path in candidates:
+    for path in modern:
         try:
             rel = path.relative_to(sessions)
         except ValueError:
             continue
-        if len(rel.parts) == 3 and rel.name == "wire.jsonl":
+        if len(rel.parts) == 5 and rel.parts[2] == "agents" and rel.name == "wire.jsonl":
+            modern_session_keys.add((rel.parts[0], rel.parts[1]))
             out.append(path)
-    return out
+    for path in legacy:
+        try:
+            rel = path.relative_to(sessions)
+        except ValueError:
+            continue
+        if (
+            len(rel.parts) == 3
+            and rel.name == "wire.jsonl"
+            and (rel.parts[0], rel.parts[1]) not in modern_session_keys
+        ):
+            out.append(path)
+    return sorted(out)
+
+
+def kimi_wire_session_dir(path: Path) -> Path:
+    try:
+        sessions = next(parent for parent in path.parents if parent.name == "sessions")
+        rel = path.relative_to(sessions)
+    except (StopIteration, ValueError):
+        return path.parent
+    if len(rel.parts) == 5 and rel.parts[2] == "agents":
+        return sessions / rel.parts[0] / rel.parts[1]
+    return path.parent
 
 
 def kimi_config_model(root: Path) -> str:
@@ -5649,6 +5674,14 @@ def parse_kimi_code_log(path: Path, result: Dict[str, Any]) -> int:
 
 
 def kimi_wire_metrics(event: Dict[str, Any]) -> Dict[str, int]:
+    if event.get("type") == "usage.record" and event.get("usageScope") == "turn":
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        return {
+            "inputTokens": nonnegative_int(usage.get("inputOther")) or 0,
+            "outputTokens": nonnegative_int(usage.get("output")) or 0,
+            "cacheReadInputTokens": nonnegative_int(usage.get("inputCacheRead")) or 0,
+            "cacheCreationInputTokens": nonnegative_int(usage.get("inputCacheCreation")) or 0,
+        }
     message = event.get("message") if isinstance(event.get("message"), dict) else {}
     if message.get("type") == "metadata":
         return {}
@@ -5681,7 +5714,8 @@ def parse_kimi_wire_log(path: Path, result: Dict[str, Any], model: str) -> int:
         metrics = kimi_wire_metrics(event)
         if not metrics:
             continue
-        if add_usage_metrics(result, model, metrics, parse_timestamp(event.get("timestamp"))):
+        when = parse_timestamp(event.get("timestamp") if event.get("timestamp") is not None else event.get("time"))
+        if add_usage_metrics(result, model, metrics, when):
             events += 1
             update_breakdown(result["breakdown"], chat=1)
     return events
@@ -5701,6 +5735,12 @@ def kimi_snapshot() -> Dict[str, Any]:
     for root in existing_roots:
         code_files.extend(kimi_code_log_files(root))
         wire_files.extend(kimi_wire_log_files(root))
+    wire_session_dirs = {_resolved_path_key(kimi_wire_session_dir(path)) for path in wire_files}
+    code_files = [
+        path
+        for path in code_files
+        if _resolved_path_key(path.parent.parent) not in wire_session_dirs
+    ]
     code_files = recent_files(code_files)
     wire_files = recent_files(wire_files)
 
@@ -5718,7 +5758,10 @@ def kimi_snapshot() -> Dict[str, Any]:
     result["status"] = "ok" if events > 0 else "no_token_events_yet"
     result["source"] = ",".join(str(path) for path in (code_files + wire_files)) or ",".join(str(root) for root in existing_roots)
     result["events"] = events
-    result["sessions"] = len({str(path.parent.parent) for path in code_files} | {str(path.parent) for path in wire_files})
+    result["sessions"] = len(
+        {str(path.parent.parent) for path in code_files}
+        | {str(kimi_wire_session_dir(path)) for path in wire_files}
+    )
     result["sources"] = {
         "kimiCodeLogFiles": len(code_files),
         "wireLogFiles": len(wire_files),

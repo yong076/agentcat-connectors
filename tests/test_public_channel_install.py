@@ -33,7 +33,7 @@ class PublicChannelInstallTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def make_archive(self, version: str = "26.34.5") -> tuple[Path, dict]:
+    def make_archive(self, version: str = "26.34.6") -> tuple[Path, dict]:
         source = self.root / f"agentcat-connectors-{version}"
         (source / "bin").mkdir(parents=True)
         (source / "scripts").mkdir()
@@ -169,7 +169,7 @@ class PublicChannelInstallTests(unittest.TestCase):
 
     def test_current_candidate_passes_real_contract_validation(self) -> None:
         manifest = {
-            "version": "26.34.5",
+            "version": "26.34.6",
             "contractVersion": 1,
             "sha256": "0" * 64,
         }

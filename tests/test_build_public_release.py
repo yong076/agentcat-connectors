@@ -24,7 +24,7 @@ class BuildPublicReleaseTests(unittest.TestCase):
             (source / "bin").mkdir(parents=True)
             (source / "contracts").mkdir()
             (source / "bin" / "agentcat").write_text(
-                'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.5")\n',
+                'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.6")\n',
                 encoding="utf-8",
             )
             (source / "contracts" / "connector-v1.json").write_text("{}\n", encoding="utf-8")
@@ -48,7 +48,7 @@ class BuildPublicReleaseTests(unittest.TestCase):
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-            self.assertEqual(manifest["version"], "26.34.5")
+            self.assertEqual(manifest["version"], "26.34.6")
             self.assertEqual(manifest["contractVersion"], 1)
             self.assertEqual(manifest["sha256"], hashlib.sha256(archive.read_bytes()).hexdigest())
             self.assertTrue(manifest["archiveUrl"].endswith(archive.name))

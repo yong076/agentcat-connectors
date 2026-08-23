@@ -11,6 +11,6 @@
     "providerInstances": [],
     "activity": {"status": "ok", "processes": [], "countsByProvider": {}},
     "daemon": {"platform": "windows", "status": "registered", "persistent": true, "registration": "scheduled_task"},
-    "update": {"status": "update_available", "currentVersion": "26.34.4", "remoteVersion": "26.34.5", "channel": "public"}
+    "update": {"status": "update_available", "currentVersion": "26.34.5", "remoteVersion": "26.34.6", "channel": "public"}
   }
 }

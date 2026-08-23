@@ -4,7 +4,7 @@
   "snapshot": {
     "schemaVersion": 4,
     "contractVersion": 1,
-    "connectorVersion": "26.34.5",
+    "connectorVersion": "26.34.6",
     "generatedAt": "2026-08-22T00:00:00Z",
     "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
     "providers": {
