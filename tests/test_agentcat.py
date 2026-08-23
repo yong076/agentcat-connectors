@@ -1346,6 +1346,22 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(payload["schemaVersion"], agentcat.SCHEMA_VERSION)
         self.assertEqual(payload["schemaVersion"], 4)
 
+    def test_http_version_endpoint_does_not_build_snapshot(self) -> None:
+        server = agentcat.ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            with patch.object(agentcat, "snapshot_for_http", side_effect=AssertionError("snapshot called")):
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/version", timeout=2.0) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+        self.assertEqual(payload, agentcat.connector_version_payload())
+
     def test_codex_runtime_limits_reads_latest_token_count_event(self) -> None:
         session_dir = agentcat.HOME / ".codex" / "sessions" / "2026" / "05" / "06"
         session_dir.mkdir(parents=True)

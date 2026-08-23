@@ -7,6 +7,7 @@ import unittest
 import zipfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -169,11 +170,42 @@ class PublicChannelInstallTests(unittest.TestCase):
 
     def test_current_candidate_passes_real_contract_validation(self) -> None:
         manifest = {
-            "version": "26.34.6",
+            "version": "26.34.7",
             "contractVersion": 1,
             "sha256": "0" * 64,
         }
         installer_module.validate_candidate(REPO_ROOT, manifest)
+
+    def test_live_validation_uses_bounded_version_endpoint(self) -> None:
+        urls: list[str] = []
+
+        class Response:
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                return self.body
+
+        def fake_urlopen(url, timeout):
+            urls.append(url)
+            if url.endswith("/healthz"):
+                return Response(b"ok")
+            return Response(b'{"connectorVersion":"26.34.7","contractVersion":1}')
+
+        with mock.patch.object(installer_module.urllib.request, "urlopen", side_effect=fake_urlopen):
+            installer_module.validate_live_connector("26.34.7", 1, timeout=0.1)
+
+        self.assertEqual(
+            urls,
+            ["http://127.0.0.1:8765/healthz", "http://127.0.0.1:8765/v1/version"],
+        )
+        self.assertFalse(any(url.endswith("/v1/snapshot") for url in urls))
 
 
 if __name__ == "__main__":

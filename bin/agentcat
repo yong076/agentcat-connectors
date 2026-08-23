@@ -133,7 +133,7 @@ CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.6")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.7")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -1751,6 +1751,16 @@ def connector_config_payload(settings: Optional[Dict[str, Any]] = None) -> Dict[
         "contractVersion": CONTRACT_VERSION,
         "providers": configured_provider_entries(resolved),
         "desktopApps": desktop_app_sources_snapshot(resolved),
+        "capabilities": list(CONNECTOR_CAPABILITIES),
+    }
+
+
+def connector_version_payload() -> Dict[str, Any]:
+    """Return bounded runtime metadata without building a usage snapshot."""
+    return {
+        "connectorVersion": CONNECTOR_VERSION,
+        "schemaVersion": SCHEMA_VERSION,
+        "contractVersion": CONTRACT_VERSION,
         "capabilities": list(CONNECTOR_CAPABILITIES),
     }
 
@@ -11240,6 +11250,9 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(500, {"error": "config_failed", "message": str(exc)})
             return
+        if path == "/v1/version":
+            self.send_json(200, connector_version_payload())
+            return
         if path == "/v1/contract":
             try:
                 self.send_json(200, connector_contract_payload())
@@ -11483,19 +11496,7 @@ def command_setup_prompt(args: argparse.Namespace) -> int:
 
 def command_version(args: argparse.Namespace) -> int:
     if args.json:
-        print(
-            json.dumps(
-                {
-                    "connectorVersion": CONNECTOR_VERSION,
-                    "schemaVersion": SCHEMA_VERSION,
-                    "contractVersion": CONTRACT_VERSION,
-                    "capabilities": list(CONNECTOR_CAPABILITIES),
-                },
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        print(json.dumps(connector_version_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(CONNECTOR_VERSION)
     return 0

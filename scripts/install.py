@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -359,8 +360,21 @@ def unload_launch_agent() -> None:
         unload_windows_daemon()
         return
     uid = os.getuid()
-    run(["launchctl", "bootout", f"gui/{uid}", str(PLIST_PATH)])
-    run(["launchctl", "unload", str(PLIST_PATH)])
+    service_target = f"gui/{uid}/{LABEL}"
+    result = run(["launchctl", "bootout", service_target])
+    if result.returncode != 0:
+        # Older launchctl variants only accept the plist path. Keep both
+        # fallbacks, but prefer the label so a replaced plist cannot leave the
+        # previous daemon registered and serving an old connector version.
+        run(["launchctl", "bootout", f"gui/{uid}", str(PLIST_PATH)])
+        run(["launchctl", "unload", str(PLIST_PATH)])
+
+    # bootout is asynchronous on some macOS releases. Do not bootstrap the new
+    # service until launchd has actually forgotten the previous registration.
+    for _ in range(40):
+        if run(["launchctl", "print", service_target]).returncode != 0:
+            break
+        time.sleep(0.05)
 
 
 def load_launch_agent() -> None:
@@ -368,18 +382,25 @@ def load_launch_agent() -> None:
         load_windows_daemon()
         return
     uid = os.getuid()
+    service_target = f"gui/{uid}/{LABEL}"
     unload_launch_agent()
     PLIST_PATH.write_text(plist_text(), encoding="utf-8")
     result = run(["launchctl", "bootstrap", f"gui/{uid}", str(PLIST_PATH)])
     if result.returncode == 0:
-        run(["launchctl", "enable", f"gui/{uid}/{LABEL}"])
-        log(f"loaded LaunchAgent {LABEL}")
-        return
-    fallback = run(["launchctl", "load", "-w", str(PLIST_PATH)])
-    if fallback.returncode == 0:
-        log(f"loaded LaunchAgent {LABEL}")
+        run(["launchctl", "enable", service_target])
     else:
-        log(f"LaunchAgent load failed: {fallback.stderr.strip() or result.stderr.strip()}")
+        fallback = run(["launchctl", "load", "-w", str(PLIST_PATH)])
+        if fallback.returncode != 0:
+            error = fallback.stderr.strip() or result.stderr.strip()
+            raise RuntimeError(f"LaunchAgent load failed: {error}")
+
+    # A KeepAlive service can race the source-directory swap and briefly
+    # respawn from the previous script inode. Force one final restart after the
+    # new symlink and plist are in place so the live daemon matches the archive.
+    restarted = run(["launchctl", "kickstart", "-k", service_target])
+    if restarted.returncode != 0:
+        raise RuntimeError(f"LaunchAgent restart failed: {restarted.stderr.strip()}")
+    log(f"loaded LaunchAgent {LABEL}")
 
 
 def agentcat_shell_command(*args: str) -> str:
@@ -600,11 +621,14 @@ def install(repo_dir: Path) -> int:
     install_gemini_settings(backup_dir)
     install_codex_config(backup_dir)
 
-    result = run([str(BIN_PATH), "snapshot"])
+    # A full snapshot can scan years of provider logs and hold the installer
+    # open for minutes. Version is the bounded installation smoke test; the
+    # public-channel installer separately validates the live daemon endpoint.
+    result = run([str(BIN_PATH), "version", "--json"])
     if result.stdout.strip():
         print(result.stdout.rstrip())
     if result.returncode != 0:
-        log(f"snapshot command failed: {result.stderr.strip()}")
+        raise RuntimeError(f"connector version check failed: {result.stderr.strip()}")
 
     log(f"backups stored in {backup_dir}")
     log("done. Run: agentcat snapshot")

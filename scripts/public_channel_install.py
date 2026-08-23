@@ -227,16 +227,20 @@ def validate_candidate(candidate: Path, manifest: dict[str, Any]) -> None:
 
 
 def run_installer(install_dir: Path) -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(install_dir / "scripts" / "install.py"),
-            "--repo-dir",
-            str(install_dir),
-            "install",
-        ],
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(install_dir / "scripts" / "install.py"),
+                "--repo-dir",
+                str(install_dir),
+                "install",
+            ],
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("connector installer timed out") from exc
     if result.returncode != 0:
         raise RuntimeError(f"connector installer exited {result.returncode}")
 
@@ -249,11 +253,14 @@ def validate_live_connector(expected_version: str, expected_contract: int, timeo
             with urllib.request.urlopen("http://127.0.0.1:8765/healthz", timeout=2) as response:
                 if response.read().decode("utf-8", "replace").strip() != "ok":
                     raise ValueError("unexpected health response")
-            with urllib.request.urlopen("http://127.0.0.1:8765/v1/snapshot", timeout=5) as response:
-                snapshot = json.load(response)
-            if str(snapshot.get("connectorVersion") or "") != expected_version:
+            # Version is a dedicated bounded endpoint. A full snapshot can scan
+            # large local histories and must never decide whether an update is
+            # healthy or trigger a rollback merely because collection is slow.
+            with urllib.request.urlopen("http://127.0.0.1:8765/v1/version", timeout=2) as response:
+                runtime = json.load(response)
+            if str(runtime.get("connectorVersion") or "") != expected_version:
                 raise ValueError("daemon is serving a different connector version")
-            if int(snapshot.get("contractVersion") or 0) != expected_contract:
+            if int(runtime.get("contractVersion") or 0) != expected_contract:
                 raise ValueError("daemon is serving a different contract version")
             return
         except Exception as exc:

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -82,6 +83,66 @@ class AgentCatInstallTests(unittest.TestCase):
         antigravity_settings = json.loads(antigravity_path.read_text(encoding="utf-8"))
         self.assertNotIn("telemetry", gemini_settings)
         self.assertNotIn("telemetry", antigravity_settings)
+
+    def test_unload_launch_agent_prefers_service_label_and_waits_for_bootout(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, check=False):
+            calls.append(args)
+            return mock.Mock(returncode=1 if args[1] == "print" else 0, stderr="")
+
+        with (
+            mock.patch.object(install, "IS_WINDOWS", False),
+            mock.patch.object(install.os, "getuid", return_value=501),
+            mock.patch.object(install, "run", side_effect=fake_run),
+        ):
+            install.unload_launch_agent()
+
+        service = "gui/501/com.trappist.agentcatd"
+        self.assertEqual(calls[0], ["launchctl", "bootout", service])
+        self.assertEqual(calls[1], ["launchctl", "print", service])
+        self.assertFalse(any(command[1] == "unload" for command in calls))
+
+    def test_load_launch_agent_force_restarts_registered_service(self) -> None:
+        calls: list[list[str]] = []
+        plist = self.root / "com.trappist.agentcatd.plist"
+
+        def fake_run(args, check=False):
+            calls.append(args)
+            return mock.Mock(returncode=0, stderr="")
+
+        with (
+            mock.patch.object(install, "IS_WINDOWS", False),
+            mock.patch.object(install.os, "getuid", return_value=501),
+            mock.patch.object(install, "PLIST_PATH", plist),
+            mock.patch.object(install, "unload_launch_agent"),
+            mock.patch.object(install, "run", side_effect=fake_run),
+        ):
+            install.load_launch_agent()
+
+        service = "gui/501/com.trappist.agentcatd"
+        self.assertTrue(plist.is_file())
+        self.assertIn(["launchctl", "bootstrap", "gui/501", str(plist)], calls)
+        self.assertIn(["launchctl", "kickstart", "-k", service], calls)
+
+    def test_install_uses_bounded_version_check_instead_of_snapshot(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, check=False):
+            calls.append(args)
+            return mock.Mock(returncode=0, stdout='{"connectorVersion":"26.34.7"}\n', stderr="")
+
+        with (
+            mock.patch.object(install, "install_binary"),
+            mock.patch.object(install, "load_launch_agent"),
+            mock.patch.object(install, "install_claude_settings"),
+            mock.patch.object(install, "install_gemini_settings"),
+            mock.patch.object(install, "install_codex_config"),
+            mock.patch.object(install, "run", side_effect=fake_run),
+        ):
+            self.assertEqual(install.install(REPO_ROOT), 0)
+
+        self.assertEqual(calls, [[str(install.BIN_PATH), "version", "--json"]])
 
 
 if __name__ == "__main__":
