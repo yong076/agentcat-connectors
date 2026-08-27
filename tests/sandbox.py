@@ -24,6 +24,7 @@ def _redirect(home: Path, agentcat_home: Path) -> dict:
         "LATEST_SNAPSHOT": agentcat_home / "latest-snapshot.json",
         "LIMITS_FILE": agentcat_home / "limits.json",
         "LIVE_LIMITS_CACHE": agentcat_home / "live-limits-cache.json",
+        "PROVIDER_INSTANCE_SECRET": agentcat_home / "provider-instance.key",
         "JOURNAL_CURSOR_FILE": agentcat_home / "jsonl-cursor.json",
         "CODEX_SESSIONS_CURSOR_FILE": agentcat_home / "codex-sessions-cursor.json",
         "CLAUDE_CONFIG_DIR": home / ".claude",

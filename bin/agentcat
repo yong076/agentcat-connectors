@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import csv
 from contextlib import closing
 import logging
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -64,6 +66,7 @@ ANTIGRAVITY_OAUTH_CLIENT_ID_RE = re.compile(rb"[0-9]{6,}-[a-z0-9]{16,}\.apps\.go
 # so stop each match before the next "GOCSPX-" rather than matching greedily.
 ANTIGRAVITY_OAUTH_CLIENT_SECRET_RE = re.compile(rb"GOCSPX-(?:(?!GOCSPX-)[A-Za-z0-9_-]){20,}")
 LIVE_LIMITS_CACHE = AGENTCAT_HOME / "live-limits-cache.json"
+PROVIDER_INSTANCE_SECRET = AGENTCAT_HOME / "provider-instance.key"
 CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/codex/usage",
     "https://chatgpt.com/backend-api/wham/usage",
@@ -172,6 +175,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.coverage",
     "projects.daily",
     "homes.discovery",
+    "providerInstances.v1",
     "pricing.feed",
     "usage.opencode.sqlite",
     "usage.copilot.localLogs",
@@ -2859,9 +2863,93 @@ def oauth_tokens(raw: Any) -> Dict[str, Any]:
     return raw
 
 
-def read_codex_auth() -> Optional[Dict[str, Any]]:
-    raw = read_json(codex_home() / "auth.json")
+def read_codex_auth(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    raw = read_json((home or codex_home()) / "auth.json")
     return raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else None
+
+
+def _jwt_claims_unverified(token: Any) -> Dict[str, Any]:
+    """Decode local JWT display claims without treating them as authorization.
+
+    The credential file itself is the identity source. These unverified claims
+    only supply a plan badge; access decisions and account grouping never depend
+    on them.
+    """
+    if not isinstance(token, str):
+        return {}
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        encoded = parts[1] + ("=" * (-len(parts[1]) % 4))
+        payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def codex_auth_identity(auth: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Return stable grouping identity and non-sensitive plan metadata."""
+    tokens = oauth_tokens(auth)
+    claims = _jwt_claims_unverified(tokens.get("id_token") or auth.get("id_token"))
+    openai_claims = claims.get("https://api.openai.com/auth")
+    if not isinstance(openai_claims, dict):
+        openai_claims = {}
+    account_id = (
+        tokens.get("account_id")
+        or auth.get("account_id")
+        or openai_claims.get("chatgpt_account_id")
+    )
+    if not isinstance(account_id, str) or not account_id.strip():
+        account_id = None
+    plan = (
+        openai_claims.get("chatgpt_plan_type")
+        or claims.get("chatgpt_plan_type")
+        or auth.get("plan_type")
+        or auth.get("plan")
+    )
+    if not isinstance(plan, str) or not plan.strip():
+        plan = None
+    return {"accountID": account_id, "planType": plan}
+
+
+def _provider_instance_secret() -> bytes:
+    """Load/create the device-local key used to pseudonymize provider IDs."""
+    try:
+        value = PROVIDER_INSTANCE_SECRET.read_bytes()
+        if len(value) >= 32:
+            return value
+    except OSError:
+        pass
+    ensure_dirs()
+    value = os.urandom(32)
+    try:
+        fd = os.open(PROVIDER_INSTANCE_SECRET, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, value)
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        # Another snapshot/CLI process won the first-run race.
+        try:
+            existing = PROVIDER_INSTANCE_SECRET.read_bytes()
+            if len(existing) >= 32:
+                return existing
+        except OSError:
+            pass
+    except OSError:
+        # A read-only install may still render stable IDs for this daemon run.
+        pass
+    return value
+
+
+def provider_instance_id(provider: str, identity: str) -> str:
+    digest = hmac.new(
+        _provider_instance_secret(),
+        f"{provider}:{identity}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:12]
+    return f"{provider}:{digest}"
 
 
 def refresh_codex_access_token(auth: Dict[str, Any]) -> Optional[str]:
@@ -3280,13 +3368,15 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
     return limits
 
 
-def codex_live_limits(force: bool = False) -> Dict[str, Any]:
-    cached = None if force else cached_live_limits("codex", LIVE_LIMITS_MAX_AGE_SECONDS)
+def codex_live_limits_for_auth(
+    auth: Dict[str, Any],
+    cache_key: str,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Fetch one Codex identity's quota without sharing another identity's cache."""
+    cached = None if force else cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
         return sanitize_codex_cached_limits(cached)
-    auth = read_codex_auth()
-    if not auth:
-        return empty_limits()
     tokens = oauth_tokens(auth)
     access_token = tokens.get("access_token")
     account_id = tokens.get("account_id") or auth.get("account_id") or ""
@@ -3304,7 +3394,7 @@ def codex_live_limits(force: bool = False) -> Dict[str, Any]:
                     merge_codex_reset_credit_details(limits, reset_payload)
                 except Exception:
                     pass
-                write_live_limits_cache("codex", limits)
+                write_live_limits_cache(cache_key, limits)
                 return limits
             except urllib.error.HTTPError as exc:
                 last_error = exc
@@ -3324,12 +3414,124 @@ def codex_live_limits(force: bool = False) -> Dict[str, Any]:
             if not refreshed:
                 break
             access_token = refreshed
-    stale = cached_live_limits("codex", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+    stale = cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
     if stale:
-        return serve_stale_live_limits("codex", stale, last_error or RuntimeError("Codex usage API failed"))
+        return serve_stale_live_limits(cache_key, stale, last_error or RuntimeError("Codex usage API failed"))
     limits = live_limit_error(last_error or RuntimeError("Codex usage API failed"), "codex-usage-api")
-    write_live_limits_cache("codex", limits)
+    write_live_limits_cache(cache_key, limits)
     return limits
+
+
+def codex_live_limits(force: bool = False) -> Dict[str, Any]:
+    auth = read_codex_auth()
+    if not auth:
+        return empty_limits()
+    # Keep the legacy provider-level key for installed clients and migrations.
+    return codex_live_limits_for_auth(auth, "codex", force=force)
+
+
+def _resolved_path_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def codex_provider_instances(current_limits: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Discover N Codex identities and collapse profiles sharing one account ID.
+
+    Profiles are candidates, not identities. Two homes carrying the same native
+    account ID (for example ~/.codex and an Orca runtime mirror) become one
+    instance. Without a native ID we deliberately keep the profile separate;
+    plan/email/quota similarity is never sufficient evidence for a merge.
+    """
+    active_path = _resolved_path_key(default_provider_home("codex"))
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for candidate in provider_home_candidates("codex"):
+        home = candidate.get("path")
+        if not isinstance(home, Path) or not candidate.get("exists"):
+            continue
+        auth = read_codex_auth(home)
+        if not auth:
+            continue
+        identity = codex_auth_identity(auth)
+        native_id = identity.get("accountID")
+        home_key = _resolved_path_key(home)
+        if native_id:
+            identity_seed = f"native:{native_id}"
+            confidence = "native_account_id"
+        else:
+            identity_seed = f"profile:{home_key}"
+            confidence = "profile_only"
+        instance_id = provider_instance_id("codex", identity_seed)
+        entry = grouped.get(instance_id)
+        if entry is None:
+            suffix = instance_id.rsplit(":", 1)[-1][-4:].upper()
+            entry = {
+                "id": instance_id,
+                "providerID": "codex",
+                "label": f"Codex · {suffix}",
+                "identityConfidence": confidence,
+                "planType": identity.get("planType"),
+                "profileCount": 0,
+                "tracked": False,
+                "active": False,
+                "lastSeenAt": None,
+                "_auth": auth,
+            }
+            grouped[instance_id] = entry
+
+        entry["profileCount"] += 1
+        entry["tracked"] = bool(entry["tracked"] or candidate.get("tracked"))
+        entry["active"] = bool(entry["active"] or home_key == active_path)
+        if not entry.get("planType") and identity.get("planType"):
+            entry["planType"] = identity.get("planType")
+        newest = (candidate.get("stats") or {}).get("newestMtime")
+        if isinstance(newest, (int, float)):
+            previous = entry.get("_lastSeenTimestamp")
+            if not isinstance(previous, (int, float)) or newest > previous:
+                entry["_lastSeenTimestamp"] = float(newest)
+
+    instances: List[Dict[str, Any]] = []
+    for entry in grouped.values():
+        auth = entry.pop("_auth")
+        last_seen = entry.pop("_lastSeenTimestamp", None)
+        if isinstance(last_seen, (int, float)):
+            entry["lastSeenAt"] = iso_from_timestamp(float(last_seen))
+        else:
+            entry.pop("lastSeenAt", None)
+
+        if entry["active"] and isinstance(current_limits, dict):
+            limits = copy.deepcopy(current_limits)
+        else:
+            cache_key = f"codex-instance:{entry['id'].rsplit(':', 1)[-1]}"
+            try:
+                limits = codex_live_limits_for_auth(auth, cache_key)
+            except Exception as exc:
+                limits = empty_limits(status="error", error=str(exc))
+        entry["limits"] = limits
+        if not entry.get("planType") and isinstance(limits.get("planType"), str):
+            entry["planType"] = limits.get("planType")
+        entry["status"] = "connected" if entry["tracked"] else "discovered"
+        instances.append(entry)
+
+    return sorted(
+        instances,
+        key=lambda item: (
+            not bool(item.get("active")),
+            not bool(item.get("tracked")),
+            str(item.get("label") or ""),
+        ),
+    )
+
+
+def provider_instances_snapshot(
+    limits_by_provider: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Provider-neutral additive surface; Codex is the first 26.35 adapter."""
+    resolved_limits = limits_by_provider if isinstance(limits_by_provider, dict) else {}
+    return codex_provider_instances(resolved_limits.get("codex"))
 
 
 def claude_config_dir() -> Path:
@@ -3734,6 +3936,7 @@ def gemini_display_name(model: Any) -> str:
         "gemini-2.5-flash-lite": "Gemini Flash Lite",
         "gemini-3-pro-preview": "Gemini 3 Pro",
         "gemini-3-flash-preview": "Gemini 3 Flash",
+        "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
         "gemini-3.1-flash-lite-preview": "Gemini 3.1 Flash Lite",
         "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
     }
@@ -4203,6 +4406,69 @@ def gemini_quota_compact_sort_key(quota: Dict[str, Any]) -> Tuple[float, int, st
     )
 
 
+def gemini_local_project_id(*extra_paths: Path) -> str:
+    """Best-effort Code Assist project. Consumer Gemini no longer auto-provisions one."""
+    for key in ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID"):
+        value = os.environ.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for path in extra_paths:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text and 4 <= len(text) <= 64 and all(ch.isalnum() or ch in "-_" for ch in text):
+            return text
+    return ""
+
+
+def antigravity_local_project_path() -> Path:
+    return ANTIGRAVITY_CLI_DIR / "cache" / "default_project_id.txt"
+
+
+def fetch_code_assist_quota(access_token: str, project_id: str = "") -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """loadCodeAssist + retrieveUserQuota.
+
+    After the 2026-06-18 consumer Code Assist cutover, loadCodeAssist often
+    returns no `cloudaicompanionProject`. retrieveUserQuota still answers
+    `{}` with remainingFraction + resetTime, so do not abort on a missing
+    project — that was why Gemini/Antigravity tiles showed no 한도.
+    """
+    project_id = str(project_id or "")
+    metadata = {
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI",
+    }
+    load_payload: Dict[str, Any] = {"metadata": metadata}
+    if project_id:
+        metadata["duetProject"] = project_id
+        load_payload["cloudaicompanionProject"] = project_id
+    try:
+        tier_payload = gemini_code_assist_post("loadCodeAssist", load_payload, access_token)
+    except Exception:
+        tier_payload = {}
+    if not isinstance(tier_payload, dict):
+        tier_payload = {}
+    project_id = str(tier_payload.get("cloudaicompanionProject") or project_id or "")
+
+    quota_payload: Dict[str, Any] = {}
+    if project_id:
+        try:
+            quota_payload = gemini_code_assist_post(
+                "retrieveUserQuota",
+                {"project": project_id},
+                access_token,
+            )
+        except Exception:
+            quota_payload = {}
+    if not (isinstance(quota_payload, dict) and quota_payload.get("buckets")):
+        quota_payload = gemini_code_assist_post("retrieveUserQuota", {}, access_token)
+    if not isinstance(quota_payload, dict):
+        quota_payload = {}
+    return tier_payload, quota_payload
+
+
 def gemini_live_limits(force: bool = False) -> Dict[str, Any]:
     cached = None if force else cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
@@ -4214,23 +4480,8 @@ def gemini_live_limits(force: bool = False) -> Dict[str, Any]:
         token = gemini_access_token()
         if not token:
             return empty_limits()
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
-        metadata = {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI",
-        }
-        if project_id:
-            metadata["duetProject"] = project_id
-        tier_payload = gemini_code_assist_post(
-            "loadCodeAssist",
-            {"cloudaicompanionProject": project_id, "metadata": metadata},
-            token,
-        )
-        project_id = str(tier_payload.get("cloudaicompanionProject") or project_id or "")
-        if not project_id:
-            return empty_limits(status="error", error="Gemini Code Assist project ID unavailable")
-        quota_payload = gemini_code_assist_post("retrieveUserQuota", {"project": project_id}, token)
+        project_id = gemini_local_project_id()
+        tier_payload, quota_payload = fetch_code_assist_quota(token, project_id)
         limits = gemini_limits_from_quota_response(quota_payload, tier_payload, source=GEMINI_CODE_ASSIST_URL)
         write_live_limits_cache("gemini", limits)
         return limits
@@ -4257,25 +4508,8 @@ def antigravity_live_limits(force: bool = False) -> Dict[str, Any]:
         token = antigravity_access_token()
         if not token:
             return empty_limits()
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
-        metadata = {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI",
-        }
-        if project_id:
-            metadata["duetProject"] = project_id
-        tier_payload = gemini_code_assist_post(
-            "loadCodeAssist",
-            {"cloudaicompanionProject": project_id, "metadata": metadata},
-            token,
-        )
-        project_id = str(tier_payload.get("cloudaicompanionProject") or project_id or "")
-        if not project_id:
-            limits = empty_limits(status="error", error="Antigravity Code Assist project ID unavailable")
-            write_live_limits_cache("antigravity", limits)
-            return limits
-        quota_payload = gemini_code_assist_post("retrieveUserQuota", {"project": project_id}, token)
+        project_id = gemini_local_project_id(antigravity_local_project_path())
+        tier_payload, quota_payload = fetch_code_assist_quota(token, project_id)
         limits = gemini_limits_from_quota_response(quota_payload, tier_payload, source=GEMINI_CODE_ASSIST_URL)
         if limits.get("status") == "not_configured" and not limits.get("quotas"):
             # An account with no Code Assist quota buckets — cache it as a definitive
@@ -10349,6 +10583,13 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             "latestByProvider": latest_by_provider,
         },
     }
+    # Independent login/quota pools (capability "providerInstances.v1").
+    # Additive and local-only: legacy clients keep reading providers.<id>, while
+    # newer clients can render N peer connections without summing percentages.
+    try:
+        snapshot["providerInstances"] = provider_instances_snapshot(runtime_limits_by_provider)
+    except Exception as exc:
+        logging.debug("provider_instances_snapshot failed: %s", exc)
     # Where each provider's usage lives, and which of those homes we read
     # (capability "homes.discovery"). Diagnostic only — it never changes what
     # gets counted — and additive, so older app builds simply ignore it.
