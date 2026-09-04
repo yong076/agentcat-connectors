@@ -74,8 +74,7 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/api/codex/usage",
 )
 CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-# 7 days. Any rate-limit window at least this long is the weekly quota,
-# whichever slot Codex happens to put it in.
+# Codex's seven-day window in minutes; upstream values may drift by one minute.
 CODEX_WEEKLY_WINDOW_MINUTES = 10080
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -3042,15 +3041,15 @@ def codex_runtime_limits() -> Dict[str, Any]:
                 minutes = int_limit(window.get("window_minutes"))
                 used = float_percent(window.get("used_percent"))
                 resets = int_limit(window.get("resets_at"))
-                # Length decides when Codex states it. The older payload omits
-                # window_minutes on the weekly slot, so fall back to the slot
-                # name there rather than guessing.
-                is_weekly = (
-                    minutes >= CODEX_WEEKLY_WINDOW_MINUTES
-                    if minutes is not None
-                    else slot == "secondary"
-                )
-                if is_weekly:
+                # Prefer known durations with a one-minute tolerance; older or
+                # novel payloads fall back to primary/secondary position.
+                if minutes is not None and abs(minutes - 300) <= 1:
+                    kind = "short"
+                elif minutes is not None and abs(minutes - CODEX_WEEKLY_WINDOW_MINUTES) <= 1:
+                    kind = "weekly"
+                else:
+                    kind = "short" if slot == "primary" else "weekly"
+                if kind == "weekly":
                     if limits.get("weeklyUsedPercent") is None:
                         limits["weeklyUsedPercent"] = used
                         limits["weeklyResetAt"] = resets
@@ -3266,7 +3265,8 @@ def codex_usage_request(access_token: str, account_id: str, url: str) -> Dict[st
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
-        "User-Agent": "AgentCat/1.0",
+        "User-Agent": "codex-cli",
+        "OpenAI-Beta": "codex-1",
     }
     if account_id:
         headers["chatgpt-account-id"] = account_id
@@ -3280,7 +3280,8 @@ def codex_reset_credits_request(access_token: str, account_id: str) -> Dict[str,
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
-        "User-Agent": "AgentCat/1.0",
+        "User-Agent": "codex-cli",
+        "OpenAI-Beta": "codex-1",
     }
     if account_id:
         headers["chatgpt-account-id"] = account_id
@@ -3308,6 +3309,8 @@ def codex_window_quota(
         window_label = f"{seconds // 86400}d"
     elif seconds and seconds % 3600 == 0:
         window_label = f"{seconds // 3600}h"
+    elif seconds and seconds % 60 == 0:
+        window_label = f"{seconds // 60}m"
     else:
         window_label = None
     return quota_entry(
@@ -3322,11 +3325,10 @@ def codex_window_quota(
 
 
 def codex_window_descriptor(window: Any, default_kind: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Return a lossless display identity for a Codex rate-limit window.
+    """Classify a Codex rate-limit window with tolerance for rounded durations.
 
-    The API has changed which bucket is primary before, and can do so again.
-    Duration is the source of truth: a 24-hour window is `1d`, not weekly.
-    ``default_kind`` is used only for old responses that omitted duration.
+    Duration wins when it is within one minute of five hours or seven days.
+    Other durations use the API field position supplied through ``default_kind``.
     """
     seconds = None
     if isinstance(window, dict):
@@ -3336,27 +3338,33 @@ def codex_window_descriptor(window: Any, default_kind: Optional[str] = None) -> 
     if not seconds or seconds <= 0:
         return None
 
-    if seconds % 86400 == 0:
+    minutes = seconds / 60.0
+    if abs(minutes - 300) <= 1:
+        amount, suffix, label, kind = 5, "h", "5시간", "short"
+    elif abs(minutes - 10080) <= 1:
+        amount, suffix, label, kind = 7, "d", "7일", "weekly"
+    elif default_kind == "short":
+        amount, suffix, label, kind = 5, "h", "5시간", "short"
+    elif default_kind == "weekly":
+        amount, suffix, label, kind = 7, "d", "7일", "weekly"
+    elif seconds % 86400 == 0:
         amount, suffix, label = seconds // 86400, "d", f"{seconds // 86400}일"
+        kind = None
     elif seconds % 3600 == 0:
         amount, suffix, label = seconds // 3600, "h", f"{seconds // 3600}시간"
+        kind = None
     elif seconds % 60 == 0:
         amount, suffix, label = seconds // 60, "m", f"{seconds // 60}분"
+        kind = None
     else:
         amount, suffix, label = seconds, "s", f"{seconds}초"
+        kind = None
 
-    # Compatibility fields are populated only for the exact legacy buckets.
-    kind = "short" if seconds == 5 * 3600 else "weekly" if seconds == 7 * 86400 else None
     return {"suffix": f"{amount}{suffix}", "label": label, "kind": kind, "seconds": seconds}
 
 
 def codex_window_kind(window: Any, default: str) -> Optional[str]:
-    """Classify a Codex window without inferring a missing policy bucket.
-
-    OpenAI can remove the short window while keeping the weekly window. In that
-    response shape `primary_window` may contain a 7-day duration, so its field
-    position must not be treated as a synonym for the old 5-hour bucket.
-    """
+    """Classify by tolerant duration, then fall back to the field position."""
     if not isinstance(window, dict):
         return None
     descriptor = codex_window_descriptor(window, default)

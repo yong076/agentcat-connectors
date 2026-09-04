@@ -362,42 +362,6 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIsNone(limits["shortUsedPercent"])
         self.assertEqual(limits["weeklyUsedPercent"], 24.0)
 
-    def test_codex_daily_window_stays_daily_and_does_not_fill_weekly_compat_field(self) -> None:
-        limits = agentcat.codex_limits_from_usage_response(
-            {
-                "plan_type": "pro",
-                "rate_limit": {
-                    "primary_window": {
-                        "used_percent": 24,
-                        "reset_at": 1770000000,
-                        "limit_window_seconds": 86400,
-                    }
-                },
-            }
-        )
-
-        self.assertEqual([quota["id"] for quota in limits["quotas"]], ["codex:1d"])
-        self.assertEqual(limits["quotas"][0]["label"], "1일")
-        self.assertEqual(limits["quotas"][0]["window"], "1d")
-        self.assertIsNone(limits["shortUsedPercent"])
-        self.assertIsNone(limits["weeklyUsedPercent"])
-
-    def test_codex_unrecognized_duration_is_preserved_as_generic_quota(self) -> None:
-        limits = agentcat.codex_limits_from_usage_response(
-            {
-                "rate_limit": {
-                    "primary_window": {
-                        "used_percent": 12,
-                        "limit_window_seconds": 2592000,
-                    }
-                }
-            }
-        )
-
-        self.assertEqual(limits["quotas"][0]["id"], "codex:30d")
-        self.assertEqual(limits["quotas"][0]["label"], "30일")
-        self.assertIsNone(limits["weeklyUsedPercent"])
-
     def test_codex_cache_rekeys_stale_daily_bucket_without_calling_it_weekly(self) -> None:
         cached = agentcat.empty_limits(status="auto")
         cached["weeklyUsedPercent"] = 24.0

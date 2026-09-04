@@ -379,5 +379,90 @@ class ClaudeStatuslineThrottleTests(LancelotWP8TestCase):
         self.assertEqual(self.event_count(), 1)
 
 
+class CodexWindowClassificationTests(LancelotWP8TestCase):
+    def write_runtime_limits(self, primary, secondary):
+        session_dir = self.home / ".codex" / "sessions" / "2026" / "09" / "04"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "rollout-wp8.jsonl").write_text(
+            json.dumps(
+                {
+                    "payload": {
+                        "type": "token_count",
+                        "rate_limits": {"primary": primary, "secondary": secondary},
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_runtime_windows_accept_one_minute_duration_drift(self):
+        self.write_runtime_limits(
+            {"used_percent": 11, "window_minutes": 299},
+            {"used_percent": 22, "window_minutes": 10081},
+        )
+
+        limits = agentcat.codex_runtime_limits()
+
+        self.assertEqual(limits["shortUsedPercent"], 11.0)
+        self.assertEqual(limits["shortWindowMinutes"], 299)
+        self.assertEqual(limits["weeklyUsedPercent"], 22.0)
+
+    def test_runtime_unknown_durations_fall_back_to_field_position(self):
+        self.write_runtime_limits(
+            {"used_percent": 11, "window_minutes": 1440},
+            {"used_percent": 22, "window_minutes": 60},
+        )
+
+        limits = agentcat.codex_runtime_limits()
+
+        self.assertEqual(limits["shortUsedPercent"], 11.0)
+        self.assertEqual(limits["weeklyUsedPercent"], 22.0)
+
+    def test_http_windows_use_tolerance_and_positional_fallback(self):
+        tolerant = agentcat.codex_limits_from_usage_response(
+            {
+                "rate_limit": {
+                    "primary_window": {"used_percent": 11, "limit_window_seconds": 299 * 60},
+                    "secondary_window": {"used_percent": 22, "limit_window_seconds": 10081 * 60},
+                }
+            }
+        )
+        positional = agentcat.codex_limits_from_usage_response(
+            {
+                "rate_limit": {
+                    "primary_window": {"used_percent": 33, "limit_window_seconds": 86400},
+                    "secondary_window": {"used_percent": 44, "limit_window_seconds": 3600},
+                }
+            }
+        )
+
+        self.assertEqual([quota["id"] for quota in tolerant["quotas"]], ["codex:5h", "codex:7d"])
+        self.assertEqual(tolerant["shortUsedPercent"], 11.0)
+        self.assertEqual(tolerant["weeklyUsedPercent"], 22.0)
+        self.assertEqual([quota["id"] for quota in positional["quotas"]], ["codex:5h", "codex:7d"])
+        self.assertEqual(positional["shortUsedPercent"], 33.0)
+        self.assertEqual(positional["weeklyUsedPercent"], 44.0)
+
+    def test_codex_http_requests_use_cli_compatibility_headers(self):
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append((request, timeout))
+            return FakeResponse({})
+
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen):
+            agentcat.codex_usage_request("token", "account", agentcat.CODEX_USAGE_URLS[0])
+            agentcat.codex_reset_credits_request("token", "account")
+
+        self.assertEqual(len(requests), 2)
+        for request, timeout in requests:
+            headers = {key.lower(): value for key, value in request.header_items()}
+            self.assertEqual(headers["user-agent"], "codex-cli")
+            self.assertEqual(headers["openai-beta"], "codex-1")
+            self.assertEqual(headers["chatgpt-account-id"], "account")
+            self.assertEqual(timeout, 12)
+
+
 if __name__ == "__main__":
     unittest.main()
