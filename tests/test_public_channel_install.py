@@ -4,6 +4,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+import re
 import zipfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -198,8 +199,13 @@ class PublicChannelInstallTests(unittest.TestCase):
         self.assertFalse((self.root / "escape.txt").exists())
 
     def test_current_candidate_passes_real_contract_validation(self) -> None:
+        # Track the shipped version constant so a release bump cannot silently
+        # desynchronize this test from the candidate it validates.
+        source = (REPO_ROOT / "bin" / "agentcat").read_text(encoding="utf-8")
+        match = re.search(r'CONNECTOR_VERSION = os\.environ\.get\("AGENTCAT_CONNECTOR_VERSION", "([^"]+)"\)', source)
+        assert match, "CONNECTOR_VERSION constant not found"
         manifest = {
-            "version": "26.34.7",
+            "version": match.group(1),
             "contractVersion": 1,
             "sha256": "0" * 64,
         }
