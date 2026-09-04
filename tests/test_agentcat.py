@@ -104,6 +104,8 @@ class AgentCatConnectorTests(unittest.TestCase):
             "GEMINI_CLI_HOME",
             "GROK_HOME",
             "KIMI_HOME",
+            "JETBRAINS_CONFIG_ROOT",
+            "HERMES_HOME",
         ):
             os.environ.pop(key, None)
         original_check_output = agentcat.subprocess.check_output
@@ -1145,9 +1147,62 @@ class AgentCatConnectorTests(unittest.TestCase):
                 return [without_delivery_timestamps(child) for child in value]
             return value
 
-        before_bytes = json.dumps(without_delivery_timestamps(before), sort_keys=True, separators=(",", ":")).encode()
-        after_bytes = json.dumps(without_delivery_timestamps(after), sort_keys=True, separators=(",", ":")).encode()
+        legacy_ids = {"codex", "claude", "gemini", "antigravity", "opencode", "copilot", "kimi", "grok"}
+        before_normalized = without_delivery_timestamps(before)
+        after_normalized = without_delivery_timestamps(after)
+        before_normalized["providers"] = {
+            key: value for key, value in before_normalized["providers"].items() if key in legacy_ids
+        }
+        after_normalized["providers"] = {
+            key: value for key, value in after_normalized["providers"].items() if key in legacy_ids
+        }
+        before_bytes = json.dumps(before_normalized, sort_keys=True, separators=(",", ":")).encode()
+        after_bytes = json.dumps(after_normalized, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(before_bytes, after_bytes)
+
+    def test_jetbrains_plugin_reads_latest_local_monthly_quota_fixture_without_network(self) -> None:
+        quota_path = (
+            agentcat.HOME / "Library" / "Preferences" / "JetBrainsIdea2026.2" /
+            "options" / "AIAssistantQuotaManager2.xml"
+        )
+        quota_path.parent.mkdir(parents=True)
+        fixture = REPO_ROOT / "tests" / "fixtures" / "provider-platform" / "jetbrains-quota.xml"
+        quota_path.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")):
+            snapshot = agentcat.build_snapshot()
+
+        provider = snapshot["providers"]["jetbrains"]
+        quota = provider["limits"]["quotas"][0]
+        self.assertEqual(provider["status"], "ok")
+        self.assertEqual(quota["scope"], "account")
+        self.assertIs(quota["aggregate"], True)
+        self.assertEqual(quota["used"], 7.5)
+        self.assertEqual(quota["remaining"], 12.5)
+        self.assertEqual(quota["usedPercent"], 37.5)
+        self.assertEqual(quota["resetAt"], 1790812800)
+
+    def test_hermes_plugin_reads_local_state_db_actual_cost_fixture_without_network(self) -> None:
+        hermes_home = agentcat.HOME / ".hermes"
+        hermes_home.mkdir()
+        sql_fixture = REPO_ROOT / "tests" / "fixtures" / "provider-platform" / "hermes-state.sql"
+        sql = sql_fixture.read_text(encoding="utf-8").replace("{{NOW}}", str(agentcat.time.time()))
+        with closing(sqlite3.connect(hermes_home / "state.db")) as conn:
+            conn.executescript(sql)
+
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")):
+            snapshot = agentcat.build_snapshot()
+
+        provider = snapshot["providers"]["hermes"]
+        self.assertEqual(provider["status"], "ok")
+        self.assertEqual(provider["tokens"]["all"], 158)
+        self.assertEqual(provider["tokens"]["week"], 158)
+        self.assertEqual(provider["models"]["hermes-4"]["all"], 158)
+        self.assertEqual(provider["actualCostUSD"], 1.25)
+        self.assertEqual(
+            provider["cost"],
+            {"status": "ok", "totalUSD": 1.25, "source": "hermes-state-db", "estimated": False},
+        )
 
     def test_connector_version_parser_and_comparison(self) -> None:
         text = 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.10")'

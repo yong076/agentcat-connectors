@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
-from . import antigravity, claude, codex, copilot, gemini, grok, kimi, opencode
+from . import antigravity, claude, codex, copilot, gemini, grok, hermes, jetbrains, kimi, opencode
 from ._base import ProviderContext, ProviderSpec
 
 
-PROVIDER_MODULES = (codex, claude, gemini, antigravity, opencode, copilot, kimi, grok)
+PROVIDER_MODULES = (codex, claude, gemini, antigravity, opencode, copilot, kimi, grok, jetbrains, hermes)
 PROVIDER_SPECS: Tuple[ProviderSpec, ...] = tuple(module.SPEC for module in PROVIDER_MODULES)
 PROVIDER_MODULES_BY_ID = {module.SPEC.id: module for module in PROVIDER_MODULES}
 CONFIG_PROVIDER_IDS = tuple(spec.id for spec in PROVIDER_SPECS)
@@ -61,6 +61,9 @@ CAPABILITY_ORDER = (
     "hooks.claudeStatusline",
     "hooks.claudeHooks",
     "hooks.geminiTelemetry",
+    "usage.jetbrains.localQuota",
+    "usage.hermes.stateDb",
+    "cost.hermes.actual",
     "activity.windowsProcessScan",
 )
 
@@ -113,7 +116,11 @@ def build_providers(
 
 
 def quota(ctx: ProviderContext, provider_id: str) -> Any:
-    return PROVIDER_MODULES_BY_ID[provider_id].quota(ctx)
+    return ctx.sanitize(PROVIDER_MODULES_BY_ID[provider_id].quota(ctx))
+
+
+def cost(ctx: ProviderContext, provider_id: str, usage_slice: Dict[str, Any]) -> Any:
+    return ctx.sanitize(PROVIDER_MODULES_BY_ID[provider_id].cost(ctx, usage_slice))
 
 
 def discover(ctx: ProviderContext, provider_ids: Optional[Iterable[str]] = None) -> Dict[str, Any]:

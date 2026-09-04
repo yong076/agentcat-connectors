@@ -1426,6 +1426,15 @@ def default_provider_home(provider: str) -> Path:
     return HOME / str(spec.get("defaultName") or f".{provider}")
 
 
+def provider_spec_home_paths(spec: Any) -> List[Path]:
+    """Resolve every home declared by a provider plugin inside the active sandbox."""
+    paths: List[Path] = []
+    for home_spec in spec.homes:
+        override = os.environ.get(str(home_spec.env)) if home_spec.env else None
+        paths.append(Path(override).expanduser() if override else HOME / str(home_spec.default))
+    return paths
+
+
 def provider_home_candidates(provider: str) -> List[Dict[str, Any]]:
     """Every home this provider might be storing usage in, with why we looked.
 
@@ -11708,6 +11717,7 @@ def build_provider_payloads(
 
     context = ProviderContext(callbacks={
         "usage": usage,
+        "home_paths": lambda spec: provider_spec_home_paths(spec),
         "disabled": lambda spec: disabled_provider_snapshot(spec.id),
         "error": error,
         "sanitize": sanitize_payload,
@@ -11734,16 +11744,23 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     for provider in provider_registry.COVERAGE_PROVIDER_IDS:
         attach_local_usage_coverage(provider, providers.get(provider, {}))
     quota_context = ProviderContext(callbacks={
-        "quota": lambda spec, _home: merge_limits(
-            limits_by_provider.get(spec.id, empty_limits()),
-            runtime_limits_by_provider.get(spec.id, empty_limits()),
-        ),
+        "quota": lambda spec, _home: runtime_limits_by_provider.get(spec.id, empty_limits()),
+        "home_paths": lambda spec: provider_spec_home_paths(spec),
+        "sanitize": sanitize_payload,
     })
+    cost_context = ProviderContext(callbacks={"cost": lambda _spec, _usage: {}, "sanitize": sanitize_payload})
     for provider, data in providers.items():
         if data.get("status") == "disabled":
             data["limits"] = empty_limits("disabled")
         else:
-            data["limits"] = provider_registry.quota(quota_context, provider)
+            detected_limits = provider_registry.quota(quota_context, provider)
+            data["limits"] = merge_limits(
+                limits_by_provider.get(provider, empty_limits()),
+                detected_limits if isinstance(detected_limits, dict) else empty_limits(),
+            )
+            cost_slice = provider_registry.cost(cost_context, provider, data)
+            if isinstance(cost_slice, dict) and cost_slice:
+                data["cost"] = sanitize_payload(cost_slice)
         data["limits"] = ensure_quota_schema_v2(data["limits"])
         data["meta"] = provider_metadata(provider)
     desktop_apps = desktop_app_sources_snapshot(settings)

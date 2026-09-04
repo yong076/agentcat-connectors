@@ -114,6 +114,12 @@ agentcat setup-prompt
 | Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
 | Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
 | Antigravity | dedicated telemetry or read-only local conversation SQLite | Keeps Antigravity separate from Gemini CLI. On Windows, reads defensive per-generation token metadata and falls back to quota/activity only if the upstream local schema changes. |
+| OpenCode | local SQLite message metadata | Reads assistant token fields without reading prompt content. |
+| GitHub Copilot | local CLI and VS Code transcript metadata | Uses explicit token fields when available and local estimates otherwise. |
+| Kimi | local Kimi Code logs + OAuth usage | Reports local token/model totals and available plan windows. |
+| Grok | local session usage + OAuth billing | Reports token/media activity and available reset windows. |
+| JetBrains AI | local IDE quota XML | Reads the newest cached monthly AI-credit quota; never makes a network request. |
+| Hermes Agent | local `~/.hermes/state.db` | Reports stored token totals and actual billed USD cost from Hermes session accounting. |
 
 ## Included Insights Engine
 
@@ -245,6 +251,11 @@ Uninstall removes the LaunchAgent, binary link, and Agent Cat-managed config ent
 python3 -m py_compile bin/agentcat scripts/install.py
 bin/agentcat snapshot --json
 ```
+
+The public archive keeps `bin/agentcat` as the executable entrypoint and ships
+its provider adapters beside it in `bin/agentcat_providers/`. The release build
+archives the source tree rather than concatenating Python, so candidate and
+local installers validate that package before activating the connector.
 
 ## Codex Skill
 
