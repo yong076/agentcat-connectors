@@ -11144,40 +11144,147 @@ def project_daily_state_file() -> Path:
     return AGENTCAT_HOME / "project-daily-state.json"
 
 
-def load_project_daily() -> Dict[str, Dict[str, int]]:
-    raw = read_json(project_daily_file())
-    out: Dict[str, Dict[str, int]] = {}
+def project_daily_cost_file() -> Path:
+    """Versioned rich ledger kept beside the legacy public flat ledger."""
+    return AGENTCAT_HOME / "project-daily-cost.json"
+
+
+def _project_daily_label_entry(raw: Any) -> Optional[Dict[str, Any]]:
+    flat = nonnegative_int(raw)
+    if flat:
+        return {"total": flat, "providers": {}}
+    if not isinstance(raw, dict):
+        return None
+    total = nonnegative_int(raw.get("total"))
+    if not total:
+        return None
+    providers: Dict[str, Dict[str, Any]] = {}
+    raw_providers = raw.get("providers")
+    if isinstance(raw_providers, dict):
+        for provider, entry in raw_providers.items():
+            normalized = _project_daily_provider_entry(entry)
+            if str(provider) and normalized:
+                providers[str(provider)] = normalized
+    return {"total": total, "providers": providers}
+
+
+def _project_daily_provider_entry(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    tokens = nonnegative_int(raw.get("tokens"))
+    if not tokens:
+        return None
+    cost_raw = raw.get("estCostUSD")
+    est_cost = float(cost_raw) if isinstance(cost_raw, (int, float)) and not isinstance(cost_raw, bool) and cost_raw >= 0 else None
+    top_model_raw = raw.get("topModel")
+    top_model = top_model_raw if isinstance(top_model_raw, str) and top_model_raw else None
+    models: Dict[str, int] = {}
+    raw_models = raw.get("models")
+    if isinstance(raw_models, dict):
+        for model, amount in raw_models.items():
+            value = nonnegative_int(amount)
+            if str(model) and value:
+                models[str(model)] = value
+    return {"tokens": tokens, "estCostUSD": est_cost, "topModel": top_model, "models": models}
+
+
+def _project_item_models(raw: Any) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
     if not isinstance(raw, dict):
         return out
-    for day, labels in raw.items():
+    class_aliases = (
+        ("input", "inputTokens"), ("output", "outputTokens"),
+        ("cacheRead", "cacheReadInputTokens"), ("cacheWrite", "cacheCreationInputTokens"),
+    )
+    for model, value in raw.items():
+        name = normalized_model_name(model) or "unknown"
+        flat = nonnegative_int(value)
+        if flat is not None:
+            if flat:
+                out[name] = {"tokens": flat, "classes": None}
+            continue
+        if not isinstance(value, dict):
+            continue
+        has_classes = any(alias in value for _cls, alias in class_aliases)
+        classes = {cls: nonnegative_int(value.get(alias)) or 0 for cls, alias in class_aliases}
+        tokens = nonnegative_int(value.get("totalTokens"))
+        if tokens is None:
+            tokens = sum(classes.values()) if has_classes else 0
+        if tokens > 0:
+            out[name] = {"tokens": tokens, "classes": classes if has_classes else None}
+    return out
+
+
+def load_project_daily() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    raw = read_json(project_daily_cost_file())
+    if not (isinstance(raw, dict) and isinstance(raw.get("days"), dict)):
+        raw = read_json(project_daily_file())
+    if isinstance(raw, dict) and isinstance(raw.get("days"), dict):
+        raw_days: Dict[str, Any] = raw["days"]
+    elif isinstance(raw, dict):
+        raw_days = raw  # v1 flat file: day keys at the top level
+    else:
+        raw_days = {}
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for day, labels in raw_days.items():
         if not PROJECT_DAILY_DAY_RE.match(str(day)) or not isinstance(labels, dict):
             continue
-        bucket: Dict[str, int] = {}
-        for label, tokens in labels.items():
-            amount = nonnegative_int(tokens)
-            if str(label) and amount:
-                bucket[str(label)] = amount
+        bucket: Dict[str, Dict[str, Any]] = {}
+        for label, entry in labels.items():
+            normalized = _project_daily_label_entry(entry)
+            if str(label) and normalized:
+                bucket[str(label)] = normalized
         if bucket:
             out[str(day)] = bucket
     return out
 
 
-def load_project_daily_baselines() -> Dict[str, int]:
+def load_project_daily_state() -> Dict[str, Any]:
+    """Baselines for delta accounting.
+
+    {"baselines": {"provider|projectId": cumulativeTokens},
+     "modelBaselines": {"provider|projectId": {model: {"tokens": int,
+     "classes": {input, output, cacheRead, cacheWrite} | None}}}}.
+    v1 state files (baselines only) load with empty model baselines, so the
+    first v2 pass seeds models without booking history onto today.
+    """
     raw = read_json(project_daily_state_file())
+    baselines: Dict[str, int] = {}
+    model_baselines: Dict[str, Dict[str, Dict[str, Any]]] = {}
     if not isinstance(raw, dict):
-        return {}
-    baselines = raw.get("baselines")
-    if not isinstance(baselines, dict):
-        return {}
-    out: Dict[str, int] = {}
-    for key, value in baselines.items():
-        amount = nonnegative_int(value)
-        if str(key) and amount is not None:
-            out[str(key)] = amount
-    return out
+        return {"baselines": baselines, "modelBaselines": model_baselines}
+    raw_baselines = raw.get("baselines")
+    if isinstance(raw_baselines, dict):
+        for key, value in raw_baselines.items():
+            amount = nonnegative_int(value)
+            if str(key) and amount is not None:
+                baselines[str(key)] = amount
+    raw_models = raw.get("modelBaselines")
+    if isinstance(raw_models, dict):
+        for key, models in raw_models.items():
+            if not str(key) or not isinstance(models, dict):
+                continue
+            normalized: Dict[str, Dict[str, Any]] = {}
+            for model, entry in models.items():
+                if not str(model) or not isinstance(entry, dict):
+                    continue
+                tokens = nonnegative_int(entry.get("tokens"))
+                if tokens is None:
+                    continue
+                raw_classes = entry.get("classes")
+                classes: Optional[Dict[str, int]] = None
+                if isinstance(raw_classes, dict):
+                    classes = {
+                        cls: nonnegative_int(raw_classes.get(cls)) or 0
+                        for cls in PROJECT_COST_CLASS_KEYS
+                    }
+                normalized[str(model)] = {"tokens": tokens, "classes": classes}
+            if normalized:
+                model_baselines[str(key)] = normalized
+    return {"baselines": baselines, "modelBaselines": model_baselines}
 
 
-def prune_project_daily(days: Dict[str, Dict[str, int]], today: "dt.date") -> bool:
+def prune_project_daily(days: Dict[str, Dict[str, Any]], today: "dt.date") -> bool:
     """Drop day buckets older than PROJECT_DAILY_RETENTION_DAYS (and malformed keys)."""
     cutoff = today - dt.timedelta(days=PROJECT_DAILY_RETENTION_DAYS)
     changed = False
@@ -11194,14 +11301,16 @@ def prune_project_daily(days: Dict[str, Dict[str, int]], today: "dt.date") -> bo
     return changed
 
 
-def snapshot_project_cumulative(providers: Dict[str, Any]) -> Dict[str, Tuple[str, int]]:
-    """'provider|project-id' -> (label, cumulative tokens) from provider rollups.
+def snapshot_project_cumulative(providers: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """'provider|project-id' -> cumulative observation from provider rollups.
 
     Keyed per provider+project so one provider's counter reset (or a project
     dropping out of another provider's top-20 list) never bleeds into the
     others' delta accounting. Labels are basenames only — never paths.
+    Each observation: {"provider", "label", "tokens", "models"} where models
+    carries per-model cumulative usage when the provider attributes it.
     """
-    out: Dict[str, Tuple[str, int]] = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for provider, usage in (providers or {}).items():
         if not isinstance(usage, dict):
             continue
@@ -11221,14 +11330,20 @@ def snapshot_project_cumulative(providers: Dict[str, Any]) -> Dict[str, Tuple[st
             label = display_project_name(project_id)
             if not label:
                 continue
-            out[f"{provider}|{project_id}"] = (label, tokens)
+            out[f"{provider}|{project_id}"] = {
+                "provider": str(provider),
+                "label": label,
+                "tokens": tokens,
+                "models": _project_item_models(item.get("models")),
+            }
     return out
 
 
 def project_daily_snapshot_slice(
-    days: Dict[str, Dict[str, int]], today: "dt.date"
+    days: Dict[str, Dict[str, Any]], today: "dt.date"
 ) -> Dict[str, Dict[str, int]]:
-    """Trailing PROJECT_DAILY_SNAPSHOT_DAYS view embedded in the snapshot."""
+    """Trailing PROJECT_DAILY_SNAPSHOT_DAYS v1 flat view ({day: {label:
+    tokens}}) embedded in the snapshot for pre-dailyCost clients."""
     cutoff = today - dt.timedelta(days=PROJECT_DAILY_SNAPSHOT_DAYS - 1)
     out: Dict[str, Dict[str, int]] = {}
     for day, labels in days.items():
@@ -11237,13 +11352,127 @@ def project_daily_snapshot_slice(
         except ValueError:
             continue
         if parsed >= cutoff and labels:
-            out[day] = dict(labels)
+            out[day] = {label: int(entry["total"]) for label, entry in labels.items()}
     return out
+
+
+def project_daily_cost_snapshot_slice(
+    days: Dict[str, Dict[str, Any]], today: "dt.date"
+) -> Dict[str, Dict[str, Any]]:
+    """Trailing PROJECT_DAILY_COST_SNAPSHOT_DAYS rich view (capability
+    "projects.dailyCost"). Per-day model mixes stay in the ledger file; the
+    snapshot exposes tokens/estCostUSD/topModel per provider."""
+    cutoff = today - dt.timedelta(days=PROJECT_DAILY_COST_SNAPSHOT_DAYS - 1)
+    out: Dict[str, Dict[str, Any]] = {}
+    for day, labels in days.items():
+        try:
+            parsed = dt.date.fromisoformat(day)
+        except ValueError:
+            continue
+        if parsed < cutoff or not labels:
+            continue
+        day_out: Dict[str, Any] = {}
+        for label, entry in labels.items():
+            day_out[label] = {
+                "total": int(entry["total"]),
+                "providers": {
+                    provider: {
+                        "tokens": int(pentry["tokens"]),
+                        "estCostUSD": pentry["estCostUSD"],
+                        "topModel": pentry["topModel"],
+                    }
+                    for provider, pentry in entry["providers"].items()
+                },
+            }
+        out[day] = day_out
+    return out
+
+
+def _project_daily_top_model(models: Dict[str, int]) -> Optional[str]:
+    """Deterministic top model for a day's mix: most tokens, ties broken by
+    lexicographically smallest name; 'unknown' never wins."""
+    best: Optional[Tuple[str, int]] = None
+    for model, tokens in models.items():
+        if model == "unknown" or tokens <= 0:
+            continue
+        if best is None or tokens > best[1] or (tokens == best[1] and model < best[0]):
+            best = (model, tokens)
+    return best[0] if best else None
+
+
+def _model_baseline_value(current: Dict[str, Any]) -> Dict[str, Any]:
+    classes = current.get("classes")
+    return {
+        "tokens": int(current["tokens"]),
+        "classes": dict(classes) if isinstance(classes, dict) else None,
+    }
+
+
+def _reseed_model_baselines(
+    baseline_models: Dict[str, Dict[str, Any]],
+    observed_models: Dict[str, Dict[str, Any]],
+) -> None:
+    """Replace all model baselines after a project counter reset/first sight."""
+    baseline_models.clear()
+    for model, current in observed_models.items():
+        baseline_models[model] = _model_baseline_value(current)
+
+
+def _project_model_deltas(
+    baseline_models: Dict[str, Dict[str, Any]],
+    observed_models: Dict[str, Dict[str, Any]],
+) -> Tuple[Dict[str, int], Optional[float], bool]:
+    """Per-model delta accounting mirroring the per-project total rules.
+
+    First sighting seeds the baseline; a shrinking model counter (or any
+    shrinking class) rebases without booking. Cost accrues only for models
+    with a known name, a full class split on both sides of the delta, and a
+    price in the merged table — everything else contributes tokens to the
+    mix but no cost. Returns (deltas, costUSD or None, baselines changed).
+    """
+    deltas: Dict[str, int] = {}
+    cost_total: Optional[float] = None
+    changed = False
+    for model, current in observed_models.items():
+        prev = baseline_models.get(model)
+        if prev is None or current["tokens"] < prev["tokens"]:
+            baseline_models[model] = _model_baseline_value(current)
+            changed = True
+            continue
+        token_delta = current["tokens"] - prev["tokens"]
+        class_deltas: Optional[Dict[str, int]] = None
+        cur_classes = current.get("classes")
+        prev_classes = prev.get("classes")
+        if isinstance(cur_classes, dict) and isinstance(prev_classes, dict):
+            candidate = {
+                cls: int(cur_classes.get(cls) or 0) - int(prev_classes.get(cls) or 0)
+                for cls in PROJECT_COST_CLASS_KEYS
+            }
+            if all(value >= 0 for value in candidate.values()):
+                class_deltas = candidate
+        new_baseline = _model_baseline_value(current)
+        if new_baseline != prev:
+            baseline_models[model] = new_baseline
+            changed = True
+        if token_delta <= 0:
+            continue
+        deltas[model] = deltas.get(model, 0) + token_delta
+        if model != "unknown" and class_deltas and any(class_deltas.values()):
+            cost = estimate_cost(
+                model,
+                class_deltas["input"],
+                class_deltas["output"],
+                class_deltas["cacheRead"],
+                class_deltas["cacheWrite"],
+            )
+            if cost is not None:
+                cost_total = (cost_total or 0.0) + cost["total"]
+    return deltas, cost_total, changed
 
 
 def update_project_daily(
     providers: Dict[str, Any], now: Optional["dt.datetime"] = None
-) -> Dict[str, Dict[str, int]]:
+) -> Dict[str, Dict[str, Any]]:
     """Book per-project cumulative growth into LOCAL-day delta buckets.
 
     Delta accounting against the previous cumulative value: only growth since
@@ -11251,33 +11480,81 @@ def update_project_daily(
     double-count. First sighting only seeds the baseline (months of history
     must not land on today), and a shrinking counter rebases the baseline
     without ever booking a negative delta.
+
+    v2 adds per-provider splits per day/label plus estimated cost: the same
+    delta rules run per model where the provider rollup attributes models
+    (Claude journal carries the full class split, Codex sessions model totals
+    only), class deltas are priced through estimate_cost (LiteLLM feed over
+    the bundled table), and estCostUSD stays null when nothing is
+    attributable — a partial value covers only the priced share, never a
+    blended guess. Returns {"v1": 14-day flat slice, "v2": 30-day rich slice}.
     """
     if now is None:
         now = dt.datetime.now(dt.timezone.utc)
     today_key = day_key_for_timestamp(now) or now.astimezone().date().isoformat()
     today = dt.date.fromisoformat(today_key)
     days = load_project_daily()
-    baselines = load_project_daily_baselines()
+    state = load_project_daily_state()
+    baselines: Dict[str, int] = state["baselines"]
+    model_baselines: Dict[str, Dict[str, Dict[str, Any]]] = state["modelBaselines"]
     days_changed = prune_project_daily(days, today)
-    baselines_changed = False
-    for key, (label, tokens) in snapshot_project_cumulative(providers).items():
+    state_changed = False
+    for key, observed in snapshot_project_cumulative(providers).items():
+        tokens = observed["tokens"]
+        key_models = model_baselines.setdefault(key, {})
         previous = baselines.get(key)
         if previous is None or tokens < previous:
             baselines[key] = tokens
-            baselines_changed = True
+            _reseed_model_baselines(key_models, observed["models"])
+            state_changed = True
             continue
         delta = tokens - previous
+        model_deltas, cost_total, models_changed = _project_model_deltas(
+            key_models, observed["models"]
+        )
+        if models_changed:
+            state_changed = True
         if delta == 0:
             continue
         baselines[key] = tokens
-        baselines_changed = True
+        state_changed = True
         bucket = days.setdefault(today_key, {})
-        bucket[label] = int(bucket.get(label) or 0) + delta
+        label_entry = bucket.setdefault(
+            observed["label"], {"total": 0, "providers": {}}
+        )
+        label_entry["total"] = int(label_entry["total"]) + delta
+        pentry = label_entry["providers"].setdefault(
+            observed["provider"],
+            {"tokens": 0, "estCostUSD": None, "topModel": None, "models": {}},
+        )
+        pentry["tokens"] = int(pentry["tokens"]) + delta
+        for model, model_delta in model_deltas.items():
+            pentry["models"][model] = int(pentry["models"].get(model) or 0) + model_delta
+        if cost_total is not None:
+            pentry["estCostUSD"] = round((pentry["estCostUSD"] or 0.0) + cost_total, 6)
+        pentry["topModel"] = _project_daily_top_model(pentry["models"])
         days_changed = True
     if days_changed:
-        write_json_atomic(project_daily_file(), days)
-    if baselines_changed:
-        write_json_atomic(project_daily_state_file(), {"baselines": baselines})
+        write_json_atomic(
+            project_daily_cost_file(),
+            {"version": PROJECT_DAILY_FILE_VERSION, "days": days},
+        )
+        write_json_atomic(
+            project_daily_file(),
+            {
+                day: {label: int(entry["total"]) for label, entry in labels.items()}
+                for day, labels in days.items()
+            },
+        )
+    if state_changed:
+        write_json_atomic(
+            project_daily_state_file(),
+            {
+                "version": PROJECT_DAILY_STATE_VERSION,
+                "baselines": baselines,
+                "modelBaselines": {k: v for k, v in model_baselines.items() if v},
+            },
+        )
     return project_daily_snapshot_slice(days, today)
 
 
