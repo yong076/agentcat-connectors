@@ -51,6 +51,7 @@ CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
+AGENTCAT_KEYS_FILE = AGENTCAT_HOME / "keys.json"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 GEMINI_USAGE_CACHE = AGENTCAT_HOME / "gemini-usage-cache.json"
 ANTIGRAVITY_CLI_DIR = HOME / ".gemini" / "antigravity-cli"
@@ -74,11 +75,16 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/api/codex/usage",
 )
 CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+CODEX_USAGE_BREAKDOWN_URL = "https://chatgpt.com/backend-api/wham/usage/daily-token-usage-breakdown"
+CODEX_USAGE_BREAKDOWN_CACHE = AGENTCAT_HOME / "codex-usage-breakdown-cache.json"
+CODEX_USAGE_BREAKDOWN_TTL_SECONDS = int(os.environ.get("AGENTCAT_CODEX_USAGE_TTL_SECONDS", "900"))
 # Codex's seven-day window in minutes; upstream values may drift by one minute.
 CODEX_WEEKLY_WINDOW_MINUTES = 10080
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
+OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
 CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
@@ -138,7 +144,11 @@ CLAUDE_DESKTOP_PROJECT_DIR_MAX = int(os.environ.get("AGENTCAT_CLAUDE_DESKTOP_PRO
 CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
+PROJECT_DAILY_COST_SNAPSHOT_DAYS = 30
+PROJECT_DAILY_FILE_VERSION = 2
+PROJECT_DAILY_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.7")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
@@ -191,6 +201,11 @@ CONNECTOR_CAPABILITIES = (
     "usage.projects",
     "usage.coverage",
     "projects.daily",
+    "projects.dailyCost",
+    "insights.periods",
+    "insights.burnRate",
+    "insights.autoQuota",
+    "insights.recommendation",
     "homes.discovery",
     "providerInstances.v1",
     "pricing.feed",
@@ -750,6 +765,7 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
     model_entries: list = []
     provider_tokens: Dict[str, int] = {}
     provider_cost: Dict[str, float] = {}
+    pc_costs: Dict[str, Dict[str, float]] = {}
     pricing_known = False
     findings: list = []
 
@@ -862,9 +878,7 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             if pc_cost:
                 provider_cost[kind] = pc_cost["total"]
                 pricing_known = True
-                # Store per-class cost on provider for summary aggregation
-                provider.setdefault("_pc_cost", {})
-                provider["_pc_cost"] = pc_cost
+                pc_costs[kind] = pc_cost
 
     # Normalize share %
     total_tokens = sum(provider_tokens.values())
@@ -892,14 +906,12 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
     # Aggregate per-class costs from JournalScanner data across all providers
     sum_input_cost = sum_output_cost = sum_cr_cost = sum_cw_cost = 0.0
     any_pc_cost = False
-    for provider in providers.values():
-        pc = provider.get("_pc_cost") if isinstance(provider, dict) else None
-        if pc:
-            sum_input_cost += pc.get("input", 0.0)
-            sum_output_cost += pc.get("output", 0.0)
-            sum_cr_cost += pc.get("cache_read", 0.0)
-            sum_cw_cost += pc.get("cache_write", 0.0)
-            any_pc_cost = True
+    for pc in pc_costs.values():
+        sum_input_cost += pc.get("input", 0.0)
+        sum_output_cost += pc.get("output", 0.0)
+        sum_cr_cost += pc.get("cache_read", 0.0)
+        sum_cw_cost += pc.get("cache_write", 0.0)
+        any_pc_cost = True
 
     cache_hit = None
     if any_cache_read or any_input:
@@ -931,6 +943,136 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
         "findings": findings,
         "pricing_status": "ok" if pricing_known else "unknown",
     }
+
+
+BURN_RATE_WINDOW_MINUTES = 60
+AUTO_QUOTA_MIN_SAMPLE_DAYS = 14
+DAY_KEY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def provider_effective_usd_per_token(
+    provider: Dict[str, Any], period: str = "today"
+) -> Optional[float]:
+    models = provider.get("models")
+    if not isinstance(models, dict):
+        return None
+    priced_cost = 0.0
+    priced_tokens = 0
+    for model_name, model_data in models.items():
+        if not isinstance(model_data, dict):
+            continue
+        period_bucket = insight_model_period_bucket(
+            model_data, period, allow_lifetime_fallback=(period == "all")
+        )
+        if period_bucket is None:
+            continue
+        classes, total = period_bucket
+        if total <= 0 or sum(int(value or 0) for value in classes.values()) <= 0:
+            continue
+        cost = estimate_cost(
+            model_name,
+            int(classes.get("inputTokens") or 0),
+            int(classes.get("outputTokens") or 0),
+            int(classes.get("cacheReadInputTokens") or 0),
+            int(classes.get("cacheCreationInputTokens") or 0),
+        )
+        if cost is None:
+            continue
+        priced_cost += cost["total"]
+        priced_tokens += total
+    return priced_cost / priced_tokens if priced_tokens > 0 else None
+
+
+def provider_burn_rate(
+    provider: Dict[str, Any], now: Optional[dt.datetime] = None
+) -> Optional[Dict[str, Any]]:
+    hourly = provider.get("hourlyTokens")
+    if not isinstance(hourly, dict) or not hourly:
+        return None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    current = nonnegative_int(hourly.get(hour_key_for_timestamp(now))) or 0
+    previous = nonnegative_int(hourly.get(hour_key_for_timestamp(now - dt.timedelta(hours=1)))) or 0
+    tokens = current + previous
+    if tokens <= 0:
+        return None
+    local = now.astimezone()
+    basis_minutes = float(BURN_RATE_WINDOW_MINUTES) + local.minute + local.second / 60.0
+    tokens_per_min = tokens / basis_minutes
+    out: Dict[str, Any] = {
+        "tokensPerMin": round(tokens_per_min, 3),
+        "basisMinutes": round(basis_minutes, 1),
+    }
+    usd_per_token = provider_effective_usd_per_token(provider, period="today")
+    if usd_per_token is not None:
+        out["usdPerHour"] = round(tokens_per_min * 60.0 * usd_per_token, 4)
+    return out
+
+
+def provider_auto_quota(
+    provider: Dict[str, Any], now: Optional[dt.datetime] = None
+) -> Optional[Dict[str, Any]]:
+    daily = provider.get("dailyTokens")
+    if not isinstance(daily, dict):
+        return None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    today_key = day_key_for_timestamp(now)
+    values: List[int] = []
+    for day, raw in daily.items():
+        if not DAY_KEY_RE.match(str(day)) or str(day) == today_key:
+            continue
+        amount = nonnegative_int(raw)
+        if amount:
+            values.append(amount)
+    if len(values) < AUTO_QUOTA_MIN_SAMPLE_DAYS:
+        return None
+    values.sort()
+    rank = (9 * len(values) + 9) // 10
+    return {"p90DailyTokens": values[rank - 1], "sampleDays": len(values), "basis": "p90"}
+
+
+def provider_quota_headroom(limits: Any) -> Optional[Tuple[float, Optional[int]]]:
+    if not isinstance(limits, dict):
+        return None
+    candidates: List[Tuple[float, Optional[int]]] = []
+    quotas = limits.get("quotas")
+    for quota in quotas if isinstance(quotas, list) else []:
+        if not isinstance(quota, dict):
+            continue
+        remaining = float_percent(quota.get("remainingPercent"))
+        if remaining is None:
+            used = float_percent(quota.get("usedPercent"))
+            remaining = remaining_percent_from_used(used) if used is not None else None
+        if remaining is not None:
+            candidates.append((remaining, int_limit(quota.get("resetAt"))))
+    if not candidates:
+        weekly_used = float_percent(limits.get("weeklyUsedPercent"))
+        if weekly_used is not None:
+            candidates.append((100.0 - weekly_used, reset_epoch(limits.get("weeklyResetAt"))))
+    return min(candidates, key=lambda entry: entry[0]) if candidates else None
+
+
+def snapshot_recommendation(providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    entries: List[Tuple[str, float, Optional[int]]] = []
+    for provider_id in sorted(providers or {}):
+        data = providers[provider_id]
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            continue
+        headroom = provider_quota_headroom(data.get("limits"))
+        if headroom is not None:
+            entries.append((str(provider_id), headroom[0], headroom[1]))
+    if len(entries) < 2:
+        return None
+
+    def sort_key(entry: Tuple[str, float, Optional[int]]) -> Tuple[float, float, str]:
+        provider_id, headroom, reset_at = entry
+        return (-headroom, float(reset_at) if reset_at is not None else float("inf"), provider_id)
+
+    entries.sort(key=sort_key)
+    top, runner_up = entries[0], entries[1]
+    reason = "most_headroom" if top[1] > runner_up[1] else "resets_soonest"
+    return {"providerId": top[0], "reason": reason, "confidence": "heuristic"}
 
 
 IGNORED_EXECUTABLES = {
