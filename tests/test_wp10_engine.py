@@ -169,7 +169,8 @@ class WP10OpenAIKeyTests(SandboxedCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(agentcat.command_set_key(args), 0)
         self.assertEqual(agentcat.read_provider_key("openai"), "secret-value")
-        self.assertEqual(agentcat.AGENTCAT_KEYS_FILE.stat().st_mode & 0o777, 0o600)
+        if not agentcat.IS_WINDOWS:
+            self.assertEqual(agentcat.AGENTCAT_KEYS_FILE.stat().st_mode & 0o777, 0o600)
         parser_args = agentcat.build_parser().parse_args(["set-key", "--provider", "openai", "--clear"])
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(parser_args.func(parser_args), 0)
@@ -435,7 +436,7 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
             json.dumps(result, allow_nan=False)
 
     def test_401_refreshes_exactly_once_and_second_401_fails_soft(self):
-        error = urllib.error.HTTPError("u", 401, "Unauthorized", None, None)
+        error = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))
         with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), patch.object(
             agentcat, "codex_usage_breakdown_request", side_effect=[error, self.RAW]
         ) as request, patch.object(agentcat, "refresh_codex_access_token", return_value="fresh") as refresh:
@@ -446,8 +447,8 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
         error.close()
 
         agentcat.CODEX_USAGE_BREAKDOWN_CACHE.unlink()
-        error_one = urllib.error.HTTPError("u", 401, "Unauthorized", None, None)
-        error_two = urllib.error.HTTPError("u", 401, "Unauthorized", None, None)
+        error_one = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))
+        error_two = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))
         with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), patch.object(
             agentcat, "codex_usage_breakdown_request", side_effect=[error_one, error_two]
         ) as request, patch.object(agentcat, "refresh_codex_access_token", return_value="fresh") as refresh:
@@ -459,7 +460,7 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
         error_two.close()
 
     def test_403_timeout_and_no_auth_fail_soft_without_unwanted_refresh(self):
-        forbidden = urllib.error.HTTPError("u", 403, "Forbidden", None, None)
+        forbidden = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b""))
         for failure in (forbidden, TimeoutError("timed out")):
             with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), patch.object(
                 agentcat, "codex_usage_breakdown_request", side_effect=failure

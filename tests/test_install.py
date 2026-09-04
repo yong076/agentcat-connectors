@@ -93,7 +93,7 @@ class AgentCatInstallTests(unittest.TestCase):
 
         with (
             mock.patch.object(install, "IS_WINDOWS", False),
-            mock.patch.object(install.os, "getuid", return_value=501),
+            mock.patch.object(install.os, "getuid", return_value=501, create=True),
             mock.patch.object(install, "run", side_effect=fake_run),
         ):
             install.unload_launch_agent()
@@ -113,7 +113,7 @@ class AgentCatInstallTests(unittest.TestCase):
 
         with (
             mock.patch.object(install, "IS_WINDOWS", False),
-            mock.patch.object(install.os, "getuid", return_value=501),
+            mock.patch.object(install.os, "getuid", return_value=501, create=True),
             mock.patch.object(install, "PLIST_PATH", plist),
             mock.patch.object(install, "unload_launch_agent"),
             mock.patch.object(install, "run", side_effect=fake_run),
