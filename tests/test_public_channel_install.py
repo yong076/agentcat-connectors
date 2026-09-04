@@ -19,6 +19,14 @@ installer_module = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(installer_module)
 
+CONNECTOR_LOADER = SourceFileLoader(
+    "public_channel_connector_module", str(REPO_ROOT / "bin" / "agentcat")
+)
+CONNECTOR_SPEC = importlib.util.spec_from_loader("public_channel_connector_module", CONNECTOR_LOADER)
+connector_module = importlib.util.module_from_spec(CONNECTOR_SPEC)
+assert CONNECTOR_SPEC.loader is not None
+CONNECTOR_SPEC.loader.exec_module(connector_module)
+
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -73,6 +81,27 @@ class PublicChannelInstallTests(unittest.TestCase):
 
         self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
         self.assertFalse(self.backup_root.exists())
+
+    def test_legacy_nonpublic_state_resolves_to_public(self) -> None:
+        state_path = self.root / "update-channel.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "channel": "pro",
+                    "status": "manifest_ready",
+                    "installStatus": "pending_install",
+                    "manifest": {"version": "99.0.0"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(connector_module, "AGENTCAT_HOME", self.root):
+            status = connector_module.update_channel_status_snapshot()
+
+        self.assertEqual(status["channel"], "public")
+        self.assertEqual(status["installStatus"], "current")
+        self.assertNotIn("targetVersion", status)
 
     def test_dirty_checkout_is_preserved_and_replacement_is_refused(self) -> None:
         self.install_dir.mkdir(parents=True)
