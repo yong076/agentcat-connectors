@@ -148,6 +148,9 @@ PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_COST_SNAPSHOT_DAYS = 30
 PROJECT_DAILY_FILE_VERSION = 2
 PROJECT_DAILY_STATE_VERSION = 2
+# Provider accounting revisions live inside the shared project-daily state so
+# a source-specific correction never invalidates unrelated provider baselines.
+GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.36.0")
@@ -6403,9 +6406,19 @@ def grok_usage_metrics(usage: Any) -> Dict[str, int]:
         ) or 0,
         "reasoningTokens": nonnegative_int(usage.get("reasoningTokens") or usage.get("reasoning_tokens")) or 0,
     }
-    total = nonnegative_int(usage.get("totalTokens") or usage.get("total_tokens")) or 0
-    if total > usage_token_total(metrics):
-        metrics["totalTokens"] = total
+    raw_total = usage.get("totalTokens")
+    if raw_total is None:
+        raw_total = usage.get("total_tokens")
+    total = nonnegative_int(raw_total)
+    if total is None:
+        # Grok reports cached-read and reasoning counters as informational
+        # breakdowns. They are not additional billable/accounted tokens.
+        total = metrics["inputTokens"] + metrics["outputTokens"]
+    elif total == 0:
+        # Preserve an explicit zero as authoritative too. Returning the
+        # informational counters would let the generic fallback sum them.
+        return {}
+    metrics["totalTokens"] = total
     return {key: amount for key, amount in metrics.items() if amount > 0}
 
 
@@ -11386,7 +11399,17 @@ def load_project_daily_state() -> Dict[str, Any]:
                 normalized[str(model)] = {"tokens": tokens, "classes": classes}
             if normalized:
                 model_baselines[str(key)] = normalized
-    return {"baselines": baselines, "modelBaselines": model_baselines}
+    grok_revision_changed = raw.get("grokAccountingVersion") != GROK_ACCOUNTING_STATE_VERSION
+    if grok_revision_changed:
+        baselines = {key: value for key, value in baselines.items() if not key.startswith("grok|")}
+        model_baselines = {
+            key: value for key, value in model_baselines.items() if not key.startswith("grok|")
+        }
+    return {
+        "baselines": baselines,
+        "modelBaselines": model_baselines,
+        "_grokRevisionChanged": grok_revision_changed,
+    }
 
 
 def prune_project_daily(days: Dict[str, Dict[str, Any]], today: "dt.date") -> bool:
@@ -11610,7 +11633,7 @@ def update_project_daily(
     baselines: Dict[str, int] = state["baselines"]
     model_baselines: Dict[str, Dict[str, Dict[str, Any]]] = state["modelBaselines"]
     days_changed = prune_project_daily(days, today)
-    state_changed = False
+    state_changed = bool(state.get("_grokRevisionChanged"))
     for key, observed in snapshot_project_cumulative(providers).items():
         tokens = observed["tokens"]
         key_models = model_baselines.setdefault(key, {})
@@ -11663,6 +11686,7 @@ def update_project_daily(
             project_daily_state_file(),
             {
                 "version": PROJECT_DAILY_STATE_VERSION,
+                "grokAccountingVersion": GROK_ACCOUNTING_STATE_VERSION,
                 "baselines": baselines,
                 "modelBaselines": {k: v for k, v in model_baselines.items() if v},
             },
