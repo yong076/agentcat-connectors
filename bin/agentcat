@@ -142,12 +142,15 @@ CLAUDE_DESKTOP_PROJECT_GLOBS = (
     "local-agent-mode-sessions/**/.claude/projects",
 )
 CLAUDE_DESKTOP_PROJECT_DIR_MAX = int(os.environ.get("AGENTCAT_CLAUDE_DESKTOP_PROJECT_DIR_MAX", "16"))
-CLAUDE_JOURNAL_CURSOR_VERSION = 3
+CLAUDE_JOURNAL_CURSOR_VERSION = 4
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_COST_SNAPSHOT_DAYS = 30
 PROJECT_DAILY_FILE_VERSION = 2
 PROJECT_DAILY_STATE_VERSION = 2
+# Provider accounting revisions live inside the shared project-daily state so
+# a source-specific correction never invalidates unrelated provider baselines.
+GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.36.0")
@@ -201,6 +204,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.breakdown",
     "usage.projects",
     "usage.coverage",
+    "usage.tokenAccounting.v1",
     "projects.daily",
     "projects.dailyCost",
     "insights.periods",
@@ -766,7 +770,8 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
     model_entries: list = []
     provider_tokens: Dict[str, int] = {}
     provider_cost: Dict[str, float] = {}
-    pc_costs: Dict[str, Dict[str, float]] = {}
+    provider_class_costs: Dict[str, Dict[str, float]] = {}
+    provider_representatives: Dict[str, Tuple[int, str]] = {}
     pricing_known = False
     findings: list = []
 
@@ -783,15 +788,6 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             continue
 
         ptokens = provider.get("tokens") or {}
-        if "inputTokens" in ptokens:
-            total_input += int(ptokens["inputTokens"] or 0); any_input = True
-        if "outputTokens" in ptokens:
-            total_output += int(ptokens["outputTokens"] or 0); any_output = True
-        if "cacheReadInputTokens" in ptokens:
-            total_cache_read += int(ptokens["cacheReadInputTokens"] or 0); any_cache_read = True
-        if "cacheCreationInputTokens" in ptokens:
-            total_cache_write += int(ptokens["cacheCreationInputTokens"] or 0); any_cache_write = True
-
         models = provider.get("models") or {}
         for model_name, model_data in models.items():
             if not isinstance(model_data, dict):
@@ -811,6 +807,15 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             if model_total == 0:
                 continue
 
+            total_input += i
+            total_output += o
+            total_cache_read += cr
+            total_cache_write += cw
+            any_input = any_input or "inputTokens" in bucket
+            any_output = any_output or "outputTokens" in bucket
+            any_cache_read = any_cache_read or "cacheReadInputTokens" in bucket
+            any_cache_write = any_cache_write or "cacheCreationInputTokens" in bucket
+
             cost = estimate_cost(model_name, i, o, cr, cw)
             if cost is None:
                 findings.append({
@@ -824,9 +829,21 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             else:
                 cost_total = cost["total"]
                 provider_cost[kind] = provider_cost.get(kind, 0.0) + cost_total
+                class_cost = provider_class_costs.setdefault(
+                    kind,
+                    {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0},
+                )
+                for key in class_cost:
+                    class_cost[key] += cost.get(key, 0.0)
                 pricing_known = True
 
             provider_tokens[kind] = provider_tokens.get(kind, 0) + model_total
+            representative = provider_representatives.get(kind)
+            candidate = (model_total, str(model_name))
+            if representative is None or candidate[0] > representative[0] or (
+                candidate[0] == representative[0] and candidate[1] < representative[1]
+            ):
+                provider_representatives[kind] = candidate
             model_entries.append({
                 "name": model_name,
                 "provider": kind,
@@ -834,6 +851,12 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
                 "estimated_cost_usd": cost_total,
                 "share_percent": 0.0,  # filled after totals known
             })
+
+        if period == "all" and "all" in ptokens:
+            provider_tokens[kind] = min(
+                provider_tokens.get(kind, 0),
+                _insight_int(ptokens.get("all")),
+            )
 
         # provider_no_limits finding
         limits = provider.get("limits") or {}
@@ -874,12 +897,12 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
         pc_cw5m = int(ptokens.get(f"{period}_cacheWrite_5m") or 0)
         if pc_inp or pc_out or pc_cr or pc_cw1h or pc_cw5m:
             # Pick pricing from the dominant model for this provider
-            rep_model = model_entries[-1]["name"] if model_entries else kind
+            representative = provider_representatives.get(kind)
+            rep_model = representative[1] if representative is not None else kind
             pc_cost = estimate_cost(rep_model, pc_inp, pc_out, pc_cr, pc_cw1h + pc_cw5m)
             if pc_cost:
-                provider_cost[kind] = pc_cost["total"]
                 pricing_known = True
-                pc_costs[kind] = pc_cost
+                provider_class_costs[kind] = pc_cost
 
     # Normalize share %
     total_tokens = sum(provider_tokens.values())
@@ -900,19 +923,19 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             "share_percent": (tokens_val / total_tokens * 100.0) if total_tokens > 0 else 0.0,
         })
 
-    total_cost = sum(provider_cost.values())
     top_provider = provider_summaries[0]["kind"] if provider_summaries else None
     top_model = model_entries[0]["name"] if model_entries else None
 
-    # Aggregate per-class costs from JournalScanner data across all providers
+    # Aggregate per-class model costs, including provider period-class overrides.
     sum_input_cost = sum_output_cost = sum_cr_cost = sum_cw_cost = 0.0
     any_pc_cost = False
-    for pc in pc_costs.values():
+    for pc in provider_class_costs.values():
         sum_input_cost += pc.get("input", 0.0)
         sum_output_cost += pc.get("output", 0.0)
         sum_cr_cost += pc.get("cache_read", 0.0)
         sum_cw_cost += pc.get("cache_write", 0.0)
         any_pc_cost = True
+    total_cost = sum_input_cost + sum_output_cost + sum_cr_cost + sum_cw_cost
 
     cache_hit = None
     if any_cache_read or any_input:
@@ -5942,16 +5965,12 @@ def add_to_periods(periods: Dict[str, int], amount: int, when: Optional[dt.datet
     periods["all"] = periods.get("all", 0) + amount
     if when is None:
         return
-    now = dt.datetime.now(dt.timezone.utc)
-    # Bucket "today" on the LOCAL calendar date so it agrees with the daily
-    # buckets (add_to_daily keys on when.astimezone().date()). Using the raw UTC
-    # date here disagreed near midnight when UTC and local dates differ.
-    if when.astimezone().date() == now.astimezone().date():
-        periods["today"] = periods.get("today", 0) + amount
-    if when >= now - dt.timedelta(days=7):
-        periods["week"] = periods.get("week", 0) + amount
-    if when >= now - dt.timedelta(days=30):
-        periods["month"] = periods.get("month", 0) + amount
+    day = day_key_for_timestamp(when)
+    if day is None:
+        return
+    dated = periods_from_daily_tokens({day: amount})
+    for period in ("today", "week", "month"):
+        periods[period] = periods.get(period, 0) + dated[period]
 
 
 def day_key_for_timestamp(when: Optional[dt.datetime]) -> Optional[str]:
@@ -6403,9 +6422,19 @@ def grok_usage_metrics(usage: Any) -> Dict[str, int]:
         ) or 0,
         "reasoningTokens": nonnegative_int(usage.get("reasoningTokens") or usage.get("reasoning_tokens")) or 0,
     }
-    total = nonnegative_int(usage.get("totalTokens") or usage.get("total_tokens")) or 0
-    if total > usage_token_total(metrics):
-        metrics["totalTokens"] = total
+    raw_total = usage.get("totalTokens")
+    if raw_total is None:
+        raw_total = usage.get("total_tokens")
+    total = nonnegative_int(raw_total)
+    if total is None:
+        # Grok reports cached-read and reasoning counters as informational
+        # breakdowns. They are not additional billable/accounted tokens.
+        total = metrics["inputTokens"] + metrics["outputTokens"]
+    elif total == 0:
+        # Preserve an explicit zero as authoritative too. Returning the
+        # informational counters would let the generic fallback sum them.
+        return {}
+    metrics["totalTokens"] = total
     return {key: amount for key, amount in metrics.items() if amount > 0}
 
 
@@ -6823,14 +6852,14 @@ def char_token_estimate(text: Any) -> int:
     return max(1, int(ascii_count / 4 + wide_count / 1.6))
 
 
-def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
+def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> Tuple[int, int]:
     events = list(iter_jsonl_file(path))
     if not events:
-        return 0
+        return 0, 0
     first = events[0]
     first_data = first.get("data") if isinstance(first.get("data"), dict) else {}
     if first.get("type") != "session.start" or first_data.get("producer") != "copilot-agent":
-        return 0
+        return 0, 0
 
     model = infer_copilot_transcript_model(events)
     try:
@@ -6839,6 +6868,7 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
         file_when = None
     pending_input_tokens = 0
     parsed = 0
+    estimated_tokens = 0
     for event in events:
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         if event.get("type") == "user.message":
@@ -6846,12 +6876,21 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
             continue
         if event.get("type") != "assistant.message":
             continue
-        content_tokens = nonnegative_int(data.get("outputTokens"))
-        if content_tokens is None:
-            content_tokens = char_token_estimate(data.get("content"))
+        explicit_output_tokens = nonnegative_int(data.get("outputTokens"))
+        estimated_content_tokens = (
+            char_token_estimate(data.get("content"))
+            if explicit_output_tokens is None
+            else 0
+        )
+        content_tokens = explicit_output_tokens if explicit_output_tokens is not None else estimated_content_tokens
         reasoning_tokens = char_token_estimate(data.get("reasoningText"))
         tool_requests = data.get("toolRequests")
-        if content_tokens <= 0 and reasoning_tokens <= 0 and not isinstance(tool_requests, list):
+        if (
+            pending_input_tokens <= 0
+            and content_tokens <= 0
+            and reasoning_tokens <= 0
+            and not isinstance(tool_requests, list)
+        ):
             continue
         metrics = {
             "inputTokens": pending_input_tokens,
@@ -6860,6 +6899,7 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
         }
         if add_usage_metrics(result, model, metrics, parse_timestamp(event.get("timestamp")) or file_when):
             parsed += 1
+            estimated_tokens += pending_input_tokens + estimated_content_tokens + reasoning_tokens
         # PR-C: copilot transcript carries the same toolRequests shape
         # opencode does — feed the breakdown counters.
         tool_names: List[str] = []
@@ -6872,7 +6912,7 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
                     tool_names.append(str(name))
         update_breakdown(result["breakdown"], chat=1, tools=tool_names)
         pending_input_tokens = 0
-    return parsed
+    return parsed, estimated_tokens
 
 
 def copilot_workspace_folder(workspace_dir: Path) -> Optional[str]:
@@ -6964,6 +7004,7 @@ def copilot_snapshot() -> Dict[str, Any]:
 
     result["status"] = "ok"
     events = 0
+    estimated_tokens = 0
     project_totals: Dict[str, int] = {}
     for path in legacy_files:
         before = int(result["tokens"].get("totalTokens") or 0)
@@ -6974,12 +7015,20 @@ def copilot_snapshot() -> Dict[str, Any]:
             project_totals[project] = project_totals.get(project, 0) + (after - before)
     for path in transcript_files:
         before = int(result["tokens"].get("totalTokens") or 0)
-        events += parse_copilot_transcript_file(path, result)
+        parsed_events, parsed_estimated_tokens = parse_copilot_transcript_file(path, result)
+        events += parsed_events
+        estimated_tokens += parsed_estimated_tokens
         after = int(result["tokens"].get("totalTokens") or 0)
         project = copilot_project_for_path(path)
         if project and after > before:
             project_totals[project] = project_totals.get(project, 0) + (after - before)
     result["events"] = events
+    total_tokens = int(result["tokens"].get("totalTokens") or 0)
+    if estimated_tokens > 0 and total_tokens > 0:
+        result["tokens"]["estimated"] = True
+        result["tokens"]["estimatedShare"] = max(
+            0.0, min(1.0, estimated_tokens / total_tokens)
+        )
     if project_totals:
         items = [
             {
@@ -7565,34 +7614,6 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
     return _build_codex_sessions_snapshot(result, cursor)
 
 
-def _codex_periods_from_daily(daily: Dict[str, int]) -> Dict[str, int]:
-    """Recompute today/week/month/all token windows from daily buckets.
-
-    Keys are local-calendar date strings (YYYY-MM-DD), matching
-    day_key_for_timestamp, so the windows age correctly across days without
-    re-reading the JSONL.
-    """
-    periods = empty_periods()
-    today = dt.datetime.now().date()
-    week_floor = today - dt.timedelta(days=7)
-    month_floor = today - dt.timedelta(days=30)
-    for key, amount in daily.items():
-        if amount <= 0:
-            continue
-        try:
-            day = dt.date.fromisoformat(key)
-        except ValueError:
-            continue
-        periods["all"] += amount
-        if day == today:
-            periods["today"] += amount
-        if day >= week_floor:
-            periods["week"] += amount
-        if day >= month_floor:
-            periods["month"] += amount
-    return periods
-
-
 def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any]) -> Dict[str, Any]:
     daily: Dict[str, int] = cursor.get("daily") or {}
     hourly: Dict[str, int] = cursor.get("hourly") or {}
@@ -7601,7 +7622,7 @@ def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any
     projects: Dict[str, Any] = cursor.get("projects") or {}
     total_turns = int(cursor.get("turns") or 0)
 
-    periods = _codex_periods_from_daily(daily)
+    periods = periods_from_daily_tokens(daily)
     if periods["all"] <= 0:
         # Session files exist but carried no usable token_count turns yet.
         result["status"] = "no_token_events_yet"
@@ -7622,7 +7643,7 @@ def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any
     models: Dict[str, Dict[str, int]] = {}
     for model, classes in model_classes.items():
         entry: Dict[str, int] = {k: int(v) for k, v in classes.items() if v}
-        model_periods = _codex_periods_from_daily(model_daily.get(model) or {})
+        model_periods = periods_from_daily_tokens(model_daily.get(model) or {})
         entry.update(model_periods)
         entry["totalTokens"] = model_periods["all"]
         models[model] = entry
@@ -7893,7 +7914,7 @@ def codexbar_cost_cache_snapshot(provider: str) -> Dict[str, Any]:
                 if amount:
                     classes[key] = classes.get(key, 0) + amount
 
-    periods = _codex_periods_from_daily(daily)
+    periods = periods_from_daily_tokens(daily)
     if periods["all"] <= 0:
         result["status"] = "no_token_events_yet"
         return result
@@ -7909,7 +7930,7 @@ def codexbar_cost_cache_snapshot(provider: str) -> Dict[str, Any]:
     models_out: Dict[str, Dict[str, int]] = {}
     for model, classes in model_classes.items():
         entry = {key: int(value) for key, value in classes.items() if int(value) > 0}
-        model_periods = _codex_periods_from_daily(model_daily.get(model) or {})
+        model_periods = periods_from_daily_tokens(model_daily.get(model) or {})
         entry.update(model_periods)
         entry["totalTokens"] = model_periods["all"]
         models_out[model] = entry
@@ -7965,6 +7986,13 @@ def merge_provider_with_usage_floor(
             value = int(amount or 0)
             if value > int(daily.get(day) or 0):
                 daily[str(day)] = value
+        # Each source's period totals are internally consistent, but taking a
+        # per-period maximum can disagree with the final per-day merge when
+        # the sources cover different days.  The lifetime fields remain
+        # floors; dated windows always come from the final dated buckets.
+        merged_periods = periods_from_daily_tokens(int_map(daily))
+        for period in ("today", "week", "month"):
+            tokens[period] = merged_periods[period]
 
     models = merged.setdefault("models", {})
     floor_models = floor.get("models") if isinstance(floor.get("models"), dict) else {}
@@ -8085,6 +8113,19 @@ def attach_codex_usage_coverage(
     sqlite: Dict[str, Any],
     codexbar_cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    tokens = snapshot.setdefault("tokens", empty_periods())
+    daily_tokens = snapshot.get("dailyTokens") if isinstance(snapshot.get("dailyTokens"), dict) else {}
+    dated_total = 0
+    for day, raw_amount in daily_tokens.items():
+        try:
+            dt.date.fromisoformat(str(day))
+            amount = int(raw_amount)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(raw_amount, bool) and amount > 0:
+            dated_total += amount
+    tokens["undatedFloor"] = max(0, int(tokens.get("all") or 0) - dated_total)
+
     session_ok = sessions.get("status") == "ok"
     sqlite_ok = sqlite.get("status") == "ok"
     if session_ok and sqlite_ok and snapshot.get("reconciled"):
@@ -8448,16 +8489,13 @@ def fetch_llm_usage_fresh() -> Dict[str, Any]:
 # JournalScanner — incremental per-class token reader for Claude JSONL logs
 # ---------------------------------------------------------------------------
 
-_JOURNAL_PERIOD_KEYS = (
-    "today_input", "today_output", "today_cacheRead", "today_cacheWrite_1h", "today_cacheWrite_5m",
-    "week_input", "week_output", "week_cacheRead", "week_cacheWrite_1h", "week_cacheWrite_5m",
-    "month_input", "month_output", "month_cacheRead", "month_cacheWrite_1h", "month_cacheWrite_5m",
+_JOURNAL_ALL_KEYS = (
     "all_input", "all_output", "all_cacheRead", "all_cacheWrite_1h", "all_cacheWrite_5m",
 )
 
 
 def _empty_journal_totals() -> Dict[str, int]:
-    return {k: 0 for k in _JOURNAL_PERIOD_KEYS}
+    return {k: 0 for k in _JOURNAL_ALL_KEYS}
 
 
 def _empty_journal_projects() -> Dict[str, Dict[str, Any]]:
@@ -8472,13 +8510,14 @@ def _empty_journal_hourly_tokens() -> Dict[str, int]:
     return {}
 
 
-def _empty_journal_models() -> Dict[str, Dict[str, int]]:
+def _empty_journal_models() -> Dict[str, Dict[str, Any]]:
     return {}
 
 
 def load_journal_cursor() -> Dict[str, Any]:
     raw = read_json(JOURNAL_CURSOR_FILE)
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or raw.get("version") != CLAUDE_JOURNAL_CURSOR_VERSION:
+        needs_rebuild = isinstance(raw, dict)
         return {
             "version": CLAUDE_JOURNAL_CURSOR_VERSION,
             "offsets": {},
@@ -8489,24 +8528,24 @@ def load_journal_cursor() -> Dict[str, Any]:
             "models": _empty_journal_models(),
             "usageRecords": {},
             "projects_needs_rebuild": False,
-            "usage_needs_rebuild": False,
-            "totals_as_of": None,
+            "usage_needs_rebuild": needs_rebuild,
         }
     has_projects = isinstance(raw.get("projects"), dict)
     has_daily = isinstance(raw.get("dailyTokens"), dict)
     has_hourly = isinstance(raw.get("hourlyTokens"), dict)
     has_models = isinstance(raw.get("models"), dict)
     has_usage_records = isinstance(raw.get("usageRecords"), dict)
-    has_current_version = raw.get("version") == CLAUDE_JOURNAL_CURSOR_VERSION
     offsets = raw.get("offsets") or {}
-    totals = raw.get("totals") or {}
+    raw_totals = raw.get("totals") or {}
+    totals = {
+        key: int(raw_totals.get(key) or 0)
+        for key in _JOURNAL_ALL_KEYS
+    }
     projects = raw.get("projects") if has_projects else _empty_journal_projects()
     daily_tokens = raw.get("dailyTokens") if has_daily else _empty_journal_daily_tokens()
     hourly_tokens = raw.get("hourlyTokens") if has_hourly else _empty_journal_hourly_tokens()
     models = raw.get("models") if has_models else _empty_journal_models()
     usage_records = raw.get("usageRecords") if has_usage_records else {}
-    for k in _JOURNAL_PERIOD_KEYS:
-        totals.setdefault(k, 0)
     return {
         "version": CLAUDE_JOURNAL_CURSOR_VERSION,
         "offsets": {str(p): int(v) for p, v in offsets.items() if isinstance(v, (int, float))},
@@ -8515,7 +8554,23 @@ def load_journal_cursor() -> Dict[str, Any]:
         "dailyTokens": {str(k): int(v) for k, v in daily_tokens.items() if isinstance(v, (int, float))},
         "hourlyTokens": {str(k): int(v) for k, v in hourly_tokens.items() if isinstance(v, (int, float))},
         "models": {
-            str(model): {str(k): int(v) for k, v in values.items() if isinstance(v, (int, float))}
+            str(model): {
+                **{
+                    str(k): int(v)
+                    for k, v in values.items()
+                    if k not in {"today", "week", "month", "dailyTokens"}
+                    and isinstance(v, (int, float))
+                },
+                "dailyTokens": {
+                    str(day): int(amount)
+                    for day, amount in (
+                        values.get("dailyTokens", {}).items()
+                        if isinstance(values.get("dailyTokens"), dict)
+                        else []
+                    )
+                    if isinstance(amount, (int, float))
+                },
+            }
             for model, values in models.items()
             if isinstance(values, dict)
         },
@@ -8525,8 +8580,7 @@ def load_journal_cursor() -> Dict[str, Any]:
             if isinstance(value, dict)
         },
         "projects_needs_rebuild": not has_projects,
-        "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_usage_records and has_current_version),
-        "totals_as_of": raw.get("totals_as_of"),
+        "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_usage_records),
     }
 
 
@@ -8745,7 +8799,7 @@ def claude_journal_files_by_root() -> List[Tuple[Path, List[Path]]]:
 def _apply_record_to_totals(
     totals: Dict[str, int],
     rec: Dict[str, Any],
-    now: "dt.datetime",
+    _now: "dt.datetime",
     projects: Optional[Dict[str, Dict[str, Any]]] = None,
     daily_tokens: Optional[Dict[str, int]] = None,
     hourly_tokens: Optional[Dict[str, int]] = None,
@@ -8755,8 +8809,6 @@ def _apply_record_to_totals(
     ts: Optional["dt.datetime"] = rec.get("timestamp")
     if ts is not None and ts.tzinfo is None:
         ts = ts.replace(tzinfo=dt.timezone.utc)
-    now_local = now.astimezone().date()
-    rec_date = ts.astimezone().date() if ts else None
     fields = (
         ("input", "input", "inputTokens"),
         ("output", "output", "outputTokens"),
@@ -8782,14 +8834,6 @@ def _apply_record_to_totals(
         totals[f"all_{tok_key}"] = totals.get(f"all_{tok_key}", 0) + amount
         if model_tokens is not None:
             model_tokens[model_key] = model_tokens.get(model_key, 0) + amount
-        if ts is None or rec_date is None:
-            continue
-        if rec_date == now_local:
-            totals[f"today_{tok_key}"] = totals.get(f"today_{tok_key}", 0) + amount
-        if ts >= now - dt.timedelta(days=7):
-            totals[f"week_{tok_key}"] = totals.get(f"week_{tok_key}", 0) + amount
-        if ts >= now - dt.timedelta(days=30):
-            totals[f"month_{tok_key}"] = totals.get(f"month_{tok_key}", 0) + amount
     if project_total == 0:
         return
     if daily_tokens is not None:
@@ -8798,7 +8842,9 @@ def _apply_record_to_totals(
         add_to_hourly(hourly_tokens, project_total, ts)
     if model_tokens is not None:
         model_tokens["totalTokens"] = model_tokens.get("totalTokens", 0) + project_total
-        add_to_periods(model_tokens, project_total, ts)
+        model_daily = model_tokens.setdefault("dailyTokens", {})
+        if isinstance(model_daily, dict):
+            add_to_daily(model_daily, project_total, ts)
     cwd = str(rec.get("cwd") or "").strip()
     if projects is not None and cwd:
         project = projects.setdefault(cwd, {"tokens": 0, "last_active": None})
@@ -8850,15 +8896,6 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     changed = False
     rebuilt = False
     now_utc = dt.datetime.now(dt.timezone.utc)
-    now_local = now_utc.astimezone().date()
-    totals_as_of_str: Optional[str] = cursor.get("totals_as_of")
-    if totals_as_of_str:
-        try:
-            prev_date = dt.datetime.fromisoformat(totals_as_of_str).astimezone().date()
-            if prev_date != now_local:
-                cursor["usage_needs_rebuild"] = True
-        except Exception:
-            pass
     offsets: Dict[str, int] = cursor.setdefault("offsets", {})
     totals: Dict[str, int] = cursor.setdefault("totals", _empty_journal_totals())
     projects: Dict[str, Dict[str, Any]] = cursor.setdefault("projects", _empty_journal_projects())
@@ -8906,9 +8943,8 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                     for raw_line in fh:
                         if not raw_line.endswith(b"\n"):
                             # Incomplete trailing line (writer mid-append): stop before
-                            # advancing the cursor past it (audit #8). Claude's midnight
-                            # rebuild would eventually recover, but not counting a torn
-                            # line is still the correct incremental behavior.
+                            # advancing the cursor past it (audit #8). The next scan resumes
+                            # at this byte once the writer completes the record.
                             break
                         new_offset += len(raw_line)
                         line = raw_line.decode("utf-8", errors="replace").strip()
@@ -8957,11 +8993,6 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
             logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
                           path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
     if changed:
-        # Stamped only on change so an idle cursor stays byte-identical and
-        # the save can be skipped. The midnight rebuild check still fires:
-        # the first scan of a new day sees yesterday's stamp, rebuilds, and
-        # that rebuild marks the cursor changed.
-        cursor["totals_as_of"] = now_utc.isoformat()
         cursor["version"] = CLAUDE_JOURNAL_CURSOR_VERSION
     cursor["_dirty"] = changed
     cursor["_rebuilt"] = rebuilt
@@ -8984,11 +9015,12 @@ def _merge_journal_totals(tokens: Dict[str, int], cursor_totals: Dict[str, int])
         tokens["cacheReadInputTokens"] = tokens.get("cacheReadInputTokens", 0) + all_cache_read
     if all_cache_write > 0:
         tokens["cacheCreationInputTokens"] = tokens.get("cacheCreationInputTokens", 0) + all_cache_write
-    for period in ("today", "week", "month", "all"):
-        lumped = sum(cursor_totals.get(f"{period}_{cls}", 0)
-                     for cls in ("input", "output", "cacheRead", "cacheWrite_1h", "cacheWrite_5m"))
-        if lumped > 0:
-            tokens[period] = lumped
+    lifetime = sum(
+        cursor_totals.get(f"all_{cls}", 0)
+        for cls in ("input", "output", "cacheRead", "cacheWrite_1h", "cacheWrite_5m")
+    )
+    if lifetime > 0:
+        tokens["all"] = lifetime
     if tokens.get("all", 0) > 0:
         tokens["totalTokens"] = tokens["all"]
 
@@ -9005,6 +9037,15 @@ def _merge_journal_models(target: Dict[str, Dict[str, int]], source: Dict[str, D
             continue
         model_tokens = target.setdefault(model, {})
         for key, amount in values.items():
+            if key == "dailyTokens" or not isinstance(amount, (int, float)):
+                continue
+            if amount > 0:
+                model_tokens[key] = max(model_tokens.get(key, 0), amount)
+        daily = values.get("dailyTokens") if isinstance(values.get("dailyTokens"), dict) else {}
+        periods = periods_from_daily_tokens(int_map(daily))
+        lifetime = int(model_tokens.get("totalTokens") or periods["all"])
+        periods["all"] = lifetime
+        for key, amount in periods.items():
             if amount > 0:
                 model_tokens[key] = max(model_tokens.get(key, 0), amount)
 
@@ -9051,6 +9092,17 @@ def _journal_projects_snapshot(projects: Dict[str, Dict[str, Any]]) -> Dict[str,
         items.append(item)
     items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
     return {"status": "ok", "items": items[:20]}
+
+
+def _claude_snapshot_with_current_windows(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Refresh Claude's rolling labels from its dated buckets at read time."""
+    periods = periods_from_daily_tokens(int_map(result.get("dailyTokens")))
+    tokens = result.setdefault("tokens", {})
+    for key in ("today", "week", "month"):
+        tokens[key] = periods[key]
+    tokens["all"] = max(_insight_int(tokens.get("all")), periods["all"])
+    tokens["totalTokens"] = tokens["all"]
+    return result
 
 
 def _path_is_within(child: Path, parent: Path) -> bool:
@@ -9258,7 +9310,7 @@ def claude_snapshot() -> Dict[str, Any]:
         )
         return attach_local_usage_coverage(
             "claude",
-            merged,
+            _claude_snapshot_with_current_windows(merged),
             codexbarCostCache={
                 "status": claude_cost_cache.get("status"),
                 "source": claude_cost_cache.get("source"),
@@ -9289,15 +9341,22 @@ def claude_snapshot() -> Dict[str, Any]:
     if isinstance(daily_model_tokens, dict):
         result["dailyModelTokensDays"] = len(daily_model_tokens)
     elif isinstance(daily_model_tokens, list):
-        periods = empty_periods()
-        model_periods_from_stats: Dict[str, Dict[str, int]] = {}
+        stats_daily: Dict[str, int] = {}
+        model_daily_from_stats: Dict[str, Dict[str, int]] = {}
         for item in daily_model_tokens:
             if not isinstance(item, dict):
                 continue
             tokens_by_model = item.get("tokensByModel")
             if not isinstance(tokens_by_model, dict):
                 continue
-            when = parse_timestamp(item.get("date"))
+            day_key = str(item.get("date") or "").strip()
+            try:
+                dt.date.fromisoformat(day_key)
+            except ValueError:
+                when = parse_timestamp(item.get("date"))
+                day_key = day_key_for_timestamp(when) or ""
+            if not day_key:
+                continue
             total = 0
             for model_raw, value in tokens_by_model.items():
                 amount = int_limit(value) or 0
@@ -9305,21 +9364,19 @@ def claude_snapshot() -> Dict[str, Any]:
                     continue
                 total += amount
                 model = normalized_model_name(model_raw) or "unknown"
-                model_periods = model_periods_from_stats.setdefault(model, empty_periods())
-                add_to_periods(model_periods, amount, when)
+                model_daily = model_daily_from_stats.setdefault(model, {})
+                model_daily[day_key] = max(model_daily.get(day_key, 0), amount)
             if total > 0:
-                add_to_periods(periods, total, when)
-                day_key = str(item.get("date") or "").strip()
-                if not re.match(r"^\d{4}-\d{2}-\d{2}$", day_key):
-                    day_key = day_key_for_timestamp(when) or ""
-                if day_key:
-                    result["dailyTokens"][day_key] = max(result["dailyTokens"].get(day_key, 0), total)
+                stats_daily[day_key] = max(stats_daily.get(day_key, 0), total)
+                result["dailyTokens"][day_key] = max(result["dailyTokens"].get(day_key, 0), total)
         result["dailyModelTokensDays"] = len(daily_model_tokens)
-        for model, stats_periods in model_periods_from_stats.items():
+        for model, model_daily in model_daily_from_stats.items():
+            stats_periods = periods_from_daily_tokens(model_daily)
             model_periods = result["models"].setdefault(model, {})
             for key, amount in stats_periods.items():
                 if amount > 0:
                     model_periods.setdefault(key, amount)
+        periods = periods_from_daily_tokens(stats_daily)
         for key in ("today", "week", "month", "all"):
             if periods[key] > 0 and result["tokens"].get(key, 0) <= 0:
                 result["tokens"][key] = periods[key]
@@ -9335,7 +9392,7 @@ def claude_snapshot() -> Dict[str, Any]:
     )
     return attach_local_usage_coverage(
         "claude",
-        merged,
+        _claude_snapshot_with_current_windows(merged),
         codexbarCostCache={
             "status": claude_cost_cache.get("status"),
             "source": claude_cost_cache.get("source"),
@@ -9404,11 +9461,29 @@ def merge_token_maps(target: Dict[str, int], source: Any) -> None:
         target[key] = int(target.get(key) or 0) + value
 
 
+def gemini_period_map(raw: Any) -> Dict[str, int]:
+    values = int_map(raw)
+    periods = {**empty_periods(), **values}
+    lifetime = int(values.get("all") or values.get("totalTokens") or 0)
+    if lifetime <= 0:
+        lifetime = sum(int(values.get(key) or 0) for key in TOKEN_CLASS_KEYS)
+    if lifetime <= 0:
+        lifetime = max((int(values.get(key) or 0) for key in ("today", "week", "month")), default=0)
+    periods["all"] = lifetime
+    return periods
+
+
 def merge_gemini_usage(usages: List[Dict[str, Any]]) -> Dict[str, Any]:
     if len(usages) == 1:
-        return copy.deepcopy(usages[0])
+        merged = copy.deepcopy(usages[0])
+        merged["tokens"] = gemini_period_map(merged.get("tokens"))
+        for model, raw_tokens in list((merged.get("models") or {}).items()):
+            model_tokens = gemini_period_map(raw_tokens)
+            if model_tokens["all"] > 0:
+                merged["models"][model] = model_tokens
+        return merged
     merged = {
-        "tokens": {},
+        "tokens": empty_periods(),
         "models": {},
         "dailyTokens": {},
         "hourlyTokens": {},
@@ -9416,13 +9491,13 @@ def merge_gemini_usage(usages: List[Dict[str, Any]]) -> Dict[str, Any]:
         "cache": {"source": "multi-source-full-log-index", "sources": []},
     }
     for usage in usages:
-        merge_token_maps(merged["tokens"], usage.get("tokens", {}))
+        merge_token_maps(merged["tokens"], gemini_period_map(usage.get("tokens")))
         merge_token_maps(merged["dailyTokens"], usage.get("dailyTokens", {}))
         merge_token_maps(merged["hourlyTokens"], usage.get("hourlyTokens", {}))
         merged["events"] += int(usage.get("events") or 0)
         for model, raw_tokens in (usage.get("models") or {}).items():
-            model_tokens = merged["models"].setdefault(str(model), {})
-            merge_token_maps(model_tokens, raw_tokens)
+            model_tokens = merged["models"].setdefault(str(model), empty_periods())
+            merge_token_maps(model_tokens, gemini_period_map(raw_tokens))
         merged["cache"]["sources"].append(usage.get("cache", {"source": "unknown"}))
     return merged
 
@@ -9438,7 +9513,7 @@ def gemini_snapshot() -> Dict[str, Any]:
         "providerLabel": "Gemini",
         "displayName": "Gemini",
         "sources": {str(source["id"]): gemini_source_status(source) for source in sources},
-        "tokens": {},
+        "tokens": empty_periods(),
         "models": {},
         "dailyTokens": {},
         "hourlyTokens": {},
@@ -9679,7 +9754,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
     for identity, token_key, model, amount, when, start_when in records:
         by_identity.setdefault(identity, []).append((token_key, model, amount, when, start_when))
 
-    tokens: Dict[str, int] = {}
+    tokens: Dict[str, int] = empty_periods()
     models: Dict[str, Dict[str, int]] = {}
     daily_tokens: Dict[str, int] = {}
     hourly_tokens: Dict[str, int] = {}
@@ -9710,7 +9785,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
 
             events += 1
             tokens[token_key] = tokens.get(token_key, 0) + delta
-            model_tokens = models.setdefault(model, {})
+            model_tokens = models.setdefault(model, empty_periods())
             model_tokens[token_key] = model_tokens.get(token_key, 0) + delta
             add_to_periods(model_tokens, delta, bucket_when)
             add_to_periods(periods, delta, bucket_when)
@@ -9721,8 +9796,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
     if total > 0:
         tokens["totalTokens"] = total
         for key, amount in periods.items():
-            if amount > 0:
-                tokens[key] = amount
+            tokens[key] = amount
     return tokens, models, daily_tokens, hourly_tokens, events
 
 
@@ -10017,10 +10091,11 @@ def int_map(raw: Any) -> Dict[str, int]:
 
 
 def periods_from_daily_tokens(daily_tokens: Dict[str, int]) -> Dict[str, int]:
+    """Return exact local-calendar 1-, 7-, 30-day and all-time totals."""
     periods = empty_periods()
     today_local = dt.datetime.now(dt.timezone.utc).astimezone().date()
-    week_start = today_local - dt.timedelta(days=7)
-    month_start = today_local - dt.timedelta(days=30)
+    week_start = today_local - dt.timedelta(days=6)
+    month_start = today_local - dt.timedelta(days=29)
     for day, amount in daily_tokens.items():
         if amount <= 0:
             continue
@@ -10028,14 +10103,12 @@ def periods_from_daily_tokens(daily_tokens: Dict[str, int]) -> Dict[str, int]:
         try:
             day_date = dt.date.fromisoformat(str(day)[:10])
         except ValueError:
-            when = parse_timestamp(f"{day}T12:00:00Z") or parse_timestamp(day)
-            add_to_periods(periods, amount, when)
             continue
         if day_date == today_local:
             periods["today"] = periods.get("today", 0) + amount
-        if day_date >= week_start:
+        if week_start <= day_date <= today_local:
             periods["week"] = periods.get("week", 0) + amount
-        if day_date >= month_start:
+        if month_start <= day_date <= today_local:
             periods["month"] = periods.get("month", 0) + amount
     return periods
 
@@ -10045,30 +10118,29 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
     daily_tokens = int_map(state.get("dailyTokens"))
     hourly_tokens = int_map(state.get("hourlyTokens"))
 
-    tokens = dict(token_classes)
+    tokens = {**empty_periods(), **token_classes}
     total = sum(token_classes.values())
     if total > 0:
         tokens["totalTokens"] = total
         periods = periods_from_daily_tokens(daily_tokens)
         periods["all"] = total
         for key, amount in periods.items():
-            if amount > 0:
-                tokens[key] = amount
+            tokens[key] = amount
 
     models: Dict[str, Dict[str, int]] = {}
     raw_models = state.get("models") if isinstance(state.get("models"), dict) else {}
     raw_model_daily = state.get("modelDailyTokens") if isinstance(state.get("modelDailyTokens"), dict) else {}
     for model, raw_model_tokens in raw_models.items():
-        model_tokens = int_map(raw_model_tokens)
-        model_total = sum(model_tokens.values())
+        raw_token_classes = int_map(raw_model_tokens)
+        model_total = sum(raw_token_classes.values())
         if model_total <= 0:
             continue
+        model_tokens = {**empty_periods(), **raw_token_classes}
         model_daily = int_map(raw_model_daily.get(model)) if isinstance(raw_model_daily, dict) else {}
         periods = periods_from_daily_tokens(model_daily)
         periods["all"] = model_total
         for key, amount in periods.items():
-            if amount > 0:
-                model_tokens[key] = amount
+            model_tokens[key] = amount
         models[str(model)] = model_tokens
 
     return {
@@ -10160,18 +10232,18 @@ def filter_google_usage_days(usage: Dict[str, Any], days: set, *, include: bool)
         )
         periods = periods_from_daily_tokens(model_days)
         periods["all"] = model_total
-        model_tokens = {
+        model_tokens = empty_periods()
+        model_tokens.update({
             key: _scaled_token_class(source_model_tokens.get(key, 0), model_total, original_model_total)
             for key in TOKEN_CLASS_KEYS
-        }
+        })
         for key, amount in periods.items():
-            if amount > 0:
-                model_tokens[key] = amount
-        models[str(model)] = {key: amount for key, amount in model_tokens.items() if amount > 0}
+            model_tokens[key] = amount
+        models[str(model)] = model_tokens
         model_daily_tokens[str(model)] = model_days
 
     total = sum(daily_tokens.values())
-    tokens: Dict[str, int] = {}
+    tokens: Dict[str, int] = empty_periods()
     source_tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else {}
     original_total = int(source_tokens.get("totalTokens") or source_tokens.get("all") or 0)
     if total > 0:
@@ -10183,8 +10255,7 @@ def filter_google_usage_days(usage: Dict[str, Any], days: set, *, include: bool)
         periods = periods_from_daily_tokens(daily_tokens)
         periods["all"] = total
         for key, amount in periods.items():
-            if amount > 0:
-                tokens[key] = amount
+            tokens[key] = amount
 
     filtered = {
         "tokens": tokens,
@@ -10210,8 +10281,15 @@ def google_usage_total(usage: Optional[Dict[str, Any]]) -> int:
 def apply_google_usage(snapshot: Dict[str, Any], usage: Optional[Dict[str, Any]], *, status_if_empty: Optional[str] = None) -> Dict[str, Any]:
     out = copy.deepcopy(snapshot)
     usage = usage if isinstance(usage, dict) else {}
-    out["tokens"] = copy.deepcopy(usage.get("tokens") or {})
-    out["models"] = copy.deepcopy(usage.get("models") or {})
+    if out.get("providerLabel") == "Antigravity" and google_usage_total(usage) <= 0:
+        out["tokens"] = {}
+    else:
+        out["tokens"] = gemini_period_map(usage.get("tokens"))
+    out["models"] = {}
+    for model, raw_tokens in (usage.get("models") or {}).items():
+        model_tokens = gemini_period_map(raw_tokens)
+        if model_tokens["all"] > 0:
+            out["models"][str(model)] = model_tokens
     out["dailyTokens"] = copy.deepcopy(usage.get("dailyTokens") or {})
     out["hourlyTokens"] = copy.deepcopy(usage.get("hourlyTokens") or {})
     out["events"] = int(usage.get("events") or 0)
@@ -10348,13 +10426,19 @@ def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
     if not conversations.exists():
         return None
     try:
-        databases = sorted(path for path in conversations.glob("*.db") if path.is_file())
+        # Do not preflight candidates with Path.is_file(): on older pathlib
+        # versions it uses Path.stat(), which can hide an otherwise readable DB.
+        databases = sorted(conversations.glob("*.db"))
     except OSError:
         return None
     result = empty_provider_usage(source=str(conversations))
     events = 0
     for database in databases:
         connection: Optional[sqlite3.Connection] = None
+        try:
+            database_when = dt.datetime.fromtimestamp(database.stat().st_mtime, dt.timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            database_when = None
         try:
             connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
             rows = connection.execute(
@@ -10372,7 +10456,7 @@ def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
             if parsed is None:
                 continue
             model, when, metrics = parsed
-            if add_usage_metrics(result, model, metrics, when):
+            if add_usage_metrics(result, model, metrics, when or database_when):
                 events += 1
     if events == 0:
         return None
@@ -11386,7 +11470,17 @@ def load_project_daily_state() -> Dict[str, Any]:
                 normalized[str(model)] = {"tokens": tokens, "classes": classes}
             if normalized:
                 model_baselines[str(key)] = normalized
-    return {"baselines": baselines, "modelBaselines": model_baselines}
+    grok_revision_changed = raw.get("grokAccountingVersion") != GROK_ACCOUNTING_STATE_VERSION
+    if grok_revision_changed:
+        baselines = {key: value for key, value in baselines.items() if not key.startswith("grok|")}
+        model_baselines = {
+            key: value for key, value in model_baselines.items() if not key.startswith("grok|")
+        }
+    return {
+        "baselines": baselines,
+        "modelBaselines": model_baselines,
+        "_grokRevisionChanged": grok_revision_changed,
+    }
 
 
 def prune_project_daily(days: Dict[str, Dict[str, Any]], today: "dt.date") -> bool:
@@ -11610,7 +11704,7 @@ def update_project_daily(
     baselines: Dict[str, int] = state["baselines"]
     model_baselines: Dict[str, Dict[str, Dict[str, Any]]] = state["modelBaselines"]
     days_changed = prune_project_daily(days, today)
-    state_changed = False
+    state_changed = bool(state.get("_grokRevisionChanged"))
     for key, observed in snapshot_project_cumulative(providers).items():
         tokens = observed["tokens"]
         key_models = model_baselines.setdefault(key, {})
@@ -11663,6 +11757,7 @@ def update_project_daily(
             project_daily_state_file(),
             {
                 "version": PROJECT_DAILY_STATE_VERSION,
+                "grokAccountingVersion": GROK_ACCOUNTING_STATE_VERSION,
                 "baselines": baselines,
                 "modelBaselines": {k: v for k, v in model_baselines.items() if v},
             },

@@ -126,6 +126,17 @@ class ConnectorContractTests(unittest.TestCase):
             for forbidden in ("C:\\\\Users\\\\", "/Users/", "accessToken", "refreshToken", "commandLine"):
                 self.assertNotIn(forbidden, serialized)
 
+        healthy = json.loads(paths["healthy"].read_text(encoding="utf-8"))["snapshot"]
+        self.assertIn("usage.tokenAccounting.v1", healthy["capabilities"])
+        undated_floor = healthy["providers"]["codex"]["tokens"]["undatedFloor"]
+        self.assertIsInstance(undated_floor, int)
+        self.assertGreaterEqual(undated_floor, 0)
+        copilot_tokens = healthy["providers"]["copilot"]["tokens"]
+        self.assertIs(copilot_tokens["estimated"], True)
+        self.assertIsInstance(copilot_tokens["estimatedShare"], float)
+        self.assertGreaterEqual(copilot_tokens["estimatedShare"], 0.0)
+        self.assertLessEqual(copilot_tokens["estimatedShare"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

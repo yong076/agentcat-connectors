@@ -26,6 +26,15 @@
       "owner": "shared",
       "fields": ["providers.antigravity.tokens", "providers.antigravity.sourceAttribution"],
       "fallback": "show Antigravity quota and activity without borrowing Gemini CLI token usage"
+    },
+    "usage.tokenAccounting.v1": {
+      "owner": "shared",
+      "fields": [
+        "providers.codex.tokens.undatedFloor",
+        "providers.copilot.tokens.estimated",
+        "providers.copilot.tokens.estimatedShare"
+      ],
+      "fallback": "render provider token totals without provenance details"
     }
   },
   "sharedRequired": [
