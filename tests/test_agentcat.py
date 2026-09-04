@@ -543,6 +543,42 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIsNone(sanitized["quotas"][0]["model"])
         self.assertNotIn("omelette", sanitized["quotas"][0]["id"])
 
+    def test_stale_v1_live_limit_cache_rows_are_upgraded_on_read(self) -> None:
+        agentcat.LIVE_LIMITS_CACHE.write_text(
+            json.dumps({
+                "claude": {
+                    "cachedAt": int(agentcat.time.time()),
+                    "failureStreak": 0,
+                    "limits": {
+                        "status": "auto",
+                        "quotas": [{
+                            "id": "claude:scoped:fixture",
+                            "label": "Fable 7 days",
+                            "window": "7d",
+                            "model": "Fable",
+                        }],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        cached = agentcat.cached_live_limits("claude", 300)
+
+        self.assertEqual(cached["quotas"][0]["scope"], "model")
+        self.assertIs(cached["quotas"][0]["aggregate"], False)
+
+    def test_live_limit_cache_writes_schema_version_two(self) -> None:
+        limits = agentcat.empty_limits(status="auto")
+        limits["quotas"] = [agentcat.quota_entry("codex:7d", "7 days", window="7d")]
+
+        agentcat.write_live_limits_cache("codex", limits)
+
+        cache = json.loads(agentcat.LIVE_LIMITS_CACHE.read_text(encoding="utf-8"))
+        self.assertEqual(cache["schemaVersion"], 2)
+        self.assertEqual(cache["codex"]["limits"]["quotas"][0]["scope"], "account")
+        self.assertIs(cache["codex"]["limits"]["quotas"][0]["aggregate"], True)
+
     def _write_claude_credentials(self, oauth: dict) -> None:
         creds_dir = agentcat.HOME / ".claude"
         creds_dir.mkdir(parents=True, exist_ok=True)
@@ -999,7 +1035,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         snapshot = agentcat.build_snapshot()
 
         self.assertEqual(snapshot["schemaVersion"], 4)
-        self.assertEqual(snapshot["contractVersion"], 1)
+        self.assertEqual(snapshot["contractVersion"], 2)
         self.assertEqual(snapshot["connectorVersion"], agentcat.CONNECTOR_VERSION)
         self.assertIn("update", snapshot)
         self.assertIn("daemon", snapshot)
@@ -1010,7 +1046,14 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("connector.channel", snapshot["capabilities"])
         self.assertIn("limits.quotaFallbackOn429", snapshot["capabilities"])
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
+        self.assertIn("quota.scoped.v2", snapshot["capabilities"])
+        self.assertIn("providers.metadata.v1", snapshot["capabilities"])
         self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
+        for provider_id in agentcat.CONFIG_PROVIDER_IDS:
+            self.assertEqual(snapshot["providers"][provider_id]["meta"], agentcat.provider_metadata(provider_id))
+            for quota in snapshot["providers"][provider_id]["limits"]["quotas"]:
+                self.assertIn(quota["scope"], {"account", "model", "surface"})
+                self.assertIs(type(quota["aggregate"]), bool)
         self.assertEqual(snapshot["update"]["channel"]["channel"], "public")
 
     def test_connector_version_parser_and_comparison(self) -> None:

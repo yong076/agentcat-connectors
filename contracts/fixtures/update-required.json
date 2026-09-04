@@ -3,10 +3,10 @@
   "expectation": "apps show an actionable update without discarding the current snapshot",
   "snapshot": {
     "schemaVersion": 4,
-    "contractVersion": 1,
+    "contractVersion": 2,
     "connectorVersion": "26.34.4",
     "generatedAt": "2026-08-22T00:00:00Z",
-    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1", "quota.scoped.v2", "providers.metadata.v1"],
     "providers": {"gemini": {"status": "ok", "tokens": {"today": 800}}},
     "providerInstances": [],
     "activity": {"status": "ok", "processes": [], "countsByProvider": {}},

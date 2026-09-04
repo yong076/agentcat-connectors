@@ -1,5 +1,5 @@
 {
-  "contractVersion": 1,
+  "contractVersion": 2,
   "snapshotSchemaVersion": 4,
   "capabilityRegistry": {
     "connector.contract.v1": {
@@ -22,6 +22,16 @@
       "fields": ["providerInstances"],
       "fallback": "render the aggregate providers map as one connection per provider"
     },
+    "quota.scoped.v2": {
+      "owner": "shared",
+      "fields": ["providers.*.limits.quotas.*.scope", "providers.*.limits.quotas.*.aggregate"],
+      "fallback": "ignore scope metadata and render quotas using the v1 model and window fields"
+    },
+    "providers.metadata.v1": {
+      "owner": "shared",
+      "fields": ["providers.*.meta.displayName", "providers.*.meta.brandColor", "providers.*.meta.iconHint", "providers.*.meta.windows", "providers.*.meta.sourceHintKey"],
+      "fallback": "use the app's curated provider descriptor or title-case the provider id"
+    },
     "usage.antigravity.sqlite": {
       "owner": "shared",
       "fields": ["providers.antigravity.tokens", "providers.antigravity.sourceAttribution"],
@@ -39,7 +49,9 @@
     "limits.claude.statuslineQuotas",
     "limits.grok.oauthUsage",
     "limits.kimi.oauthUsage",
-    "providerInstances.v1"
+    "providerInstances.v1",
+    "quota.scoped.v2",
+    "providers.metadata.v1"
   ],
   "apps": {
     "macos": {
@@ -52,7 +64,9 @@
         "limits.claude.statuslineQuotas",
         "limits.grok.oauthUsage",
         "limits.kimi.oauthUsage",
-        "providerInstances.v1"
+        "providerInstances.v1",
+        "quota.scoped.v2",
+        "providers.metadata.v1"
       ],
       "platformRequired": []
     },
@@ -70,7 +84,9 @@
         "limits.claude.statuslineQuotas",
         "limits.grok.oauthUsage",
         "limits.kimi.oauthUsage",
-        "providerInstances.v1"
+        "providerInstances.v1",
+        "quota.scoped.v2",
+        "providers.metadata.v1"
       ],
       "platformRequired": [
         "activity.windowsProcessScan",

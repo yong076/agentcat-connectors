@@ -82,7 +82,7 @@ function Install-VerifiedRelease([string[]]$PythonPrefix) {
       }
       $manifest = [ordered]@{
         version = $directVersion
-        contractVersion = if ([string]::IsNullOrWhiteSpace($directContractVersion)) { 1 } else { [int]$directContractVersion }
+        contractVersion = if ([string]::IsNullOrWhiteSpace($directContractVersion)) { 2 } else { [int]$directContractVersion }
         archiveUrl = $directArchiveUrl
         sha256 = $directSha256
       }

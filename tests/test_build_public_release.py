@@ -27,7 +27,9 @@ class BuildPublicReleaseTests(unittest.TestCase):
                 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.6")\n',
                 encoding="utf-8",
             )
-            (source / "contracts" / "connector-v1.json").write_text("{}\n", encoding="utf-8")
+            (source / "contracts" / "connector-v1.json").write_text(
+                '{"contractVersion": 2}\n', encoding="utf-8"
+            )
             subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
             subprocess.run(
@@ -49,7 +51,7 @@ class BuildPublicReleaseTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
             self.assertEqual(manifest["version"], "26.34.6")
-            self.assertEqual(manifest["contractVersion"], 1)
+            self.assertEqual(manifest["contractVersion"], 2)
             self.assertEqual(manifest["sha256"], hashlib.sha256(archive.read_bytes()).hexdigest())
             self.assertTrue(manifest["archiveUrl"].endswith(archive.name))
             with zipfile.ZipFile(archive) as package:

@@ -69,6 +69,7 @@ ANTIGRAVITY_OAUTH_CLIENT_ID_RE = re.compile(rb"[0-9]{6,}-[a-z0-9]{16,}\.apps\.go
 # so stop each match before the next "GOCSPX-" rather than matching greedily.
 ANTIGRAVITY_OAUTH_CLIENT_SECRET_RE = re.compile(rb"GOCSPX-(?:(?!GOCSPX-)[A-Za-z0-9_-]){20,}")
 LIVE_LIMITS_CACHE = AGENTCAT_HOME / "live-limits-cache.json"
+LIVE_LIMITS_CACHE_SCHEMA_VERSION = 2
 PROVIDER_INSTANCE_SECRET = AGENTCAT_HOME / "provider-instance.key"
 CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/codex/usage",
@@ -152,7 +153,7 @@ PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.7")
 SCHEMA_VERSION = 4
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 WINDOWS_TASK_NAME = "AgentCatD"
 WINDOWS_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOWS_RUN_VALUE = "AgentCatD"
@@ -209,6 +210,8 @@ CONNECTOR_CAPABILITIES = (
     "insights.recommendation",
     "homes.discovery",
     "providerInstances.v1",
+    "quota.scoped.v2",
+    "providers.metadata.v1",
     "pricing.feed",
     "usage.opencode.sqlite",
     "usage.antigravity.sqlite",
@@ -1589,7 +1592,70 @@ def tracked_provider_homes(provider: str) -> List[Path]:
 
 
 CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot", "kimi", "grok")
+PROVIDER_METADATA: Dict[str, Dict[str, Any]] = {
+    "codex": {
+        "displayName": "Codex",
+        "brandColor": "#10A37F",
+        "iconHint": "codex",
+        "windows": ["5h", "7d", "session"],
+        "sourceHintKey": "provider.source.codex",
+    },
+    "claude": {
+        "displayName": "Claude",
+        "brandColor": "#D97757",
+        "iconHint": "claude",
+        "windows": ["5h", "7d", "monthly", "session"],
+        "sourceHintKey": "provider.source.claude",
+    },
+    "gemini": {
+        "displayName": "Gemini",
+        "brandColor": "#4285F4",
+        "iconHint": "gemini",
+        "windows": ["daily"],
+        "sourceHintKey": "provider.source.gemini",
+    },
+    "antigravity": {
+        "displayName": "Antigravity",
+        "brandColor": "#7C3AED",
+        "iconHint": "antigravity",
+        "windows": ["daily"],
+        "sourceHintKey": "provider.source.antigravity",
+    },
+    "opencode": {
+        "displayName": "OpenCode",
+        "brandColor": "#111827",
+        "iconHint": "opencode",
+        "windows": [],
+        "sourceHintKey": "provider.source.opencode",
+    },
+    "copilot": {
+        "displayName": "GitHub Copilot",
+        "brandColor": "#6E40C9",
+        "iconHint": "copilot",
+        "windows": [],
+        "sourceHintKey": "provider.source.copilot",
+    },
+    "kimi": {
+        "displayName": "Kimi",
+        "brandColor": "#111827",
+        "iconHint": "kimi",
+        "windows": ["5h", "7d", "monthly"],
+        "sourceHintKey": "provider.source.kimi",
+    },
+    "grok": {
+        "displayName": "Grok",
+        "brandColor": "#000000",
+        "iconHint": "grok",
+        "windows": ["5h", "7d", "monthly", "media"],
+        "sourceHintKey": "provider.source.grok",
+    },
+}
 DESKTOP_APP_PROVIDER_IDS = ("claude", "codex")
+
+
+def provider_metadata(provider: str) -> Dict[str, Any]:
+    """Return path-free presentation metadata owned by the connector."""
+    return copy.deepcopy(PROVIDER_METADATA[provider])
 
 DESKTOP_APP_SPECS: Dict[str, Dict[str, Any]] = {
     "claude": {
@@ -2851,6 +2917,8 @@ def quota_entry(
     limit: Any = None,
     window: Optional[str] = None,
     model: Optional[str] = None,
+    scope: Optional[str] = None,
+    aggregate: Optional[bool] = None,
     source: Optional[str] = None,
 ) -> Dict[str, Any]:
     used_pct = float_percent(used_percent)
@@ -2860,10 +2928,14 @@ def quota_entry(
     if used_pct is None and remaining_pct is not None:
         used_pct = remaining_percent_from_used(remaining_pct)
 
+    resolved_scope = scope if scope in {"account", "model", "surface"} else ("model" if model else "account")
+    resolved_aggregate = aggregate if isinstance(aggregate, bool) else resolved_scope == "account"
     return {
         "id": quota_id,
         "label": label,
         "window": window,
+        "scope": resolved_scope,
+        "aggregate": resolved_aggregate,
         "unit": unit,
         "used": float_value(used),
         "remaining": float_value(remaining),
@@ -2874,6 +2946,28 @@ def quota_entry(
         "model": model,
         "source": source,
     }
+
+
+def ensure_quota_schema_v2(limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Re-derive additive v2 quota fields for live data and legacy cache rows."""
+    out = dict(limits)
+    quotas = limits.get("quotas")
+    if not isinstance(quotas, list):
+        return out
+    normalized: List[Dict[str, Any]] = []
+    for quota in quotas:
+        if not isinstance(quota, dict):
+            continue
+        item = dict(quota)
+        scope = item.get("scope")
+        if scope not in {"account", "model", "surface"}:
+            scope = "model" if item.get("model") else "account"
+        item["scope"] = scope
+        if not isinstance(item.get("aggregate"), bool):
+            item["aggregate"] = scope == "account"
+        normalized.append(item)
+    out["quotas"] = normalized
+    return out
 
 
 def live_limit_error(exc: Exception, source: str) -> Dict[str, Any]:
@@ -2960,7 +3054,7 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
         effective_max_age = max_age_seconds
     if age > effective_max_age and not allow_stale:
         return None
-    out = dict(limits)
+    out = sanitize_cached_live_limits(provider, limits)
     out["cachedAt"] = cached_at
     out["cacheAgeSeconds"] = max(age, 0)
     if age > effective_max_age:
@@ -2969,6 +3063,7 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
 
 
 def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
+    limits = ensure_quota_schema_v2(limits)
     status = limits.get("status")
     if status == "error":
         pass
@@ -2983,6 +3078,7 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
         ensure_dirs()
         raw = read_json(LIVE_LIMITS_CACHE)
         cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+        cache["schemaVersion"] = LIVE_LIMITS_CACHE_SCHEMA_VERSION
         previous = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
         previous_streak = int_count(previous.get("failureStreak")) or 0
         failed = status == "error" or bool(limits.get("liveError"))
@@ -4423,7 +4519,16 @@ def sanitize_claude_cached_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
 
     sanitized.sort(key=claude_quota_sort_key)
     out["quotas"] = sanitized
-    return out
+    return ensure_quota_schema_v2(out)
+
+
+def sanitize_cached_live_limits(provider: str, limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Upgrade cached provider limits before they can re-enter a v2 snapshot."""
+    if provider == "claude":
+        return sanitize_claude_cached_limits(limits)
+    if provider == "codex":
+        return ensure_quota_schema_v2(sanitize_codex_cached_limits(limits))
+    return ensure_quota_schema_v2(limits)
 
 
 def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
@@ -4441,7 +4546,7 @@ def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
     return (order.get(quota_id, 100), quota_id)
 
 
-def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, str, str, Optional[str]]]:
+def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, str, str, Optional[str], str]]:
     """Return dynamic metadata for a scoped Claude limit row.
 
     Claude's OAuth usage endpoint keeps newly introduced model capacities in
@@ -4478,7 +4583,8 @@ def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, st
         window, window_label = "7d", "7일"
 
     normalized_model = model_id or display_name or surface_name
-    return normalized_model, f"{scope_name} {window_label}", window, group or None
+    scope_kind = "model" if isinstance(model_scope, dict) else "surface"
+    return normalized_model, f"{scope_name} {window_label}", window, group or None, scope_kind
 
 
 def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "claude-oauth-usage-api") -> Dict[str, Any]:
@@ -4565,7 +4671,7 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
             metadata = claude_scoped_quota_metadata(item)
             if used_percent is None or metadata is None:
                 continue
-            model_key, label, window, group = metadata
+            model_key, label, window, group, scope_kind = metadata
             scope_key = ":".join(
                 part for part in (group or "scoped", model_key, str(item.get("kind") or "")) if part
             )
@@ -4576,6 +4682,7 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
                 reset_at=item.get("resets_at"),
                 window=window,
                 model=model_key,
+                scope=scope_kind,
                 source=source,
             )
             quotas.append(quota)
@@ -5381,6 +5488,7 @@ def grok_limits_from_credits_response(payload: Dict[str, Any], source: str = GRO
                 unit="percent",
                 window=product_window,
                 model=slug,
+                scope="surface",
                 source=source,
             )
         )
@@ -11737,16 +11845,21 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         providers["gemini"] = disabled_provider_snapshot("gemini")
     if (provider_config.get("antigravity") or {}).get("enabled") is False:
         providers["antigravity"] = disabled_provider_snapshot("antigravity")
+    for provider, data in tuple(providers.items()):
+        sanitized = sanitize_payload(data)
+        providers[provider] = sanitized if isinstance(sanitized, dict) else empty_provider_usage(status="error")
     for provider in ("gemini", "antigravity", "opencode", "copilot", "kimi", "grok"):
         attach_local_usage_coverage(provider, providers.get(provider, {}))
     for provider, data in providers.items():
         if data.get("status") == "disabled":
             data["limits"] = empty_limits("disabled")
-            continue
-        data["limits"] = merge_limits(
-            limits_by_provider.get(provider, empty_limits()),
-            runtime_limits_by_provider.get(provider, empty_limits()),
-        )
+        else:
+            data["limits"] = merge_limits(
+                limits_by_provider.get(provider, empty_limits()),
+                runtime_limits_by_provider.get(provider, empty_limits()),
+            )
+        data["limits"] = ensure_quota_schema_v2(data["limits"])
+        data["meta"] = provider_metadata(provider)
     desktop_apps = desktop_app_sources_snapshot(settings)
     attach_desktop_app_sources(providers, desktop_apps)
     snapshot = {

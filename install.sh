@@ -54,7 +54,7 @@ if [[ -n "${AGENTCAT_CONNECTORS_ARCHIVE_URL:-}" ]]; then
 import json, os, sys
 payload = {
     "version": os.environ["AGENTCAT_CONNECTORS_VERSION"],
-    "contractVersion": int(os.environ.get("AGENTCAT_CONNECTORS_CONTRACT_VERSION") or "1"),
+    "contractVersion": int(os.environ.get("AGENTCAT_CONNECTORS_CONTRACT_VERSION") or "2"),
     "archiveUrl": os.environ["AGENTCAT_CONNECTORS_ARCHIVE_URL"],
     "sha256": os.environ["AGENTCAT_CONNECTORS_SHA256"],
 }

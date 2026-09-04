@@ -1,0 +1,24 @@
+{
+  "scenario": "provider-quota-v2",
+  "expectation": "every supported provider exposes path-free metadata and every quota row carries explicit scope semantics",
+  "snapshot": {
+    "schemaVersion": 4,
+    "contractVersion": 2,
+    "connectorVersion": "26.34.6",
+    "generatedAt": "2026-09-04T00:00:00Z",
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1", "quota.scoped.v2", "providers.metadata.v1"],
+    "providers": {
+      "codex": {"status": "ok", "meta": {"displayName": "Codex", "brandColor": "#10A37F", "iconHint": "codex", "windows": ["5h", "7d", "session"], "sourceHintKey": "provider.source.codex"}, "limits": {"quotas": [{"id": "codex:7d", "label": "7 days", "window": "7d", "scope": "account", "aggregate": true}]}},
+      "claude": {"status": "ok", "meta": {"displayName": "Claude", "brandColor": "#D97757", "iconHint": "claude", "windows": ["5h", "7d", "monthly", "session"], "sourceHintKey": "provider.source.claude"}, "limits": {"quotas": [{"id": "claude:scoped:fable", "label": "Fable 7 days", "window": "7d", "scope": "model", "aggregate": false, "model": "Fable"}]}},
+      "gemini": {"status": "ok", "meta": {"displayName": "Gemini", "brandColor": "#4285F4", "iconHint": "gemini", "windows": ["daily"], "sourceHintKey": "provider.source.gemini"}, "limits": {"quotas": [{"id": "gemini:pro", "label": "Gemini Pro", "window": "daily", "scope": "model", "aggregate": false, "model": "gemini-pro"}]}},
+      "antigravity": {"status": "ok", "meta": {"displayName": "Antigravity", "brandColor": "#7C3AED", "iconHint": "antigravity", "windows": ["daily"], "sourceHintKey": "provider.source.antigravity"}, "limits": {"quotas": [{"id": "antigravity:daily", "label": "Daily", "window": "daily", "scope": "account", "aggregate": true}]}},
+      "opencode": {"status": "ok", "meta": {"displayName": "OpenCode", "brandColor": "#111827", "iconHint": "opencode", "windows": [], "sourceHintKey": "provider.source.opencode"}, "limits": {"quotas": [{"id": "opencode:configured", "label": "Configured", "window": null, "scope": "account", "aggregate": true}]}},
+      "copilot": {"status": "ok", "meta": {"displayName": "GitHub Copilot", "brandColor": "#6E40C9", "iconHint": "copilot", "windows": [], "sourceHintKey": "provider.source.copilot"}, "limits": {"quotas": [{"id": "copilot:configured", "label": "Configured", "window": null, "scope": "account", "aggregate": true}]}},
+      "kimi": {"status": "ok", "meta": {"displayName": "Kimi", "brandColor": "#111827", "iconHint": "kimi", "windows": ["5h", "7d", "monthly"], "sourceHintKey": "provider.source.kimi"}, "limits": {"quotas": [{"id": "kimi:7d", "label": "7 days", "window": "7d", "scope": "account", "aggregate": true}]}},
+      "grok": {"status": "ok", "meta": {"displayName": "Grok", "brandColor": "#000000", "iconHint": "grok", "windows": ["5h", "7d", "monthly", "media"], "sourceHintKey": "provider.source.grok"}, "limits": {"quotas": [{"id": "grok:imagine", "label": "Imagine", "window": "media", "scope": "surface", "aggregate": false}]}}
+    },
+    "providerInstances": [],
+    "activity": {"status": "ok", "processes": [], "countsByProvider": {}},
+    "daemon": {"platform": "macos", "status": "registered", "persistent": true, "registration": "launch_agent"}
+  }
+}

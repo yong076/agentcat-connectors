@@ -70,8 +70,8 @@ class SandboxedCase(unittest.TestCase):
 class WP10CapabilityTests(SandboxedCase):
     def test_public_and_wp10_capabilities_are_declared_once(self):
         capabilities = agentcat.CONNECTOR_CAPABILITIES
-        self.assertEqual(len(capabilities), 45)
-        self.assertEqual(len(set(capabilities)), 45)
+        self.assertEqual(len(capabilities), 47)
+        self.assertEqual(len(set(capabilities)), 47)
         for capability in PUBLIC_CAPABILITIES + WP10_CAPABILITIES:
             self.assertIn(capability, capabilities)
         self.assertEqual(capabilities[capabilities.index("projects.daily") + 1:capabilities.index("projects.daily") + 6], WP10_CAPABILITIES)

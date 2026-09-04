@@ -50,7 +50,7 @@ class PublicChannelInstallTests(unittest.TestCase):
         (source / "bin" / "agentcat").write_text("connector", encoding="utf-8")
         (source / "scripts" / "install.py").write_text("installer", encoding="utf-8")
         (source / "contracts" / "connector-v1.json").write_text(
-            json.dumps({"contractVersion": 1, "snapshotSchemaVersion": 4}),
+            json.dumps({"contractVersion": 2, "snapshotSchemaVersion": 4}),
             encoding="utf-8",
         )
         archive = self.root / f"connector-{version}.zip"
@@ -58,7 +58,7 @@ class PublicChannelInstallTests(unittest.TestCase):
             for path in source.rglob("*"):
                 if path.is_file():
                     package.write(path, Path(source.name) / path.relative_to(source))
-        manifest = {"version": version, "contractVersion": 1, "sha256": sha256(archive)}
+        manifest = {"version": version, "contractVersion": 2, "sha256": sha256(archive)}
         return archive, manifest
 
     def test_checksum_mismatch_never_touches_existing_install(self) -> None:
@@ -200,7 +200,7 @@ class PublicChannelInstallTests(unittest.TestCase):
     def test_current_candidate_passes_real_contract_validation(self) -> None:
         manifest = {
             "version": "26.34.7",
-            "contractVersion": 1,
+            "contractVersion": 2,
             "sha256": "0" * 64,
         }
         installer_module.validate_candidate(REPO_ROOT, manifest)
@@ -225,10 +225,10 @@ class PublicChannelInstallTests(unittest.TestCase):
             urls.append(url)
             if url.endswith("/healthz"):
                 return Response(b"ok")
-            return Response(b'{"connectorVersion":"26.34.7","contractVersion":1}')
+            return Response(b'{"connectorVersion":"26.34.7","contractVersion":2}')
 
         with mock.patch.object(installer_module.urllib.request, "urlopen", side_effect=fake_urlopen):
-            installer_module.validate_live_connector("26.34.7", 1, timeout=0.1)
+            installer_module.validate_live_connector("26.34.7", 2, timeout=0.1)
 
         self.assertEqual(
             urls,
