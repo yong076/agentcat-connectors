@@ -8,6 +8,7 @@ import csv
 from contextlib import closing
 import logging
 import datetime as dt
+import email.utils
 import hashlib
 import hmac
 import json
@@ -2676,6 +2677,46 @@ def quota_entry(
 def live_limit_error(exc: Exception, source: str) -> Dict[str, Any]:
     limits = empty_limits(status="error", error=str(exc))
     limits["source"] = source
+    reason = "unknown_error"
+    if isinstance(exc, urllib.error.HTTPError):
+        status = int(exc.code)
+        if status == 429:
+            reason = "rate_limited"
+            retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+            retry_seconds = 300
+            if retry_after is not None:
+                try:
+                    retry_seconds = max(int(float(str(retry_after).strip())), 0)
+                except (TypeError, ValueError):
+                    try:
+                        retry_date = email.utils.parsedate_to_datetime(str(retry_after))
+                        if retry_date.tzinfo is None:
+                            retry_date = retry_date.replace(tzinfo=dt.timezone.utc)
+                        retry_seconds = max(int(retry_date.timestamp() - time.time()), 0)
+                    except (TypeError, ValueError, OverflowError):
+                        retry_seconds = 300
+            limits["retryAt"] = int(time.time()) + retry_seconds
+        elif status == 401:
+            reason = "token_expired"
+        elif status == 403:
+            try:
+                body = exc.read(64 * 1024).decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            reason = "missing_scope" if "user:profile" in body else "token_expired"
+        elif status >= 500:
+            reason = "server_error"
+        else:
+            reason = "http_error"
+        try:
+            exc.close()
+        except Exception:
+            pass
+    elif isinstance(exc, json.JSONDecodeError):
+        reason = "parse_error"
+    elif isinstance(exc, (urllib.error.URLError, OSError, TimeoutError)):
+        reason = "network_error"
+    limits["reason"] = reason
     return limits
 
 
@@ -2690,8 +2731,17 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     limits = entry.get("limits")
     if cached_at is None or not isinstance(limits, dict):
         return None
-    age = int(time.time()) - cached_at
-    if limits.get("status") == "error":
+    now = int(time.time())
+    age = now - cached_at
+    retry_at = int_limit(limits.get("retryAt"))
+    if retry_at is not None:
+        if retry_at > now:
+            effective_max_age = max(retry_at - cached_at, 0)
+        elif not allow_stale:
+            return None
+        else:
+            effective_max_age = -1
+    elif limits.get("status") == "error":
         effective_max_age = LIVE_LIMITS_ERROR_BACKOFF_SECONDS
     elif limits.get("status") == "not_configured" and limits.get("reason") == "not_applicable":
         effective_max_age = LIVE_LIMITS_NOT_APPLICABLE_TTL
@@ -2745,6 +2795,11 @@ def serve_stale_live_limits(provider: str, stale: Dict[str, Any], exc: Exception
     """
     stale = dict(stale)
     stale["liveError"] = str(exc)
+    error_limits = live_limit_error(exc, str(stale.get("source") or provider))
+    stale["liveErrorReason"] = error_limits.get("reason")
+    stale.pop("retryAt", None)
+    if error_limits.get("retryAt") is not None:
+        stale["retryAt"] = error_limits["retryAt"]
     served = {k: v for k, v in stale.items() if k not in ("cacheAgeSeconds", "stale", "cachedAt")}
     write_live_limits_cache(provider, served)
     return stale
@@ -3831,6 +3886,22 @@ def refresh_claude_access_token(refresh_token: str) -> Optional[str]:
     return token.strip() if isinstance(token, str) and token.strip() else None
 
 
+def claude_usage_request(access_token: str) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        CLAUDE_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.1.69",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
 def claude_quota_label(key: str) -> str:
     labels = {
         "five_hour": "5시간",
@@ -4083,7 +4154,9 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
     now_ms = int(time.time() * 1000)
     refresh_token = oauth.get("refreshToken") or oauth.get("refresh_token")
     should_refresh = bool(expires_at and now_ms + CLAUDE_OAUTH_EXPIRY_BUFFER_MS >= expires_at)
+    refresh_attempted = False
     if should_refresh and isinstance(refresh_token, str) and refresh_token:
+        refresh_attempted = True
         try:
             refreshed = refresh_claude_access_token(refresh_token)
         except Exception:
@@ -4093,29 +4166,41 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
         token = refreshed
     elif expires_at and now_ms >= expires_at:
         return empty_limits(reason="token_expired")
-    req = urllib.request.Request(
-        CLAUDE_USAGE_URL,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.69",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        limits = claude_limits_from_usage_response(payload if isinstance(payload, dict) else {}, source=CLAUDE_USAGE_URL)
-        write_live_limits_cache("claude", limits)
-        return limits
-    except Exception as exc:
-        stale = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
-        if stale:
-            return serve_stale_live_limits("claude", stale, exc)
-        limits = live_limit_error(exc, CLAUDE_USAGE_URL)
-        write_live_limits_cache("claude", limits)
-        return limits
+    last_error: Optional[Exception] = None
+    while True:
+        try:
+            payload = claude_usage_request(token)
+            limits = claude_limits_from_usage_response(payload, source=CLAUDE_USAGE_URL)
+            write_live_limits_cache("claude", limits)
+            return limits
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if (
+                exc.code == 401
+                and not refresh_attempted
+                and isinstance(refresh_token, str)
+                and refresh_token
+            ):
+                refresh_attempted = True
+                try:
+                    refreshed = refresh_claude_access_token(refresh_token)
+                except Exception:
+                    refreshed = None
+                if refreshed:
+                    exc.close()
+                    token = refreshed
+                    continue
+            break
+        except Exception as exc:
+            last_error = exc
+            break
+
+    stale = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+    if stale:
+        return serve_stale_live_limits("claude", stale, last_error or RuntimeError("Claude usage API failed"))
+    limits = live_limit_error(last_error or RuntimeError("Claude usage API failed"), CLAUDE_USAGE_URL)
+    write_live_limits_cache("claude", limits)
+    return limits
 
 
 def gemini_display_name(model: Any) -> str:
