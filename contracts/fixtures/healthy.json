@@ -6,8 +6,8 @@
     "contractVersion": 1,
     "connectorVersion": "26.34.6",
     "generatedAt": "2026-08-22T00:00:00Z",
-    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
-    "providers": {"codex": {"status": "ok", "tokens": {"today": 1200, "week": 6400, "all": 24000}}},
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1", "usage.tokenAccounting.v1"],
+    "providers": {"codex": {"status": "ok", "tokens": {"today": 1200, "week": 6400, "all": 24000, "undatedFloor": 24000}}},
     "providerInstances": [{"id": "codex:default", "provider": "codex", "label": "Codex", "status": "ok"}],
     "activity": {"status": "ok", "processes": [], "countsByProvider": {"codex": 1}},
     "daemon": {"platform": "macos", "status": "registered", "persistent": true, "registration": "launch_agent"}

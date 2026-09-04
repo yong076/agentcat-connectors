@@ -204,6 +204,7 @@ CONNECTOR_CAPABILITIES = (
     "usage.breakdown",
     "usage.projects",
     "usage.coverage",
+    "usage.tokenAccounting.v1",
     "projects.daily",
     "projects.dailyCost",
     "insights.periods",
@@ -8085,6 +8086,19 @@ def attach_codex_usage_coverage(
     sqlite: Dict[str, Any],
     codexbar_cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    tokens = snapshot.setdefault("tokens", empty_periods())
+    daily_tokens = snapshot.get("dailyTokens") if isinstance(snapshot.get("dailyTokens"), dict) else {}
+    dated_total = 0
+    for day, raw_amount in daily_tokens.items():
+        try:
+            dt.date.fromisoformat(str(day))
+            amount = int(raw_amount)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(raw_amount, bool) and amount > 0:
+            dated_total += amount
+    tokens["undatedFloor"] = max(0, int(tokens.get("all") or 0) - dated_total)
+
     session_ok = sessions.get("status") == "ok"
     sqlite_ok = sqlite.get("status") == "ok"
     if session_ok and sqlite_ok and snapshot.get("reconciled"):

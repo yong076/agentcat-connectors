@@ -707,3 +707,32 @@ class GeminiZeroWindowTests(SandboxedCase):
         filtered = agentcat.filter_google_usage_days(merged, {"2099-01-01"}, include=True)
         applied = agentcat.apply_google_usage({}, filtered)
         self.assertEqual(applied["tokens"], agentcat.empty_periods())
+
+
+class CodexUndatedFloorTests(SandboxedCase):
+    def test_coverage_exposes_lifetime_tokens_without_valid_daily_dates(self) -> None:
+        snapshot = {
+            "status": "ok",
+            "tokens": {"all": 100},
+            "dailyTokens": {
+                "2026-09-01": 30,
+                "not-a-day": 50,
+                "2026-09-02": -4,
+                "2026-09-03": True,
+            },
+        }
+
+        agentcat.attach_codex_usage_coverage(snapshot, {}, {})
+
+        self.assertEqual(snapshot["tokens"]["undatedFloor"], 70)
+
+    def test_coverage_clamps_undated_floor_when_daily_exceeds_lifetime(self) -> None:
+        snapshot = {
+            "status": "ok",
+            "tokens": {"all": 10},
+            "dailyTokens": {"2026-09-01": 12},
+        }
+
+        agentcat.attach_codex_usage_coverage(snapshot, {}, {})
+
+        self.assertEqual(snapshot["tokens"]["undatedFloor"], 0)
