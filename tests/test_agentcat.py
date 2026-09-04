@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import os
+import copy
 import datetime as dt
 import json
 import sqlite3
@@ -11,7 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from typing import List
@@ -1055,6 +1056,98 @@ class AgentCatConnectorTests(unittest.TestCase):
                 self.assertIn(quota["scope"], {"account", "model", "surface"})
                 self.assertIs(type(quota["aggregate"]), bool)
         self.assertEqual(snapshot["update"]["channel"]["channel"], "public")
+
+    def test_provider_registry_derives_ids_metadata_homes_and_hooks(self) -> None:
+        registry = agentcat.provider_registry
+        self.assertEqual(agentcat.CONFIG_PROVIDER_IDS, tuple(module.SPEC.id for module in registry.PROVIDER_MODULES))
+        self.assertEqual(set(agentcat.PROVIDER_HOME_SPECS), set(agentcat.CONFIG_PROVIDER_IDS))
+        self.assertEqual(agentcat.PROVIDER_METADATA, registry.provider_metadata())
+        self.assertEqual(agentcat.CONNECTOR_CAPABILITIES, registry.connector_capabilities())
+        for module in registry.PROVIDER_MODULES:
+            for hook in ("discover", "usage", "quota", "cost", "health"):
+                self.assertTrue(callable(getattr(module, hook)))
+
+    def test_provider_plugin_extraction_byte_matches_legacy_full_snapshot_fixture(self) -> None:
+        fixture_path = REPO_ROOT / "contracts" / "fixtures" / "provider-quota-v2.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))["snapshot"]["providers"]
+
+        def legacy_builder(provider_config, activity):
+            def safe(provider_id, reader):
+                try:
+                    return reader()
+                except Exception as exc:
+                    payload = agentcat.empty_provider_usage(status="error")
+                    payload["error"] = str(exc)
+                    return payload
+
+            gemini_provider, antigravity_provider = agentcat.split_google_cli_snapshots(
+                agentcat.gemini_snapshot(), activity
+            )
+            providers = {
+                "codex": safe("codex", agentcat.codex_snapshot),
+                "claude": safe("claude", agentcat.claude_snapshot),
+                "gemini": gemini_provider,
+                "antigravity": antigravity_provider,
+                "opencode": safe("opencode", agentcat.opencode_snapshot),
+                "copilot": safe("copilot", agentcat.copilot_snapshot),
+                "kimi": safe("kimi", agentcat.kimi_snapshot),
+                "grok": safe("grok", agentcat.grok_snapshot),
+            }
+            return {provider: agentcat.sanitize_payload(payload) for provider, payload in providers.items()}
+
+        empty_limits = {provider: agentcat.empty_limits() for provider in agentcat.CONFIG_PROVIDER_IDS}
+        stable_insights = {"summary": {}, "providers": [], "models": [], "findings": [], "pricing_status": "bundled"}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(agentcat, "agentcat_settings", return_value={}))
+            stack.enter_context(patch.object(agentcat, "latest_events_by_provider", return_value={}))
+            stack.enter_context(patch.object(agentcat, "configured_limits", return_value=copy.deepcopy(empty_limits)))
+            stack.enter_context(patch.object(agentcat, "runtime_limits", return_value=copy.deepcopy(empty_limits)))
+            stack.enter_context(patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok", "processes": []}))
+            stack.enter_context(patch.object(agentcat, "auto_update_status_snapshot", return_value={"status": "current"}))
+            stack.enter_context(patch.object(agentcat, "daemon_status_snapshot", return_value={"status": "registered"}))
+            stack.enter_context(patch.object(agentcat, "desktop_app_sources_snapshot", return_value={}))
+            stack.enter_context(patch.object(agentcat, "provider_instances_snapshot", return_value=[]))
+            stack.enter_context(patch.object(agentcat, "home_discovery_snapshot", return_value={}))
+            stack.enter_context(patch.object(agentcat, "update_project_daily", return_value={}))
+            stack.enter_context(patch.object(agentcat, "load_project_daily", return_value={}))
+            stack.enter_context(patch.object(agentcat, "project_daily_cost_snapshot_slice", return_value={}))
+            stack.enter_context(patch.object(agentcat, "pricing_status_snapshot", return_value={"source": "bundled", "fetchedAt": None}))
+            stack.enter_context(patch.object(agentcat, "derive_insights", return_value=stable_insights))
+            stack.enter_context(patch.object(agentcat, "provider_burn_rate", return_value=None))
+            stack.enter_context(patch.object(agentcat, "provider_auto_quota", return_value=None))
+            stack.enter_context(patch.object(agentcat, "snapshot_recommendation", return_value=None))
+            stack.enter_context(patch.object(agentcat, "now_iso", return_value="2026-09-04T00:00:00Z"))
+            stack.enter_context(patch.object(agentcat, "write_json_atomic"))
+            for provider_id in ("codex", "claude", "gemini", "opencode", "copilot", "kimi", "grok"):
+                stack.enter_context(patch.object(
+                    agentcat,
+                    f"{provider_id}_snapshot",
+                    side_effect=lambda provider_id=provider_id: copy.deepcopy(fixture[provider_id]),
+                ))
+            stack.enter_context(patch.object(
+                agentcat,
+                "split_google_cli_snapshots",
+                side_effect=lambda *_: (copy.deepcopy(fixture["gemini"]), copy.deepcopy(fixture["antigravity"])),
+            ))
+
+            with patch.object(agentcat, "build_provider_payloads", side_effect=legacy_builder):
+                before = agentcat._build_snapshot_impl()
+            after = agentcat._build_snapshot_impl()
+
+        def without_delivery_timestamps(value):
+            if isinstance(value, dict):
+                return {
+                    key: without_delivery_timestamps(child)
+                    for key, child in value.items()
+                    if key not in {"generatedAt", "servedAt"}
+                }
+            if isinstance(value, list):
+                return [without_delivery_timestamps(child) for child in value]
+            return value
+
+        before_bytes = json.dumps(without_delivery_timestamps(before), sort_keys=True, separators=(",", ":")).encode()
+        after_bytes = json.dumps(without_delivery_timestamps(after), sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(before_bytes, after_bytes)
 
     def test_connector_version_parser_and_comparison(self) -> None:
         text = 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.10")'

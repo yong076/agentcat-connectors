@@ -42,6 +42,9 @@ def connector_contract_version(repo: Path) -> int:
 
 def build_release(repo: Path, output: Path, repository: str, source_ref: str) -> tuple[Path, Path]:
     version = connector_version(repo)
+    provider_registry = repo / "bin" / "agentcat_providers" / "registry.py"
+    if not provider_registry.exists():
+        raise ValueError("provider plugin registry is missing")
     output.mkdir(parents=True, exist_ok=True)
     archive_name = f"agentcat-connectors-v{version}.zip"
     archive = output / archive_name

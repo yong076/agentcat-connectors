@@ -1,6 +1,11 @@
 {
   "contractVersion": 2,
   "snapshotSchemaVersion": 4,
+  "providerPluginLayout": {
+    "entrypoint": "bin/agentcat",
+    "modules": "bin/agentcat_providers",
+    "installation": "source-tree"
+  },
   "capabilityRegistry": {
     "connector.contract.v1": {
       "owner": "shared",

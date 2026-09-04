@@ -30,6 +30,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+_provider_package_dir = str(Path(__file__).resolve().parent)
+if _provider_package_dir not in sys.path:
+    sys.path.insert(0, _provider_package_dir)
+from agentcat_providers import ProviderContext
+from agentcat_providers import registry as provider_registry
+
 
 def resolve_user_home_env() -> str:
     """The user's real home directory, as a string.
@@ -181,58 +187,7 @@ PRICING_FETCH_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_MAX_A
 PRICING_FETCH_INTERVAL_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_INTERVAL_SECONDS", str(6 * 3600)))
 PRICING_FETCH_INITIAL_DELAY_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_INITIAL_DELAY_SECONDS", "20"))
 PRICING_FETCH_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AGENTCAT_PRICING_FETCH_HTTP_TIMEOUT_SECONDS", "10"))
-CONNECTOR_CAPABILITIES = (
-    "snapshot.metadata",
-    "connector.contract.v1",
-    "connector.autoUpdate",
-    "connector.channel",
-    # Compatibility alias consumed by released Windows builds. New clients
-    # should key off connector.daemon.status.v1 and the documented daemon
-    # object instead of treating daemon support as an unversioned boolean.
-    "connector.daemon",
-    "connector.daemon.status.v1",
-    "activity.terminal",
-    "activity.memory",
-    "activity.runtimeModes",
-    "connector.config",
-    "desktopApps.localMetadata",
-    "events.sqlite",
-    "usage.dailyTokens",
-    "usage.hourlyTokens",
-    "usage.breakdown",
-    "usage.projects",
-    "usage.coverage",
-    "projects.daily",
-    "projects.dailyCost",
-    "insights.periods",
-    "insights.burnRate",
-    "insights.autoQuota",
-    "insights.recommendation",
-    "homes.discovery",
-    "providerInstances.v1",
-    "quota.scoped.v2",
-    "providers.metadata.v1",
-    "pricing.feed",
-    "usage.opencode.sqlite",
-    "usage.antigravity.sqlite",
-    "usage.copilot.localLogs",
-    "limits.liveCache",
-    "limits.errorBackoff",
-    "limits.quotaFallbackOn429",
-    "limits.codex.oauthUsage",
-    "limits.claude.oauthUsage",
-    "limits.claude.statusline",
-    "limits.claude.statuslineQuotas",
-    "limits.gemini.codeAssist",
-    "limits.grok.oauthUsage",
-    "limits.kimi.oauthUsage",
-    "usage.grok.sessions",
-    "hooks.codexNotify",
-    "hooks.claudeStatusline",
-    "hooks.claudeHooks",
-    "hooks.geminiTelemetry",
-    "activity.windowsProcessScan",
-)
+CONNECTOR_CAPABILITIES = provider_registry.connector_capabilities()
 _GEMINI_CACHE_LOCK = threading.Lock()
 _GEMINI_CACHE_KEY: Optional[Tuple[int, int]] = None
 _GEMINI_CACHE_VALUE: Optional[Dict[str, Any]] = None
@@ -1287,27 +1242,7 @@ def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
 # number the product shows, which costs more trust than the gap it closes.
 # ---------------------------------------------------------------------------
 
-PROVIDER_HOME_SPECS: Dict[str, Dict[str, Any]] = {
-    "codex": {
-        "envVar": "CODEX_HOME",
-        "defaultName": ".codex",
-        "siblingGlob": ".codex*",
-        "usageGlobs": ("sessions/**/*.jsonl", "archived_sessions/**/*.jsonl"),
-        # Markers prove a directory really is a provider home, so a stray
-        # ~/.codex-notes folder never gets offered as a usage source.
-        "markers": ("sessions", "archived_sessions", "auth.json"),
-        # Homes other local tools create by mirroring ~/.codex.
-        "knownRuntimeHomes": ("Library/Application Support/orca/codex-runtime-home/home",),
-    },
-    "claude": {
-        "envVar": "CLAUDE_CONFIG_DIR",
-        "defaultName": ".claude",
-        "siblingGlob": ".claude*",
-        "usageGlobs": ("projects/**/*.jsonl",),
-        "markers": ("projects", "settings.json"),
-        "knownRuntimeHomes": (),
-    },
-}
+PROVIDER_HOME_SPECS: Dict[str, Dict[str, Any]] = provider_registry.provider_home_specs()
 
 HOME_DISCOVERY_PROVIDER_IDS = tuple(PROVIDER_HOME_SPECS)
 
@@ -1591,65 +1526,8 @@ def tracked_provider_homes(provider: str) -> List[Path]:
     return homes
 
 
-CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot", "kimi", "grok")
-PROVIDER_METADATA: Dict[str, Dict[str, Any]] = {
-    "codex": {
-        "displayName": "Codex",
-        "brandColor": "#10A37F",
-        "iconHint": "codex",
-        "windows": ["5h", "7d", "session"],
-        "sourceHintKey": "provider.source.codex",
-    },
-    "claude": {
-        "displayName": "Claude",
-        "brandColor": "#D97757",
-        "iconHint": "claude",
-        "windows": ["5h", "7d", "monthly", "session"],
-        "sourceHintKey": "provider.source.claude",
-    },
-    "gemini": {
-        "displayName": "Gemini",
-        "brandColor": "#4285F4",
-        "iconHint": "gemini",
-        "windows": ["daily"],
-        "sourceHintKey": "provider.source.gemini",
-    },
-    "antigravity": {
-        "displayName": "Antigravity",
-        "brandColor": "#7C3AED",
-        "iconHint": "antigravity",
-        "windows": ["daily"],
-        "sourceHintKey": "provider.source.antigravity",
-    },
-    "opencode": {
-        "displayName": "OpenCode",
-        "brandColor": "#111827",
-        "iconHint": "opencode",
-        "windows": [],
-        "sourceHintKey": "provider.source.opencode",
-    },
-    "copilot": {
-        "displayName": "GitHub Copilot",
-        "brandColor": "#6E40C9",
-        "iconHint": "copilot",
-        "windows": [],
-        "sourceHintKey": "provider.source.copilot",
-    },
-    "kimi": {
-        "displayName": "Kimi",
-        "brandColor": "#111827",
-        "iconHint": "kimi",
-        "windows": ["5h", "7d", "monthly"],
-        "sourceHintKey": "provider.source.kimi",
-    },
-    "grok": {
-        "displayName": "Grok",
-        "brandColor": "#000000",
-        "iconHint": "grok",
-        "windows": ["5h", "7d", "monthly", "media"],
-        "sourceHintKey": "provider.source.grok",
-    },
-}
+CONFIG_PROVIDER_IDS = provider_registry.CONFIG_PROVIDER_IDS
+PROVIDER_METADATA: Dict[str, Dict[str, Any]] = provider_registry.provider_metadata()
 DESKTOP_APP_PROVIDER_IDS = ("claude", "codex")
 
 
@@ -11791,6 +11669,52 @@ def build_snapshot() -> Dict[str, Any]:
         return _build_snapshot_impl()
 
 
+def build_provider_payloads(
+    provider_config: Dict[str, Dict[str, Any]],
+    activity: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Build all provider usage slices through the plugin registry."""
+    overrides: Dict[str, Dict[str, Any]] = {}
+    gemini_disabled = (provider_config.get("gemini") or {}).get("enabled") is False
+    antigravity_disabled = (provider_config.get("antigravity") or {}).get("enabled") is False
+    if not (gemini_disabled and antigravity_disabled):
+        try:
+            gemini_provider, antigravity_provider = split_google_cli_snapshots(gemini_snapshot(), activity)
+        except Exception as exc:
+            logging.debug("gemini/antigravity snapshot failed: %s", exc)
+            gemini_provider = empty_provider_usage(status="error")
+            gemini_provider["error"] = str(exc)
+            antigravity_provider = empty_provider_usage(status="error")
+            antigravity_provider["error"] = str(exc)
+        overrides = {"gemini": gemini_provider, "antigravity": antigravity_provider}
+
+    usage_readers = {
+        "codex": codex_snapshot,
+        "claude": claude_snapshot,
+        "opencode": opencode_snapshot,
+        "copilot": copilot_snapshot,
+        "kimi": kimi_snapshot,
+        "grok": grok_snapshot,
+    }
+
+    def usage(spec: Any, _home: Any) -> Dict[str, Any]:
+        return usage_readers[spec.id]()
+
+    def error(spec: Any, exc: Exception) -> Dict[str, Any]:
+        logging.debug("provider %s snapshot failed: %s", spec.id, exc)
+        payload = empty_provider_usage(status="error")
+        payload["error"] = str(exc)
+        return payload
+
+    context = ProviderContext(callbacks={
+        "usage": usage,
+        "disabled": lambda spec: disabled_provider_snapshot(spec.id),
+        "error": error,
+        "sanitize": sanitize_payload,
+    })
+    return provider_registry.build_providers(context, provider_config, overrides)
+
+
 def _build_snapshot_impl() -> Dict[str, Any]:
     ensure_dirs()
     settings = agentcat_settings()
@@ -11801,63 +11725,25 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
     limits_by_provider = configured_limits()
     runtime_limits_by_provider = runtime_limits()
-    def _safe_provider(provider_id: str, fn: Any) -> Dict[str, Any]:
-        # Per-provider isolation: one provider's reader raising must NOT fail the whole
-        # build_snapshot. The refresh loop swallows the exception and then serves the
-        # previous snapshot with a fresh servedAt — so a single bad provider silently
-        # freezes ALL numbers as if current (audit #14). Degrade to an error entry.
-        try:
-            return fn()
-        except Exception as exc:
-            logging.debug("provider %s snapshot failed: %s", provider_id, exc)
-            snap = empty_provider_usage(status="error")
-            snap["error"] = str(exc)
-            return snap
-
     try:
         activity = terminal_activity_snapshot()
     except Exception as exc:
         logging.debug("terminal_activity_snapshot failed: %s", exc)
         activity = {"status": "error", "error": str(exc)}
-    if (provider_config.get("gemini") or {}).get("enabled") is False and (provider_config.get("antigravity") or {}).get("enabled") is False:
-        gemini_provider = disabled_provider_snapshot("gemini")
-        antigravity_provider = disabled_provider_snapshot("antigravity")
-    else:
-        try:
-            gemini_provider, antigravity_provider = split_google_cli_snapshots(gemini_snapshot(), activity)
-        except Exception as exc:
-            logging.debug("gemini/antigravity snapshot failed: %s", exc)
-            gemini_provider = empty_provider_usage(status="error")
-            gemini_provider["error"] = str(exc)
-            antigravity_provider = empty_provider_usage(status="error")
-            antigravity_provider["error"] = str(exc)
-    providers = {
-        "codex": disabled_provider_snapshot("codex") if (provider_config.get("codex") or {}).get("enabled") is False else _safe_provider("codex", codex_snapshot),
-        "claude": disabled_provider_snapshot("claude") if (provider_config.get("claude") or {}).get("enabled") is False else _safe_provider("claude", claude_snapshot),
-        "gemini": gemini_provider,
-        "antigravity": antigravity_provider,
-        "opencode": disabled_provider_snapshot("opencode") if (provider_config.get("opencode") or {}).get("enabled") is False else _safe_provider("opencode", opencode_snapshot),
-        "copilot": disabled_provider_snapshot("copilot") if (provider_config.get("copilot") or {}).get("enabled") is False else _safe_provider("copilot", copilot_snapshot),
-        "kimi": disabled_provider_snapshot("kimi") if (provider_config.get("kimi") or {}).get("enabled") is False else _safe_provider("kimi", kimi_snapshot),
-        "grok": disabled_provider_snapshot("grok") if (provider_config.get("grok") or {}).get("enabled") is False else _safe_provider("grok", grok_snapshot),
-    }
-    if (provider_config.get("gemini") or {}).get("enabled") is False:
-        providers["gemini"] = disabled_provider_snapshot("gemini")
-    if (provider_config.get("antigravity") or {}).get("enabled") is False:
-        providers["antigravity"] = disabled_provider_snapshot("antigravity")
-    for provider, data in tuple(providers.items()):
-        sanitized = sanitize_payload(data)
-        providers[provider] = sanitized if isinstance(sanitized, dict) else empty_provider_usage(status="error")
-    for provider in ("gemini", "antigravity", "opencode", "copilot", "kimi", "grok"):
+    providers = build_provider_payloads(provider_config, activity)
+    for provider in provider_registry.COVERAGE_PROVIDER_IDS:
         attach_local_usage_coverage(provider, providers.get(provider, {}))
+    quota_context = ProviderContext(callbacks={
+        "quota": lambda spec, _home: merge_limits(
+            limits_by_provider.get(spec.id, empty_limits()),
+            runtime_limits_by_provider.get(spec.id, empty_limits()),
+        ),
+    })
     for provider, data in providers.items():
         if data.get("status") == "disabled":
             data["limits"] = empty_limits("disabled")
         else:
-            data["limits"] = merge_limits(
-                limits_by_provider.get(provider, empty_limits()),
-                runtime_limits_by_provider.get(provider, empty_limits()),
-            )
+            data["limits"] = provider_registry.quota(quota_context, provider)
         data["limits"] = ensure_quota_schema_v2(data["limits"])
         data["meta"] = provider_metadata(provider)
     desktop_apps = desktop_app_sources_snapshot(settings)

@@ -148,6 +148,9 @@ def install_binary(repo_dir: Path, backup_dir: Path) -> None:
     src = repo_dir / "bin" / "agentcat"
     if not src.exists():
         raise FileNotFoundError(src)
+    provider_registry = repo_dir / "bin" / "agentcat_providers" / "registry.py"
+    if not provider_registry.exists():
+        raise FileNotFoundError(provider_registry)
     mode = src.stat().st_mode
     src.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 

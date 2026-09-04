@@ -22,11 +22,13 @@ class BuildPublicReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source"
             (source / "bin").mkdir(parents=True)
+            (source / "bin" / "agentcat_providers").mkdir()
             (source / "contracts").mkdir()
             (source / "bin" / "agentcat").write_text(
                 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.6")\n',
                 encoding="utf-8",
             )
+            (source / "bin" / "agentcat_providers" / "registry.py").write_text("\n", encoding="utf-8")
             (source / "contracts" / "connector-v1.json").write_text(
                 '{"contractVersion": 2}\n', encoding="utf-8"
             )
@@ -57,6 +59,7 @@ class BuildPublicReleaseTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as package:
                 names = package.namelist()
             self.assertTrue(any(name.endswith("/bin/agentcat") for name in names))
+            self.assertTrue(any(name.endswith("/bin/agentcat_providers/registry.py") for name in names))
             self.assertTrue(any(name.endswith("/contracts/connector-v1.json") for name in names))
 
 
