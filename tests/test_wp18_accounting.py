@@ -2,6 +2,7 @@ import importlib.util
 import datetime as dt
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -772,3 +773,80 @@ class ProviderCostTests(SandboxedCase):
         self.assertEqual(result["providers"][0]["estimated_cost_usd"], 21.0)
         self.assertEqual(result["summary"]["input_cost_usd"], 30.0)
         self.assertEqual(result["summary"]["estimated_cost_usd"], 30.0)
+
+
+class AntigravityMtimeTests(SandboxedCase):
+    @staticmethod
+    def _varint(value: int) -> bytes:
+        encoded = bytearray()
+        while value >= 0x80:
+            encoded.append((value & 0x7F) | 0x80)
+            value >>= 7
+        encoded.append(value)
+        return bytes(encoded)
+
+    @classmethod
+    def _field(cls, number: int, value: int | bytes) -> bytes:
+        if isinstance(value, int):
+            return cls._varint(number << 3) + cls._varint(value)
+        return cls._varint((number << 3) | 2) + cls._varint(len(value)) + value
+
+    @classmethod
+    def _blob(cls, timestamp: int | None = None) -> bytes:
+        usage = cls._field(2, 10) + cls._field(3, 5)
+        message = cls._field(4, usage) + cls._field(21, b"antigravity-fixture")
+        if timestamp is not None:
+            generation = cls._field(4, cls._field(1, timestamp))
+            message += cls._field(9, generation)
+        return cls._field(1, message)
+
+    def _database(self, blob: bytes, mtime: dt.datetime) -> Path:
+        conversations = agentcat.antigravity_conversations_dir()
+        conversations.mkdir(parents=True)
+        database = conversations / "fixture.db"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("create table gen_metadata (data blob)")
+            connection.execute("insert into gen_metadata(data) values (?)", (blob,))
+            connection.commit()
+        finally:
+            connection.close()
+        os.utime(database, (mtime.timestamp(), mtime.timestamp()))
+        return database
+
+    def test_missing_embedded_timestamp_uses_database_mtime(self) -> None:
+        mtime = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)
+        self._database(self._blob(), mtime)
+
+        usage = agentcat.antigravity_sqlite_usage()
+
+        self.assertEqual(usage["dailyTokens"], {agentcat.day_key_for_timestamp(mtime): 15})
+        self.assertEqual(usage["tokens"]["week"], 15)
+
+    def test_embedded_timestamp_takes_precedence_over_database_mtime(self) -> None:
+        embedded = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        old_mtime = embedded - dt.timedelta(days=40)
+        self._database(self._blob(int(embedded.timestamp())), old_mtime)
+
+        usage = agentcat.antigravity_sqlite_usage()
+
+        self.assertEqual(usage["dailyTokens"], {agentcat.day_key_for_timestamp(embedded): 15})
+        self.assertEqual(usage["tokens"]["today"], 15)
+
+    def test_embedded_timestamp_survives_database_mtime_stat_failure(self) -> None:
+        embedded = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        database = self._database(self._blob(int(embedded.timestamp())), embedded)
+        original_stat = Path.stat
+
+        def stat_with_failed_database_mtime(path, *args, **kwargs):
+            if path == database:
+                raise OSError("mtime unavailable")
+            return original_stat(path, *args, **kwargs)
+
+        with patch.object(Path, "stat", stat_with_failed_database_mtime):
+            usage = agentcat.antigravity_sqlite_usage()
+
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage["dailyTokens"], {agentcat.day_key_for_timestamp(embedded): 15})
+        self.assertEqual(usage["tokens"]["all"], 15)
+

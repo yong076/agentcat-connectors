@@ -10414,6 +10414,10 @@ def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
     for database in databases:
         connection: Optional[sqlite3.Connection] = None
         try:
+            database_when = dt.datetime.fromtimestamp(database.stat().st_mtime, dt.timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            database_when = None
+        try:
             connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
             rows = connection.execute(
                 "select data from gen_metadata where length(data) < 100000 order by rowid"
@@ -10430,7 +10434,7 @@ def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
             if parsed is None:
                 continue
             model, when, metrics = parsed
-            if add_usage_metrics(result, model, metrics, when):
+            if add_usage_metrics(result, model, metrics, when or database_when):
                 events += 1
     if events == 0:
         return None
