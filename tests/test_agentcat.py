@@ -1992,6 +1992,37 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertTrue(str(snapshot["source"]).endswith("state_test.sqlite"))
         self.assertEqual(snapshot["tokens"]["all"], 55)
 
+    def test_codex_sessions_cursor_carries_model_across_zero_turn_scan(self) -> None:
+        # A `codex exec` session is typically first scanned right after its
+        # turn_context and before its first token_count. That zero-turn scan
+        # must still persist lastModel, or every later turn is "unknown".
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        path = self._write_codex_session(
+            "rollout-zero-turn.jsonl",
+            [
+                {"type": "session_meta", "payload": {"id": "zero-turn"}},
+                {"type": "turn_context", "payload": {"model": "gpt-5.5"}},
+            ],
+        )
+        first = agentcat.codex_snapshot()
+        self.assertEqual(int(first["tokens"].get("all") or 0), 0)
+
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    self._token_count_event(
+                        {"input_tokens": 30, "cached_input_tokens": 0,
+                         "output_tokens": 12, "reasoning_output_tokens": 0},
+                        now,
+                    )
+                )
+                + "\n"
+            )
+        second = agentcat.codex_snapshot()
+        self.assertEqual(second["tokens"]["all"], 42)
+        self.assertEqual(second["models"]["gpt-5.5"]["all"], 42)
+        self.assertNotIn("unknown", second["models"])
+
     def test_codex_sessions_cursor_dedupes_on_reread(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         path = self._write_codex_session(

@@ -132,7 +132,7 @@ CODEX_SESSIONS_CURSOR_FILE = AGENTCAT_HOME / "codex-sessions-cursor.json"
 # fixed scanner therefore keeps serving the old, wrong number forever. That is
 # exactly what happened to v2: the hardlink dedup landed without a bump, so
 # mirrored-home users kept a permanently doubled total.
-CODEX_SESSIONS_CURSOR_VERSION = 3
+CODEX_SESSIONS_CURSOR_VERSION = 4  # 4: lastModel carried across zero-turn scans; forces a one-time rebuild
 # Claude Code stores its config under $CLAUDE_CONFIG_DIR when set (dotfiles-managed
 # / multi-account setups), otherwise ~/.claude. Honor it so those users' journals
 # and credentials are found instead of silently reading zero.
@@ -7504,8 +7504,12 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
 
         new_offset = prev_offset
         # Carry the last model seen in this file across incremental reads — the
-        # turn_context that set it may live before prev_offset.
-        prev_model = meta.get("lastModel") if turn_index else None
+        # turn_context that set it may live before prev_offset. NOT gated on
+        # turn_index: a fresh `codex exec` session is usually first scanned
+        # after its turn_context but before its first token_count, so the
+        # model must survive a zero-turn scan or every later turn lands in
+        # "unknown" (2026-09-05: 58% of a day's Codex tokens).
+        prev_model = meta.get("lastModel")
         current_model: Optional[str] = prev_model if isinstance(prev_model, str) else None
         counted_raw_totals = _codex_coerce_raw_totals(meta.get("countedRawTotals")) if turn_index else None
         raw_totals_baseline = _codex_coerce_raw_totals(meta.get("rawTotalsBaseline")) if turn_index else None
