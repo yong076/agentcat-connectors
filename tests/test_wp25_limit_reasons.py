@@ -5,12 +5,10 @@ import io
 import json
 import os
 import tempfile
-import time
 import unittest
 import urllib.error
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from typing import Any, Dict, Optional
 from unittest.mock import patch
 
 from tests.sandbox import assert_sandboxed, redirect_module_paths, restore_module_paths
@@ -187,3 +185,123 @@ class KimiCredentialDiscoveryTests(WP25TestCase):
 
         self.assertEqual(limits["reason"], "token_expired")
         self.assertNotEqual(limits.get("reason"), "token_missing")
+
+
+class GeminiCodeAssistProjectTests(WP25TestCase):
+    quota_url = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+
+    def quota_payload(self):
+        return {
+            "buckets": [
+                {
+                    "modelId": "gemini-2.5-pro",
+                    "remainingFraction": 0.4,
+                    "resetTime": "2026-08-20T09:36:27Z",
+                    "tokenType": "REQUESTS",
+                }
+            ]
+        }
+
+    def gemini_live(self, post_side_effect):
+        env = {"GOOGLE_CLOUD_PROJECT": "", "GOOGLE_CLOUD_PROJECT_ID": ""}
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            agentcat, "read_gemini_auth_type", return_value="oauth-personal"
+        ), patch.object(
+            agentcat, "gemini_access_token", return_value="tok"
+        ), patch.object(
+            agentcat, "gemini_code_assist_post", side_effect=post_side_effect
+        ):
+            return agentcat.gemini_live_limits(force=True)
+
+    def raise_quota_status(self, status):
+        def fake_post(method, payload, token):
+            if method == "loadCodeAssist":
+                return {}
+            if method == "retrieveUserQuota":
+                self.assertEqual(payload, {})
+                raise self.http_error(self.quota_url, status)
+            raise AssertionError(method)
+
+        return fake_post
+
+    def test_live_limit_error_403_without_project_is_project_required(self):
+        forbidden = agentcat.live_limit_error(self.http_error(self.quota_url, 403), "x", project_id="")
+        unauthorized = agentcat.live_limit_error(self.http_error(self.quota_url, 401), "x", project_id="")
+        generic_forbidden = agentcat.live_limit_error(self.http_error(self.quota_url, 403), "x")
+
+        self.assertEqual(forbidden["reason"], "project_required")
+        self.assertEqual(unauthorized["reason"], "token_expired")
+        self.assertEqual(generic_forbidden["reason"], "token_expired")
+
+    def test_403_without_project_is_project_required(self):
+        limits = self.gemini_live(self.raise_quota_status(403))
+
+        self.assertEqual(limits["reason"], "project_required")
+        self.assertEqual(limits["status"], "error")
+        self.assertNotEqual(limits.get("reason"), "token_expired")
+
+    def test_401_without_project_is_token_expired(self):
+        limits = self.gemini_live(self.raise_quota_status(401))
+
+        self.assertEqual(limits["reason"], "token_expired")
+        self.assertEqual(limits["status"], "error")
+
+    def test_retrieve_user_quota_succeeds_without_project(self):
+        calls = []
+        quota = self.quota_payload()
+
+        def fake_post(method, payload, token):
+            calls.append((method, payload))
+            if method == "loadCodeAssist":
+                return {"allowedTiers": [{"id": "standard-tier"}]}
+            if method == "retrieveUserQuota":
+                self.assertEqual(payload, {})
+                return quota
+            raise AssertionError(method)
+
+        limits = self.gemini_live(fake_post)
+
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 40.0)
+        self.assertEqual(limits["quotas"][0]["usedPercent"], 60.0)
+        self.assertEqual(limits["quotas"][0]["resetAt"], agentcat.reset_epoch("2026-08-20T09:36:27Z"))
+        self.assertEqual([method for method, _ in calls], ["loadCodeAssist", "retrieveUserQuota"])
+
+    def test_project_required_keeps_cached_quotas(self):
+        good = agentcat.empty_limits(status="auto")
+        good["source"] = agentcat.GEMINI_CODE_ASSIST_URL
+        good["quotas"] = [
+            {
+                "id": "gemini:pro",
+                "label": "Gemini Pro",
+                "model": "gemini-2.5-pro",
+                "usedPercent": 10.0,
+                "remainingPercent": 90.0,
+            }
+        ]
+        agentcat.write_live_limits_cache("gemini", good)
+
+        limits = self.gemini_live(self.raise_quota_status(403))
+        cached = json.loads(agentcat.LIVE_LIMITS_CACHE.read_text(encoding="utf-8"))["gemini"]["limits"]
+
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["quotas"][0]["id"], "gemini:pro")
+        self.assertEqual(limits["liveErrorReason"], "project_required")
+        self.assertEqual(cached["status"], "auto")
+        self.assertEqual(cached["quotas"][0]["id"], "gemini:pro")
+        self.assertEqual(cached["liveErrorReason"], "project_required")
+
+    def test_antigravity_403_without_project_is_project_required(self):
+        env = {"GOOGLE_CLOUD_PROJECT": "", "GOOGLE_CLOUD_PROJECT_ID": ""}
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            agentcat, "read_antigravity_oauth_credentials", return_value={"access_token": "tok"}
+        ), patch.object(
+            agentcat, "antigravity_access_token", return_value="tok"
+        ), patch.object(
+            agentcat, "gemini_code_assist_post", side_effect=self.raise_quota_status(403)
+        ):
+            limits = agentcat.antigravity_live_limits(force=True)
+
+        self.assertEqual(limits["reason"], "project_required")
+        self.assertEqual(limits["error"], "Antigravity Code Assist project ID unavailable")
+        self.assertNotEqual(limits.get("reason"), "token_expired")

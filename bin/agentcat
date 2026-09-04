@@ -2901,7 +2901,11 @@ def quota_entry(
     }
 
 
-def live_limit_error(exc: Exception, source: str) -> Dict[str, Any]:
+def live_limit_error(
+    exc: Exception,
+    source: str,
+    project_id: Optional[str] = None,
+) -> Dict[str, Any]:
     limits = empty_limits(status="error", error=str(exc))
     limits["source"] = source
     reason = "unknown_error"
@@ -2930,7 +2934,14 @@ def live_limit_error(exc: Exception, source: str) -> Dict[str, Any]:
                 body = exc.read(64 * 1024).decode("utf-8", errors="replace")
             except Exception:
                 body = ""
-            reason = "missing_scope" if "user:profile" in body else "token_expired"
+            if "user:profile" in body:
+                reason = "missing_scope"
+            elif project_id is not None and not str(project_id).strip():
+                # Valid OAuth, but Code Assist has no project after the 2026-06-18
+                # consumer cutover. Do not call this token_expired.
+                reason = "project_required"
+            else:
+                reason = "token_expired"
         elif status >= 500:
             reason = "server_error"
         else:
@@ -3009,6 +3020,20 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
         raw = read_json(LIVE_LIMITS_CACHE)
         cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
         previous = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
+        previous_limits = previous.get("limits") if isinstance(previous.get("limits"), dict) else {}
+        if (
+            status == "error"
+            and previous_limits.get("status") in {"auto", "ok"}
+            and previous_limits.get("quotas")
+        ):
+            # Keep last-good quotas. An error-only payload would blank the tile
+            # even though the token is still valid (e.g. project_required 403).
+            merged = dict(previous_limits)
+            merged["liveError"] = limits.get("error")
+            merged["liveErrorReason"] = limits.get("reason")
+            if limits.get("retryAt") is not None:
+                merged["retryAt"] = limits.get("retryAt")
+            limits = merged
         previous_streak = int_count(previous.get("failureStreak")) or 0
         failed = status == "error" or bool(limits.get("liveError"))
         cache[provider] = {
@@ -3025,7 +3050,12 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
         pass
 
 
-def serve_stale_live_limits(provider: str, stale: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
+def serve_stale_live_limits(
+    provider: str,
+    stale: Dict[str, Any],
+    exc: Exception,
+    project_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Return the last-good live limits during a probe failure, re-stamping the
     cache so the daemon does not re-probe (and re-refresh the OAuth token) on every
     60s tick while the provider keeps failing. Without the re-stamp, `cachedAt`
@@ -3035,7 +3065,7 @@ def serve_stale_live_limits(provider: str, stale: Dict[str, Any], exc: Exception
     """
     stale = dict(stale)
     stale["liveError"] = str(exc)
-    error_limits = live_limit_error(exc, str(stale.get("source") or provider))
+    error_limits = live_limit_error(exc, str(stale.get("source") or provider), project_id=project_id)
     stale["liveErrorReason"] = error_limits.get("reason")
     stale.pop("retryAt", None)
     if error_limits.get("retryAt") is not None:
@@ -5228,6 +5258,9 @@ def fetch_code_assist_quota(access_token: str, project_id: str = "") -> Tuple[Di
             )
         except Exception:
             quota_payload = {}
+    # Empty project is common after the 2026-06-18 consumer cutover. Try
+    # retrieveUserQuota({}) before failing — it still returns remainingFraction
+    # + resetTime. A 403 here is project_required, not token_expired.
     if not (isinstance(quota_payload, dict) and quota_payload.get("buckets")):
         quota_payload = gemini_code_assist_post("retrieveUserQuota", {}, access_token)
     if not isinstance(quota_payload, dict):
@@ -5242,11 +5275,11 @@ def gemini_live_limits(force: bool = False) -> Dict[str, Any]:
     auth_type = read_gemini_auth_type()
     if auth_type != "oauth-personal":
         return empty_limits()
+    project_id = gemini_local_project_id()
     try:
         token = gemini_access_token()
         if not token:
             return empty_limits()
-        project_id = gemini_local_project_id()
         tier_payload, quota_payload = fetch_code_assist_quota(token, project_id)
         limits = gemini_limits_from_quota_response(quota_payload, tier_payload, source=GEMINI_CODE_ASSIST_URL)
         write_live_limits_cache("gemini", limits)
@@ -5254,8 +5287,13 @@ def gemini_live_limits(force: bool = False) -> Dict[str, Any]:
     except Exception as exc:
         stale = cached_live_limits("gemini", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
         if stale:
-            return serve_stale_live_limits("gemini", normalize_gemini_limits(stale), exc)
-        limits = live_limit_error(exc, GEMINI_CODE_ASSIST_URL)
+            return serve_stale_live_limits(
+                "gemini",
+                normalize_gemini_limits(stale),
+                exc,
+                project_id=project_id,
+            )
+        limits = live_limit_error(exc, GEMINI_CODE_ASSIST_URL, project_id=project_id)
         write_live_limits_cache("gemini", limits)
         return limits
 
@@ -5270,11 +5308,11 @@ def antigravity_live_limits(force: bool = False) -> Dict[str, Any]:
         return normalize_gemini_limits(cached)
     if read_antigravity_oauth_credentials() is None:
         return empty_limits()
+    project_id = gemini_local_project_id(antigravity_local_project_path())
     try:
         token = antigravity_access_token()
         if not token:
             return empty_limits()
-        project_id = gemini_local_project_id(antigravity_local_project_path())
         tier_payload, quota_payload = fetch_code_assist_quota(token, project_id)
         limits = gemini_limits_from_quota_response(quota_payload, tier_payload, source=GEMINI_CODE_ASSIST_URL)
         if limits.get("status") == "not_configured" and not limits.get("quotas"):
@@ -5288,8 +5326,15 @@ def antigravity_live_limits(force: bool = False) -> Dict[str, Any]:
     except Exception as exc:
         stale = cached_live_limits("antigravity", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
         if stale:
-            return serve_stale_live_limits("antigravity", normalize_gemini_limits(stale), exc)
-        limits = live_limit_error(exc, GEMINI_CODE_ASSIST_URL)
+            return serve_stale_live_limits(
+                "antigravity",
+                normalize_gemini_limits(stale),
+                exc,
+                project_id=project_id,
+            )
+        limits = live_limit_error(exc, GEMINI_CODE_ASSIST_URL, project_id=project_id)
+        if limits.get("reason") == "project_required":
+            limits["error"] = "Antigravity Code Assist project ID unavailable"
         write_live_limits_cache("antigravity", limits)
         return limits
 
