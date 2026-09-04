@@ -844,6 +844,12 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
                 "share_percent": 0.0,  # filled after totals known
             })
 
+        if period == "all" and "all" in ptokens:
+            provider_tokens[kind] = min(
+                provider_tokens.get(kind, 0),
+                _insight_int(ptokens.get("all")),
+            )
+
         # provider_no_limits finding
         limits = provider.get("limits") or {}
         has_quota = bool(limits.get("quotas")) or limits.get("weeklyTokens") is not None \

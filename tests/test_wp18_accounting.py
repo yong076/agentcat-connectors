@@ -418,6 +418,49 @@ class PeriodInsightTests(SandboxedCase):
         )
 
 
+class AllInsightClampTests(SandboxedCase):
+    def test_each_provider_is_clamped_without_changing_model_attribution(self) -> None:
+        snapshot = {
+            "providers": {
+                "headline_lower": {
+                    "tokens": {"all": 60},
+                    "models": {
+                        "model-a": {"all": {"inputTokens": 70}},
+                        "model-b": {"all": {"outputTokens": 30}},
+                    },
+                },
+                "models_lower": {
+                    "tokens": {"all": 100},
+                    "models": {"model-c": {"all": {"inputTokens": 50}}},
+                },
+                "no_headline": {
+                    "tokens": {},
+                    "models": {"model-d": {"all": {"inputTokens": 30}}},
+                },
+                "explicit_zero": {
+                    "tokens": {"all": 0},
+                    "models": {"model-e": {"all": {"inputTokens": 20}}},
+                },
+            }
+        }
+        original = json.loads(json.dumps(snapshot))
+
+        with patch.object(agentcat, "estimate_cost", return_value=None):
+            result = agentcat.derive_insights(snapshot, period="all")
+
+        provider_tokens = {item["kind"]: item["tokens"] for item in result["providers"]}
+        self.assertEqual(
+            provider_tokens,
+            {"headline_lower": 60, "models_lower": 50, "no_headline": 30},
+        )
+        self.assertEqual(result["summary"]["total_tokens"], 140)
+        self.assertEqual(
+            {item["name"]: item["tokens"] for item in result["models"]},
+            {"model-a": 70, "model-b": 30, "model-c": 50, "model-d": 30, "model-e": 20},
+        )
+        self.assertEqual(snapshot, original)
+
+
 class ClaudeWindowTests(SandboxedCase):
     def _write_usage(self, when: dt.datetime) -> Path:
         project = agentcat.CLAUDE_PROJECTS_DIR / "fixture"
