@@ -142,7 +142,7 @@ CLAUDE_DESKTOP_PROJECT_GLOBS = (
     "local-agent-mode-sessions/**/.claude/projects",
 )
 CLAUDE_DESKTOP_PROJECT_DIR_MAX = int(os.environ.get("AGENTCAT_CLAUDE_DESKTOP_PROJECT_DIR_MAX", "16"))
-CLAUDE_JOURNAL_CURSOR_VERSION = 3
+CLAUDE_JOURNAL_CURSOR_VERSION = 4
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
 PROJECT_DAILY_COST_SNAPSHOT_DAYS = 30
@@ -8436,16 +8436,13 @@ def fetch_llm_usage_fresh() -> Dict[str, Any]:
 # JournalScanner — incremental per-class token reader for Claude JSONL logs
 # ---------------------------------------------------------------------------
 
-_JOURNAL_PERIOD_KEYS = (
-    "today_input", "today_output", "today_cacheRead", "today_cacheWrite_1h", "today_cacheWrite_5m",
-    "week_input", "week_output", "week_cacheRead", "week_cacheWrite_1h", "week_cacheWrite_5m",
-    "month_input", "month_output", "month_cacheRead", "month_cacheWrite_1h", "month_cacheWrite_5m",
+_JOURNAL_ALL_KEYS = (
     "all_input", "all_output", "all_cacheRead", "all_cacheWrite_1h", "all_cacheWrite_5m",
 )
 
 
 def _empty_journal_totals() -> Dict[str, int]:
-    return {k: 0 for k in _JOURNAL_PERIOD_KEYS}
+    return {k: 0 for k in _JOURNAL_ALL_KEYS}
 
 
 def _empty_journal_projects() -> Dict[str, Dict[str, Any]]:
@@ -8460,13 +8457,14 @@ def _empty_journal_hourly_tokens() -> Dict[str, int]:
     return {}
 
 
-def _empty_journal_models() -> Dict[str, Dict[str, int]]:
+def _empty_journal_models() -> Dict[str, Dict[str, Any]]:
     return {}
 
 
 def load_journal_cursor() -> Dict[str, Any]:
     raw = read_json(JOURNAL_CURSOR_FILE)
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or raw.get("version") != CLAUDE_JOURNAL_CURSOR_VERSION:
+        needs_rebuild = isinstance(raw, dict)
         return {
             "version": CLAUDE_JOURNAL_CURSOR_VERSION,
             "offsets": {},
@@ -8477,24 +8475,24 @@ def load_journal_cursor() -> Dict[str, Any]:
             "models": _empty_journal_models(),
             "usageRecords": {},
             "projects_needs_rebuild": False,
-            "usage_needs_rebuild": False,
-            "totals_as_of": None,
+            "usage_needs_rebuild": needs_rebuild,
         }
     has_projects = isinstance(raw.get("projects"), dict)
     has_daily = isinstance(raw.get("dailyTokens"), dict)
     has_hourly = isinstance(raw.get("hourlyTokens"), dict)
     has_models = isinstance(raw.get("models"), dict)
     has_usage_records = isinstance(raw.get("usageRecords"), dict)
-    has_current_version = raw.get("version") == CLAUDE_JOURNAL_CURSOR_VERSION
     offsets = raw.get("offsets") or {}
-    totals = raw.get("totals") or {}
+    raw_totals = raw.get("totals") or {}
+    totals = {
+        key: int(raw_totals.get(key) or 0)
+        for key in _JOURNAL_ALL_KEYS
+    }
     projects = raw.get("projects") if has_projects else _empty_journal_projects()
     daily_tokens = raw.get("dailyTokens") if has_daily else _empty_journal_daily_tokens()
     hourly_tokens = raw.get("hourlyTokens") if has_hourly else _empty_journal_hourly_tokens()
     models = raw.get("models") if has_models else _empty_journal_models()
     usage_records = raw.get("usageRecords") if has_usage_records else {}
-    for k in _JOURNAL_PERIOD_KEYS:
-        totals.setdefault(k, 0)
     return {
         "version": CLAUDE_JOURNAL_CURSOR_VERSION,
         "offsets": {str(p): int(v) for p, v in offsets.items() if isinstance(v, (int, float))},
@@ -8503,7 +8501,23 @@ def load_journal_cursor() -> Dict[str, Any]:
         "dailyTokens": {str(k): int(v) for k, v in daily_tokens.items() if isinstance(v, (int, float))},
         "hourlyTokens": {str(k): int(v) for k, v in hourly_tokens.items() if isinstance(v, (int, float))},
         "models": {
-            str(model): {str(k): int(v) for k, v in values.items() if isinstance(v, (int, float))}
+            str(model): {
+                **{
+                    str(k): int(v)
+                    for k, v in values.items()
+                    if k not in {"today", "week", "month", "dailyTokens"}
+                    and isinstance(v, (int, float))
+                },
+                "dailyTokens": {
+                    str(day): int(amount)
+                    for day, amount in (
+                        values.get("dailyTokens", {}).items()
+                        if isinstance(values.get("dailyTokens"), dict)
+                        else []
+                    )
+                    if isinstance(amount, (int, float))
+                },
+            }
             for model, values in models.items()
             if isinstance(values, dict)
         },
@@ -8513,8 +8527,7 @@ def load_journal_cursor() -> Dict[str, Any]:
             if isinstance(value, dict)
         },
         "projects_needs_rebuild": not has_projects,
-        "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_usage_records and has_current_version),
-        "totals_as_of": raw.get("totals_as_of"),
+        "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_usage_records),
     }
 
 
@@ -8733,7 +8746,7 @@ def claude_journal_files_by_root() -> List[Tuple[Path, List[Path]]]:
 def _apply_record_to_totals(
     totals: Dict[str, int],
     rec: Dict[str, Any],
-    now: "dt.datetime",
+    _now: "dt.datetime",
     projects: Optional[Dict[str, Dict[str, Any]]] = None,
     daily_tokens: Optional[Dict[str, int]] = None,
     hourly_tokens: Optional[Dict[str, int]] = None,
@@ -8743,8 +8756,6 @@ def _apply_record_to_totals(
     ts: Optional["dt.datetime"] = rec.get("timestamp")
     if ts is not None and ts.tzinfo is None:
         ts = ts.replace(tzinfo=dt.timezone.utc)
-    now_local = now.astimezone().date()
-    rec_date = ts.astimezone().date() if ts else None
     fields = (
         ("input", "input", "inputTokens"),
         ("output", "output", "outputTokens"),
@@ -8770,14 +8781,6 @@ def _apply_record_to_totals(
         totals[f"all_{tok_key}"] = totals.get(f"all_{tok_key}", 0) + amount
         if model_tokens is not None:
             model_tokens[model_key] = model_tokens.get(model_key, 0) + amount
-        if ts is None or rec_date is None:
-            continue
-        if rec_date == now_local:
-            totals[f"today_{tok_key}"] = totals.get(f"today_{tok_key}", 0) + amount
-        if ts >= now - dt.timedelta(days=7):
-            totals[f"week_{tok_key}"] = totals.get(f"week_{tok_key}", 0) + amount
-        if ts >= now - dt.timedelta(days=30):
-            totals[f"month_{tok_key}"] = totals.get(f"month_{tok_key}", 0) + amount
     if project_total == 0:
         return
     if daily_tokens is not None:
@@ -8786,7 +8789,9 @@ def _apply_record_to_totals(
         add_to_hourly(hourly_tokens, project_total, ts)
     if model_tokens is not None:
         model_tokens["totalTokens"] = model_tokens.get("totalTokens", 0) + project_total
-        add_to_periods(model_tokens, project_total, ts)
+        model_daily = model_tokens.setdefault("dailyTokens", {})
+        if isinstance(model_daily, dict):
+            add_to_daily(model_daily, project_total, ts)
     cwd = str(rec.get("cwd") or "").strip()
     if projects is not None and cwd:
         project = projects.setdefault(cwd, {"tokens": 0, "last_active": None})
@@ -8838,15 +8843,6 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     changed = False
     rebuilt = False
     now_utc = dt.datetime.now(dt.timezone.utc)
-    now_local = now_utc.astimezone().date()
-    totals_as_of_str: Optional[str] = cursor.get("totals_as_of")
-    if totals_as_of_str:
-        try:
-            prev_date = dt.datetime.fromisoformat(totals_as_of_str).astimezone().date()
-            if prev_date != now_local:
-                cursor["usage_needs_rebuild"] = True
-        except Exception:
-            pass
     offsets: Dict[str, int] = cursor.setdefault("offsets", {})
     totals: Dict[str, int] = cursor.setdefault("totals", _empty_journal_totals())
     projects: Dict[str, Dict[str, Any]] = cursor.setdefault("projects", _empty_journal_projects())
@@ -8894,9 +8890,8 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                     for raw_line in fh:
                         if not raw_line.endswith(b"\n"):
                             # Incomplete trailing line (writer mid-append): stop before
-                            # advancing the cursor past it (audit #8). Claude's midnight
-                            # rebuild would eventually recover, but not counting a torn
-                            # line is still the correct incremental behavior.
+                            # advancing the cursor past it (audit #8). The next scan resumes
+                            # at this byte once the writer completes the record.
                             break
                         new_offset += len(raw_line)
                         line = raw_line.decode("utf-8", errors="replace").strip()
@@ -8945,11 +8940,6 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
             logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
                           path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
     if changed:
-        # Stamped only on change so an idle cursor stays byte-identical and
-        # the save can be skipped. The midnight rebuild check still fires:
-        # the first scan of a new day sees yesterday's stamp, rebuilds, and
-        # that rebuild marks the cursor changed.
-        cursor["totals_as_of"] = now_utc.isoformat()
         cursor["version"] = CLAUDE_JOURNAL_CURSOR_VERSION
     cursor["_dirty"] = changed
     cursor["_rebuilt"] = rebuilt
@@ -8972,11 +8962,12 @@ def _merge_journal_totals(tokens: Dict[str, int], cursor_totals: Dict[str, int])
         tokens["cacheReadInputTokens"] = tokens.get("cacheReadInputTokens", 0) + all_cache_read
     if all_cache_write > 0:
         tokens["cacheCreationInputTokens"] = tokens.get("cacheCreationInputTokens", 0) + all_cache_write
-    for period in ("today", "week", "month", "all"):
-        lumped = sum(cursor_totals.get(f"{period}_{cls}", 0)
-                     for cls in ("input", "output", "cacheRead", "cacheWrite_1h", "cacheWrite_5m"))
-        if lumped > 0:
-            tokens[period] = lumped
+    lifetime = sum(
+        cursor_totals.get(f"all_{cls}", 0)
+        for cls in ("input", "output", "cacheRead", "cacheWrite_1h", "cacheWrite_5m")
+    )
+    if lifetime > 0:
+        tokens["all"] = lifetime
     if tokens.get("all", 0) > 0:
         tokens["totalTokens"] = tokens["all"]
 
@@ -8993,6 +8984,15 @@ def _merge_journal_models(target: Dict[str, Dict[str, int]], source: Dict[str, D
             continue
         model_tokens = target.setdefault(model, {})
         for key, amount in values.items():
+            if key == "dailyTokens" or not isinstance(amount, (int, float)):
+                continue
+            if amount > 0:
+                model_tokens[key] = max(model_tokens.get(key, 0), amount)
+        daily = values.get("dailyTokens") if isinstance(values.get("dailyTokens"), dict) else {}
+        periods = periods_from_daily_tokens(int_map(daily))
+        lifetime = int(model_tokens.get("totalTokens") or periods["all"])
+        periods["all"] = lifetime
+        for key, amount in periods.items():
             if amount > 0:
                 model_tokens[key] = max(model_tokens.get(key, 0), amount)
 
@@ -9039,6 +9039,15 @@ def _journal_projects_snapshot(projects: Dict[str, Dict[str, Any]]) -> Dict[str,
         items.append(item)
     items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
     return {"status": "ok", "items": items[:20]}
+
+
+def _claude_snapshot_with_current_windows(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Refresh Claude's rolling labels from its dated buckets at read time."""
+    periods = periods_from_daily_tokens(int_map(result.get("dailyTokens")))
+    tokens = result.setdefault("tokens", {})
+    for key in ("today", "week", "month"):
+        tokens[key] = periods[key]
+    return result
 
 
 def _path_is_within(child: Path, parent: Path) -> bool:
@@ -9246,7 +9255,7 @@ def claude_snapshot() -> Dict[str, Any]:
         )
         return attach_local_usage_coverage(
             "claude",
-            merged,
+            _claude_snapshot_with_current_windows(merged),
             codexbarCostCache={
                 "status": claude_cost_cache.get("status"),
                 "source": claude_cost_cache.get("source"),
@@ -9328,7 +9337,7 @@ def claude_snapshot() -> Dict[str, Any]:
     )
     return attach_local_usage_coverage(
         "claude",
-        merged,
+        _claude_snapshot_with_current_windows(merged),
         codexbarCostCache={
             "status": claude_cost_cache.get("status"),
             "source": claude_cost_cache.get("source"),

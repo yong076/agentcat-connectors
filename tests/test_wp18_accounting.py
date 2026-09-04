@@ -335,3 +335,152 @@ class PeriodWindowTests(SandboxedCase):
                 os.environ["TZ"] = original_tz
             time.tzset()
 
+
+class ClaudeWindowTests(SandboxedCase):
+    def _write_usage(self, when: dt.datetime) -> Path:
+        project = agentcat.CLAUDE_PROJECTS_DIR / "fixture"
+        project.mkdir(parents=True, exist_ok=True)
+        journal = project / "session.jsonl"
+        event = {
+            "timestamp": when.isoformat(),
+            "cwd": str(self.home / "project"),
+            "requestId": f"request-{when.date().isoformat()}",
+            "message": {
+                "model": "claude-sonnet-fixture",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        }
+        with journal.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event) + "\n")
+        return journal
+
+    def test_cursor_omits_rolling_fields_and_snapshot_recomputes_them(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        self._write_usage(now)
+        self._write_usage(now - dt.timedelta(days=7))
+
+        with (
+            patch.object(agentcat, "claude_usage_by_source", return_value={"status": "not_available"}),
+            patch.object(
+                agentcat,
+                "codexbar_cost_cache_snapshot",
+                return_value=agentcat.empty_provider_usage(),
+            ),
+        ):
+            snapshot = agentcat.claude_snapshot()
+
+        cursor = json.loads(agentcat.JOURNAL_CURSOR_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(set(cursor["totals"]), set(agentcat._JOURNAL_ALL_KEYS))
+        self.assertFalse(
+            any(
+                key.startswith(("today_", "week_", "month_"))
+                for key in cursor["totals"]
+            )
+        )
+        model_state = cursor["models"]["claude-sonnet-fixture"]
+        self.assertNotIn("today", model_state)
+        self.assertNotIn("week", model_state)
+        self.assertNotIn("month", model_state)
+        self.assertIn("dailyTokens", model_state)
+
+        expected = agentcat.periods_from_daily_tokens(snapshot["dailyTokens"])
+        self.assertEqual(snapshot["tokens"]["today"], expected["today"])
+        self.assertEqual(snapshot["tokens"]["week"], expected["week"])
+        self.assertEqual(snapshot["tokens"]["month"], expected["month"])
+        self.assertEqual(snapshot["tokens"]["all"], 30)
+
+    def test_v3_cursor_rebuilds_raw_journal_and_persists_v4(self) -> None:
+        journal = self._write_usage(dt.datetime.now(dt.timezone.utc))
+        agentcat.JOURNAL_CURSOR_FILE.write_text(
+            json.dumps(
+                {
+                    "version": agentcat.CLAUDE_JOURNAL_CURSOR_VERSION - 1,
+                    "offsets": {str(journal): journal.stat().st_size},
+                    "totals": {"all_input": 999, "today_input": 999},
+                    "projects": {},
+                    "dailyTokens": {"2020-01-01": 999},
+                    "hourlyTokens": {},
+                    "models": {
+                        "claude-fixture": {
+                            "inputTokens": 999,
+                            "totalTokens": 999,
+                            "today": 999,
+                        }
+                    },
+                    "usageRecords": {},
+                    "totals_as_of": "2020-01-01T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cursor = agentcat.load_journal_cursor()
+        self.assertTrue(cursor["usage_needs_rebuild"])
+        self.assertEqual(cursor["offsets"], {})
+        with (
+            patch.object(agentcat, "claude_usage_by_source", return_value={"status": "not_available"}),
+            patch.object(
+                agentcat,
+                "codexbar_cost_cache_snapshot",
+                return_value=agentcat.empty_provider_usage(),
+            ),
+        ):
+            snapshot = agentcat.claude_snapshot()
+
+        persisted = json.loads(agentcat.JOURNAL_CURSOR_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["version"], agentcat.CLAUDE_JOURNAL_CURSOR_VERSION)
+        self.assertEqual(persisted["offsets"][str(journal)], journal.stat().st_size)
+        self.assertEqual(persisted["totals"]["all_input"], 10)
+        self.assertEqual(persisted["totals"]["all_output"], 5)
+        self.assertFalse(
+            any(
+                key.startswith(("today_", "week_", "month_"))
+                for key in persisted["totals"]
+            )
+        )
+        model_state = persisted["models"]["claude-sonnet-fixture"]
+        self.assertIn("dailyTokens", model_state)
+        self.assertNotIn("today", model_state)
+        self.assertNotIn("week", model_state)
+        self.assertNotIn("month", model_state)
+        self.assertNotIn("totals_as_of", persisted)
+        self.assertEqual(snapshot["tokens"]["all"], 15)
+        self.assertEqual(snapshot["tokens"]["today"], 15)
+
+    def test_windows_age_without_append_or_cursor_rebuild(self) -> None:
+        first_now = dt.datetime(2026, 9, 4, 12, 0, tzinfo=dt.timezone.utc)
+        clock = {"now": first_now}
+
+        class FixedDateTime(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                current = clock["now"]
+                return current if tz is None else current.astimezone(tz)
+
+        journal = self._write_usage(first_now)
+        with (
+            patch.object(agentcat.dt, "datetime", FixedDateTime),
+            patch.object(agentcat, "claude_usage_by_source", return_value={"status": "not_available"}),
+            patch.object(
+                agentcat,
+                "codexbar_cost_cache_snapshot",
+                return_value=agentcat.empty_provider_usage(),
+            ),
+        ):
+            first = agentcat.claude_snapshot()
+            persisted_before = agentcat.JOURNAL_CURSOR_FILE.read_bytes()
+            mtime_before = agentcat.JOURNAL_CURSOR_FILE.stat().st_mtime_ns
+            offset_before = json.loads(persisted_before.decode("utf-8"))["offsets"][str(journal)]
+
+            clock["now"] = first_now + dt.timedelta(days=1)
+            second = agentcat.claude_snapshot()
+
+        self.assertEqual(first["tokens"]["today"], 15)
+        self.assertEqual(second["tokens"]["today"], 0)
+        self.assertEqual(second["tokens"]["week"], 15)
+        self.assertEqual(second["tokens"]["all"], 15)
+        self.assertEqual(agentcat.JOURNAL_CURSOR_FILE.read_bytes(), persisted_before)
+        self.assertEqual(agentcat.JOURNAL_CURSOR_FILE.stat().st_mtime_ns, mtime_before)
+        persisted_after = json.loads(agentcat.JOURNAL_CURSOR_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(persisted_after["offsets"][str(journal)], offset_before)
+
