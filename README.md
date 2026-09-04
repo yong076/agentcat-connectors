@@ -7,9 +7,9 @@ activity from Codex, Claude Code, Gemini CLI, and other supported agent tools.
 
 It installs a small local collector, keeps data under `~/.agentcat`, and patches
 supported CLI settings so future sessions can report activity without sending
-prompts to a remote server. This public connector powers the free product:
-local monitoring, provider breadth, quota state, basic costs, budget caps, and
-weekly report inputs.
+prompts to a remote server. This single public connector powers the product
+with local monitoring, provider breadth, quota state, basic costs, budget caps,
+and weekly report inputs.
 
 ## License
 
@@ -79,22 +79,6 @@ archive only when URL, version, and SHA-256 are supplied together via
 `AGENTCAT_CONNECTORS_ARCHIVE_URL`, `AGENTCAT_CONNECTORS_VERSION`, and
 `AGENTCAT_CONNECTORS_SHA256`.
 
-Pro connector safe-swap QA (local/private builds only):
-
-```bash
-python3 scripts/pro_channel_install.py \
-  --archive /path/to/agentcat-connectors-pro.tgz \
-  --manifest /path/to/pro-manifest.json \
-  --install-dir "$TMPDIR/agentcat-pro-connectors" \
-  --event-log "$TMPDIR/agentcat-pro-connector-events.jsonl"
-```
-
-The optional event log records `pro_connector_swap_started`,
-`pro_connector_swap_succeeded`, and `pro_connector_swap_rolled_back` without
-contacting the Pro API. App-led installs can additionally pass
-`--event-api-url`, `--event-bearer`, and `--device-id` after entitlement checks.
-Those flags are observability only; install success never depends on them.
-
 Development on Windows from a cloned checkout:
 
 ```powershell
@@ -130,6 +114,20 @@ agentcat setup-prompt
 | Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
 | Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
 | Antigravity | dedicated telemetry or read-only local conversation SQLite | Keeps Antigravity separate from Gemini CLI. On Windows, reads defensive per-generation token metadata and falls back to quota/activity only if the upstream local schema changes. |
+| OpenCode | local SQLite message metadata | Reads assistant token fields without reading prompt content. |
+| GitHub Copilot | local CLI and VS Code transcript metadata | Uses explicit token fields when available and local estimates otherwise. |
+| Kimi | local Kimi Code logs + OAuth usage | Reports local token/model totals and available plan windows. |
+| Grok | local session usage + OAuth billing | Reports token/media activity and available reset windows. |
+| JetBrains AI | local IDE quota XML | Reads the newest cached monthly AI-credit quota; never makes a network request. |
+| Hermes Agent | local `~/.hermes/state.db` | Reports stored token totals and actual billed USD cost from Hermes session accounting. |
+
+## Included Insights Engine
+
+The single public connector includes today/week/month/all-time insights; burn
+rate, automatic quota estimates, and provider recommendations; per-project
+daily cost; OpenAI API-key usage with a secure local `set-key` command; Codex
+usage-source breakdowns; Antigravity history; and reset-safe model baselines
+that avoid recording counter resets as new usage.
 
 ## Multiple Provider Homes
 
@@ -253,6 +251,11 @@ Uninstall removes the LaunchAgent, binary link, and Agent Cat-managed config ent
 python3 -m py_compile bin/agentcat scripts/install.py
 bin/agentcat snapshot --json
 ```
+
+The public archive keeps `bin/agentcat` as the executable entrypoint and ships
+its provider adapters beside it in `bin/agentcat_providers/`. The release build
+archives the source tree rather than concatenating Python, so candidate and
+local installers validate that package before activating the connector.
 
 ## Codex Skill
 

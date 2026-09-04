@@ -19,6 +19,14 @@ installer_module = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(installer_module)
 
+CONNECTOR_LOADER = SourceFileLoader(
+    "public_channel_connector_module", str(REPO_ROOT / "bin" / "agentcat")
+)
+CONNECTOR_SPEC = importlib.util.spec_from_loader("public_channel_connector_module", CONNECTOR_LOADER)
+connector_module = importlib.util.module_from_spec(CONNECTOR_SPEC)
+assert CONNECTOR_SPEC.loader is not None
+CONNECTOR_SPEC.loader.exec_module(connector_module)
+
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -42,7 +50,7 @@ class PublicChannelInstallTests(unittest.TestCase):
         (source / "bin" / "agentcat").write_text("connector", encoding="utf-8")
         (source / "scripts" / "install.py").write_text("installer", encoding="utf-8")
         (source / "contracts" / "connector-v1.json").write_text(
-            json.dumps({"contractVersion": 1, "snapshotSchemaVersion": 4}),
+            json.dumps({"contractVersion": 2, "snapshotSchemaVersion": 4}),
             encoding="utf-8",
         )
         archive = self.root / f"connector-{version}.zip"
@@ -50,7 +58,7 @@ class PublicChannelInstallTests(unittest.TestCase):
             for path in source.rglob("*"):
                 if path.is_file():
                     package.write(path, Path(source.name) / path.relative_to(source))
-        manifest = {"version": version, "contractVersion": 1, "sha256": sha256(archive)}
+        manifest = {"version": version, "contractVersion": 2, "sha256": sha256(archive)}
         return archive, manifest
 
     def test_checksum_mismatch_never_touches_existing_install(self) -> None:
@@ -73,6 +81,27 @@ class PublicChannelInstallTests(unittest.TestCase):
 
         self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
         self.assertFalse(self.backup_root.exists())
+
+    def test_legacy_nonpublic_state_resolves_to_public(self) -> None:
+        state_path = self.root / "update-channel.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "channel": "pro",
+                    "status": "manifest_ready",
+                    "installStatus": "pending_install",
+                    "manifest": {"version": "99.0.0"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(connector_module, "AGENTCAT_HOME", self.root):
+            status = connector_module.update_channel_status_snapshot()
+
+        self.assertEqual(status["channel"], "public")
+        self.assertEqual(status["installStatus"], "current")
+        self.assertNotIn("targetVersion", status)
 
     def test_dirty_checkout_is_preserved_and_replacement_is_refused(self) -> None:
         self.install_dir.mkdir(parents=True)
@@ -171,7 +200,7 @@ class PublicChannelInstallTests(unittest.TestCase):
     def test_current_candidate_passes_real_contract_validation(self) -> None:
         manifest = {
             "version": "26.34.7",
-            "contractVersion": 1,
+            "contractVersion": 2,
             "sha256": "0" * 64,
         }
         installer_module.validate_candidate(REPO_ROOT, manifest)
@@ -196,10 +225,10 @@ class PublicChannelInstallTests(unittest.TestCase):
             urls.append(url)
             if url.endswith("/healthz"):
                 return Response(b"ok")
-            return Response(b'{"connectorVersion":"26.34.7","contractVersion":1}')
+            return Response(b'{"connectorVersion":"26.34.7","contractVersion":2}')
 
         with mock.patch.object(installer_module.urllib.request, "urlopen", side_effect=fake_urlopen):
-            installer_module.validate_live_connector("26.34.7", 1, timeout=0.1)
+            installer_module.validate_live_connector("26.34.7", 2, timeout=0.1)
 
         self.assertEqual(
             urls,

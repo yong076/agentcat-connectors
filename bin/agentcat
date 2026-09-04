@@ -8,9 +8,11 @@ import csv
 from contextlib import closing
 import logging
 import datetime as dt
+import email.utils
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -27,6 +29,12 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
+
+_provider_package_dir = str(Path(__file__).resolve().parent)
+if _provider_package_dir not in sys.path:
+    sys.path.insert(0, _provider_package_dir)
+from agentcat_providers import ProviderContext
+from agentcat_providers import registry as provider_registry
 
 
 def resolve_user_home_env() -> str:
@@ -50,6 +58,7 @@ CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
+AGENTCAT_KEYS_FILE = AGENTCAT_HOME / "keys.json"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 GEMINI_USAGE_CACHE = AGENTCAT_HOME / "gemini-usage-cache.json"
 ANTIGRAVITY_CLI_DIR = HOME / ".gemini" / "antigravity-cli"
@@ -66,6 +75,7 @@ ANTIGRAVITY_OAUTH_CLIENT_ID_RE = re.compile(rb"[0-9]{6,}-[a-z0-9]{16,}\.apps\.go
 # so stop each match before the next "GOCSPX-" rather than matching greedily.
 ANTIGRAVITY_OAUTH_CLIENT_SECRET_RE = re.compile(rb"GOCSPX-(?:(?!GOCSPX-)[A-Za-z0-9_-]){20,}")
 LIVE_LIMITS_CACHE = AGENTCAT_HOME / "live-limits-cache.json"
+LIVE_LIMITS_CACHE_SCHEMA_VERSION = 2
 PROVIDER_INSTANCE_SECRET = AGENTCAT_HOME / "provider-instance.key"
 CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/codex/usage",
@@ -73,12 +83,19 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/api/codex/usage",
 )
 CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-# 7 days. Any rate-limit window at least this long is the weekly quota,
-# whichever slot Codex happens to put it in.
+CODEX_USAGE_BREAKDOWN_URL = "https://chatgpt.com/backend-api/wham/usage/daily-token-usage-breakdown"
+CODEX_USAGE_BREAKDOWN_CACHE = AGENTCAT_HOME / "codex-usage-breakdown-cache.json"
+CODEX_USAGE_BREAKDOWN_TTL_SECONDS = int(os.environ.get("AGENTCAT_CODEX_USAGE_TTL_SECONDS", "900"))
+# Codex's seven-day window in minutes; upstream values may drift by one minute.
 CODEX_WEEKLY_WINDOW_MINUTES = 10080
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
+OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
+CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing"
 GROK_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
@@ -106,11 +123,14 @@ GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECON
 LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_BYTES", str(16 * 1024 * 1024)))
 LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
 LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
-LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
+LIVE_LIMITS_ERROR_BACKOFF_BASE_SECONDS = 30
+LIVE_LIMITS_ERROR_BACKOFF_MAX_SECONDS = 900
 # A "no quota for this account" answer is cached to stop the per-tick reprobe loop, but on
 # a shorter horizon than a good result so a transient empty response or a later plan upgrade
 # is re-checked within minutes, not 15.
 LIVE_LIMITS_NOT_APPLICABLE_TTL = int(os.environ.get("AGENTCAT_LIVE_LIMITS_NOT_APPLICABLE_TTL", "300"))
+CLAUDE_STATUSLINE_MIN_INTERVAL_SECONDS = 15
+CLAUDE_STATUSLINE_DUPLICATE_INTERVAL_SECONDS = 30
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CODEX_SESSIONS_CURSOR_FILE = AGENTCAT_HOME / "codex-sessions-cursor.json"
 # Bump whenever a counting bug means the *persisted rollups* are wrong, not just
@@ -132,10 +152,14 @@ CLAUDE_DESKTOP_PROJECT_DIR_MAX = int(os.environ.get("AGENTCAT_CLAUDE_DESKTOP_PRO
 CLAUDE_JOURNAL_CURSOR_VERSION = 3
 PROJECT_DAILY_RETENTION_DAYS = 60
 PROJECT_DAILY_SNAPSHOT_DAYS = 14
+PROJECT_DAILY_COST_SNAPSHOT_DAYS = 30
+PROJECT_DAILY_FILE_VERSION = 2
+PROJECT_DAILY_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.7")
 SCHEMA_VERSION = 4
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 WINDOWS_TASK_NAME = "AgentCatD"
 WINDOWS_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOWS_RUN_VALUE = "AgentCatD"
@@ -163,51 +187,7 @@ PRICING_FETCH_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_MAX_A
 PRICING_FETCH_INTERVAL_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_INTERVAL_SECONDS", str(6 * 3600)))
 PRICING_FETCH_INITIAL_DELAY_SECONDS = int(os.environ.get("AGENTCAT_PRICING_FETCH_INITIAL_DELAY_SECONDS", "20"))
 PRICING_FETCH_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AGENTCAT_PRICING_FETCH_HTTP_TIMEOUT_SECONDS", "10"))
-CONNECTOR_CAPABILITIES = (
-    "snapshot.metadata",
-    "connector.contract.v1",
-    "connector.autoUpdate",
-    "connector.channel",
-    # Compatibility alias consumed by released Windows builds. New clients
-    # should key off connector.daemon.status.v1 and the documented daemon
-    # object instead of treating daemon support as an unversioned boolean.
-    "connector.daemon",
-    "connector.daemon.status.v1",
-    "activity.terminal",
-    "activity.memory",
-    "activity.runtimeModes",
-    "connector.config",
-    "desktopApps.localMetadata",
-    "events.sqlite",
-    "usage.dailyTokens",
-    "usage.hourlyTokens",
-    "usage.breakdown",
-    "usage.projects",
-    "usage.coverage",
-    "projects.daily",
-    "homes.discovery",
-    "providerInstances.v1",
-    "pricing.feed",
-    "usage.opencode.sqlite",
-    "usage.antigravity.sqlite",
-    "usage.copilot.localLogs",
-    "limits.liveCache",
-    "limits.errorBackoff",
-    "limits.quotaFallbackOn429",
-    "limits.codex.oauthUsage",
-    "limits.claude.oauthUsage",
-    "limits.claude.statusline",
-    "limits.claude.statuslineQuotas",
-    "limits.gemini.codeAssist",
-    "limits.grok.oauthUsage",
-    "limits.kimi.oauthUsage",
-    "usage.grok.sessions",
-    "hooks.codexNotify",
-    "hooks.claudeStatusline",
-    "hooks.claudeHooks",
-    "hooks.geminiTelemetry",
-    "activity.windowsProcessScan",
-)
+CONNECTOR_CAPABILITIES = provider_registry.connector_capabilities()
 _GEMINI_CACHE_LOCK = threading.Lock()
 _GEMINI_CACHE_KEY: Optional[Tuple[int, int]] = None
 _GEMINI_CACHE_VALUE: Optional[Dict[str, Any]] = None
@@ -744,6 +724,7 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
     model_entries: list = []
     provider_tokens: Dict[str, int] = {}
     provider_cost: Dict[str, float] = {}
+    pc_costs: Dict[str, Dict[str, float]] = {}
     pricing_known = False
     findings: list = []
 
@@ -856,9 +837,7 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             if pc_cost:
                 provider_cost[kind] = pc_cost["total"]
                 pricing_known = True
-                # Store per-class cost on provider for summary aggregation
-                provider.setdefault("_pc_cost", {})
-                provider["_pc_cost"] = pc_cost
+                pc_costs[kind] = pc_cost
 
     # Normalize share %
     total_tokens = sum(provider_tokens.values())
@@ -886,14 +865,12 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
     # Aggregate per-class costs from JournalScanner data across all providers
     sum_input_cost = sum_output_cost = sum_cr_cost = sum_cw_cost = 0.0
     any_pc_cost = False
-    for provider in providers.values():
-        pc = provider.get("_pc_cost") if isinstance(provider, dict) else None
-        if pc:
-            sum_input_cost += pc.get("input", 0.0)
-            sum_output_cost += pc.get("output", 0.0)
-            sum_cr_cost += pc.get("cache_read", 0.0)
-            sum_cw_cost += pc.get("cache_write", 0.0)
-            any_pc_cost = True
+    for pc in pc_costs.values():
+        sum_input_cost += pc.get("input", 0.0)
+        sum_output_cost += pc.get("output", 0.0)
+        sum_cr_cost += pc.get("cache_read", 0.0)
+        sum_cw_cost += pc.get("cache_write", 0.0)
+        any_pc_cost = True
 
     cache_hit = None
     if any_cache_read or any_input:
@@ -925,6 +902,136 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
         "findings": findings,
         "pricing_status": "ok" if pricing_known else "unknown",
     }
+
+
+BURN_RATE_WINDOW_MINUTES = 60
+AUTO_QUOTA_MIN_SAMPLE_DAYS = 14
+DAY_KEY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def provider_effective_usd_per_token(
+    provider: Dict[str, Any], period: str = "today"
+) -> Optional[float]:
+    models = provider.get("models")
+    if not isinstance(models, dict):
+        return None
+    priced_cost = 0.0
+    priced_tokens = 0
+    for model_name, model_data in models.items():
+        if not isinstance(model_data, dict):
+            continue
+        period_bucket = insight_model_period_bucket(
+            model_data, period, allow_lifetime_fallback=(period == "all")
+        )
+        if period_bucket is None:
+            continue
+        classes, total = period_bucket
+        if total <= 0 or sum(int(value or 0) for value in classes.values()) <= 0:
+            continue
+        cost = estimate_cost(
+            model_name,
+            int(classes.get("inputTokens") or 0),
+            int(classes.get("outputTokens") or 0),
+            int(classes.get("cacheReadInputTokens") or 0),
+            int(classes.get("cacheCreationInputTokens") or 0),
+        )
+        if cost is None:
+            continue
+        priced_cost += cost["total"]
+        priced_tokens += total
+    return priced_cost / priced_tokens if priced_tokens > 0 else None
+
+
+def provider_burn_rate(
+    provider: Dict[str, Any], now: Optional[dt.datetime] = None
+) -> Optional[Dict[str, Any]]:
+    hourly = provider.get("hourlyTokens")
+    if not isinstance(hourly, dict) or not hourly:
+        return None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    current = nonnegative_int(hourly.get(hour_key_for_timestamp(now))) or 0
+    previous = nonnegative_int(hourly.get(hour_key_for_timestamp(now - dt.timedelta(hours=1)))) or 0
+    tokens = current + previous
+    if tokens <= 0:
+        return None
+    local = now.astimezone()
+    basis_minutes = float(BURN_RATE_WINDOW_MINUTES) + local.minute + local.second / 60.0
+    tokens_per_min = tokens / basis_minutes
+    out: Dict[str, Any] = {
+        "tokensPerMin": round(tokens_per_min, 3),
+        "basisMinutes": round(basis_minutes, 1),
+    }
+    usd_per_token = provider_effective_usd_per_token(provider, period="today")
+    if usd_per_token is not None:
+        out["usdPerHour"] = round(tokens_per_min * 60.0 * usd_per_token, 4)
+    return out
+
+
+def provider_auto_quota(
+    provider: Dict[str, Any], now: Optional[dt.datetime] = None
+) -> Optional[Dict[str, Any]]:
+    daily = provider.get("dailyTokens")
+    if not isinstance(daily, dict):
+        return None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    today_key = day_key_for_timestamp(now)
+    values: List[int] = []
+    for day, raw in daily.items():
+        if not DAY_KEY_RE.match(str(day)) or str(day) == today_key:
+            continue
+        amount = nonnegative_int(raw)
+        if amount:
+            values.append(amount)
+    if len(values) < AUTO_QUOTA_MIN_SAMPLE_DAYS:
+        return None
+    values.sort()
+    rank = (9 * len(values) + 9) // 10
+    return {"p90DailyTokens": values[rank - 1], "sampleDays": len(values), "basis": "p90"}
+
+
+def provider_quota_headroom(limits: Any) -> Optional[Tuple[float, Optional[int]]]:
+    if not isinstance(limits, dict):
+        return None
+    candidates: List[Tuple[float, Optional[int]]] = []
+    quotas = limits.get("quotas")
+    for quota in quotas if isinstance(quotas, list) else []:
+        if not isinstance(quota, dict):
+            continue
+        remaining = float_percent(quota.get("remainingPercent"))
+        if remaining is None:
+            used = float_percent(quota.get("usedPercent"))
+            remaining = remaining_percent_from_used(used) if used is not None else None
+        if remaining is not None:
+            candidates.append((remaining, int_limit(quota.get("resetAt"))))
+    if not candidates:
+        weekly_used = float_percent(limits.get("weeklyUsedPercent"))
+        if weekly_used is not None:
+            candidates.append((100.0 - weekly_used, reset_epoch(limits.get("weeklyResetAt"))))
+    return min(candidates, key=lambda entry: entry[0]) if candidates else None
+
+
+def snapshot_recommendation(providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    entries: List[Tuple[str, float, Optional[int]]] = []
+    for provider_id in sorted(providers or {}):
+        data = providers[provider_id]
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            continue
+        headroom = provider_quota_headroom(data.get("limits"))
+        if headroom is not None:
+            entries.append((str(provider_id), headroom[0], headroom[1]))
+    if len(entries) < 2:
+        return None
+
+    def sort_key(entry: Tuple[str, float, Optional[int]]) -> Tuple[float, float, str]:
+        provider_id, headroom, reset_at = entry
+        return (-headroom, float(reset_at) if reset_at is not None else float("inf"), provider_id)
+
+    entries.sort(key=sort_key)
+    top, runner_up = entries[0], entries[1]
+    reason = "most_headroom" if top[1] > runner_up[1] else "resets_soonest"
+    return {"providerId": top[0], "reason": reason, "confidence": "heuristic"}
 
 
 IGNORED_EXECUTABLES = {
@@ -1135,27 +1242,7 @@ def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
 # number the product shows, which costs more trust than the gap it closes.
 # ---------------------------------------------------------------------------
 
-PROVIDER_HOME_SPECS: Dict[str, Dict[str, Any]] = {
-    "codex": {
-        "envVar": "CODEX_HOME",
-        "defaultName": ".codex",
-        "siblingGlob": ".codex*",
-        "usageGlobs": ("sessions/**/*.jsonl", "archived_sessions/**/*.jsonl"),
-        # Markers prove a directory really is a provider home, so a stray
-        # ~/.codex-notes folder never gets offered as a usage source.
-        "markers": ("sessions", "archived_sessions", "auth.json"),
-        # Homes other local tools create by mirroring ~/.codex.
-        "knownRuntimeHomes": ("Library/Application Support/orca/codex-runtime-home/home",),
-    },
-    "claude": {
-        "envVar": "CLAUDE_CONFIG_DIR",
-        "defaultName": ".claude",
-        "siblingGlob": ".claude*",
-        "usageGlobs": ("projects/**/*.jsonl",),
-        "markers": ("projects", "settings.json"),
-        "knownRuntimeHomes": (),
-    },
-}
+PROVIDER_HOME_SPECS: Dict[str, Dict[str, Any]] = provider_registry.provider_home_specs()
 
 HOME_DISCOVERY_PROVIDER_IDS = tuple(PROVIDER_HOME_SPECS)
 
@@ -1339,6 +1426,15 @@ def default_provider_home(provider: str) -> Path:
     return HOME / str(spec.get("defaultName") or f".{provider}")
 
 
+def provider_spec_home_paths(spec: Any) -> List[Path]:
+    """Resolve every home declared by a provider plugin inside the active sandbox."""
+    paths: List[Path] = []
+    for home_spec in spec.homes:
+        override = os.environ.get(str(home_spec.env)) if home_spec.env else None
+        paths.append(Path(override).expanduser() if override else HOME / str(home_spec.default))
+    return paths
+
+
 def provider_home_candidates(provider: str) -> List[Dict[str, Any]]:
     """Every home this provider might be storing usage in, with why we looked.
 
@@ -1439,8 +1535,14 @@ def tracked_provider_homes(provider: str) -> List[Path]:
     return homes
 
 
-CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot", "kimi", "grok")
+CONFIG_PROVIDER_IDS = provider_registry.CONFIG_PROVIDER_IDS
+PROVIDER_METADATA: Dict[str, Dict[str, Any]] = provider_registry.provider_metadata()
 DESKTOP_APP_PROVIDER_IDS = ("claude", "codex")
+
+
+def provider_metadata(provider: str) -> Dict[str, Any]:
+    """Return path-free presentation metadata owned by the connector."""
+    return copy.deepcopy(PROVIDER_METADATA[provider])
 
 DESKTOP_APP_SPECS: Dict[str, Dict[str, Any]] = {
     "claude": {
@@ -2423,6 +2525,15 @@ def init_db() -> None:
             """
         )
         conn.execute("create index if not exists idx_events_provider_ts on events(provider, ts desc)")
+        conn.execute(
+            """
+            create table if not exists claude_statusline_throttle (
+              session_key text primary key,
+              last_posted_at integer not null,
+              payload_hash text not null
+            )
+            """
+        )
         conn.commit()
     # The sqlite file is created on connect; lock it down owner-only afterward.
     _chmod_quiet(EVENTS_DB, 0o600)
@@ -2445,6 +2556,54 @@ def store_event(provider: str, source: str, event_type: Optional[str], payload: 
         "eventType": event_type,
         "tokens": extract_tokens(sanitized),
     }
+
+
+def should_store_claude_statusline(payload: Any) -> bool:
+    """Atomically reserve a rate-limited statusline event for this session."""
+    session_id = find_first_key(payload, ("session_id", "sessionId"))
+    if session_id is None:
+        session_id = f"process:{os.getppid()}"
+    session_key = hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()
+    sanitized = sanitize_payload(payload)
+    payload_hash = hashlib.sha256(
+        json.dumps(sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    now = int(time.time())
+    try:
+        init_db()
+        with closing(sqlite3.connect(EVENTS_DB, timeout=5.0)) as conn:
+            conn.execute("pragma busy_timeout=5000")
+            conn.execute("begin immediate")
+            row = conn.execute(
+                "select last_posted_at, payload_hash from claude_statusline_throttle where session_key = ?",
+                (session_key,),
+            ).fetchone()
+            if row:
+                elapsed = now - int(row[0])
+                if elapsed < CLAUDE_STATUSLINE_MIN_INTERVAL_SECONDS:
+                    conn.rollback()
+                    return False
+                if str(row[1]) == payload_hash and elapsed < CLAUDE_STATUSLINE_DUPLICATE_INTERVAL_SECONDS:
+                    conn.rollback()
+                    return False
+            conn.execute(
+                """
+                insert into claude_statusline_throttle(session_key, last_posted_at, payload_hash)
+                values (?, ?, ?)
+                on conflict(session_key) do update set
+                  last_posted_at = excluded.last_posted_at,
+                  payload_hash = excluded.payload_hash
+                """,
+                (session_key, now, payload_hash),
+            )
+            conn.execute(
+                "delete from claude_statusline_throttle where last_posted_at < ?",
+                (now - 7 * 86400,),
+            )
+            conn.commit()
+        return True
+    except Exception:
+        return True
 
 
 def prune_events(max_age_days: Optional[int] = None) -> int:
@@ -2645,6 +2804,8 @@ def quota_entry(
     limit: Any = None,
     window: Optional[str] = None,
     model: Optional[str] = None,
+    scope: Optional[str] = None,
+    aggregate: Optional[bool] = None,
     source: Optional[str] = None,
 ) -> Dict[str, Any]:
     used_pct = float_percent(used_percent)
@@ -2654,10 +2815,14 @@ def quota_entry(
     if used_pct is None and remaining_pct is not None:
         used_pct = remaining_percent_from_used(remaining_pct)
 
+    resolved_scope = scope if scope in {"account", "model", "surface"} else ("model" if model else "account")
+    resolved_aggregate = aggregate if isinstance(aggregate, bool) else resolved_scope == "account"
     return {
         "id": quota_id,
         "label": label,
         "window": window,
+        "scope": resolved_scope,
+        "aggregate": resolved_aggregate,
         "unit": unit,
         "used": float_value(used),
         "remaining": float_value(remaining),
@@ -2670,10 +2835,80 @@ def quota_entry(
     }
 
 
+def ensure_quota_schema_v2(limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Re-derive additive v2 quota fields for live data and legacy cache rows."""
+    out = dict(limits)
+    quotas = limits.get("quotas")
+    if not isinstance(quotas, list):
+        return out
+    normalized: List[Dict[str, Any]] = []
+    for quota in quotas:
+        if not isinstance(quota, dict):
+            continue
+        item = dict(quota)
+        scope = item.get("scope")
+        if scope not in {"account", "model", "surface"}:
+            scope = "model" if item.get("model") else "account"
+        item["scope"] = scope
+        if not isinstance(item.get("aggregate"), bool):
+            item["aggregate"] = scope == "account"
+        normalized.append(item)
+    out["quotas"] = normalized
+    return out
+
+
 def live_limit_error(exc: Exception, source: str) -> Dict[str, Any]:
     limits = empty_limits(status="error", error=str(exc))
     limits["source"] = source
+    reason = "unknown_error"
+    if isinstance(exc, urllib.error.HTTPError):
+        status = int(exc.code)
+        if status == 429:
+            reason = "rate_limited"
+            retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+            retry_seconds = 300
+            if retry_after is not None:
+                try:
+                    retry_seconds = max(int(float(str(retry_after).strip())), 0)
+                except (TypeError, ValueError):
+                    try:
+                        retry_date = email.utils.parsedate_to_datetime(str(retry_after))
+                        if retry_date.tzinfo is None:
+                            retry_date = retry_date.replace(tzinfo=dt.timezone.utc)
+                        retry_seconds = max(int(retry_date.timestamp() - time.time()), 0)
+                    except (TypeError, ValueError, OverflowError):
+                        retry_seconds = 300
+            limits["retryAt"] = int(time.time()) + retry_seconds
+        elif status == 401:
+            reason = "token_expired"
+        elif status == 403:
+            try:
+                body = exc.read(64 * 1024).decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            reason = "missing_scope" if "user:profile" in body else "token_expired"
+        elif status >= 500:
+            reason = "server_error"
+        else:
+            reason = "http_error"
+        try:
+            exc.close()
+        except Exception:
+            pass
+    elif isinstance(exc, json.JSONDecodeError):
+        reason = "parse_error"
+    elif isinstance(exc, (urllib.error.URLError, OSError, TimeoutError)):
+        reason = "network_error"
+    limits["reason"] = reason
     return limits
+
+
+def live_limits_error_backoff_seconds(failure_streak: int) -> int:
+    exponent = min(max(int(failure_streak) - 1, 0), 5)
+    return min(
+        LIVE_LIMITS_ERROR_BACKOFF_BASE_SECONDS * (2 ** exponent),
+        LIVE_LIMITS_ERROR_BACKOFF_MAX_SECONDS,
+    )
 
 
 def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = False) -> Optional[Dict[str, Any]]:
@@ -2687,16 +2922,26 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     limits = entry.get("limits")
     if cached_at is None or not isinstance(limits, dict):
         return None
-    age = int(time.time()) - cached_at
-    if limits.get("status") == "error":
-        effective_max_age = LIVE_LIMITS_ERROR_BACKOFF_SECONDS
+    now = int(time.time())
+    age = now - cached_at
+    failure_streak = int_count(entry.get("failureStreak")) or 0
+    retry_at = int_limit(limits.get("retryAt"))
+    if retry_at is not None:
+        if retry_at > now:
+            effective_max_age = max(retry_at - cached_at, 0)
+        elif not allow_stale:
+            return None
+        else:
+            effective_max_age = -1
+    elif failure_streak > 0:
+        effective_max_age = live_limits_error_backoff_seconds(failure_streak)
     elif limits.get("status") == "not_configured" and limits.get("reason") == "not_applicable":
         effective_max_age = LIVE_LIMITS_NOT_APPLICABLE_TTL
     else:
         effective_max_age = max_age_seconds
     if age > effective_max_age and not allow_stale:
         return None
-    out = dict(limits)
+    out = sanitize_cached_live_limits(provider, limits)
     out["cachedAt"] = cached_at
     out["cacheAgeSeconds"] = max(age, 0)
     if age > effective_max_age:
@@ -2705,6 +2950,7 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
 
 
 def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
+    limits = ensure_quota_schema_v2(limits)
     status = limits.get("status")
     if status == "error":
         pass
@@ -2719,8 +2965,13 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
         ensure_dirs()
         raw = read_json(LIVE_LIMITS_CACHE)
         cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+        cache["schemaVersion"] = LIVE_LIMITS_CACHE_SCHEMA_VERSION
+        previous = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
+        previous_streak = int_count(previous.get("failureStreak")) or 0
+        failed = status == "error" or bool(limits.get("liveError"))
         cache[provider] = {
             "cachedAt": int(time.time()),
+            "failureStreak": previous_streak + 1 if failed else 0,
             "limits": limits,
         }
         tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
@@ -2742,6 +2993,11 @@ def serve_stale_live_limits(provider: str, stale: Dict[str, Any], exc: Exception
     """
     stale = dict(stale)
     stale["liveError"] = str(exc)
+    error_limits = live_limit_error(exc, str(stale.get("source") or provider))
+    stale["liveErrorReason"] = error_limits.get("reason")
+    stale.pop("retryAt", None)
+    if error_limits.get("retryAt") is not None:
+        stale["retryAt"] = error_limits["retryAt"]
     served = {k: v for k, v in stale.items() if k not in ("cacheAgeSeconds", "stale", "cachedAt")}
     write_live_limits_cache(provider, served)
     return stale
@@ -2911,15 +3167,15 @@ def codex_runtime_limits() -> Dict[str, Any]:
                 minutes = int_limit(window.get("window_minutes"))
                 used = float_percent(window.get("used_percent"))
                 resets = int_limit(window.get("resets_at"))
-                # Length decides when Codex states it. The older payload omits
-                # window_minutes on the weekly slot, so fall back to the slot
-                # name there rather than guessing.
-                is_weekly = (
-                    minutes >= CODEX_WEEKLY_WINDOW_MINUTES
-                    if minutes is not None
-                    else slot == "secondary"
-                )
-                if is_weekly:
+                # Prefer known durations with a one-minute tolerance; older or
+                # novel payloads fall back to primary/secondary position.
+                if minutes is not None and abs(minutes - 300) <= 1:
+                    kind = "short"
+                elif minutes is not None and abs(minutes - CODEX_WEEKLY_WINDOW_MINUTES) <= 1:
+                    kind = "weekly"
+                else:
+                    kind = "short" if slot == "primary" else "weekly"
+                if kind == "weekly":
                     if limits.get("weeklyUsedPercent") is None:
                         limits["weeklyUsedPercent"] = used
                         limits["weeklyResetAt"] = resets
@@ -3135,7 +3391,8 @@ def codex_usage_request(access_token: str, account_id: str, url: str) -> Dict[st
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
-        "User-Agent": "AgentCat/1.0",
+        "User-Agent": "codex-cli",
+        "OpenAI-Beta": "codex-1",
     }
     if account_id:
         headers["chatgpt-account-id"] = account_id
@@ -3149,7 +3406,8 @@ def codex_reset_credits_request(access_token: str, account_id: str) -> Dict[str,
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
-        "User-Agent": "AgentCat/1.0",
+        "User-Agent": "codex-cli",
+        "OpenAI-Beta": "codex-1",
     }
     if account_id:
         headers["chatgpt-account-id"] = account_id
@@ -3177,6 +3435,8 @@ def codex_window_quota(
         window_label = f"{seconds // 86400}d"
     elif seconds and seconds % 3600 == 0:
         window_label = f"{seconds // 3600}h"
+    elif seconds and seconds % 60 == 0:
+        window_label = f"{seconds // 60}m"
     else:
         window_label = None
     return quota_entry(
@@ -3191,11 +3451,10 @@ def codex_window_quota(
 
 
 def codex_window_descriptor(window: Any, default_kind: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Return a lossless display identity for a Codex rate-limit window.
+    """Classify a Codex rate-limit window with tolerance for rounded durations.
 
-    The API has changed which bucket is primary before, and can do so again.
-    Duration is the source of truth: a 24-hour window is `1d`, not weekly.
-    ``default_kind`` is used only for old responses that omitted duration.
+    Duration wins when it is within one minute of five hours or seven days.
+    Other durations use the API field position supplied through ``default_kind``.
     """
     seconds = None
     if isinstance(window, dict):
@@ -3205,27 +3464,33 @@ def codex_window_descriptor(window: Any, default_kind: Optional[str] = None) -> 
     if not seconds or seconds <= 0:
         return None
 
-    if seconds % 86400 == 0:
+    minutes = seconds / 60.0
+    if abs(minutes - 300) <= 1:
+        amount, suffix, label, kind = 5, "h", "5시간", "short"
+    elif abs(minutes - 10080) <= 1:
+        amount, suffix, label, kind = 7, "d", "7일", "weekly"
+    elif default_kind == "short":
+        amount, suffix, label, kind = 5, "h", "5시간", "short"
+    elif default_kind == "weekly":
+        amount, suffix, label, kind = 7, "d", "7일", "weekly"
+    elif seconds % 86400 == 0:
         amount, suffix, label = seconds // 86400, "d", f"{seconds // 86400}일"
+        kind = None
     elif seconds % 3600 == 0:
         amount, suffix, label = seconds // 3600, "h", f"{seconds // 3600}시간"
+        kind = None
     elif seconds % 60 == 0:
         amount, suffix, label = seconds // 60, "m", f"{seconds // 60}분"
+        kind = None
     else:
         amount, suffix, label = seconds, "s", f"{seconds}초"
+        kind = None
 
-    # Compatibility fields are populated only for the exact legacy buckets.
-    kind = "short" if seconds == 5 * 3600 else "weekly" if seconds == 7 * 86400 else None
     return {"suffix": f"{amount}{suffix}", "label": label, "kind": kind, "seconds": seconds}
 
 
 def codex_window_kind(window: Any, default: str) -> Optional[str]:
-    """Classify a Codex window without inferring a missing policy bucket.
-
-    OpenAI can remove the short window while keeping the weekly window. In that
-    response shape `primary_window` may contain a 7-day duration, so its field
-    position must not be treated as a synonym for the old 5-hour bucket.
-    """
+    """Classify by tolerant duration, then fall back to the field position."""
     if not isinstance(window, dict):
         return None
     descriptor = codex_window_descriptor(window, default)
@@ -3689,6 +3954,223 @@ def provider_instances_snapshot(
     return codex_provider_instances(resolved_limits.get("codex"))
 
 
+def codex_usage_breakdown_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json", "User-Agent": "AgentCat/1.0"}
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def finite_float_value(raw: Any) -> Optional[float]:
+    """Coerce one numeric value without permitting JSON-invalid NaN/Infinity."""
+    try:
+        value = float_value(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if value is not None and math.isfinite(value) else None
+
+
+def codex_usage_breakdown_from_response(payload: Any, source: str = "codex-daily-usage-api") -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "status": "not_available", "units": "credits", "bySurface": {},
+        "byModel": [], "daily": [], "source": source,
+    }
+    if not isinstance(payload, dict):
+        return result
+    units = payload.get("units")
+    if isinstance(units, str) and units.strip():
+        result["units"] = units.strip()
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return result
+    by_surface: Dict[str, float] = {}
+    by_model: Dict[Tuple[str, Optional[str]], float] = {}
+    daily: List[Dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        surfaces: Dict[str, float] = {}
+        raw_surfaces = entry.get("product_surface_usage_values")
+        if isinstance(raw_surfaces, dict):
+            for surface, raw_value in raw_surfaces.items():
+                value = finite_float_value(raw_value)
+                if value is None:
+                    continue
+                key = str(surface)
+                surfaces[key] = surfaces.get(key, 0.0) + value
+                by_surface[key] = by_surface.get(key, 0.0) + value
+        daily.append({"date": str(entry["date"]) if entry.get("date") is not None else None, "surfaces": surfaces})
+        raw_models = entry.get("models")
+        if isinstance(raw_models, list):
+            for model_entry in raw_models:
+                if not isinstance(model_entry, dict):
+                    continue
+                credits = finite_float_value(model_entry.get("credits"))
+                if credits is None:
+                    continue
+                model = str(model_entry.get("model") if model_entry.get("model") is not None else "unknown")
+                speed_raw = model_entry.get("speed")
+                speed = str(speed_raw) if isinstance(speed_raw, str) and speed_raw.strip() else None
+                by_model[(model, speed)] = by_model.get((model, speed), 0.0) + credits
+    result["status"] = "ok"
+    result["bySurface"] = {key: round(value, 6) for key, value in by_surface.items()}
+    result["daily"] = daily
+    result["byModel"] = sorted(
+        ({"model": model, "speed": speed, "credits": round(credits, 6)} for (model, speed), credits in by_model.items()),
+        key=lambda item: item["credits"], reverse=True,
+    )
+    return result
+
+
+def empty_codex_usage_breakdown() -> Dict[str, Any]:
+    return {
+        "status": "not_available", "units": "credits", "bySurface": {},
+        "byModel": [], "daily": [], "source": "codex-daily-usage-api",
+    }
+
+
+def validated_codex_usage_breakdown(raw: Any) -> Optional[Dict[str, Any]]:
+    """Return a detached, finite cached breakdown or reject the whole blob."""
+    if not isinstance(raw, dict):
+        return None
+    if not isinstance(raw.get("status"), str):
+        return None
+    if not isinstance(raw.get("units"), str) or not isinstance(raw.get("source"), str):
+        return None
+    by_surface = raw.get("bySurface")
+    by_model = raw.get("byModel")
+    daily = raw.get("daily")
+    if not isinstance(by_surface, dict) or not isinstance(by_model, list) or not isinstance(daily, list):
+        return None
+    for key, value in by_surface.items():
+        if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, (int, float)) or finite_float_value(value) is None:
+            return None
+    for entry in by_model:
+        if not isinstance(entry, dict) or not isinstance(entry.get("model"), str):
+            return None
+        speed = entry.get("speed")
+        credits = entry.get("credits")
+        if speed is not None and not isinstance(speed, str):
+            return None
+        if isinstance(credits, bool) or not isinstance(credits, (int, float)) or finite_float_value(credits) is None:
+            return None
+    for entry in daily:
+        if not isinstance(entry, dict) or not isinstance(entry.get("surfaces"), dict):
+            return None
+        date = entry.get("date")
+        if date is not None and not isinstance(date, str):
+            return None
+        for key, value in entry["surfaces"].items():
+            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, (int, float)) or finite_float_value(value) is None:
+                return None
+    try:
+        # Enforce the same strict JSON numeric contract Swift's decoder expects.
+        json.dumps(raw, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return copy.deepcopy(raw)
+
+
+def _codex_usage_breakdown_impl() -> Dict[str, Any]:
+    not_available = empty_codex_usage_breakdown()
+    cached = read_json(CODEX_USAGE_BREAKDOWN_CACHE)
+    cached_data = validated_codex_usage_breakdown(cached.get("data")) if isinstance(cached, dict) else None
+    fetched_at: Optional[int] = None
+    if isinstance(cached, dict):
+        raw_fetched_at = cached.get("fetched_at")
+        if not isinstance(raw_fetched_at, bool):
+            try:
+                candidate = int(raw_fetched_at)
+            except (TypeError, ValueError, OverflowError):
+                candidate = -1
+            if candidate >= 0:
+                fetched_at = candidate
+    if cached_data is not None and fetched_at is not None:
+        age = int(time.time()) - fetched_at
+        if 0 <= age < CODEX_USAGE_BREAKDOWN_TTL_SECONDS:
+            return cached_data
+
+    def cache_and_return(data: Dict[str, Any]) -> Dict[str, Any]:
+        validated = validated_codex_usage_breakdown(data)
+        if validated is None:
+            return not_available
+        try:
+            write_json_atomic(CODEX_USAGE_BREAKDOWN_CACHE, {"fetched_at": int(time.time()), "data": validated})
+        except Exception:
+            pass
+        return validated
+
+    def stale_or_unavailable() -> Dict[str, Any]:
+        if cached_data is not None:
+            stale = dict(cached_data)
+            stale["stale"] = True
+            return stale
+        return not_available
+
+    try:
+        auth = read_codex_auth()
+    except Exception:
+        return stale_or_unavailable()
+    if not auth:
+        return stale_or_unavailable()
+    try:
+        tokens = oauth_tokens(auth)
+    except Exception:
+        return stale_or_unavailable()
+    access_token = tokens.get("access_token")
+    account_id = tokens.get("account_id") or auth.get("account_id") or ""
+    if not isinstance(access_token, str) or not access_token:
+        return stale_or_unavailable()
+    for attempt in range(2):
+        try:
+            payload = codex_usage_breakdown_request(access_token, str(account_id), CODEX_USAGE_BREAKDOWN_URL)
+            parsed = codex_usage_breakdown_from_response(payload)
+            if parsed.get("status") != "ok":
+                # A 200 with an unknown schema is still a failed refresh. Keep
+                # the last known-good cache rather than replacing it with an
+                # empty section. A legitimate data: [] response parses as ok.
+                return stale_or_unavailable()
+            return cache_and_return(parsed)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and attempt == 0:
+                try:
+                    refreshed = refresh_codex_access_token(auth)
+                except Exception:
+                    refreshed = None
+                if refreshed:
+                    access_token = refreshed
+                    continue
+            return stale_or_unavailable()
+        except Exception:
+            return stale_or_unavailable()
+    return stale_or_unavailable()
+
+
+def codex_usage_breakdown() -> Dict[str, Any]:
+    """Return account usage without ever risking the parent Codex snapshot."""
+    try:
+        return _codex_usage_breakdown_impl()
+    except Exception as exc:
+        logging.debug("codex usage breakdown failed: %s", exc)
+        return empty_codex_usage_breakdown()
+
+
+def attach_codex_usage_breakdown(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the optional section fail-soft while preserving existing fields."""
+    if "codexUsageBreakdown" in snapshot:
+        return snapshot
+    try:
+        breakdown = codex_usage_breakdown()
+    except Exception as exc:
+        logging.debug("codex usage breakdown attachment failed: %s", exc)
+        breakdown = empty_codex_usage_breakdown()
+    snapshot["codexUsageBreakdown"] = breakdown
+    return snapshot
+
+
 def claude_config_dir() -> Path:
     """Resolve Claude Code's config directory at call time.
 
@@ -3749,8 +4231,9 @@ def claude_api_billing_mode() -> Optional[str]:
 def read_claude_oauth_credentials() -> Dict[str, Any]:
     """Resolve Claude Code OAuth credentials with a machine-readable failure reason.
 
-    Returns ``{"oauth": <dict|None>, "reason": <str|None>}``. When no usable
-    credentials are found, ``reason`` is one of:
+    Successful reads include ``credentialSource`` (``scoped-keychain``,
+    ``legacy-keychain``, or ``credentials-file``). When no usable credentials
+    are found, ``reason`` is one of:
       - ``keychain_denied``: the macOS Keychain refused the read (ACL deny,
         locked/headless session) — a distinct, diagnosable state, not "logged out".
       - ``api_billing``: this install bills through the API (API key, Bedrock or
@@ -3759,43 +4242,54 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
         like "Claude detection is broken".
       - ``token_missing``: no credentials on disk and no OAuth block present.
     """
-    candidates: List[Any] = []
-    keychain_denied = False
-    if sys.platform == "darwin":
-        try:
-            raw = subprocess.check_output(
-                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
-            )
-            candidates.append(json.loads(raw))
-        except subprocess.CalledProcessError as exc:
-            # 44 = item genuinely not found (no Claude Code login in this Keychain).
-            # Any other non-zero exit means the read was refused/blocked, which the
-            # old bare `except: pass` hid as an indistinguishable "not configured".
-            if exc.returncode != 44:
-                keychain_denied = True
-                _warn_keychain_once("agentcat: Claude Keychain read refused (security exit %s)", exc.returncode)
-        except Exception as exc:  # security binary missing, timeout, malformed JSON
-            _warn_keychain_once("agentcat: Claude Keychain read failed: %s", type(exc).__name__)
-
-    config_dir = claude_config_dir()
-    for path in (config_dir / ".credentials.json", config_dir / "credentials.json"):
-        raw = read_json(path)
-        if isinstance(raw, dict) and not raw.get("_agentcat_error"):
-            candidates.append(raw)
-
-    for item in candidates:
+    def usable_oauth(item: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(item, dict):
-            continue
+            return None
         oauth = item.get("claudeAiOauth")
         if not isinstance(oauth, dict):
             oauth = item.get("claude_ai_oauth")
         if isinstance(oauth, dict) and (oauth.get("accessToken") or oauth.get("access_token")):
-            return {"oauth": oauth, "reason": None}
+            return oauth
         if item.get("accessToken") or item.get("access_token"):
-            return {"oauth": item, "reason": None}
+            return item
+        return None
+
+    config_dir = claude_config_dir()
+    keychain_denied = False
+    if sys.platform == "darwin":
+        services: List[Tuple[str, str]] = []
+        if os.environ.get("CLAUDE_CONFIG_DIR"):
+            normalized_dir = str(config_dir.expanduser().resolve())
+            scope_hash = hashlib.sha256(normalized_dir.encode("utf-8")).hexdigest()[:8]
+            services.append((f"Claude Code-credentials-{scope_hash}", "scoped-keychain"))
+        services.append(("Claude Code-credentials", "legacy-keychain"))
+        for service, credential_source in services:
+            try:
+                raw = subprocess.check_output(
+                    ["security", "find-generic-password", "-s", service, "-w"],
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=5,
+                )
+                oauth = usable_oauth(json.loads(raw))
+                if oauth is not None:
+                    return {"oauth": oauth, "reason": None, "credentialSource": credential_source}
+            except subprocess.CalledProcessError as exc:
+                # 44 = item genuinely not found (no Claude Code login in this Keychain).
+                # Any other non-zero exit means the read was refused/blocked, which the
+                # old bare `except: pass` hid as an indistinguishable "not configured".
+                if exc.returncode != 44:
+                    keychain_denied = True
+                    _warn_keychain_once("agentcat: Claude Keychain read refused (security exit %s)", exc.returncode)
+            except Exception as exc:  # security binary missing, timeout, malformed JSON
+                _warn_keychain_once("agentcat: Claude Keychain read failed: %s", type(exc).__name__)
+
+    for path in (config_dir / ".credentials.json", config_dir / "credentials.json"):
+        raw = read_json(path)
+        if isinstance(raw, dict) and not raw.get("_agentcat_error"):
+            oauth = usable_oauth(raw)
+            if oauth is not None:
+                return {"oauth": oauth, "reason": None, "credentialSource": "credentials-file"}
 
     if keychain_denied:
         return {"oauth": None, "reason": "keychain_denied"}
@@ -3803,6 +4297,45 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
     if billing:
         return {"oauth": None, "reason": "api_billing", "billingMode": billing}
     return {"oauth": None, "reason": "token_missing"}
+
+
+def refresh_claude_access_token(refresh_token: str) -> Optional[str]:
+    """Refresh Claude OAuth in memory without modifying Claude Code's auth state."""
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        CLAUDE_OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    return token.strip() if isinstance(token, str) and token.strip() else None
+
+
+def claude_usage_request(access_token: str) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        CLAUDE_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.1.69",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
 
 
 def claude_quota_label(key: str) -> str:
@@ -3873,7 +4406,16 @@ def sanitize_claude_cached_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
 
     sanitized.sort(key=claude_quota_sort_key)
     out["quotas"] = sanitized
-    return out
+    return ensure_quota_schema_v2(out)
+
+
+def sanitize_cached_live_limits(provider: str, limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Upgrade cached provider limits before they can re-enter a v2 snapshot."""
+    if provider == "claude":
+        return sanitize_claude_cached_limits(limits)
+    if provider == "codex":
+        return ensure_quota_schema_v2(sanitize_codex_cached_limits(limits))
+    return ensure_quota_schema_v2(limits)
 
 
 def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
@@ -3891,7 +4433,7 @@ def claude_quota_sort_key(quota: Dict[str, Any]) -> Tuple[int, str]:
     return (order.get(quota_id, 100), quota_id)
 
 
-def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, str, str, Optional[str]]]:
+def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, str, str, Optional[str], str]]:
     """Return dynamic metadata for a scoped Claude limit row.
 
     Claude's OAuth usage endpoint keeps newly introduced model capacities in
@@ -3928,7 +4470,8 @@ def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, st
         window, window_label = "7d", "7일"
 
     normalized_model = model_id or display_name or surface_name
-    return normalized_model, f"{scope_name} {window_label}", window, group or None
+    scope_kind = "model" if isinstance(model_scope, dict) else "surface"
+    return normalized_model, f"{scope_name} {window_label}", window, group or None, scope_kind
 
 
 def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "claude-oauth-usage-api") -> Dict[str, Any]:
@@ -4015,7 +4558,7 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
             metadata = claude_scoped_quota_metadata(item)
             if used_percent is None or metadata is None:
                 continue
-            model_key, label, window, group = metadata
+            model_key, label, window, group, scope_kind = metadata
             scope_key = ":".join(
                 part for part in (group or "scoped", model_key, str(item.get("kind") or "")) if part
             )
@@ -4026,6 +4569,7 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
                 reset_at=item.get("resets_at"),
                 window=window,
                 model=model_key,
+                scope=scope_kind,
                 source=source,
             )
             quotas.append(quota)
@@ -4050,38 +4594,74 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
     oauth = creds["oauth"]
     if not isinstance(oauth, dict):
         return empty_limits(reason=creds["reason"])
+    credential_source = creds.get("credentialSource")
+
+    def credentialed(limits: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(credential_source, str) and credential_source:
+            limits["credentialSource"] = credential_source
+        return limits
+
     token = oauth.get("accessToken") or oauth.get("access_token")
     if not (isinstance(token, str) and token):
-        return empty_limits(reason="token_missing")
+        return credentialed(empty_limits(reason="token_missing"))
     expires_at = int_limit(oauth.get("expiresAt"))
-    if expires_at and time.time() * 1000 >= expires_at:
-        # The stored access token is already expired. Claude Code refreshes its own
-        # token when it runs; a connector that only reads the file cannot recover
-        # until then, so surface an actionable reason instead of a guaranteed 401.
-        return empty_limits(reason="token_expired")
-    req = urllib.request.Request(
-        CLAUDE_USAGE_URL,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.69",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        limits = claude_limits_from_usage_response(payload if isinstance(payload, dict) else {}, source=CLAUDE_USAGE_URL)
-        write_live_limits_cache("claude", limits)
-        return limits
-    except Exception as exc:
-        stale = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
-        if stale:
-            return serve_stale_live_limits("claude", stale, exc)
-        limits = live_limit_error(exc, CLAUDE_USAGE_URL)
-        write_live_limits_cache("claude", limits)
-        return limits
+    now_ms = int(time.time() * 1000)
+    refresh_token = oauth.get("refreshToken") or oauth.get("refresh_token")
+    should_refresh = bool(expires_at and now_ms + CLAUDE_OAUTH_EXPIRY_BUFFER_MS >= expires_at)
+    refresh_attempted = False
+    if should_refresh and isinstance(refresh_token, str) and refresh_token:
+        refresh_attempted = True
+        try:
+            refreshed = refresh_claude_access_token(refresh_token)
+        except Exception:
+            refreshed = None
+        if not refreshed:
+            return credentialed(empty_limits(reason="token_expired"))
+        token = refreshed
+    elif expires_at and now_ms >= expires_at:
+        return credentialed(empty_limits(reason="token_expired"))
+    last_error: Optional[Exception] = None
+    while True:
+        try:
+            payload = claude_usage_request(token)
+            limits = claude_limits_from_usage_response(payload, source=CLAUDE_USAGE_URL)
+            credentialed(limits)
+            write_live_limits_cache("claude", limits)
+            return limits
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if (
+                exc.code == 401
+                and not refresh_attempted
+                and isinstance(refresh_token, str)
+                and refresh_token
+            ):
+                refresh_attempted = True
+                try:
+                    refreshed = refresh_claude_access_token(refresh_token)
+                except Exception:
+                    refreshed = None
+                if refreshed:
+                    exc.close()
+                    token = refreshed
+                    continue
+            break
+        except Exception as exc:
+            last_error = exc
+            break
+
+    stale = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+    if stale:
+        return serve_stale_live_limits(
+            "claude",
+            credentialed(stale),
+            last_error or RuntimeError("Claude usage API failed"),
+        )
+    limits = credentialed(live_limit_error(
+        last_error or RuntimeError("Claude usage API failed"), CLAUDE_USAGE_URL
+    ))
+    write_live_limits_cache("claude", limits)
+    return limits
 
 
 def gemini_display_name(model: Any) -> str:
@@ -4795,6 +5375,7 @@ def grok_limits_from_credits_response(payload: Dict[str, Any], source: str = GRO
                 unit="percent",
                 window=product_window,
                 model=slug,
+                scope="surface",
                 source=source,
             )
         )
@@ -6781,6 +7362,7 @@ def load_codex_sessions_cursor() -> Dict[str, Any]:
             clean_projects[str(cwd)] = {
                 "tokens": int(payload.get("tokens") or 0),
                 "last_active": payload.get("last_active"),
+                "models": _coerce_int_map(payload.get("models")),
             }
         cursor["projects"] = clean_projects
     cursor["turns"] = int(raw.get("turns") or 0)
@@ -6947,6 +7529,8 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
                         if cwd:
                             proj = projects.setdefault(cwd, {"tokens": 0, "last_active": None})
                             proj["tokens"] = int(proj.get("tokens") or 0) + total
+                            project_models = proj.setdefault("models", {})
+                            project_models[model] = int(project_models.get(model) or 0) + total
                             if when is not None:
                                 last_dt = parse_timestamp(proj.get("last_active"))
                                 if last_dt is None or when > last_dt:
@@ -7047,13 +7631,17 @@ def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any
         tok = int(payload.get("tokens") or 0)
         if tok <= 0:
             continue
-        items.append({
+        item = {
             "id": cwd,
             "path": cwd,
             "name": display_project_name(cwd),
             "tokens": tok,
             "lastActive": payload.get("last_active"),
-        })
+        }
+        project_models = _coerce_int_map(payload.get("models"))
+        if project_models:
+            item["models"] = project_models
+        items.append(item)
     items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
     if items:
         result["projects"] = {"status": "ok", "items": items[:20]}
@@ -7144,6 +7732,7 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
 
     models: Dict[str, Dict[str, int]] = {}
     project_tokens: Dict[str, int] = {}
+    project_models: Dict[str, Dict[str, int]] = {}
     project_last: Dict[str, dt.datetime] = {}
     rollout_model_cache: Dict[str, Optional[str]] = {}
     for tokens_raw, model_raw, updated_raw, rollout_raw, cwd_raw in rows:
@@ -7157,13 +7746,6 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
         add_to_periods(result["tokens"], tokens, when)
         add_to_daily(result["dailyTokens"], tokens, when)
         add_to_hourly(result["hourlyTokens"], tokens, when)
-        project_path = str(cwd_raw or "").strip()
-        if project_path:
-            project_tokens[project_path] = project_tokens.get(project_path, 0) + tokens
-            if when is not None:
-                current = project_last.get(project_path)
-                if current is None or when > current:
-                    project_last[project_path] = when
         model = normalized_model_name(model_raw)
         if model is None and rollout_raw:
             rollout_key = str(rollout_raw)
@@ -7174,6 +7756,15 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
             model = "unknown"
         model_periods = models.setdefault(model, empty_periods())
         add_to_periods(model_periods, tokens, when)
+        project_path = str(cwd_raw or "").strip()
+        if project_path:
+            project_tokens[project_path] = project_tokens.get(project_path, 0) + tokens
+            mix = project_models.setdefault(project_path, {})
+            mix[model] = mix.get(model, 0) + tokens
+            if when is not None:
+                current = project_last.get(project_path)
+                if current is None or when > current:
+                    project_last[project_path] = when
 
     result["status"] = "ok"
     result["threads"] = len(rows)
@@ -7182,13 +7773,16 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
         items = []
         for project_path, tokens in project_tokens.items():
             last_active = project_last.get(project_path)
-            items.append({
+            item = {
                 "id": project_path,
                 "path": project_path,
                 "name": display_project_name(project_path),
                 "tokens": tokens,
                 "lastActive": last_active.isoformat().replace("+00:00", "Z") if last_active else None,
-            })
+            }
+            if project_models.get(project_path):
+                item["models"] = dict(project_models[project_path])
+            items.append(item)
         items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
         result["projects"] = {"status": "ok", "items": items[:20]}
     # Codex SQLite gives us per-thread token totals but not per-tool
@@ -7199,7 +7793,7 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
     if rows:
         result["breakdown"]["chat"] = len(rows)
         result["breakdown"]["status"] = "ok"
-    return result
+    return attach_codex_usage_breakdown(result)
 
 
 def _codex_tokens_all(snapshot: Dict[str, Any]) -> int:
@@ -7688,6 +8282,9 @@ def merge_codex_sessions_with_sqlite(sessions: Dict[str, Any], sqlite: Dict[str,
             merged_breakdown["status"] = "ok"
             changed = True
 
+    if "codexUsageBreakdown" in sqlite and "codexUsageBreakdown" not in merged:
+        merged["codexUsageBreakdown"] = copy.deepcopy(sqlite.get("codexUsageBreakdown"))
+
     if changed:
         merged["source"] = f"{sessions.get('source')} + {sqlite.get('source')}"
         merged["sources"] = {
@@ -7734,6 +8331,10 @@ def codex_snapshot() -> Dict[str, Any]:
 
     codexbar_cache = codexbar_cost_cache_snapshot("codex")
     if sessions.get("status") == "ok":
+        if "codexUsageBreakdown" in sqlite:
+            sessions["codexUsageBreakdown"] = copy.deepcopy(sqlite["codexUsageBreakdown"])
+        else:
+            attach_codex_usage_breakdown(sessions)
         if sqlite.get("status") == "ok":
             local = merge_codex_sessions_with_sqlite(sessions, sqlite)
             merged = merge_provider_with_usage_floor(
@@ -7741,20 +8342,26 @@ def codex_snapshot() -> Dict[str, Any]:
                 codexbar_cache,
                 strategy="codexbar_cost_cache_floor",
             )
-            return attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+            return attach_codex_usage_breakdown(
+                attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+            )
         merged = merge_provider_with_usage_floor(
             sessions,
             codexbar_cache,
             strategy="codexbar_cost_cache_floor",
         )
-        return attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+        return attach_codex_usage_breakdown(
+            attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+        )
 
     merged = merge_provider_with_usage_floor(
         sqlite,
         codexbar_cache,
         strategy="codexbar_cost_cache_floor",
     )
-    return attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+    return attach_codex_usage_breakdown(
+        attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -7819,18 +8426,17 @@ def fetch_llm_usage_fresh() -> Dict[str, Any]:
     instead of waiting out the error backoff. Never refreshes or writes a provider's token,
     so an expired token yields a reason (token_expired / …), not a silent blank.
     """
-    return {
-        "generatedAt": now_iso(),
-        "source": "on-demand-oauth",
-        "providers": {
+    providers = {
             "claude": live_usage_provider_from_limits(claude_live_limits(force=True)),
             "codex": live_usage_provider_from_limits(codex_live_limits(force=True)),
             "gemini": live_usage_provider_from_limits(gemini_live_limits(force=True)),
             "antigravity": live_usage_provider_from_limits(antigravity_live_limits(force=True)),
             "grok": live_usage_provider_from_limits(grok_live_limits(force=True)),
             "kimi": live_usage_provider_from_limits(kimi_live_limits(force=True)),
-        },
     }
+    if read_provider_key("openai"):
+        providers["openai"] = openai_usage_live()
+    return {"generatedAt": now_iso(), "source": "on-demand-oauth", "providers": providers}
 
 
 # ---------------------------------------------------------------------------
@@ -8156,12 +8762,18 @@ def _apply_record_to_totals(
     project_total = 0
     model = normalized_model_name(rec.get("model")) or "unknown"
     model_tokens = models.setdefault(model, {}) if models is not None else None
+    project_class_keys = {
+        "input": "input", "output": "output", "cache_read": "cacheRead",
+        "cache_write_1h": "cacheWrite", "cache_write_5m": "cacheWrite",
+    }
+    project_classes = {cls: 0 for cls in PROJECT_COST_CLASS_KEYS}
     for rec_key, tok_key, model_key in fields:
         raw_amount = rec.get(rec_key) or 0
         if raw_amount <= 0:
             continue
         amount = int(raw_amount) * sign
         project_total += amount
+        project_classes[project_class_keys[rec_key]] += amount
         totals[f"all_{tok_key}"] = totals.get(f"all_{tok_key}", 0) + amount
         if model_tokens is not None:
             model_tokens[model_key] = model_tokens.get(model_key, 0) + amount
@@ -8186,6 +8798,11 @@ def _apply_record_to_totals(
     if projects is not None and cwd:
         project = projects.setdefault(cwd, {"tokens": 0, "last_active": None})
         project["tokens"] = int(project.get("tokens") or 0) + project_total
+        project_models = project.setdefault("models", {})
+        model_classes = project_models.setdefault(model, {cls: 0 for cls in PROJECT_COST_CLASS_KEYS})
+        for cls, amount in project_classes.items():
+            if amount:
+                model_classes[cls] = int(model_classes.get(cls) or 0) + amount
         if ts is not None:
             last_active = project.get("last_active")
             last_dt = parse_timestamp(last_active)
@@ -8387,6 +9004,27 @@ def _merge_journal_models(target: Dict[str, Dict[str, int]], source: Dict[str, D
                 model_tokens[key] = max(model_tokens.get(key, 0), amount)
 
 
+def _journal_project_item_models(raw: Any) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for model, classes in raw.items():
+        if not isinstance(classes, dict):
+            continue
+        inp = int(classes.get("input") or 0)
+        outp = int(classes.get("output") or 0)
+        cache_read = int(classes.get("cacheRead") or 0)
+        cache_write = int(classes.get("cacheWrite") or 0)
+        total = inp + outp + cache_read + cache_write
+        if total > 0:
+            out[str(model)] = {
+                "inputTokens": inp, "outputTokens": outp,
+                "cacheReadInputTokens": cache_read,
+                "cacheCreationInputTokens": cache_write, "totalTokens": total,
+            }
+    return out
+
+
 def _journal_projects_snapshot(projects: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     items = []
     for path, payload in projects.items():
@@ -8395,13 +9033,17 @@ def _journal_projects_snapshot(projects: Dict[str, Dict[str, Any]]) -> Dict[str,
         tokens = int(payload.get("tokens") or 0)
         if tokens <= 0:
             continue
-        items.append({
+        item = {
             "id": path,
             "path": path,
             "name": display_project_name(path),
             "tokens": tokens,
             "lastActive": payload.get("last_active"),
-        })
+        }
+        models = _journal_project_item_models(payload.get("models"))
+        if models:
+            item["models"] = models
+        items.append(item)
     items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
     return {"status": "ok", "items": items[:20]}
 
@@ -9442,6 +10084,117 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def antigravity_history_days() -> set:
+    days = set()
+    path = ANTIGRAVITY_CLI_DIR / "history.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return days
+    for line in lines[-2000:]:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        when = parse_timestamp(payload.get("timestamp"))
+        day = day_key_for_timestamp(when)
+        if day:
+            days.add(day)
+    return days
+
+
+def antigravity_inference_days(activity: Optional[Dict[str, Any]]) -> set:
+    days = antigravity_history_days()
+    counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
+    if isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0 and int(counts.get("gemini") or 0) <= 0:
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        today_utc = day_key_for_timestamp(now_utc)
+        today_local = day_key_for_timestamp(now_utc.astimezone())
+        if today_utc:
+            days.add(today_utc)
+        if today_local:
+            days.add(today_local)
+    return days
+
+
+def _hour_day_key(raw: str) -> str:
+    return str(raw or "")[:10]
+
+
+def filter_google_usage_days(usage: Dict[str, Any], days: set, *, include: bool) -> Dict[str, Any]:
+    daily_tokens = {
+        day: amount
+        for day, amount in int_map(usage.get("dailyTokens")).items()
+        if (day in days) == include
+    }
+    hourly_tokens = {
+        hour: amount
+        for hour, amount in int_map(usage.get("hourlyTokens")).items()
+        if (_hour_day_key(hour) in days) == include
+    }
+    model_daily_raw = usage.get("modelDailyTokens") if isinstance(usage.get("modelDailyTokens"), dict) else {}
+    source_models = usage.get("models") if isinstance(usage.get("models"), dict) else {}
+    models: Dict[str, Dict[str, int]] = {}
+    model_daily_tokens: Dict[str, Dict[str, int]] = {}
+    for model, raw_days in model_daily_raw.items():
+        model_days = {
+            day: amount
+            for day, amount in int_map(raw_days).items()
+            if (day in days) == include
+        }
+        model_total = sum(model_days.values())
+        if model_total <= 0:
+            continue
+        source_model_tokens = int_map(source_models.get(model))
+        original_model_total = (
+            source_model_tokens.get("totalTokens")
+            or source_model_tokens.get("all")
+            or sum(source_model_tokens.get(key, 0) for key in TOKEN_CLASS_KEYS)
+        )
+        periods = periods_from_daily_tokens(model_days)
+        periods["all"] = model_total
+        model_tokens = {
+            key: _scaled_token_class(source_model_tokens.get(key, 0), model_total, original_model_total)
+            for key in TOKEN_CLASS_KEYS
+        }
+        for key, amount in periods.items():
+            if amount > 0:
+                model_tokens[key] = amount
+        models[str(model)] = {key: amount for key, amount in model_tokens.items() if amount > 0}
+        model_daily_tokens[str(model)] = model_days
+
+    total = sum(daily_tokens.values())
+    tokens: Dict[str, int] = {}
+    source_tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else {}
+    original_total = int(source_tokens.get("totalTokens") or source_tokens.get("all") or 0)
+    if total > 0:
+        for key in TOKEN_CLASS_KEYS:
+            amount = _scaled_token_class(int(source_tokens.get(key) or 0), total, original_total)
+            if amount > 0:
+                tokens[key] = amount
+        tokens["totalTokens"] = total
+        periods = periods_from_daily_tokens(daily_tokens)
+        periods["all"] = total
+        for key, amount in periods.items():
+            if amount > 0:
+                tokens[key] = amount
+
+    filtered = {
+        "tokens": tokens,
+        "models": models,
+        "dailyTokens": daily_tokens,
+        "hourlyTokens": hourly_tokens,
+        "modelDailyTokens": model_daily_tokens,
+        "events": int(usage.get("events") or 0) if total > 0 and total == original_total else 0,
+        "cache": copy.deepcopy(usage.get("cache") or {"source": "filtered"}),
+    }
+    if total > 0 and total != original_total:
+        filtered["cache"]["source"] = "filtered-by-antigravity-history"
+    return filtered
+
+
 def google_usage_total(usage: Optional[Dict[str, Any]]) -> int:
     if not isinstance(usage, dict):
         return 0
@@ -9639,14 +10392,20 @@ def antigravity_provider_snapshot(
     )
     has_usage = google_usage_total(usage) > 0
     if usage and has_usage:
-        # Antigravity only reports real tokens when it has its own dedicated
-        # telemetry outfile; Gemini-CLI tokens are never borrowed.
-        source_status["status"] = "ok"
+        source_status["status"] = (
+            "inferred_from_history"
+            if source_note == "history-day-inference"
+            else "ok"
+        )
         source_status["tokens"] = google_usage_total(usage)
         source_status["events"] = int(usage.get("events") or source_status.get("events") or 0)
     source_status.setdefault(
         "collectionMethod",
-        "dedicated_otel_token_metrics" if has_usage else "server_side_only_no_local_token_stream",
+        "history_day_inference"
+        if source_note == "history-day-inference"
+        else "dedicated_otel_token_metrics"
+        if has_usage
+        else "server_side_only_no_local_token_stream",
     )
     out = {
         "status": "ok" if google_usage_total(usage) > 0 else status_if_empty,
@@ -9713,12 +10472,46 @@ def split_google_cli_snapshots(
         )
         return gemini_provider, antigravity_provider
 
-    # Antigravity bills server-side and never writes a local telemetry outfile, so
-    # there is no honest way to attribute Gemini-CLI tokens to it. Emit Antigravity
-    # as its own provider with empty tokens rather than borrowing Gemini's usage.
+    # Tier 2: older Antigravity installs could share Google's common telemetry
+    # stream. Only an explicitly unconfigured Gemini telemetry source is
+    # eligible; a missing flag is unknown and stays Gemini-owned. Within that
+    # legacy stream, attribute complete days corroborated by Antigravity's own
+    # history (or an unambiguous currently-active process), remove those days
+    # from Gemini, and label the result as inference. Dedicated OTEL and local
+    # trajectory SQLite above always win and are never filtered.
     counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
+    inference_days = antigravity_inference_days(activity)
+    if inference_days:
+        antigravity_source_status["historyDays"] = len(inference_days)
     antigravity_installed = bool(antigravity_source_status.get("installed"))
     antigravity_active = isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0
+    if (
+        inference_days
+        and google_usage_total(common_usage) > 0
+        and (antigravity_installed or antigravity_active)
+        and gemini_source_status.get("telemetryConfigured") is False
+    ):
+        inferred_usage = filter_google_usage_days(common_usage, inference_days, include=True)
+        if google_usage_total(inferred_usage) > 0:
+            gemini_usage = filter_google_usage_days(common_usage, inference_days, include=False)
+            gemini_provider = apply_google_usage(
+                gemini_snapshot_data,
+                gemini_usage,
+                status_if_empty="no_token_events_yet",
+            )
+            inferred_source_status = dict(antigravity_source_status)
+            inferred_source_status["source"] = gemini_source_path or str(GEMINI_TELEMETRY)
+            inferred_source_status["collectionMethod"] = "history_day_inference"
+            antigravity_provider = antigravity_provider_snapshot(
+                gemini_snapshot_data,
+                inferred_usage,
+                status_if_empty="no_token_events_yet",
+                source_note="history-day-inference",
+                source_status_override=inferred_source_status,
+            )
+            return gemini_provider, antigravity_provider
+
+    # Without corroborated days there is no honest fallback attribution.
     status_if_empty = "no_telemetry_yet" if (antigravity_installed or antigravity_active) else "not_found"
     antigravity_provider = antigravity_provider_snapshot(
         gemini_snapshot_data,
@@ -10180,9 +10973,8 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
 CONNECTOR_VERSION_RE = re.compile(
     r"CONNECTOR_VERSION\s*=\s*os\.environ\.get\(\s*['\"]AGENTCAT_CONNECTOR_VERSION['\"]\s*,\s*['\"]([^'\"]+)['\"]"
 )
-CONNECTOR_MANIFEST_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[.-][0-9A-Za-z]+)*$")
-PRO_CONNECTOR_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-VALID_UPDATE_CHANNELS = {"public", "pro"}
+CONNECTOR_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+VALID_UPDATE_CHANNELS = {"public"}
 
 
 def agentcat_connectors_dir() -> Path:
@@ -10268,301 +11060,26 @@ def read_update_channel_state() -> Dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def validate_pro_connector_manifest(manifest: Any) -> Dict[str, Any]:
-    if not isinstance(manifest, dict):
-        raise ValueError("manifest must be an object")
-    if manifest.get("channel") != "pro":
-        raise ValueError("manifest.channel must be pro")
-
-    version = str(manifest.get("version") or "").strip()
-    if not CONNECTOR_MANIFEST_VERSION_RE.match(version):
-        raise ValueError("manifest.version is invalid")
-
-    download_url = str(manifest.get("downloadUrl") or "").strip()
-    parsed = urllib.parse.urlparse(download_url)
-    if parsed.scheme != "https" or not parsed.netloc:
-        raise ValueError("manifest.downloadUrl must be HTTPS")
-
-    sha256 = str(manifest.get("sha256") or "").strip()
-    if not PRO_CONNECTOR_SHA256_RE.match(sha256):
-        raise ValueError("manifest.sha256 must be 64 lowercase hex chars")
-
-    normalized: Dict[str, Any] = {
-        "version": version,
-        "downloadUrl": download_url,
-        "sha256": sha256,
-        "channel": "pro",
-    }
-    min_app_version = manifest.get("minAppVersion")
-    if min_app_version is not None:
-        min_app_version_text = str(min_app_version).strip()
-        if not CONNECTOR_MANIFEST_VERSION_RE.match(min_app_version_text):
-            raise ValueError("manifest.minAppVersion is invalid")
-        normalized["minAppVersion"] = min_app_version_text
-    return normalized
-
-
 def write_update_channel_state(channel: str, manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if channel not in VALID_UPDATE_CHANNELS:
-        raise ValueError("channel must be public or pro")
+        raise ValueError("channel must be public")
     state: Dict[str, Any] = {
-        "channel": channel,
+        "channel": "public",
         "updatedAt": now_iso(),
         "currentVersion": CONNECTOR_VERSION,
+        "status": "public",
+        "installStatus": "current",
     }
-    if channel == "pro":
-        if manifest is None:
-            raise ValueError("pro channel requires a connector manifest")
-        normalized = validate_pro_connector_manifest(manifest)
-        state["manifest"] = normalized
-        # Never record a pending install for a target that isn't ahead of what
-        # is already running. The Pro backend has served a stale version before
-        # (26.27.0 against an installed 26.28.12), which parked the channel on
-        # `pending_install` pointing backwards with nothing able to clear it.
-        if connector_version_key(normalized["version"]) <= connector_version_key(CONNECTOR_VERSION):
-            state["status"] = "current"
-            state["installStatus"] = "current"
-        else:
-            state["status"] = "manifest_ready"
-            # `pending_install` now means an install is actually scheduled; the
-            # caller flips this to a running or terminal state.
-            state["installStatus"] = "pending_install"
-    else:
-        state["status"] = "public"
-        state["installStatus"] = "current"
     write_json_atomic(update_channel_state_file(), state)
     return state
-
-
-# --- Pro channel install -----------------------------------------------------
-#
-# The app hands us an entitlement-gated manifest plus a short-lived, manifest-
-# scoped download token. We fetch the archive, verify it against the manifest
-# checksum, hand it to the safe-swap installer, and restart the daemon. The
-# token is used once and never written to disk or logs.
-
-PRO_INSTALL_TERMINAL_STATUSES = {
-    "installed",
-    "current",
-    "download_failed",
-    "checksum_mismatch",
-    "install_failed",
-    "install_blocked",
-}
-
-_pro_install_lock = threading.Lock()
-_pro_install_running = False
-
-
-def pro_channel_installer_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "scripts" / "pro_channel_install.py"
-
-
-def update_pro_install_status(install_status: str, **extra: Any) -> Dict[str, Any]:
-    """Patch install status onto the persisted channel state.
-
-    Deliberately merges rather than rewrites: the manifest and channel written
-    by write_update_channel_state must survive a status transition.
-    """
-    state = read_update_channel_state()
-    if not state:
-        return {}
-    state["installStatus"] = install_status
-    state["installUpdatedAt"] = now_iso()
-    for key, value in extra.items():
-        if value is None:
-            state.pop(key, None)
-        else:
-            state[key] = value
-    write_json_atomic(update_channel_state_file(), state)
-    return state
-
-
-def download_pro_connector_archive(
-    manifest: Dict[str, Any],
-    download_token: Optional[str],
-    destination: Path,
-) -> None:
-    """Fetch the archive to `destination`. Raises on transport failure.
-
-    The bearer never reaches a log line: urllib errors carry the URL, not the
-    headers, and we re-raise with our own message.
-    """
-    request = urllib.request.Request(manifest["downloadUrl"], method="GET")
-    request.add_header("Accept", "application/octet-stream")
-    request.add_header("User-Agent", f"agentcatd/{CONNECTOR_VERSION}")
-    if download_token:
-        request.add_header("Authorization", f"Bearer {download_token}")
-    with urllib.request.urlopen(request, timeout=120) as response:
-        status = getattr(response, "status", 200)
-        if status != 200:
-            raise ValueError(f"download returned HTTP {status}")
-        with destination.open("wb") as handle:
-            shutil.copyfileobj(response, handle, 1024 * 1024)
-
-
-def sha256_of_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def restart_agentcatd() -> bool:
-    """Ask launchd to restart us so the swapped-in code takes over.
-
-    Best-effort: a failure here leaves the new code installed and picked up on
-    the next natural start, so it must not fail the install.
-    """
-    if sys.platform != "darwin":
-        return False
-    try:
-        uid = os.getuid()
-        result = subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{uid}/com.trappist.agentcatd"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-def perform_pro_channel_install(manifest: Dict[str, Any], download_token: Optional[str]) -> Dict[str, Any]:
-    """Download -> verify -> swap -> restart, recording a concrete state at
-    every failure so the channel can never sit on `pending_install` forever."""
-    installer = pro_channel_installer_path()
-    if not installer.exists():
-        return update_pro_install_status(
-            "install_blocked",
-            installError="pro_channel_install.py is missing from this connector",
-        )
-
-    workdir = Path(tempfile.mkdtemp(prefix="agentcat-pro-"))
-    archive = workdir / f"agentcat-connectors-v{manifest['version']}.tar.gz"
-    manifest_path = workdir / "manifest.json"
-    try:
-        update_pro_install_status("downloading", installError=None)
-        try:
-            download_pro_connector_archive(manifest, download_token, archive)
-        except Exception as exc:
-            return update_pro_install_status(
-                "download_failed",
-                installError=_redact_paths(str(exc))[:400],
-            )
-
-        actual = sha256_of_file(archive)
-        if actual != manifest["sha256"]:
-            return update_pro_install_status(
-                "checksum_mismatch",
-                installError="archive checksum did not match the manifest",
-            )
-
-        update_pro_install_status("installing")
-        write_json_atomic(manifest_path, manifest)
-        try:
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(installer),
-                    "--archive",
-                    str(archive),
-                    "--manifest",
-                    str(manifest_path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-        except Exception as exc:
-            return update_pro_install_status(
-                "install_failed",
-                installError=_redact_paths(str(exc))[:400],
-            )
-
-        if result.returncode != 0:
-            return update_pro_install_status(
-                "install_failed",
-                installError=_redact_paths((result.stderr or "").strip())[:400] or
-                f"installer exited {result.returncode}",
-            )
-
-        state = update_pro_install_status(
-            "installed",
-            status="installed",
-            installedVersion=manifest["version"],
-            installError=None,
-        )
-        restart_agentcatd()
-        return state
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-
-
-def schedule_pro_channel_install(manifest: Dict[str, Any], download_token: Optional[str]) -> bool:
-    """Run the install off the request thread. Returns False when one is
-    already in flight, so a repeated 'prepare' press can't start a second
-    swap over the first."""
-    global _pro_install_running
-    with _pro_install_lock:
-        if _pro_install_running:
-            return False
-        _pro_install_running = True
-
-    def run() -> None:
-        global _pro_install_running
-        try:
-            perform_pro_channel_install(manifest, download_token)
-        except Exception as exc:
-            try:
-                update_pro_install_status(
-                    "install_failed",
-                    installError=_redact_paths(str(exc))[:400],
-                )
-            except Exception:
-                pass
-        finally:
-            with _pro_install_lock:
-                _pro_install_running = False
-
-    threading.Thread(target=run, name="pro-channel-install", daemon=True).start()
-    return True
 
 
 def update_channel_status_snapshot() -> Dict[str, Any]:
     raw = read_update_channel_state()
-    channel = raw.get("channel") if raw.get("channel") in VALID_UPDATE_CHANNELS else "public"
-    if channel == "pro":
-        manifest = raw.get("manifest")
-        if isinstance(manifest, dict):
-            snapshot = {
-                "channel": "pro",
-                "status": raw.get("status") or "manifest_ready",
-                "installStatus": raw.get("installStatus") or "pending_install",
-                "currentVersion": CONNECTOR_VERSION,
-                "targetVersion": manifest.get("version"),
-                "minAppVersion": manifest.get("minAppVersion"),
-                "updatedAt": raw.get("updatedAt"),
-            }
-            # Surface why an install stopped, so a failure is visible instead of
-            # looking like a permanent "pending".
-            for key in ("installUpdatedAt", "installedVersion", "installError"):
-                if raw.get(key):
-                    snapshot[key] = raw[key]
-            return snapshot
-        return {
-            "channel": "pro",
-            "status": "invalid_manifest",
-            "installStatus": "blocked",
-            "currentVersion": CONNECTOR_VERSION,
-            "updatedAt": raw.get("updatedAt"),
-        }
     return {
         "channel": "public",
-        "status": raw.get("status") or "public",
-        "installStatus": raw.get("installStatus") or "current",
+        "status": (raw.get("status") or "public") if raw.get("channel") == "public" else "public",
+        "installStatus": (raw.get("installStatus") or "current") if raw.get("channel") == "public" else "current",
         "currentVersion": CONNECTOR_VERSION,
         "updatedAt": raw.get("updatedAt"),
     }
@@ -10600,7 +11117,7 @@ def validate_public_connector_manifest(manifest: Any) -> Dict[str, Any]:
     if not archive_url.startswith("https://github.com/yong076/agentcat-connectors/"):
         raise ValueError("public connector manifest archive URL is not approved")
     digest = str(manifest.get("sha256") or "").strip()
-    if not PRO_CONNECTOR_SHA256_RE.fullmatch(digest):
+    if not CONNECTOR_SHA256_RE.fullmatch(digest):
         raise ValueError("public connector manifest SHA-256 is invalid")
     return dict(manifest)
 
@@ -10727,40 +11244,147 @@ def project_daily_state_file() -> Path:
     return AGENTCAT_HOME / "project-daily-state.json"
 
 
-def load_project_daily() -> Dict[str, Dict[str, int]]:
-    raw = read_json(project_daily_file())
-    out: Dict[str, Dict[str, int]] = {}
+def project_daily_cost_file() -> Path:
+    """Versioned rich ledger kept beside the legacy public flat ledger."""
+    return AGENTCAT_HOME / "project-daily-cost.json"
+
+
+def _project_daily_label_entry(raw: Any) -> Optional[Dict[str, Any]]:
+    flat = nonnegative_int(raw)
+    if flat:
+        return {"total": flat, "providers": {}}
+    if not isinstance(raw, dict):
+        return None
+    total = nonnegative_int(raw.get("total"))
+    if not total:
+        return None
+    providers: Dict[str, Dict[str, Any]] = {}
+    raw_providers = raw.get("providers")
+    if isinstance(raw_providers, dict):
+        for provider, entry in raw_providers.items():
+            normalized = _project_daily_provider_entry(entry)
+            if str(provider) and normalized:
+                providers[str(provider)] = normalized
+    return {"total": total, "providers": providers}
+
+
+def _project_daily_provider_entry(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    tokens = nonnegative_int(raw.get("tokens"))
+    if not tokens:
+        return None
+    cost_raw = raw.get("estCostUSD")
+    est_cost = float(cost_raw) if isinstance(cost_raw, (int, float)) and not isinstance(cost_raw, bool) and cost_raw >= 0 else None
+    top_model_raw = raw.get("topModel")
+    top_model = top_model_raw if isinstance(top_model_raw, str) and top_model_raw else None
+    models: Dict[str, int] = {}
+    raw_models = raw.get("models")
+    if isinstance(raw_models, dict):
+        for model, amount in raw_models.items():
+            value = nonnegative_int(amount)
+            if str(model) and value:
+                models[str(model)] = value
+    return {"tokens": tokens, "estCostUSD": est_cost, "topModel": top_model, "models": models}
+
+
+def _project_item_models(raw: Any) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
     if not isinstance(raw, dict):
         return out
-    for day, labels in raw.items():
+    class_aliases = (
+        ("input", "inputTokens"), ("output", "outputTokens"),
+        ("cacheRead", "cacheReadInputTokens"), ("cacheWrite", "cacheCreationInputTokens"),
+    )
+    for model, value in raw.items():
+        name = normalized_model_name(model) or "unknown"
+        flat = nonnegative_int(value)
+        if flat is not None:
+            if flat:
+                out[name] = {"tokens": flat, "classes": None}
+            continue
+        if not isinstance(value, dict):
+            continue
+        has_classes = any(alias in value for _cls, alias in class_aliases)
+        classes = {cls: nonnegative_int(value.get(alias)) or 0 for cls, alias in class_aliases}
+        tokens = nonnegative_int(value.get("totalTokens"))
+        if tokens is None:
+            tokens = sum(classes.values()) if has_classes else 0
+        if tokens > 0:
+            out[name] = {"tokens": tokens, "classes": classes if has_classes else None}
+    return out
+
+
+def load_project_daily() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    raw = read_json(project_daily_cost_file())
+    if not (isinstance(raw, dict) and isinstance(raw.get("days"), dict)):
+        raw = read_json(project_daily_file())
+    if isinstance(raw, dict) and isinstance(raw.get("days"), dict):
+        raw_days: Dict[str, Any] = raw["days"]
+    elif isinstance(raw, dict):
+        raw_days = raw  # v1 flat file: day keys at the top level
+    else:
+        raw_days = {}
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for day, labels in raw_days.items():
         if not PROJECT_DAILY_DAY_RE.match(str(day)) or not isinstance(labels, dict):
             continue
-        bucket: Dict[str, int] = {}
-        for label, tokens in labels.items():
-            amount = nonnegative_int(tokens)
-            if str(label) and amount:
-                bucket[str(label)] = amount
+        bucket: Dict[str, Dict[str, Any]] = {}
+        for label, entry in labels.items():
+            normalized = _project_daily_label_entry(entry)
+            if str(label) and normalized:
+                bucket[str(label)] = normalized
         if bucket:
             out[str(day)] = bucket
     return out
 
 
-def load_project_daily_baselines() -> Dict[str, int]:
+def load_project_daily_state() -> Dict[str, Any]:
+    """Baselines for delta accounting.
+
+    {"baselines": {"provider|projectId": cumulativeTokens},
+     "modelBaselines": {"provider|projectId": {model: {"tokens": int,
+     "classes": {input, output, cacheRead, cacheWrite} | None}}}}.
+    Legacy state files (baselines only) load with empty model baselines, so the
+    first rich-ledger pass seeds models without booking history onto today.
+    """
     raw = read_json(project_daily_state_file())
+    baselines: Dict[str, int] = {}
+    model_baselines: Dict[str, Dict[str, Dict[str, Any]]] = {}
     if not isinstance(raw, dict):
-        return {}
-    baselines = raw.get("baselines")
-    if not isinstance(baselines, dict):
-        return {}
-    out: Dict[str, int] = {}
-    for key, value in baselines.items():
-        amount = nonnegative_int(value)
-        if str(key) and amount is not None:
-            out[str(key)] = amount
-    return out
+        return {"baselines": baselines, "modelBaselines": model_baselines}
+    raw_baselines = raw.get("baselines")
+    if isinstance(raw_baselines, dict):
+        for key, value in raw_baselines.items():
+            amount = nonnegative_int(value)
+            if str(key) and amount is not None:
+                baselines[str(key)] = amount
+    raw_models = raw.get("modelBaselines")
+    if isinstance(raw_models, dict):
+        for key, models in raw_models.items():
+            if not str(key) or not isinstance(models, dict):
+                continue
+            normalized: Dict[str, Dict[str, Any]] = {}
+            for model, entry in models.items():
+                if not str(model) or not isinstance(entry, dict):
+                    continue
+                tokens = nonnegative_int(entry.get("tokens"))
+                if tokens is None:
+                    continue
+                raw_classes = entry.get("classes")
+                classes: Optional[Dict[str, int]] = None
+                if isinstance(raw_classes, dict):
+                    classes = {
+                        cls: nonnegative_int(raw_classes.get(cls)) or 0
+                        for cls in PROJECT_COST_CLASS_KEYS
+                    }
+                normalized[str(model)] = {"tokens": tokens, "classes": classes}
+            if normalized:
+                model_baselines[str(key)] = normalized
+    return {"baselines": baselines, "modelBaselines": model_baselines}
 
 
-def prune_project_daily(days: Dict[str, Dict[str, int]], today: "dt.date") -> bool:
+def prune_project_daily(days: Dict[str, Dict[str, Any]], today: "dt.date") -> bool:
     """Drop day buckets older than PROJECT_DAILY_RETENTION_DAYS (and malformed keys)."""
     cutoff = today - dt.timedelta(days=PROJECT_DAILY_RETENTION_DAYS)
     changed = False
@@ -10777,14 +11401,16 @@ def prune_project_daily(days: Dict[str, Dict[str, int]], today: "dt.date") -> bo
     return changed
 
 
-def snapshot_project_cumulative(providers: Dict[str, Any]) -> Dict[str, Tuple[str, int]]:
-    """'provider|project-id' -> (label, cumulative tokens) from provider rollups.
+def snapshot_project_cumulative(providers: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """'provider|project-id' -> cumulative observation from provider rollups.
 
     Keyed per provider+project so one provider's counter reset (or a project
     dropping out of another provider's top-20 list) never bleeds into the
     others' delta accounting. Labels are basenames only — never paths.
+    Each observation: {"provider", "label", "tokens", "models"} where models
+    carries per-model cumulative usage when the provider attributes it.
     """
-    out: Dict[str, Tuple[str, int]] = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for provider, usage in (providers or {}).items():
         if not isinstance(usage, dict):
             continue
@@ -10804,14 +11430,20 @@ def snapshot_project_cumulative(providers: Dict[str, Any]) -> Dict[str, Tuple[st
             label = display_project_name(project_id)
             if not label:
                 continue
-            out[f"{provider}|{project_id}"] = (label, tokens)
+            out[f"{provider}|{project_id}"] = {
+                "provider": str(provider),
+                "label": label,
+                "tokens": tokens,
+                "models": _project_item_models(item.get("models")),
+            }
     return out
 
 
 def project_daily_snapshot_slice(
-    days: Dict[str, Dict[str, int]], today: "dt.date"
+    days: Dict[str, Dict[str, Any]], today: "dt.date"
 ) -> Dict[str, Dict[str, int]]:
-    """Trailing PROJECT_DAILY_SNAPSHOT_DAYS view embedded in the snapshot."""
+    """Trailing PROJECT_DAILY_SNAPSHOT_DAYS v1 flat view ({day: {label:
+    tokens}}) embedded in the snapshot for pre-dailyCost clients."""
     cutoff = today - dt.timedelta(days=PROJECT_DAILY_SNAPSHOT_DAYS - 1)
     out: Dict[str, Dict[str, int]] = {}
     for day, labels in days.items():
@@ -10820,13 +11452,133 @@ def project_daily_snapshot_slice(
         except ValueError:
             continue
         if parsed >= cutoff and labels:
-            out[day] = dict(labels)
+            out[day] = {label: int(entry["total"]) for label, entry in labels.items()}
     return out
+
+
+def project_daily_cost_snapshot_slice(
+    days: Dict[str, Dict[str, Any]], today: "dt.date"
+) -> Dict[str, Dict[str, Any]]:
+    """Trailing PROJECT_DAILY_COST_SNAPSHOT_DAYS rich view (capability
+    "projects.dailyCost"). Per-day model mixes stay in the ledger file; the
+    snapshot exposes tokens/estCostUSD/topModel per provider."""
+    cutoff = today - dt.timedelta(days=PROJECT_DAILY_COST_SNAPSHOT_DAYS - 1)
+    out: Dict[str, Dict[str, Any]] = {}
+    for day, labels in days.items():
+        try:
+            parsed = dt.date.fromisoformat(day)
+        except ValueError:
+            continue
+        if parsed < cutoff or not labels:
+            continue
+        day_out: Dict[str, Any] = {}
+        for label, entry in labels.items():
+            day_out[label] = {
+                "total": int(entry["total"]),
+                "providers": {
+                    provider: {
+                        "tokens": int(pentry["tokens"]),
+                        "estCostUSD": pentry["estCostUSD"],
+                        "topModel": pentry["topModel"],
+                    }
+                    for provider, pentry in entry["providers"].items()
+                },
+            }
+        out[day] = day_out
+    return out
+
+
+def _project_daily_top_model(models: Dict[str, int]) -> Optional[str]:
+    """Deterministic top model for a day's mix: most tokens, ties broken by
+    lexicographically smallest name; 'unknown' never wins."""
+    best: Optional[Tuple[str, int]] = None
+    for model, tokens in models.items():
+        if model == "unknown" or tokens <= 0:
+            continue
+        if best is None or tokens > best[1] or (tokens == best[1] and model < best[0]):
+            best = (model, tokens)
+    return best[0] if best else None
+
+
+def _model_baseline_value(current: Dict[str, Any]) -> Dict[str, Any]:
+    classes = current.get("classes")
+    return {
+        "tokens": int(current["tokens"]),
+        "classes": dict(classes) if isinstance(classes, dict) else None,
+    }
+
+
+def _reseed_model_baselines(
+    baseline_models: Dict[str, Dict[str, Any]],
+    observed_models: Dict[str, Dict[str, Any]],
+) -> None:
+    """Replace all model baselines after a project counter reset/first sight."""
+    baseline_models.clear()
+    for model, current in observed_models.items():
+        baseline_models[model] = _model_baseline_value(current)
+
+
+def _project_model_deltas(
+    baseline_models: Dict[str, Dict[str, Any]],
+    observed_models: Dict[str, Dict[str, Any]],
+) -> Tuple[Dict[str, int], Optional[float], bool]:
+    """Per-model delta accounting mirroring the per-project total rules.
+
+    First sighting seeds the baseline; a shrinking model counter (or any
+    shrinking class) rebases without booking. Cost accrues only for models
+    with a known name, a full class split on both sides of the delta, and a
+    price in the merged table — everything else contributes tokens to the
+    mix but no cost. Returns (deltas, costUSD or None, baselines changed).
+    """
+    deltas: Dict[str, int] = {}
+    cost_total: Optional[float] = None
+    changed = False
+    for model, current in observed_models.items():
+        prev = baseline_models.get(model)
+        if prev is None or current["tokens"] < prev["tokens"]:
+            baseline_models[model] = _model_baseline_value(current)
+            changed = True
+            continue
+        token_delta = current["tokens"] - prev["tokens"]
+        class_deltas: Optional[Dict[str, int]] = None
+        cur_classes = current.get("classes")
+        prev_classes = prev.get("classes")
+        if isinstance(cur_classes, dict) and isinstance(prev_classes, dict):
+            candidate = {
+                cls: int(cur_classes.get(cls) or 0) - int(prev_classes.get(cls) or 0)
+                for cls in PROJECT_COST_CLASS_KEYS
+            }
+            if any(value < 0 for value in candidate.values()):
+                # A class counter reset makes the aggregate model delta
+                # unattributable. Rebase the whole model and resume booking
+                # only from this coherent baseline on the next snapshot.
+                baseline_models[model] = _model_baseline_value(current)
+                changed = True
+                continue
+            class_deltas = candidate
+        new_baseline = _model_baseline_value(current)
+        if new_baseline != prev:
+            baseline_models[model] = new_baseline
+            changed = True
+        if token_delta <= 0:
+            continue
+        deltas[model] = deltas.get(model, 0) + token_delta
+        if model != "unknown" and class_deltas and any(class_deltas.values()):
+            cost = estimate_cost(
+                model,
+                class_deltas["input"],
+                class_deltas["output"],
+                class_deltas["cacheRead"],
+                class_deltas["cacheWrite"],
+            )
+            if cost is not None:
+                cost_total = (cost_total or 0.0) + cost["total"]
+    return deltas, cost_total, changed
 
 
 def update_project_daily(
     providers: Dict[str, Any], now: Optional["dt.datetime"] = None
-) -> Dict[str, Dict[str, int]]:
+) -> Dict[str, Dict[str, Any]]:
     """Book per-project cumulative growth into LOCAL-day delta buckets.
 
     Delta accounting against the previous cumulative value: only growth since
@@ -10834,33 +11586,82 @@ def update_project_daily(
     double-count. First sighting only seeds the baseline (months of history
     must not land on today), and a shrinking counter rebases the baseline
     without ever booking a negative delta.
+
+    The rich ledger adds per-provider splits per day/label plus estimated cost: the same
+    delta rules run per model where the provider rollup attributes models
+    (Claude journal carries the full class split, Codex sessions model totals
+    only), class deltas are priced through estimate_cost (LiteLLM feed over
+    the bundled table), and estCostUSD stays null when nothing is
+    attributable — a partial value covers only the priced share, never a
+    blended guess. The return value deliberately remains the public 14-day
+    flat slice; the 30-day rich slice is loaded separately for the snapshot.
     """
     if now is None:
         now = dt.datetime.now(dt.timezone.utc)
     today_key = day_key_for_timestamp(now) or now.astimezone().date().isoformat()
     today = dt.date.fromisoformat(today_key)
     days = load_project_daily()
-    baselines = load_project_daily_baselines()
+    state = load_project_daily_state()
+    baselines: Dict[str, int] = state["baselines"]
+    model_baselines: Dict[str, Dict[str, Dict[str, Any]]] = state["modelBaselines"]
     days_changed = prune_project_daily(days, today)
-    baselines_changed = False
-    for key, (label, tokens) in snapshot_project_cumulative(providers).items():
+    state_changed = False
+    for key, observed in snapshot_project_cumulative(providers).items():
+        tokens = observed["tokens"]
+        key_models = model_baselines.setdefault(key, {})
         previous = baselines.get(key)
         if previous is None or tokens < previous:
             baselines[key] = tokens
-            baselines_changed = True
+            _reseed_model_baselines(key_models, observed["models"])
+            state_changed = True
             continue
         delta = tokens - previous
+        model_deltas, cost_total, models_changed = _project_model_deltas(
+            key_models, observed["models"]
+        )
+        if models_changed:
+            state_changed = True
         if delta == 0:
             continue
         baselines[key] = tokens
-        baselines_changed = True
+        state_changed = True
         bucket = days.setdefault(today_key, {})
-        bucket[label] = int(bucket.get(label) or 0) + delta
+        label_entry = bucket.setdefault(
+            observed["label"], {"total": 0, "providers": {}}
+        )
+        label_entry["total"] = int(label_entry["total"]) + delta
+        pentry = label_entry["providers"].setdefault(
+            observed["provider"],
+            {"tokens": 0, "estCostUSD": None, "topModel": None, "models": {}},
+        )
+        pentry["tokens"] = int(pentry["tokens"]) + delta
+        for model, model_delta in model_deltas.items():
+            pentry["models"][model] = int(pentry["models"].get(model) or 0) + model_delta
+        if cost_total is not None:
+            pentry["estCostUSD"] = round((pentry["estCostUSD"] or 0.0) + cost_total, 6)
+        pentry["topModel"] = _project_daily_top_model(pentry["models"])
         days_changed = True
     if days_changed:
-        write_json_atomic(project_daily_file(), days)
-    if baselines_changed:
-        write_json_atomic(project_daily_state_file(), {"baselines": baselines})
+        write_json_atomic(
+            project_daily_cost_file(),
+            {"version": PROJECT_DAILY_FILE_VERSION, "days": days},
+        )
+        write_json_atomic(
+            project_daily_file(),
+            {
+                day: {label: int(entry["total"]) for label, entry in labels.items()}
+                for day, labels in days.items()
+            },
+        )
+    if state_changed:
+        write_json_atomic(
+            project_daily_state_file(),
+            {
+                "version": PROJECT_DAILY_STATE_VERSION,
+                "baselines": baselines,
+                "modelBaselines": {k: v for k, v in model_baselines.items() if v},
+            },
+        )
     return project_daily_snapshot_slice(days, today)
 
 
@@ -10877,6 +11678,53 @@ def build_snapshot() -> Dict[str, Any]:
         return _build_snapshot_impl()
 
 
+def build_provider_payloads(
+    provider_config: Dict[str, Dict[str, Any]],
+    activity: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Build all provider usage slices through the plugin registry."""
+    overrides: Dict[str, Dict[str, Any]] = {}
+    gemini_disabled = (provider_config.get("gemini") or {}).get("enabled") is False
+    antigravity_disabled = (provider_config.get("antigravity") or {}).get("enabled") is False
+    if not (gemini_disabled and antigravity_disabled):
+        try:
+            gemini_provider, antigravity_provider = split_google_cli_snapshots(gemini_snapshot(), activity)
+        except Exception as exc:
+            logging.debug("gemini/antigravity snapshot failed: %s", exc)
+            gemini_provider = empty_provider_usage(status="error")
+            gemini_provider["error"] = str(exc)
+            antigravity_provider = empty_provider_usage(status="error")
+            antigravity_provider["error"] = str(exc)
+        overrides = {"gemini": gemini_provider, "antigravity": antigravity_provider}
+
+    usage_readers = {
+        "codex": codex_snapshot,
+        "claude": claude_snapshot,
+        "opencode": opencode_snapshot,
+        "copilot": copilot_snapshot,
+        "kimi": kimi_snapshot,
+        "grok": grok_snapshot,
+    }
+
+    def usage(spec: Any, _home: Any) -> Dict[str, Any]:
+        return usage_readers[spec.id]()
+
+    def error(spec: Any, exc: Exception) -> Dict[str, Any]:
+        logging.debug("provider %s snapshot failed: %s", spec.id, exc)
+        payload = empty_provider_usage(status="error")
+        payload["error"] = str(exc)
+        return payload
+
+    context = ProviderContext(callbacks={
+        "usage": usage,
+        "home_paths": lambda spec: provider_spec_home_paths(spec),
+        "disabled": lambda spec: disabled_provider_snapshot(spec.id),
+        "error": error,
+        "sanitize": sanitize_payload,
+    })
+    return provider_registry.build_providers(context, provider_config, overrides)
+
+
 def _build_snapshot_impl() -> Dict[str, Any]:
     ensure_dirs()
     settings = agentcat_settings()
@@ -10887,60 +11735,34 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
     limits_by_provider = configured_limits()
     runtime_limits_by_provider = runtime_limits()
-    def _safe_provider(provider_id: str, fn: Any) -> Dict[str, Any]:
-        # Per-provider isolation: one provider's reader raising must NOT fail the whole
-        # build_snapshot. The refresh loop swallows the exception and then serves the
-        # previous snapshot with a fresh servedAt — so a single bad provider silently
-        # freezes ALL numbers as if current (audit #14). Degrade to an error entry.
-        try:
-            return fn()
-        except Exception as exc:
-            logging.debug("provider %s snapshot failed: %s", provider_id, exc)
-            snap = empty_provider_usage(status="error")
-            snap["error"] = str(exc)
-            return snap
-
     try:
         activity = terminal_activity_snapshot()
     except Exception as exc:
         logging.debug("terminal_activity_snapshot failed: %s", exc)
         activity = {"status": "error", "error": str(exc)}
-    if (provider_config.get("gemini") or {}).get("enabled") is False and (provider_config.get("antigravity") or {}).get("enabled") is False:
-        gemini_provider = disabled_provider_snapshot("gemini")
-        antigravity_provider = disabled_provider_snapshot("antigravity")
-    else:
-        try:
-            gemini_provider, antigravity_provider = split_google_cli_snapshots(gemini_snapshot(), activity)
-        except Exception as exc:
-            logging.debug("gemini/antigravity snapshot failed: %s", exc)
-            gemini_provider = empty_provider_usage(status="error")
-            gemini_provider["error"] = str(exc)
-            antigravity_provider = empty_provider_usage(status="error")
-            antigravity_provider["error"] = str(exc)
-    providers = {
-        "codex": disabled_provider_snapshot("codex") if (provider_config.get("codex") or {}).get("enabled") is False else _safe_provider("codex", codex_snapshot),
-        "claude": disabled_provider_snapshot("claude") if (provider_config.get("claude") or {}).get("enabled") is False else _safe_provider("claude", claude_snapshot),
-        "gemini": gemini_provider,
-        "antigravity": antigravity_provider,
-        "opencode": disabled_provider_snapshot("opencode") if (provider_config.get("opencode") or {}).get("enabled") is False else _safe_provider("opencode", opencode_snapshot),
-        "copilot": disabled_provider_snapshot("copilot") if (provider_config.get("copilot") or {}).get("enabled") is False else _safe_provider("copilot", copilot_snapshot),
-        "kimi": disabled_provider_snapshot("kimi") if (provider_config.get("kimi") or {}).get("enabled") is False else _safe_provider("kimi", kimi_snapshot),
-        "grok": disabled_provider_snapshot("grok") if (provider_config.get("grok") or {}).get("enabled") is False else _safe_provider("grok", grok_snapshot),
-    }
-    if (provider_config.get("gemini") or {}).get("enabled") is False:
-        providers["gemini"] = disabled_provider_snapshot("gemini")
-    if (provider_config.get("antigravity") or {}).get("enabled") is False:
-        providers["antigravity"] = disabled_provider_snapshot("antigravity")
-    for provider in ("gemini", "antigravity", "opencode", "copilot", "kimi", "grok"):
+    providers = build_provider_payloads(provider_config, activity)
+    for provider in provider_registry.COVERAGE_PROVIDER_IDS:
         attach_local_usage_coverage(provider, providers.get(provider, {}))
+    quota_context = ProviderContext(callbacks={
+        "quota": lambda spec, _home: runtime_limits_by_provider.get(spec.id, empty_limits()),
+        "home_paths": lambda spec: provider_spec_home_paths(spec),
+        "sanitize": sanitize_payload,
+    })
+    cost_context = ProviderContext(callbacks={"cost": lambda _spec, _usage: {}, "sanitize": sanitize_payload})
     for provider, data in providers.items():
         if data.get("status") == "disabled":
             data["limits"] = empty_limits("disabled")
-            continue
-        data["limits"] = merge_limits(
-            limits_by_provider.get(provider, empty_limits()),
-            runtime_limits_by_provider.get(provider, empty_limits()),
-        )
+        else:
+            detected_limits = provider_registry.quota(quota_context, provider)
+            data["limits"] = merge_limits(
+                limits_by_provider.get(provider, empty_limits()),
+                detected_limits if isinstance(detected_limits, dict) else empty_limits(),
+            )
+            cost_slice = provider_registry.cost(cost_context, provider, data)
+            if isinstance(cost_slice, dict) and cost_slice:
+                data["cost"] = sanitize_payload(cost_slice)
+        data["limits"] = ensure_quota_schema_v2(data["limits"])
+        data["meta"] = provider_metadata(provider)
     desktop_apps = desktop_app_sources_snapshot(settings)
     attach_desktop_app_sources(providers, desktop_apps)
     snapshot = {
@@ -10958,6 +11780,25 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             "latestByProvider": latest_by_provider,
         },
     }
+    for data in providers.values():
+        try:
+            burn_rate = provider_burn_rate(data)
+            if burn_rate:
+                data["burnRate"] = burn_rate
+        except Exception as exc:
+            logging.debug("provider_burn_rate failed: %s", exc)
+        try:
+            auto_quota = provider_auto_quota(data)
+            if auto_quota:
+                data["autoQuota"] = auto_quota
+        except Exception as exc:
+            logging.debug("provider_auto_quota failed: %s", exc)
+    try:
+        recommendation = snapshot_recommendation(providers)
+        if recommendation:
+            snapshot["recommendation"] = recommendation
+    except Exception as exc:
+        logging.debug("snapshot_recommendation failed: %s", exc)
     # Independent login/quota pools (capability "providerInstances.v1").
     # Additive and local-only: legacy clients keep reading providers.<id>, while
     # newer clients can render N peer connections without summing percentages.
@@ -10977,6 +11818,9 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     # block the snapshot write.
     try:
         snapshot["projectsDaily"] = update_project_daily(providers)
+        today_key = day_key_for_timestamp(dt.datetime.now(dt.timezone.utc))
+        today = dt.date.fromisoformat(today_key) if today_key else dt.datetime.now().astimezone().date()
+        snapshot["projectsDailyCost"] = project_daily_cost_snapshot_slice(load_project_daily(), today)
     except Exception as exc:
         logging.debug("update_project_daily failed: %s", exc)
     # LiteLLM pricing feed metadata (capability "pricing.feed"). Additive and
@@ -10985,14 +11829,15 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         snapshot["pricing"] = pricing_status_snapshot()
     except Exception as exc:
         logging.debug("pricing_status_snapshot failed: %s", exc)
-    # Slice C: embed pre-derived insights so clients (Mac/Windows) decode
-    # rather than re-derive. Failure here must NOT block the snapshot write —
-    # degrade to insights.status = error and let the client render fallback.
-    try:
-        derived = derive_insights(snapshot, period="week")
-        snapshot["insights"] = {"status": "ok", **derived}
-    except Exception as exc:
-        snapshot["insights"] = {"status": "error", "error": str(exc)}
+    insights_by_period: Dict[str, Any] = {}
+    for period in ("today", "week", "month", "all"):
+        try:
+            derived = derive_insights(snapshot, period=period)
+            insights_by_period[period] = {"status": "ok", **derived}
+        except Exception as exc:
+            insights_by_period[period] = {"status": "error", "error": str(exc)}
+    snapshot["insightsByPeriod"] = insights_by_period
+    snapshot["insights"] = insights_by_period["week"]
     write_json_atomic(LATEST_SNAPSHOT, snapshot)
     return snapshot
 
@@ -11184,6 +12029,39 @@ def host_header_allowed(host: Optional[str]) -> bool:
     return _host_from_header(host) in ALLOWED_HOST_HEADERS
 
 
+def local_http_origin_allowed(origin: Optional[str]) -> bool:
+    """Allow absent native-client origins or explicit HTTP(S) loopback origins."""
+    if origin is None or not origin.strip():
+        return True
+    try:
+        parsed = urllib.parse.urlparse(origin.strip())
+        parsed.port  # force validation of a present port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and (parsed.hostname or "").lower() in ALLOWED_HOST_HEADERS
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path in {"", "/"}
+    )
+
+
+def key_mutation_request_error(headers: Any) -> Optional[Tuple[int, str]]:
+    """Reject simple/cross-site browser writes while preserving native loopback JSON."""
+    content_type = str(headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        return 415, "json_content_type_required"
+    fetch_site = str(headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if fetch_site and fetch_site not in {"same-origin", "same-site", "none"}:
+        return 403, "cross_site_request"
+    if not local_http_origin_allowed(headers.get("Origin")):
+        return 403, "foreign_origin"
+    return None
+
+
 class AgentCatHandler(BaseHTTPRequestHandler):
     server_version = "AgentCat/1"
 
@@ -11275,6 +12153,9 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(500, {"error": "usage_failed", "message": str(exc)})
             return
+        if path == "/v1/keys":
+            self.send_json(200, {"openai": {"configured": bool(read_provider_key("openai"))}})
+            return
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
@@ -11308,32 +12189,39 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(500, {"error": "update_channel_failed", "message": str(exc)})
                 return
-            # Recording the manifest was never enough on its own: nothing
-            # downloaded it or ran the safe-swap installer, so the channel sat
-            # on `pending_install` forever. Start the install here.
-            scheduled = False
-            if state.get("installStatus") == "pending_install":
-                raw_token = payload.get("downloadToken")
-                token = raw_token.strip() if isinstance(raw_token, str) and raw_token.strip() else None
-                if token:
-                    scheduled = schedule_pro_channel_install(state["manifest"], token)
-                else:
-                    # The Pro archive is entitlement-gated, so without a scoped
-                    # download token there is nothing to try. Say that rather
-                    # than leaving the channel parked on `pending_install`.
-                    update_pro_install_status(
-                        "install_blocked",
-                        installError="download token required",
-                    )
             self.send_json(
                 200,
                 {
                     "ok": True,
                     "channel": update_channel_status_snapshot(),
                     "state": state,
-                    "installScheduled": scheduled,
                 },
             )
+            return
+
+        if path == "/v1/keys":
+            guard_error = key_mutation_request_error(self.headers)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "key_write_forbidden", "message": reason})
+                return
+            try:
+                payload = self.read_json_body(max_bytes=16 * 1024)
+                provider = str(payload.get("provider") or "openai").strip().lower()
+                if provider != "openai":
+                    raise ValueError("unsupported provider")
+                clear = bool(payload.get("clear"))
+                key = payload.get("key")
+                if not clear and (not isinstance(key, str) or not key.strip()):
+                    raise ValueError("provide key or clear")
+                write_provider_key(provider, None if clear else key.strip())
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_key", "message": str(exc)})
+                return
+            except Exception:
+                self.send_json(500, {"error": "key_write_failed"})
+                return
+            self.send_json(200, {"ok": True, provider: {"configured": not clear}})
             return
 
         if path != "/v1/events":
@@ -11462,7 +12350,8 @@ def command_event(args: argparse.Namespace) -> int:
 
 def command_claude_statusline(args: argparse.Namespace) -> int:
     payload = read_stdin_payload()
-    store_event("claude", "claude-statusline", "statusline", payload)
+    if should_store_claude_statusline(payload):
+        store_event("claude", "claude-statusline", "statusline", payload)
     print(statusline_text(payload))
     return 0
 
@@ -12119,6 +13008,111 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if report["status"] == "ok" else 1
 
 
+def _month_start_unix() -> int:
+    now = dt.datetime.now().astimezone()
+    return int(now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def read_provider_key(provider: str) -> Optional[str]:
+    env = os.environ.get(f"AGENTCAT_{provider.upper()}_KEY")
+    if env:
+        return env
+    raw = read_json(AGENTCAT_KEYS_FILE)
+    if isinstance(raw, dict) and not raw.get("_agentcat_error"):
+        value = raw.get(provider)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def write_provider_key(provider: str, key: Optional[str]) -> None:
+    ensure_dirs()
+    raw = read_json(AGENTCAT_KEYS_FILE)
+    keys = dict(raw) if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+    if key:
+        keys[provider] = key
+    else:
+        keys.pop(provider, None)
+    write_json_atomic(AGENTCAT_KEYS_FILE, keys)
+    _chmod_quiet(AGENTCAT_KEYS_FILE, 0o600)
+
+
+def command_set_key(args: argparse.Namespace) -> int:
+    provider = str(args.provider).strip().lower()
+    if getattr(args, "clear", False):
+        write_provider_key(provider, None)
+        print(f"cleared {provider} key")
+        return 0
+    key = (args.key or "").strip()
+    if not key:
+        print("provide --key <value> or --clear", file=sys.stderr)
+        return 1
+    write_provider_key(provider, key)
+    print(f"stored {provider} key locally (0600; only ever sent to {provider}'s own API)")
+    return 0
+
+
+def _openai_get(url: str, key: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        f"{url}?{urllib.parse.urlencode(params)}",
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _openai_paginate(url: str, key: str, params: Dict[str, Any], max_pages: int = 6) -> Iterable[Dict[str, Any]]:
+    page_params = dict(params)
+    for _ in range(max_pages):
+        payload = _openai_get(url, key, page_params)
+        for bucket in payload.get("data") or []:
+            if isinstance(bucket, dict):
+                for result in bucket.get("results") or []:
+                    if isinstance(result, dict):
+                        yield result
+        if not payload.get("has_more") or not payload.get("next_page"):
+            return
+        page_params["page"] = payload["next_page"]
+
+
+def openai_usage_live() -> Dict[str, Any]:
+    key = read_provider_key("openai")
+    base: Dict[str, Any] = {
+        "status": "not_configured", "source": "openai-usage-api", "model": None,
+        "tokens": {"total": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+        "cost_usd": None, "quota": None, "updated_at": now_iso(),
+    }
+    if not key:
+        base["reason"] = "no_api_key"
+        return base
+    start = _month_start_unix()
+    try:
+        tokens_in = tokens_out = tokens_cached = 0
+        for result in _openai_paginate(OPENAI_USAGE_URL, key, {"start_time": start, "bucket_width": "1d", "limit": 31}):
+            tokens_in += int(result.get("input_tokens") or 0)
+            tokens_out += int(result.get("output_tokens") or 0)
+            tokens_cached += int(result.get("input_cached_tokens") or 0)
+        cost = 0.0
+        for result in _openai_paginate(OPENAI_COSTS_URL, key, {"start_time": start, "bucket_width": "1d", "limit": 31}):
+            amount = result.get("amount") if isinstance(result.get("amount"), dict) else {}
+            cost += float(amount.get("value") or 0.0)
+    except urllib.error.HTTPError as exc:
+        base["status"] = "error"
+        base["reason"] = "http_401" if exc.code in (401, 403) else "http_error"
+        return base
+    except Exception:
+        base["status"] = "error"
+        base["reason"] = "http_error"
+        return base
+    return {
+        "status": "ok", "source": "openai-usage-api", "model": None,
+        "tokens": {"total": tokens_in + tokens_out, "input": tokens_in, "output": tokens_out,
+                   "cache_read": tokens_cached, "cache_write": 0},
+        "cost_usd": round(cost, 4), "quota": None, "updated_at": now_iso(),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentcat")
     subparsers = parser.add_subparsers(dest="command")
@@ -12135,6 +13129,13 @@ def build_parser() -> argparse.ArgumentParser:
     usage = subparsers.add_parser("usage")
     usage.add_argument("--json", action="store_true")
     usage.set_defaults(func=command_usage)
+
+    set_key = subparsers.add_parser("set-key")
+    set_key.add_argument("--provider", choices=("openai",), default="openai")
+    set_key_group = set_key.add_mutually_exclusive_group(required=True)
+    set_key_group.add_argument("--key")
+    set_key_group.add_argument("--clear", action="store_true")
+    set_key.set_defaults(func=command_set_key)
 
     event = subparsers.add_parser("event")
     event.add_argument("--provider", required=True)

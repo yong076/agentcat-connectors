@@ -3,10 +3,10 @@
   "expectation": "apps render two account-scoped instances without double-counting the aggregate provider",
   "snapshot": {
     "schemaVersion": 4,
-    "contractVersion": 1,
+    "contractVersion": 2,
     "connectorVersion": "26.34.6",
     "generatedAt": "2026-08-22T00:00:00Z",
-    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1", "quota.scoped.v2", "providers.metadata.v1"],
     "providers": {"codex": {"status": "ok", "tokens": {"all": 3000}}},
     "providerInstances": [
       {"id": "codex:account-a", "provider": "codex", "label": "Work", "status": "ok", "tokens": {"all": 1800}},

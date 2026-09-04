@@ -32,8 +32,19 @@ def connector_version(repo: Path) -> str:
     return match.group(1)
 
 
+def connector_contract_version(repo: Path) -> int:
+    payload = json.loads((repo / "contracts" / "connector-v1.json").read_text(encoding="utf-8"))
+    version = int(payload.get("contractVersion") or 0)
+    if version < 1:
+        raise ValueError("connector contract version is invalid")
+    return version
+
+
 def build_release(repo: Path, output: Path, repository: str, source_ref: str) -> tuple[Path, Path]:
     version = connector_version(repo)
+    provider_registry = repo / "bin" / "agentcat_providers" / "registry.py"
+    if not provider_registry.exists():
+        raise ValueError("provider plugin registry is missing")
     output.mkdir(parents=True, exist_ok=True)
     archive_name = f"agentcat-connectors-v{version}.zip"
     archive = output / archive_name
@@ -53,7 +64,7 @@ def build_release(repo: Path, output: Path, repository: str, source_ref: str) ->
     )
     payload = {
         "version": version,
-        "contractVersion": 1,
+        "contractVersion": connector_contract_version(repo),
         "archiveUrl": f"https://github.com/{repository}/releases/download/v{version}/{archive_name}",
         "sha256": sha256_file(archive),
     }

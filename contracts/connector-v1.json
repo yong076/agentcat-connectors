@@ -1,6 +1,11 @@
 {
-  "contractVersion": 1,
+  "contractVersion": 2,
   "snapshotSchemaVersion": 4,
+  "providerPluginLayout": {
+    "entrypoint": "bin/agentcat",
+    "modules": "bin/agentcat_providers",
+    "installation": "source-tree"
+  },
   "capabilityRegistry": {
     "connector.contract.v1": {
       "owner": "shared",
@@ -22,6 +27,31 @@
       "fields": ["providerInstances"],
       "fallback": "render the aggregate providers map as one connection per provider"
     },
+    "quota.scoped.v2": {
+      "owner": "shared",
+      "fields": ["providers.*.limits.quotas.*.scope", "providers.*.limits.quotas.*.aggregate"],
+      "fallback": "ignore scope metadata and render quotas using the v1 model and window fields"
+    },
+    "providers.metadata.v1": {
+      "owner": "shared",
+      "fields": ["providers.*.meta.displayName", "providers.*.meta.brandColor", "providers.*.meta.iconHint", "providers.*.meta.windows", "providers.*.meta.sourceHintKey"],
+      "fallback": "use the app's curated provider descriptor or title-case the provider id"
+    },
+    "usage.jetbrains.localQuota": {
+      "owner": "shared",
+      "fields": ["providers.jetbrains.limits.quotas"],
+      "fallback": "hide JetBrains AI when its local IDE quota cache is unavailable"
+    },
+    "usage.hermes.stateDb": {
+      "owner": "shared",
+      "fields": ["providers.hermes.tokens", "providers.hermes.models"],
+      "fallback": "hide Hermes usage when its local state database is unavailable"
+    },
+    "cost.hermes.actual": {
+      "owner": "shared",
+      "fields": ["providers.hermes.cost.totalUSD", "providers.hermes.cost.estimated"],
+      "fallback": "show token usage without a cost total"
+    },
     "usage.antigravity.sqlite": {
       "owner": "shared",
       "fields": ["providers.antigravity.tokens", "providers.antigravity.sourceAttribution"],
@@ -39,7 +69,9 @@
     "limits.claude.statuslineQuotas",
     "limits.grok.oauthUsage",
     "limits.kimi.oauthUsage",
-    "providerInstances.v1"
+    "providerInstances.v1",
+    "quota.scoped.v2",
+    "providers.metadata.v1"
   ],
   "apps": {
     "macos": {
@@ -52,7 +84,9 @@
         "limits.claude.statuslineQuotas",
         "limits.grok.oauthUsage",
         "limits.kimi.oauthUsage",
-        "providerInstances.v1"
+        "providerInstances.v1",
+        "quota.scoped.v2",
+        "providers.metadata.v1"
       ],
       "platformRequired": []
     },
@@ -70,7 +104,9 @@
         "limits.claude.statuslineQuotas",
         "limits.grok.oauthUsage",
         "limits.kimi.oauthUsage",
-        "providerInstances.v1"
+        "providerInstances.v1",
+        "quota.scoped.v2",
+        "providers.metadata.v1"
       ],
       "platformRequired": [
         "activity.windowsProcessScan",

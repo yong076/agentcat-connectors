@@ -191,6 +191,9 @@ def validate_candidate(candidate: Path, manifest: dict[str, Any]) -> None:
         env.pop(key, None)
     with tempfile.TemporaryDirectory(prefix="agentcat-candidate-home-") as temp_home:
         env["AGENTCAT_HOME"] = str(Path(temp_home) / ".agentcat")
+        provider_modules = sorted((candidate / "bin" / "agentcat_providers").glob("*.py"))
+        if not provider_modules or not any(path.name == "registry.py" for path in provider_modules):
+            raise ValueError("candidate provider plugin registry is missing")
         compile_result = subprocess.run(
             [
                 sys.executable,
@@ -199,6 +202,7 @@ def validate_candidate(candidate: Path, manifest: dict[str, Any]) -> None:
                 str(candidate / "bin" / "agentcat"),
                 str(candidate / "scripts" / "install.py"),
                 str(candidate / "scripts" / "public_channel_install.py"),
+                *(str(path) for path in provider_modules),
             ],
             capture_output=True,
             text=True,

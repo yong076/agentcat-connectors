@@ -104,7 +104,10 @@ class ConnectorContractTests(unittest.TestCase):
 
     def test_golden_fixtures_cover_app_fallback_scenarios(self) -> None:
         fixtures_dir = REPO_ROOT / "contracts" / "fixtures"
-        expected = {"empty", "healthy", "stale", "partial", "multi-account", "update-required"}
+        expected = {
+            "empty", "healthy", "stale", "partial", "multi-account",
+            "update-required", "provider-quota-v2",
+        }
         paths = {path.stem: path for path in fixtures_dir.glob("*.json")}
         self.assertEqual(set(paths), expected)
 
@@ -117,6 +120,8 @@ class ConnectorContractTests(unittest.TestCase):
             self.assertIn("connector.contract.v1", snapshot["capabilities"])
             self.assertIn("connector.daemon.status.v1", snapshot["capabilities"])
             self.assertIn("providerInstances.v1", snapshot["capabilities"])
+            self.assertIn("quota.scoped.v2", snapshot["capabilities"])
+            self.assertIn("providers.metadata.v1", snapshot["capabilities"])
             self.assertIsInstance(snapshot["providers"], dict)
             self.assertIsInstance(snapshot["providerInstances"], list)
             self.assertIsInstance(snapshot["activity"], dict)
@@ -125,6 +130,23 @@ class ConnectorContractTests(unittest.TestCase):
             serialized = json.dumps(payload)
             for forbidden in ("C:\\\\Users\\\\", "/Users/", "accessToken", "refreshToken", "commandLine"):
                 self.assertNotIn(forbidden, serialized)
+
+    def test_provider_fixture_covers_scoped_quota_and_metadata_contract(self) -> None:
+        path = REPO_ROOT / "contracts" / "fixtures" / "provider-quota-v2.json"
+        providers = json.loads(path.read_text(encoding="utf-8"))["snapshot"]["providers"]
+
+        self.assertEqual(set(providers), set(agentcat.CONFIG_PROVIDER_IDS))
+        for provider_id, provider in providers.items():
+            meta = provider["meta"]
+            self.assertEqual(meta, agentcat.provider_metadata(provider_id))
+            self.assertEqual(
+                set(meta),
+                {"displayName", "brandColor", "iconHint", "windows", "sourceHintKey"},
+            )
+            self.assertNotIn("/", json.dumps(meta))
+            for quota in provider["limits"]["quotas"]:
+                self.assertIn(quota["scope"], {"account", "model", "surface"})
+                self.assertIs(type(quota["aggregate"]), bool)
 
 
 if __name__ == "__main__":
