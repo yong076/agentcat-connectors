@@ -117,7 +117,9 @@ agentcat setup-prompt
 
 ## Included Insights Engine
 
-The single public connector includes today/week/month/all-time insights; burn
+The single public connector includes `today` (the current local calendar day),
+`week` (seven local calendar days including today), `month` (thirty local
+calendar days including today), and `all` (all-time) insights; burn
 rate, automatic quota estimates, and provider recommendations; per-project
 daily cost; OpenAI API-key usage with a secure local `set-key` command; Codex
 usage-source breakdowns; Antigravity history; and reset-safe model baselines

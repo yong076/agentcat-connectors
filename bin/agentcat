@@ -5945,16 +5945,12 @@ def add_to_periods(periods: Dict[str, int], amount: int, when: Optional[dt.datet
     periods["all"] = periods.get("all", 0) + amount
     if when is None:
         return
-    now = dt.datetime.now(dt.timezone.utc)
-    # Bucket "today" on the LOCAL calendar date so it agrees with the daily
-    # buckets (add_to_daily keys on when.astimezone().date()). Using the raw UTC
-    # date here disagreed near midnight when UTC and local dates differ.
-    if when.astimezone().date() == now.astimezone().date():
-        periods["today"] = periods.get("today", 0) + amount
-    if when >= now - dt.timedelta(days=7):
-        periods["week"] = periods.get("week", 0) + amount
-    if when >= now - dt.timedelta(days=30):
-        periods["month"] = periods.get("month", 0) + amount
+    day = day_key_for_timestamp(when)
+    if day is None:
+        return
+    dated = periods_from_daily_tokens({day: amount})
+    for period in ("today", "week", "month"):
+        periods[period] = periods.get(period, 0) + dated[period]
 
 
 def day_key_for_timestamp(when: Optional[dt.datetime]) -> Optional[str]:
@@ -7578,34 +7574,6 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
     return _build_codex_sessions_snapshot(result, cursor)
 
 
-def _codex_periods_from_daily(daily: Dict[str, int]) -> Dict[str, int]:
-    """Recompute today/week/month/all token windows from daily buckets.
-
-    Keys are local-calendar date strings (YYYY-MM-DD), matching
-    day_key_for_timestamp, so the windows age correctly across days without
-    re-reading the JSONL.
-    """
-    periods = empty_periods()
-    today = dt.datetime.now().date()
-    week_floor = today - dt.timedelta(days=7)
-    month_floor = today - dt.timedelta(days=30)
-    for key, amount in daily.items():
-        if amount <= 0:
-            continue
-        try:
-            day = dt.date.fromisoformat(key)
-        except ValueError:
-            continue
-        periods["all"] += amount
-        if day == today:
-            periods["today"] += amount
-        if day >= week_floor:
-            periods["week"] += amount
-        if day >= month_floor:
-            periods["month"] += amount
-    return periods
-
-
 def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any]) -> Dict[str, Any]:
     daily: Dict[str, int] = cursor.get("daily") or {}
     hourly: Dict[str, int] = cursor.get("hourly") or {}
@@ -7614,7 +7582,7 @@ def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any
     projects: Dict[str, Any] = cursor.get("projects") or {}
     total_turns = int(cursor.get("turns") or 0)
 
-    periods = _codex_periods_from_daily(daily)
+    periods = periods_from_daily_tokens(daily)
     if periods["all"] <= 0:
         # Session files exist but carried no usable token_count turns yet.
         result["status"] = "no_token_events_yet"
@@ -7635,7 +7603,7 @@ def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any
     models: Dict[str, Dict[str, int]] = {}
     for model, classes in model_classes.items():
         entry: Dict[str, int] = {k: int(v) for k, v in classes.items() if v}
-        model_periods = _codex_periods_from_daily(model_daily.get(model) or {})
+        model_periods = periods_from_daily_tokens(model_daily.get(model) or {})
         entry.update(model_periods)
         entry["totalTokens"] = model_periods["all"]
         models[model] = entry
@@ -7906,7 +7874,7 @@ def codexbar_cost_cache_snapshot(provider: str) -> Dict[str, Any]:
                 if amount:
                     classes[key] = classes.get(key, 0) + amount
 
-    periods = _codex_periods_from_daily(daily)
+    periods = periods_from_daily_tokens(daily)
     if periods["all"] <= 0:
         result["status"] = "no_token_events_yet"
         return result
@@ -7922,7 +7890,7 @@ def codexbar_cost_cache_snapshot(provider: str) -> Dict[str, Any]:
     models_out: Dict[str, Dict[str, int]] = {}
     for model, classes in model_classes.items():
         entry = {key: int(value) for key, value in classes.items() if int(value) > 0}
-        model_periods = _codex_periods_from_daily(model_daily.get(model) or {})
+        model_periods = periods_from_daily_tokens(model_daily.get(model) or {})
         entry.update(model_periods)
         entry["totalTokens"] = model_periods["all"]
         models_out[model] = entry
@@ -7978,6 +7946,13 @@ def merge_provider_with_usage_floor(
             value = int(amount or 0)
             if value > int(daily.get(day) or 0):
                 daily[str(day)] = value
+        # Each source's period totals are internally consistent, but taking a
+        # per-period maximum can disagree with the final per-day merge when
+        # the sources cover different days.  The lifetime fields remain
+        # floors; dated windows always come from the final dated buckets.
+        merged_periods = periods_from_daily_tokens(int_map(daily))
+        for period in ("today", "week", "month"):
+            tokens[period] = merged_periods[period]
 
     models = merged.setdefault("models", {})
     floor_models = floor.get("models") if isinstance(floor.get("models"), dict) else {}
@@ -9302,15 +9277,22 @@ def claude_snapshot() -> Dict[str, Any]:
     if isinstance(daily_model_tokens, dict):
         result["dailyModelTokensDays"] = len(daily_model_tokens)
     elif isinstance(daily_model_tokens, list):
-        periods = empty_periods()
-        model_periods_from_stats: Dict[str, Dict[str, int]] = {}
+        stats_daily: Dict[str, int] = {}
+        model_daily_from_stats: Dict[str, Dict[str, int]] = {}
         for item in daily_model_tokens:
             if not isinstance(item, dict):
                 continue
             tokens_by_model = item.get("tokensByModel")
             if not isinstance(tokens_by_model, dict):
                 continue
-            when = parse_timestamp(item.get("date"))
+            day_key = str(item.get("date") or "").strip()
+            try:
+                dt.date.fromisoformat(day_key)
+            except ValueError:
+                when = parse_timestamp(item.get("date"))
+                day_key = day_key_for_timestamp(when) or ""
+            if not day_key:
+                continue
             total = 0
             for model_raw, value in tokens_by_model.items():
                 amount = int_limit(value) or 0
@@ -9318,21 +9300,19 @@ def claude_snapshot() -> Dict[str, Any]:
                     continue
                 total += amount
                 model = normalized_model_name(model_raw) or "unknown"
-                model_periods = model_periods_from_stats.setdefault(model, empty_periods())
-                add_to_periods(model_periods, amount, when)
+                model_daily = model_daily_from_stats.setdefault(model, {})
+                model_daily[day_key] = max(model_daily.get(day_key, 0), amount)
             if total > 0:
-                add_to_periods(periods, total, when)
-                day_key = str(item.get("date") or "").strip()
-                if not re.match(r"^\d{4}-\d{2}-\d{2}$", day_key):
-                    day_key = day_key_for_timestamp(when) or ""
-                if day_key:
-                    result["dailyTokens"][day_key] = max(result["dailyTokens"].get(day_key, 0), total)
+                stats_daily[day_key] = max(stats_daily.get(day_key, 0), total)
+                result["dailyTokens"][day_key] = max(result["dailyTokens"].get(day_key, 0), total)
         result["dailyModelTokensDays"] = len(daily_model_tokens)
-        for model, stats_periods in model_periods_from_stats.items():
+        for model, model_daily in model_daily_from_stats.items():
+            stats_periods = periods_from_daily_tokens(model_daily)
             model_periods = result["models"].setdefault(model, {})
             for key, amount in stats_periods.items():
                 if amount > 0:
                     model_periods.setdefault(key, amount)
+        periods = periods_from_daily_tokens(stats_daily)
         for key in ("today", "week", "month", "all"):
             if periods[key] > 0 and result["tokens"].get(key, 0) <= 0:
                 result["tokens"][key] = periods[key]
@@ -10030,10 +10010,11 @@ def int_map(raw: Any) -> Dict[str, int]:
 
 
 def periods_from_daily_tokens(daily_tokens: Dict[str, int]) -> Dict[str, int]:
+    """Return exact local-calendar 1-, 7-, 30-day and all-time totals."""
     periods = empty_periods()
     today_local = dt.datetime.now(dt.timezone.utc).astimezone().date()
-    week_start = today_local - dt.timedelta(days=7)
-    month_start = today_local - dt.timedelta(days=30)
+    week_start = today_local - dt.timedelta(days=6)
+    month_start = today_local - dt.timedelta(days=29)
     for day, amount in daily_tokens.items():
         if amount <= 0:
             continue
@@ -10041,14 +10022,12 @@ def periods_from_daily_tokens(daily_tokens: Dict[str, int]) -> Dict[str, int]:
         try:
             day_date = dt.date.fromisoformat(str(day)[:10])
         except ValueError:
-            when = parse_timestamp(f"{day}T12:00:00Z") or parse_timestamp(day)
-            add_to_periods(periods, amount, when)
             continue
         if day_date == today_local:
             periods["today"] = periods.get("today", 0) + amount
-        if day_date >= week_start:
+        if week_start <= day_date <= today_local:
             periods["week"] = periods.get("week", 0) + amount
-        if day_date >= month_start:
+        if month_start <= day_date <= today_local:
             periods["month"] = periods.get("month", 0) + amount
     return periods
 

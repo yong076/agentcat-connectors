@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import os
 import tempfile
+import time
 import unittest
 import urllib.parse
 from importlib.machinery import SourceFileLoader
@@ -204,3 +205,133 @@ class GrokAccountingTests(SandboxedCase):
         self.assertEqual(snapshot["projects"]["items"][0]["path"], project_path)
         self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 220)
         self.assertEqual(snapshot["models"]["grok-fixture"]["totalTokens"], 220)
+
+
+class PeriodWindowTests(SandboxedCase):
+    def test_windows_are_exact_inclusive_local_calendar_days(self) -> None:
+        fixed_now = dt.datetime(2026, 9, 4, 15, 30, tzinfo=dt.timezone.utc)
+        today = fixed_now.astimezone().date()
+
+        class FixedDateTime(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz is None else fixed_now.astimezone(tz)
+
+        daily = {
+            today.isoformat(): 1,
+            (today + dt.timedelta(days=1)).isoformat(): 100_000,
+            (today - dt.timedelta(days=6)).isoformat(): 10,
+            (today - dt.timedelta(days=7)).isoformat(): 100,
+            (today - dt.timedelta(days=29)).isoformat(): 1_000,
+            (today - dt.timedelta(days=30)).isoformat(): 10_000,
+        }
+        with patch.object(agentcat.dt, "datetime", FixedDateTime):
+            periods = agentcat.periods_from_daily_tokens(daily)
+
+        self.assertEqual(
+            periods,
+            {"today": 1, "week": 11, "month": 1_111, "all": 111_111},
+        )
+
+    def test_event_periods_use_the_same_calendar_boundaries(self) -> None:
+        fixed_now = dt.datetime(2026, 9, 4, 23, 59, tzinfo=dt.timezone.utc)
+        week_floor = fixed_now.astimezone().date() - dt.timedelta(days=6)
+
+        class FixedDateTime(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz is None else fixed_now.astimezone(tz)
+
+        periods = agentcat.empty_periods()
+        with patch.object(agentcat.dt, "datetime", FixedDateTime):
+            agentcat.add_to_periods(
+                periods,
+                7,
+                dt.datetime.combine(week_floor, dt.time(12), tzinfo=fixed_now.astimezone().tzinfo),
+            )
+
+        self.assertEqual(periods, {"today": 0, "week": 7, "month": 7, "all": 7})
+
+    def test_usage_floor_recomputes_windows_from_merged_daily_tokens(self) -> None:
+        today = dt.datetime.now().astimezone().date()
+        yesterday = today - dt.timedelta(days=1)
+        primary = {
+            "status": "ok",
+            "source": "primary",
+            "tokens": {"today": 10, "week": 10, "month": 10, "all": 10, "totalTokens": 10},
+            "dailyTokens": {today.isoformat(): 10},
+            "models": {},
+        }
+        floor = {
+            "status": "ok",
+            "source": "floor",
+            "tokens": {"today": 0, "week": 20, "month": 20, "all": 20, "totalTokens": 20},
+            "dailyTokens": {yesterday.isoformat(): 20},
+            "models": {},
+        }
+
+        merged = agentcat.merge_provider_with_usage_floor(
+            primary,
+            floor,
+            strategy="fixture_floor",
+        )
+
+        self.assertEqual(merged["dailyTokens"], {
+            today.isoformat(): 10,
+            yesterday.isoformat(): 20,
+        })
+        self.assertEqual(merged["tokens"]["today"], 10)
+        self.assertEqual(merged["tokens"]["week"], 30)
+        self.assertEqual(merged["tokens"]["month"], 30)
+        self.assertEqual(merged["tokens"]["all"], 20)
+        self.assertEqual(merged["tokens"]["totalTokens"], 20)
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX timezone control")
+    def test_claude_stats_model_uses_raw_local_date_bucket(self) -> None:
+        original_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        try:
+            fixed_now = dt.datetime(2026, 9, 4, 19, 0, tzinfo=dt.timezone.utc)
+
+            class FixedDateTime(dt.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return fixed_now if tz is None else fixed_now.astimezone(tz)
+
+            claude_dir = self.home / ".claude"
+            claude_dir.mkdir(parents=True)
+            (claude_dir / "stats-cache.json").write_text(
+                json.dumps(
+                    {
+                        "dailyModelTokens": [
+                            {
+                                "date": "2026-09-04",
+                                "tokensByModel": {"claude-sonnet-fixture": 25},
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(agentcat.dt, "datetime", FixedDateTime),
+                patch.object(agentcat, "claude_usage_by_source", return_value={"status": "not_available"}),
+                patch.object(
+                    agentcat,
+                    "codexbar_cost_cache_snapshot",
+                    return_value=agentcat.empty_provider_usage(),
+                ),
+            ):
+                snapshot = agentcat.claude_snapshot()
+
+            self.assertEqual(snapshot["dailyTokens"], {"2026-09-04": 25})
+            self.assertEqual(snapshot["tokens"]["today"], 25)
+            self.assertEqual(snapshot["models"]["claude-sonnet-fixture"]["today"], 25)
+        finally:
+            if original_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original_tz
+            time.tzset()
+
