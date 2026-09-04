@@ -464,5 +464,66 @@ class CodexWindowClassificationTests(LancelotWP8TestCase):
             self.assertEqual(timeout, 12)
 
 
+class ClaudeCredentialSourceTests(LancelotWP8TestCase):
+    def test_scoped_keychain_service_is_read_before_legacy(self):
+        config_dir = self.root / "claude-work"
+        config_dir.mkdir()
+        expected_hash = agentcat.hashlib.sha256(
+            str(config_dir.resolve()).encode("utf-8")
+        ).hexdigest()[:8]
+
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config_dir)}), patch.object(
+            agentcat.sys, "platform", "darwin"
+        ), patch.object(
+            agentcat.subprocess,
+            "check_output",
+            return_value=json.dumps({"claudeAiOauth": {"accessToken": "scoped-token"}}),
+        ) as check_output:
+            credentials = agentcat.read_claude_oauth_credentials()
+
+        self.assertEqual(credentials["oauth"]["accessToken"], "scoped-token")
+        self.assertEqual(credentials["credentialSource"], "scoped-keychain")
+        self.assertEqual(check_output.call_count, 1)
+        command = check_output.call_args.args[0]
+        self.assertEqual(command[command.index("-s") + 1], f"Claude Code-credentials-{expected_hash}")
+
+    def test_legacy_keychain_is_fallback_for_missing_scoped_item(self):
+        config_dir = self.root / "claude-work"
+        config_dir.mkdir()
+        services = []
+
+        def fake_check_output(command, **_kwargs):
+            service = command[command.index("-s") + 1]
+            services.append(service)
+            if len(services) == 1:
+                raise agentcat.subprocess.CalledProcessError(44, command)
+            return json.dumps({"claudeAiOauth": {"accessToken": "legacy-token"}})
+
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config_dir)}), patch.object(
+            agentcat.sys, "platform", "darwin"
+        ), patch.object(agentcat.subprocess, "check_output", side_effect=fake_check_output):
+            credentials = agentcat.read_claude_oauth_credentials()
+
+        self.assertEqual(credentials["oauth"]["accessToken"], "legacy-token")
+        self.assertEqual(credentials["credentialSource"], "legacy-keychain")
+        self.assertEqual(services[1], "Claude Code-credentials")
+
+    def test_credentials_file_source_is_reported_in_live_limits(self):
+        self.write_claude_credentials(
+            {"accessToken": "file-token", "expiresAt": int(time.time() * 1000) + 3_600_000}
+        )
+        with patch.object(agentcat.sys, "platform", "linux"), patch.object(
+            agentcat.urllib.request,
+            "urlopen",
+            return_value=FakeResponse({"five_hour": {"utilization": 7}}),
+        ):
+            limits = agentcat.claude_live_limits(force=True)
+
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["credentialSource"], "credentials-file")
+        cached = agentcat.cached_live_limits("claude", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
+        self.assertEqual(cached["credentialSource"], "credentials-file")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3888,8 +3888,9 @@ def claude_api_billing_mode() -> Optional[str]:
 def read_claude_oauth_credentials() -> Dict[str, Any]:
     """Resolve Claude Code OAuth credentials with a machine-readable failure reason.
 
-    Returns ``{"oauth": <dict|None>, "reason": <str|None>}``. When no usable
-    credentials are found, ``reason`` is one of:
+    Successful reads include ``credentialSource`` (``scoped-keychain``,
+    ``legacy-keychain``, or ``credentials-file``). When no usable credentials
+    are found, ``reason`` is one of:
       - ``keychain_denied``: the macOS Keychain refused the read (ACL deny,
         locked/headless session) — a distinct, diagnosable state, not "logged out".
       - ``api_billing``: this install bills through the API (API key, Bedrock or
@@ -3898,43 +3899,54 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
         like "Claude detection is broken".
       - ``token_missing``: no credentials on disk and no OAuth block present.
     """
-    candidates: List[Any] = []
-    keychain_denied = False
-    if sys.platform == "darwin":
-        try:
-            raw = subprocess.check_output(
-                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
-            )
-            candidates.append(json.loads(raw))
-        except subprocess.CalledProcessError as exc:
-            # 44 = item genuinely not found (no Claude Code login in this Keychain).
-            # Any other non-zero exit means the read was refused/blocked, which the
-            # old bare `except: pass` hid as an indistinguishable "not configured".
-            if exc.returncode != 44:
-                keychain_denied = True
-                _warn_keychain_once("agentcat: Claude Keychain read refused (security exit %s)", exc.returncode)
-        except Exception as exc:  # security binary missing, timeout, malformed JSON
-            _warn_keychain_once("agentcat: Claude Keychain read failed: %s", type(exc).__name__)
-
-    config_dir = claude_config_dir()
-    for path in (config_dir / ".credentials.json", config_dir / "credentials.json"):
-        raw = read_json(path)
-        if isinstance(raw, dict) and not raw.get("_agentcat_error"):
-            candidates.append(raw)
-
-    for item in candidates:
+    def usable_oauth(item: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(item, dict):
-            continue
+            return None
         oauth = item.get("claudeAiOauth")
         if not isinstance(oauth, dict):
             oauth = item.get("claude_ai_oauth")
         if isinstance(oauth, dict) and (oauth.get("accessToken") or oauth.get("access_token")):
-            return {"oauth": oauth, "reason": None}
+            return oauth
         if item.get("accessToken") or item.get("access_token"):
-            return {"oauth": item, "reason": None}
+            return item
+        return None
+
+    config_dir = claude_config_dir()
+    keychain_denied = False
+    if sys.platform == "darwin":
+        services: List[Tuple[str, str]] = []
+        if os.environ.get("CLAUDE_CONFIG_DIR"):
+            normalized_dir = str(config_dir.expanduser().resolve())
+            scope_hash = hashlib.sha256(normalized_dir.encode("utf-8")).hexdigest()[:8]
+            services.append((f"Claude Code-credentials-{scope_hash}", "scoped-keychain"))
+        services.append(("Claude Code-credentials", "legacy-keychain"))
+        for service, credential_source in services:
+            try:
+                raw = subprocess.check_output(
+                    ["security", "find-generic-password", "-s", service, "-w"],
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=5,
+                )
+                oauth = usable_oauth(json.loads(raw))
+                if oauth is not None:
+                    return {"oauth": oauth, "reason": None, "credentialSource": credential_source}
+            except subprocess.CalledProcessError as exc:
+                # 44 = item genuinely not found (no Claude Code login in this Keychain).
+                # Any other non-zero exit means the read was refused/blocked, which the
+                # old bare `except: pass` hid as an indistinguishable "not configured".
+                if exc.returncode != 44:
+                    keychain_denied = True
+                    _warn_keychain_once("agentcat: Claude Keychain read refused (security exit %s)", exc.returncode)
+            except Exception as exc:  # security binary missing, timeout, malformed JSON
+                _warn_keychain_once("agentcat: Claude Keychain read failed: %s", type(exc).__name__)
+
+    for path in (config_dir / ".credentials.json", config_dir / "credentials.json"):
+        raw = read_json(path)
+        if isinstance(raw, dict) and not raw.get("_agentcat_error"):
+            oauth = usable_oauth(raw)
+            if oauth is not None:
+                return {"oauth": oauth, "reason": None, "credentialSource": "credentials-file"}
 
     if keychain_denied:
         return {"oauth": None, "reason": "keychain_denied"}
@@ -4228,9 +4240,16 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
     oauth = creds["oauth"]
     if not isinstance(oauth, dict):
         return empty_limits(reason=creds["reason"])
+    credential_source = creds.get("credentialSource")
+
+    def credentialed(limits: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(credential_source, str) and credential_source:
+            limits["credentialSource"] = credential_source
+        return limits
+
     token = oauth.get("accessToken") or oauth.get("access_token")
     if not (isinstance(token, str) and token):
-        return empty_limits(reason="token_missing")
+        return credentialed(empty_limits(reason="token_missing"))
     expires_at = int_limit(oauth.get("expiresAt"))
     now_ms = int(time.time() * 1000)
     refresh_token = oauth.get("refreshToken") or oauth.get("refresh_token")
@@ -4243,15 +4262,16 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
         except Exception:
             refreshed = None
         if not refreshed:
-            return empty_limits(reason="token_expired")
+            return credentialed(empty_limits(reason="token_expired"))
         token = refreshed
     elif expires_at and now_ms >= expires_at:
-        return empty_limits(reason="token_expired")
+        return credentialed(empty_limits(reason="token_expired"))
     last_error: Optional[Exception] = None
     while True:
         try:
             payload = claude_usage_request(token)
             limits = claude_limits_from_usage_response(payload, source=CLAUDE_USAGE_URL)
+            credentialed(limits)
             write_live_limits_cache("claude", limits)
             return limits
         except urllib.error.HTTPError as exc:
@@ -4278,8 +4298,14 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
 
     stale = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
     if stale:
-        return serve_stale_live_limits("claude", stale, last_error or RuntimeError("Claude usage API failed"))
-    limits = live_limit_error(last_error or RuntimeError("Claude usage API failed"), CLAUDE_USAGE_URL)
+        return serve_stale_live_limits(
+            "claude",
+            credentialed(stale),
+            last_error or RuntimeError("Claude usage API failed"),
+        )
+    limits = credentialed(live_limit_error(
+        last_error or RuntimeError("Claude usage API failed"), CLAUDE_USAGE_URL
+    ))
     write_live_limits_cache("claude", limits)
     return limits
 
