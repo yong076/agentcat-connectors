@@ -94,6 +94,8 @@ GROK_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=cr
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+# Epoch values below this are seconds; Kimi CLI 0.39.x env files may use ms.
+KIMI_EXPIRES_AT_MS_THRESHOLD = 10 ** 11
 GROK_MEDIA_TOOL_NAMES = {
     "image_gen": "images",
     "image_edit": "images",
@@ -5522,7 +5524,104 @@ def grok_live_limits(force: bool = False) -> Dict[str, Any]:
     return empty_limits(reason="not_applicable")
 
 
+def kimi_credential_files() -> List[Path]:
+    """Every `credentials/kimi-code*.json` under known Kimi roots.
+
+    Kimi CLI 0.39.x keeps an empty stub at `kimi-code.json` and the live
+    token in sibling env-scoped files (`kimi-code-env-<hash>.json`).
+    """
+    files: List[Path] = []
+    seen: Set[str] = set()
+    for root in kimi_roots():
+        creds_dir = root / "credentials"
+        try:
+            candidates = sorted(creds_dir.glob("kimi-code*.json"))
+        except OSError:
+            continue
+        for path in candidates:
+            if not path.is_file():
+                continue
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(path)
+    return files
+
+
+def kimi_expires_at_epoch_seconds(raw: Any) -> Optional[int]:
+    """Normalize Kimi `expires_at` to epoch seconds.
+
+    Values below 10^11 are treated as seconds; larger values as milliseconds.
+    Zero is a known stub/expired sentinel and is preserved.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    value: Optional[int] = None
+    if isinstance(raw, (int, float)):
+        value = int(raw)
+    elif isinstance(raw, str):
+        text = raw.strip().replace(",", "").replace("_", "")
+        if not text:
+            return None
+        sign = -1 if text.startswith("-") else 1
+        digits = text[1:] if text[0] in "+-" else text
+        if not digits.isdigit():
+            return None
+        value = sign * int(digits)
+    else:
+        return None
+    if value < 0:
+        return None
+    if value == 0 or value < KIMI_EXPIRES_AT_MS_THRESHOLD:
+        return value
+    return value // 1000
+
+
+def _kimi_token_from_payload(raw: Dict[str, Any], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _kimi_credentials_from_file(path: Path) -> Optional[Dict[str, Any]]:
+    raw = read_json(path)
+    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+        return None
+    access = _kimi_token_from_payload(raw, "access_token", "accessToken")
+    refresh = _kimi_token_from_payload(raw, "refresh_token", "refreshToken")
+    if not access and not refresh:
+        return None
+    return {
+        "path": path,
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_at": kimi_expires_at_epoch_seconds(raw.get("expires_at") or raw.get("expiresAt")),
+        "reason": None,
+    }
+
+
 def kimi_credentials_path() -> Path:
+    chosen: Optional[Path] = None
+    chosen_expiry = -1
+    stub: Optional[Path] = None
+    for path in kimi_credential_files():
+        creds = _kimi_credentials_from_file(path)
+        if creds is None:
+            if stub is None and path.name == "kimi-code.json":
+                stub = path
+            continue
+        expiry = creds.get("expires_at")
+        score = expiry if isinstance(expiry, int) else 0
+        if chosen is None or score >= chosen_expiry:
+            chosen = path
+            chosen_expiry = score
+    if chosen is not None:
+        return chosen
+    if stub is not None:
+        return stub
     for root in kimi_roots():
         path = root / "credentials" / "kimi-code.json"
         if path.is_file():
@@ -5531,18 +5630,23 @@ def kimi_credentials_path() -> Path:
 
 
 def read_kimi_oauth_credentials() -> Dict[str, Any]:
-    raw = read_json(kimi_credentials_path())
-    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+    best: Optional[Dict[str, Any]] = None
+    best_expiry = -1
+    for path in kimi_credential_files():
+        creds = _kimi_credentials_from_file(path)
+        if creds is None:
+            continue
+        expiry = creds.get("expires_at")
+        score = expiry if isinstance(expiry, int) else 0
+        if best is None or score >= best_expiry:
+            best = creds
+            best_expiry = score
+    if best is None:
         return {"access_token": None, "refresh_token": None, "reason": "token_missing"}
-    access = raw.get("access_token") or raw.get("accessToken")
-    refresh = raw.get("refresh_token") or raw.get("refreshToken")
-    if not (isinstance(access, str) and access.strip()) and not (isinstance(refresh, str) and refresh.strip()):
-        return {"access_token": None, "refresh_token": None, "reason": "token_missing"}
-    expires_at = int_limit(raw.get("expires_at") or raw.get("expiresAt"))
     return {
-        "access_token": access.strip() if isinstance(access, str) else None,
-        "refresh_token": refresh.strip() if isinstance(refresh, str) else None,
-        "expires_at": expires_at,
+        "access_token": best.get("access_token"),
+        "refresh_token": best.get("refresh_token"),
+        "expires_at": best.get("expires_at"),
         "reason": None,
     }
 
@@ -5745,7 +5849,9 @@ def kimi_live_limits(force: bool = False) -> Dict[str, Any]:
     last_error: Optional[Exception] = None
     tokens: List[str] = []
     expires_at = creds.get("expires_at")
-    expired = isinstance(expires_at, int) and expires_at > 0 and expires_at < int(time.time())
+    now = int(time.time())
+    expired = isinstance(expires_at, int) and expires_at <= now
+    refresh_failed = False
     if isinstance(access, str) and access and not expired:
         tokens.append(access)
     if isinstance(refresh, str) and refresh:
@@ -5753,9 +5859,11 @@ def kimi_live_limits(force: bool = False) -> Dict[str, Any]:
             refreshed = refresh_kimi_access_token(refresh)
         except Exception as exc:
             last_error = exc
+            refresh_failed = True
             refreshed = None
         if refreshed:
             tokens.append(refreshed)
+            refresh_failed = False
     if isinstance(access, str) and access and access not in tokens:
         tokens.append(access)
 
@@ -5780,7 +5888,7 @@ def kimi_live_limits(force: bool = False) -> Dict[str, Any]:
     if last_error is None:
         return empty_limits(reason="token_expired" if expired else "token_missing")
     limits = live_limit_error(last_error, KIMI_USAGE_URL)
-    if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403}:
+    if refresh_failed or (isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403}):
         limits["reason"] = "token_expired"
     write_live_limits_cache("kimi", limits)
     return limits
