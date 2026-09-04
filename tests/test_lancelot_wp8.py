@@ -50,8 +50,15 @@ class LancelotWP8TestCase(unittest.TestCase):
         assert_sandboxed(agentcat, self.home, self.agentcat_home)
         self.env = patch.dict(os.environ, {}, clear=True)
         self.env.start()
+        self.network = patch.object(
+            agentcat.urllib.request,
+            "urlopen",
+            side_effect=AssertionError("network must be mocked in WP8 tests"),
+        )
+        self.network.start()
 
     def tearDown(self):
+        self.network.stop()
         self.env.stop()
         restore_module_paths(agentcat, self.old_paths)
         self.tmp.cleanup()
@@ -261,6 +268,74 @@ class ClaudeUnauthorizedRefreshTests(LancelotWP8TestCase):
         self.assertEqual(limits["status"], "error")
         self.assertEqual(limits["reason"], "token_expired")
         self.assertEqual(len(calls), 3)
+
+
+class LiveLimitBackoffTests(LancelotWP8TestCase):
+    def cache_entry(self, provider="claude"):
+        return json.loads(agentcat.LIVE_LIMITS_CACHE.read_text(encoding="utf-8"))[provider]
+
+    def test_backoff_curve_starts_at_thirty_seconds_and_caps_at_nine_hundred(self):
+        self.assertEqual(
+            [agentcat.live_limits_error_backoff_seconds(streak) for streak in range(1, 8)],
+            [30, 60, 120, 240, 480, 900, 900],
+        )
+
+    def test_consecutive_failures_increment_provider_streak_and_extend_backoff(self):
+        failure = agentcat.live_limit_error(RuntimeError("failed"), "usage-api")
+        with patch.object(agentcat.time, "time", return_value=1_000):
+            agentcat.write_live_limits_cache("claude", failure)
+        self.assertEqual(self.cache_entry()["failureStreak"], 1)
+
+        with patch.object(agentcat.time, "time", return_value=1_029):
+            self.assertIsNotNone(agentcat.cached_live_limits("claude", -1))
+        with patch.object(agentcat.time, "time", return_value=1_031):
+            self.assertIsNone(agentcat.cached_live_limits("claude", 10_000))
+            agentcat.write_live_limits_cache("claude", failure)
+        self.assertEqual(self.cache_entry()["failureStreak"], 2)
+
+        with patch.object(agentcat.time, "time", return_value=1_090):
+            self.assertIsNotNone(agentcat.cached_live_limits("claude", -1))
+        with patch.object(agentcat.time, "time", return_value=1_092):
+            self.assertIsNone(agentcat.cached_live_limits("claude", 10_000))
+
+    def test_success_resets_failure_streak(self):
+        failure = agentcat.live_limit_error(RuntimeError("failed"), "usage-api")
+        with patch.object(agentcat.time, "time", return_value=1_000):
+            agentcat.write_live_limits_cache("claude", failure)
+        with patch.object(agentcat.time, "time", return_value=1_031):
+            agentcat.write_live_limits_cache("claude", failure)
+
+        success = agentcat.empty_limits(status="auto")
+        success["quotas"] = [{"id": "claude:5h", "usedPercent": 10.0}]
+        with patch.object(agentcat.time, "time", return_value=1_100):
+            agentcat.write_live_limits_cache("claude", success)
+
+        self.assertEqual(self.cache_entry()["failureStreak"], 0)
+        with patch.object(agentcat.time, "time", return_value=1_200):
+            self.assertIsNotNone(agentcat.cached_live_limits("claude", 200))
+
+    def test_stale_result_failures_also_increment_streak(self):
+        success = agentcat.empty_limits(status="auto")
+        success["source"] = "usage-api"
+        success["quotas"] = [{"id": "claude:5h", "usedPercent": 10.0}]
+        with patch.object(agentcat.time, "time", return_value=1_000):
+            agentcat.write_live_limits_cache("claude", success)
+        with patch.object(agentcat.time, "time", return_value=2_000):
+            stale = agentcat.cached_live_limits("claude", 1, allow_stale=True)
+            agentcat.serve_stale_live_limits("claude", stale, OSError("offline"))
+
+        self.assertEqual(self.cache_entry()["failureStreak"], 1)
+
+    def test_not_applicable_keeps_five_minute_ttl_without_a_failure_streak(self):
+        limits = agentcat.empty_limits(reason="not_applicable")
+        with patch.object(agentcat.time, "time", return_value=1_000):
+            agentcat.write_live_limits_cache("claude", limits)
+        self.assertEqual(self.cache_entry()["failureStreak"], 0)
+
+        with patch.object(agentcat.time, "time", return_value=1_299):
+            self.assertIsNotNone(agentcat.cached_live_limits("claude", 10_000))
+        with patch.object(agentcat.time, "time", return_value=1_301):
+            self.assertIsNone(agentcat.cached_live_limits("claude", 10_000))
 
 
 if __name__ == "__main__":

@@ -110,7 +110,8 @@ GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECON
 LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_BYTES", str(16 * 1024 * 1024)))
 LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
 LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
-LIVE_LIMITS_ERROR_BACKOFF_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_ERROR_BACKOFF_SECONDS", "1800"))
+LIVE_LIMITS_ERROR_BACKOFF_BASE_SECONDS = 30
+LIVE_LIMITS_ERROR_BACKOFF_MAX_SECONDS = 900
 # A "no quota for this account" answer is cached to stop the per-tick reprobe loop, but on
 # a shorter horizon than a good result so a transient empty response or a later plan upgrade
 # is re-checked within minutes, not 15.
@@ -2720,6 +2721,14 @@ def live_limit_error(exc: Exception, source: str) -> Dict[str, Any]:
     return limits
 
 
+def live_limits_error_backoff_seconds(failure_streak: int) -> int:
+    exponent = min(max(int(failure_streak) - 1, 0), 5)
+    return min(
+        LIVE_LIMITS_ERROR_BACKOFF_BASE_SECONDS * (2 ** exponent),
+        LIVE_LIMITS_ERROR_BACKOFF_MAX_SECONDS,
+    )
+
+
 def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = False) -> Optional[Dict[str, Any]]:
     raw = read_json(LIVE_LIMITS_CACHE)
     if not isinstance(raw, dict) or raw.get("_agentcat_error"):
@@ -2733,6 +2742,7 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
         return None
     now = int(time.time())
     age = now - cached_at
+    failure_streak = int_count(entry.get("failureStreak")) or 0
     retry_at = int_limit(limits.get("retryAt"))
     if retry_at is not None:
         if retry_at > now:
@@ -2741,8 +2751,8 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
             return None
         else:
             effective_max_age = -1
-    elif limits.get("status") == "error":
-        effective_max_age = LIVE_LIMITS_ERROR_BACKOFF_SECONDS
+    elif failure_streak > 0:
+        effective_max_age = live_limits_error_backoff_seconds(failure_streak)
     elif limits.get("status") == "not_configured" and limits.get("reason") == "not_applicable":
         effective_max_age = LIVE_LIMITS_NOT_APPLICABLE_TTL
     else:
@@ -2772,8 +2782,12 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
         ensure_dirs()
         raw = read_json(LIVE_LIMITS_CACHE)
         cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+        previous = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
+        previous_streak = int_count(previous.get("failureStreak")) or 0
+        failed = status == "error" or bool(limits.get("liveError"))
         cache[provider] = {
             "cachedAt": int(time.time()),
+            "failureStreak": previous_streak + 1 if failed else 0,
             "limits": limits,
         }
         tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
