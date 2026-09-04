@@ -79,6 +79,9 @@ CODEX_WEEKLY_WINDOW_MINUTES = 10080
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing"
 GROK_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
@@ -3805,6 +3808,29 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
     return {"oauth": None, "reason": "token_missing"}
 
 
+def refresh_claude_access_token(refresh_token: str) -> Optional[str]:
+    """Refresh Claude OAuth in memory without modifying Claude Code's auth state."""
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        CLAUDE_OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    return token.strip() if isinstance(token, str) and token.strip() else None
+
+
 def claude_quota_label(key: str) -> str:
     labels = {
         "five_hour": "5시간",
@@ -4054,10 +4080,18 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
     if not (isinstance(token, str) and token):
         return empty_limits(reason="token_missing")
     expires_at = int_limit(oauth.get("expiresAt"))
-    if expires_at and time.time() * 1000 >= expires_at:
-        # The stored access token is already expired. Claude Code refreshes its own
-        # token when it runs; a connector that only reads the file cannot recover
-        # until then, so surface an actionable reason instead of a guaranteed 401.
+    now_ms = int(time.time() * 1000)
+    refresh_token = oauth.get("refreshToken") or oauth.get("refresh_token")
+    should_refresh = bool(expires_at and now_ms + CLAUDE_OAUTH_EXPIRY_BUFFER_MS >= expires_at)
+    if should_refresh and isinstance(refresh_token, str) and refresh_token:
+        try:
+            refreshed = refresh_claude_access_token(refresh_token)
+        except Exception:
+            refreshed = None
+        if not refreshed:
+            return empty_limits(reason="token_expired")
+        token = refreshed
+    elif expires_at and now_ms >= expires_at:
         return empty_limits(reason="token_expired")
     req = urllib.request.Request(
         CLAUDE_USAGE_URL,
