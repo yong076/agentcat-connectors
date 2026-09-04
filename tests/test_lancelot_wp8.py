@@ -4,11 +4,13 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
 import urllib.error
 import urllib.parse
+from contextlib import closing, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
@@ -336,6 +338,45 @@ class LiveLimitBackoffTests(LancelotWP8TestCase):
             self.assertIsNotNone(agentcat.cached_live_limits("claude", 10_000))
         with patch.object(agentcat.time, "time", return_value=1_301):
             self.assertIsNone(agentcat.cached_live_limits("claude", 10_000))
+
+
+class ClaudeStatuslineThrottleTests(LancelotWP8TestCase):
+    def run_statusline(self, payload, now):
+        with patch.object(agentcat, "read_stdin_payload", return_value=payload), patch.object(
+            agentcat.time, "time", return_value=now
+        ):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(agentcat.command_claude_statusline(agentcat.argparse.Namespace()), 0)
+
+    def event_count(self):
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
+            return conn.execute(
+                "select count(*) from events where source = 'claude-statusline'"
+            ).fetchone()[0]
+
+    def test_per_session_floor_and_duplicate_window_drop_streaming_updates(self):
+        first = {"session_id": "session-a", "model": "claude", "rate_limits": {"five_hour": 10}}
+        changed = {"session_id": "session-a", "model": "claude", "rate_limits": {"five_hour": 11}}
+
+        self.run_statusline(first, 1_000)
+        self.run_statusline(changed, 1_010)
+        self.run_statusline(first, 1_016)
+        self.run_statusline(first, 1_030)
+
+        self.assertEqual(self.event_count(), 2)
+
+    def test_different_sessions_have_independent_floors(self):
+        self.run_statusline({"session_id": "session-a", "model": "claude"}, 1_000)
+        self.run_statusline({"session_id": "session-b", "model": "claude"}, 1_001)
+
+        self.assertEqual(self.event_count(), 2)
+
+    def test_missing_session_id_falls_back_to_parent_process(self):
+        with patch.object(agentcat.os, "getppid", return_value=4242):
+            self.run_statusline({"model": "claude-a"}, 1_000)
+            self.run_statusline({"model": "claude-b"}, 1_001)
+
+        self.assertEqual(self.event_count(), 1)
 
 
 if __name__ == "__main__":

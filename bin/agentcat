@@ -116,6 +116,8 @@ LIVE_LIMITS_ERROR_BACKOFF_MAX_SECONDS = 900
 # a shorter horizon than a good result so a transient empty response or a later plan upgrade
 # is re-checked within minutes, not 15.
 LIVE_LIMITS_NOT_APPLICABLE_TTL = int(os.environ.get("AGENTCAT_LIVE_LIMITS_NOT_APPLICABLE_TTL", "300"))
+CLAUDE_STATUSLINE_MIN_INTERVAL_SECONDS = 15
+CLAUDE_STATUSLINE_DUPLICATE_INTERVAL_SECONDS = 30
 JOURNAL_CURSOR_FILE = AGENTCAT_HOME / "jsonl-cursor.json"
 CODEX_SESSIONS_CURSOR_FILE = AGENTCAT_HOME / "codex-sessions-cursor.json"
 # Bump whenever a counting bug means the *persisted rollups* are wrong, not just
@@ -2428,6 +2430,15 @@ def init_db() -> None:
             """
         )
         conn.execute("create index if not exists idx_events_provider_ts on events(provider, ts desc)")
+        conn.execute(
+            """
+            create table if not exists claude_statusline_throttle (
+              session_key text primary key,
+              last_posted_at integer not null,
+              payload_hash text not null
+            )
+            """
+        )
         conn.commit()
     # The sqlite file is created on connect; lock it down owner-only afterward.
     _chmod_quiet(EVENTS_DB, 0o600)
@@ -2450,6 +2461,54 @@ def store_event(provider: str, source: str, event_type: Optional[str], payload: 
         "eventType": event_type,
         "tokens": extract_tokens(sanitized),
     }
+
+
+def should_store_claude_statusline(payload: Any) -> bool:
+    """Atomically reserve a rate-limited statusline event for this session."""
+    session_id = find_first_key(payload, ("session_id", "sessionId"))
+    if session_id is None:
+        session_id = f"process:{os.getppid()}"
+    session_key = hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()
+    sanitized = sanitize_payload(payload)
+    payload_hash = hashlib.sha256(
+        json.dumps(sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    now = int(time.time())
+    try:
+        init_db()
+        with closing(sqlite3.connect(EVENTS_DB, timeout=5.0)) as conn:
+            conn.execute("pragma busy_timeout=5000")
+            conn.execute("begin immediate")
+            row = conn.execute(
+                "select last_posted_at, payload_hash from claude_statusline_throttle where session_key = ?",
+                (session_key,),
+            ).fetchone()
+            if row:
+                elapsed = now - int(row[0])
+                if elapsed < CLAUDE_STATUSLINE_MIN_INTERVAL_SECONDS:
+                    conn.rollback()
+                    return False
+                if str(row[1]) == payload_hash and elapsed < CLAUDE_STATUSLINE_DUPLICATE_INTERVAL_SECONDS:
+                    conn.rollback()
+                    return False
+            conn.execute(
+                """
+                insert into claude_statusline_throttle(session_key, last_posted_at, payload_hash)
+                values (?, ?, ?)
+                on conflict(session_key) do update set
+                  last_posted_at = excluded.last_posted_at,
+                  payload_hash = excluded.payload_hash
+                """,
+                (session_key, now, payload_hash),
+            )
+            conn.execute(
+                "delete from claude_statusline_throttle where last_posted_at < ?",
+                (now - 7 * 86400,),
+            )
+            conn.commit()
+        return True
+    except Exception:
+        return True
 
 
 def prune_events(max_age_days: Optional[int] = None) -> int:
@@ -11595,7 +11654,8 @@ def command_event(args: argparse.Namespace) -> int:
 
 def command_claude_statusline(args: argparse.Namespace) -> int:
     payload = read_stdin_payload()
-    store_event("claude", "claude-statusline", "statusline", payload)
+    if should_store_claude_statusline(payload):
+        store_event("claude", "claude-statusline", "statusline", payload)
     print(statusline_text(payload))
     return 0
 
