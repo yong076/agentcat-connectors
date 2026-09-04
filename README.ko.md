@@ -9,8 +9,8 @@ Claude Code, Gemini CLI 및 지원되는 에이전트 도구 활동을 로컬에
 작은 로컬 수집기를 설치하고, 데이터는 `~/.agentcat` 아래에 보관합니다.
 지원되는 CLI 설정에는 Agent Cat이 관리하는 hook/telemetry 항목을 추가해서
 이후 세션부터 활동과 사용량을 보고할 수 있게 합니다. 프롬프트 본문은 원격
-서버로 보내지 않습니다. 이 공개 커넥터가 무료 제품의 핵심입니다: 로컬
-모니터링, 넓은 provider 지원, quota 상태, 기본 비용, 예산 cap, 주간 리포트
+서버로 보내지 않습니다. 이 하나의 공개 커넥터가 Agent Cat 제품의 로컬
+모니터링, 다양한 provider 지원, quota 상태, 기본 비용, 예산 cap, 주간 리포트
 입력값을 제공합니다.
 
 ## 라이선스
@@ -111,6 +111,14 @@ agentcat setup-prompt
 | Claude Code | 로컬 stats/hooks + Claude Code OAuth usage API | Claude Code OAuth credential이 있으면 5시간, 7일, 모델 quota, 월별 extra credit 남은 양을 표시합니다. |
 | Gemini CLI | 로컬 telemetry + Gemini Code Assist quota API | Google 로그인 Gemini CLI 세션에서 모델별 Code Assist request quota 남은 비율을 표시합니다. |
 | Antigravity | 전용 telemetry 또는 read-only 로컬 대화 SQLite | Gemini CLI 사용량을 빌리지 않고 별도 표시합니다. Windows에서는 generation별 실제 token metadata를 방어적으로 읽고, 로컬 스키마가 달라지면 quota/activity만 표시합니다. |
+
+## 포함된 인사이트 엔진
+
+하나의 공개 커넥터에서 오늘/주간/월간/전체 기간 인사이트, burn rate, 자동 quota
+추정과 provider 추천, 프로젝트별 일일 비용을 제공합니다. OpenAI API 키 사용량과
+키를 로컬에 안전하게 저장·삭제하는 `set-key` 명령, Codex 사용 출처별 분석,
+Antigravity 사용 기록도 포함합니다. 모델별 기준값은 counter가 초기화될 때 이를 새
+사용량으로 잘못 기록하지 않도록 안전하게 다시 설정합니다.
 
 ## Provider 홈이 여러 개인 경우
 

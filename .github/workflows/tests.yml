@@ -38,7 +38,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Compile scripts
-        run: python -m py_compile bin/agentcat scripts/install.py scripts/pro_channel_install.py scripts/public_channel_install.py
+        run: python -m py_compile bin/agentcat scripts/install.py scripts/public_channel_install.py
 
       - name: Validate connector contract
         run: python -m unittest tests.test_contract tests.test_public_channel_install tests.test_install_ps1

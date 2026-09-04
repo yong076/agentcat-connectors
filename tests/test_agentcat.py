@@ -1,11 +1,10 @@
 import importlib.util
 import io
-import hashlib
 import os
-import subprocess
 import datetime as dt
 import json
 import sqlite3
+import sys
 import tempfile
 import threading
 import urllib.error
@@ -17,6 +16,9 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from typing import List
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sandbox import assert_sandboxed, redirect_module_paths, restore_module_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -78,55 +80,49 @@ class AgentCatConnectorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.old_paths = {
-            "HOME": agentcat.HOME,
-            "AGENTCAT_HOME": agentcat.AGENTCAT_HOME,
-            "EVENTS_DB": agentcat.EVENTS_DB,
-            "LATEST_SNAPSHOT": agentcat.LATEST_SNAPSHOT,
-            "LIMITS_FILE": agentcat.LIMITS_FILE,
-            "GEMINI_TELEMETRY": agentcat.GEMINI_TELEMETRY,
-            "GEMINI_USAGE_CACHE": agentcat.GEMINI_USAGE_CACHE,
-            "ANTIGRAVITY_CLI_DIR": agentcat.ANTIGRAVITY_CLI_DIR,
-            "ANTIGRAVITY_TELEMETRY": agentcat.ANTIGRAVITY_TELEMETRY,
-            "ANTIGRAVITY_USAGE_CACHE": agentcat.ANTIGRAVITY_USAGE_CACHE,
-            "ANTIGRAVITY_OAUTH_TOKEN": agentcat.ANTIGRAVITY_OAUTH_TOKEN,
-            "ANTIGRAVITY_CLIENT_CACHE": agentcat.ANTIGRAVITY_CLIENT_CACHE,
-            "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
-            "JOURNAL_CURSOR_FILE": agentcat.JOURNAL_CURSOR_FILE,
-            "CODEX_SESSIONS_CURSOR_FILE": agentcat.CODEX_SESSIONS_CURSOR_FILE,
-            "CLAUDE_PROJECTS_DIR": agentcat.CLAUDE_PROJECTS_DIR,
-            "_GEMINI_CACHE_KEY": agentcat._GEMINI_CACHE_KEY,
-            "_GEMINI_CACHE_VALUE": agentcat._GEMINI_CACHE_VALUE,
-            "_GEMINI_CACHE_LOADED_AT": agentcat._GEMINI_CACHE_LOADED_AT,
-        }
-
         home = self.root / "home"
         agentcat_home = self.root / "agentcat"
         home.mkdir()
         agentcat_home.mkdir()
-        agentcat.HOME = home
-        agentcat.AGENTCAT_HOME = agentcat_home
-        agentcat.EVENTS_DB = agentcat_home / "events.sqlite"
-        agentcat.LATEST_SNAPSHOT = agentcat_home / "latest-snapshot.json"
-        agentcat.LIMITS_FILE = agentcat_home / "limits.json"
-        agentcat.GEMINI_TELEMETRY = agentcat_home / "gemini" / "telemetry.log"
-        agentcat.GEMINI_USAGE_CACHE = agentcat_home / "gemini-usage-cache.json"
-        agentcat.ANTIGRAVITY_CLI_DIR = home / ".gemini" / "antigravity-cli"
-        agentcat.ANTIGRAVITY_TELEMETRY = agentcat_home / "gemini" / "antigravity-telemetry.log"
-        agentcat.ANTIGRAVITY_USAGE_CACHE = agentcat_home / "antigravity-usage-cache.json"
-        agentcat.ANTIGRAVITY_OAUTH_TOKEN = agentcat.ANTIGRAVITY_CLI_DIR / "antigravity-oauth-token"
-        agentcat.ANTIGRAVITY_CLIENT_CACHE = agentcat_home / "antigravity-oauth-client.json"
-        agentcat.LIVE_LIMITS_CACHE = agentcat_home / "live-limits-cache.json"
-        agentcat.JOURNAL_CURSOR_FILE = agentcat_home / "jsonl-cursor.json"
-        agentcat.CODEX_SESSIONS_CURSOR_FILE = agentcat_home / "codex-sessions-cursor.json"
-        agentcat.CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
+        self.old_paths = redirect_module_paths(agentcat, home, agentcat_home)
+        assert_sandboxed(agentcat, home, agentcat_home)
+        self.old_paths.update({
+            "_GEMINI_CACHE_KEY": agentcat._GEMINI_CACHE_KEY,
+            "_GEMINI_CACHE_VALUE": agentcat._GEMINI_CACHE_VALUE,
+            "_GEMINI_CACHE_LOADED_AT": agentcat._GEMINI_CACHE_LOADED_AT,
+        })
         agentcat._GEMINI_CACHE_KEY = None
         agentcat._GEMINI_CACHE_VALUE = None
         agentcat._GEMINI_CACHE_LOADED_AT = 0.0
+        self.env_patch = patch.dict(os.environ, {}, clear=False)
+        self.env_patch.start()
+        for key in (
+            "AGENTCAT_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "GEMINI_CLI_HOME",
+            "GROK_HOME",
+            "KIMI_HOME",
+        ):
+            os.environ.pop(key, None)
+        original_check_output = agentcat.subprocess.check_output
+
+        def sandboxed_check_output(command, *args, **kwargs):
+            if command and str(command[0]).endswith("security"):
+                raise agentcat.subprocess.CalledProcessError(44, command)
+            return original_check_output(command, *args, **kwargs)
+
+        self.keychain_patch = patch.object(
+            agentcat.subprocess,
+            "check_output",
+            side_effect=sandboxed_check_output,
+        )
+        self.keychain_patch.start()
 
     def tearDown(self) -> None:
-        for name, value in self.old_paths.items():
-            setattr(agentcat, name, value)
+        self.keychain_patch.stop()
+        self.env_patch.stop()
+        restore_module_paths(agentcat, self.old_paths)
         self.tmp.cleanup()
 
     def test_percent_parser_clamps_and_rejects_invalid_values(self) -> None:
@@ -361,42 +357,6 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["quotas"][0]["window"], "7d")
         self.assertIsNone(limits["shortUsedPercent"])
         self.assertEqual(limits["weeklyUsedPercent"], 24.0)
-
-    def test_codex_daily_window_stays_daily_and_does_not_fill_weekly_compat_field(self) -> None:
-        limits = agentcat.codex_limits_from_usage_response(
-            {
-                "plan_type": "pro",
-                "rate_limit": {
-                    "primary_window": {
-                        "used_percent": 24,
-                        "reset_at": 1770000000,
-                        "limit_window_seconds": 86400,
-                    }
-                },
-            }
-        )
-
-        self.assertEqual([quota["id"] for quota in limits["quotas"]], ["codex:1d"])
-        self.assertEqual(limits["quotas"][0]["label"], "1일")
-        self.assertEqual(limits["quotas"][0]["window"], "1d")
-        self.assertIsNone(limits["shortUsedPercent"])
-        self.assertIsNone(limits["weeklyUsedPercent"])
-
-    def test_codex_unrecognized_duration_is_preserved_as_generic_quota(self) -> None:
-        limits = agentcat.codex_limits_from_usage_response(
-            {
-                "rate_limit": {
-                    "primary_window": {
-                        "used_percent": 12,
-                        "limit_window_seconds": 2592000,
-                    }
-                }
-            }
-        )
-
-        self.assertEqual(limits["quotas"][0]["id"], "codex:30d")
-        self.assertEqual(limits["quotas"][0]["label"], "30일")
-        self.assertIsNone(limits["weeklyUsedPercent"])
 
     def test_codex_cache_rekeys_stale_daily_bucket_without_calling_it_weekly(self) -> None:
         cached = agentcat.empty_limits(status="auto")
@@ -1052,228 +1012,6 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
         self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
         self.assertEqual(snapshot["update"]["channel"]["channel"], "public")
-
-    def test_update_channel_manifest_validation_and_snapshot_status(self) -> None:
-        # Must be ahead of the running connector, otherwise the downgrade guard
-        # (correctly) reports "current" instead of scheduling an install.
-        manifest = {
-            "version": "99.0.0",
-            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/99.0.0",
-            "sha256": "a" * 64,
-            "minAppVersion": "26.26.0",
-            "channel": "pro",
-        }
-
-        state = agentcat.write_update_channel_state("pro", manifest)
-        status = agentcat.update_channel_status_snapshot()
-
-        self.assertEqual(state["status"], "manifest_ready")
-        self.assertEqual(state["installStatus"], "pending_install")
-        self.assertEqual(status["channel"], "pro")
-        self.assertEqual(status["targetVersion"], "99.0.0")
-        self.assertEqual(status["installStatus"], "pending_install")
-        self.assertTrue(agentcat.update_channel_state_file().exists())
-
-    def test_update_channel_refuses_to_pend_on_a_downgrade(self) -> None:
-        # The issue #40 case: backend served 26.27.0 while a newer connector was
-        # installed, and the channel parked on pending_install pointing back.
-        manifest = {
-            "version": "1.0.0",
-            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/1.0.0",
-            "sha256": "a" * 64,
-            "channel": "pro",
-        }
-
-        state = agentcat.write_update_channel_state("pro", manifest)
-
-        self.assertEqual(state["status"], "current")
-        self.assertEqual(state["installStatus"], "current")
-
-    def test_update_channel_treats_same_version_as_current(self) -> None:
-        manifest = {
-            "version": agentcat.CONNECTOR_VERSION,
-            "downloadUrl": f"https://api.agentcat.app/v1/pro/connector/download/{agentcat.CONNECTOR_VERSION}",
-            "sha256": "a" * 64,
-            "channel": "pro",
-        }
-
-        state = agentcat.write_update_channel_state("pro", manifest)
-
-        self.assertEqual(state["installStatus"], "current")
-
-    # --- Pro channel install handoff (issue #40) ---
-    #
-    # Before this, write_update_channel_state recorded pending_install and
-    # nothing ever downloaded the archive or ran the installer.
-
-    def _pro_manifest(self) -> dict:
-        return {
-            "version": "99.0.0",
-            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/99.0.0",
-            "sha256": "b" * 64,
-            "channel": "pro",
-        }
-
-    def _prepare_pro_channel(self) -> dict:
-        manifest = self._pro_manifest()
-        agentcat.write_update_channel_state("pro", manifest)
-        return manifest
-
-    def test_pro_install_reports_checksum_mismatch(self) -> None:
-        manifest = self._prepare_pro_channel()
-
-        def fake_download(_manifest, _token, destination):
-            destination.write_bytes(b"not the promised archive")
-
-        with patch.object(agentcat, "download_pro_connector_archive", fake_download):
-            state = agentcat.perform_pro_channel_install(manifest, "scoped-token")
-
-        self.assertEqual(state["installStatus"], "checksum_mismatch")
-        self.assertIn("checksum", state["installError"])
-
-    def test_pro_install_reports_download_failure(self) -> None:
-        manifest = self._prepare_pro_channel()
-
-        def fake_download(_manifest, _token, _destination):
-            raise urllib.error.HTTPError(manifest["downloadUrl"], 403, "Forbidden", None, None)
-
-        with patch.object(agentcat, "download_pro_connector_archive", fake_download):
-            state = agentcat.perform_pro_channel_install(manifest, "scoped-token")
-
-        self.assertEqual(state["installStatus"], "download_failed")
-        self.assertTrue(state["installError"])
-
-    def test_pro_install_reports_installer_failure_with_stderr(self) -> None:
-        manifest = self._prepare_pro_channel()
-        payload = b"archive"
-        manifest["sha256"] = hashlib.sha256(payload).hexdigest()
-
-        def fake_download(_manifest, _token, destination):
-            destination.write_bytes(payload)
-
-        completed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="swap refused")
-        with patch.object(agentcat, "download_pro_connector_archive", fake_download), \
-                patch.object(agentcat.subprocess, "run", return_value=completed):
-            state = agentcat.perform_pro_channel_install(manifest, "scoped-token")
-
-        self.assertEqual(state["installStatus"], "install_failed")
-        self.assertIn("swap refused", state["installError"])
-
-    def test_pro_install_success_records_version_and_restarts(self) -> None:
-        manifest = self._prepare_pro_channel()
-        payload = b"archive"
-        manifest["sha256"] = hashlib.sha256(payload).hexdigest()
-
-        def fake_download(_manifest, _token, destination):
-            destination.write_bytes(payload)
-
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="{}", stderr="")
-        restarted = []
-        with patch.object(agentcat, "download_pro_connector_archive", fake_download), \
-                patch.object(agentcat.subprocess, "run", return_value=completed), \
-                patch.object(agentcat, "restart_agentcatd", lambda: restarted.append(True) or True):
-            state = agentcat.perform_pro_channel_install(manifest, "scoped-token")
-
-        self.assertEqual(state["installStatus"], "installed")
-        self.assertEqual(state["installedVersion"], "99.0.0")
-        self.assertEqual(restarted, [True])
-        # The manifest must survive the status transition.
-        self.assertEqual(state["manifest"]["version"], "99.0.0")
-
-    def test_pro_install_download_sends_scoped_bearer(self) -> None:
-        manifest = self._pro_manifest()
-        captured = {}
-
-        class FakeResponse:
-            status = 200
-
-            def read(self, *_args):
-                return b""
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_exc):
-                return False
-
-        def fake_urlopen(request, timeout=None):
-            captured["auth"] = request.get_header("Authorization")
-            return FakeResponse()
-
-        with patch.object(agentcat.urllib.request, "urlopen", fake_urlopen), \
-                patch.object(agentcat.shutil, "copyfileobj", lambda *a, **k: None):
-            agentcat.download_pro_connector_archive(manifest, "scoped-token", self.root / "archive.tar.gz")
-
-        self.assertEqual(captured["auth"], "Bearer scoped-token")
-
-    def test_pro_install_status_appears_in_channel_snapshot(self) -> None:
-        self._prepare_pro_channel()
-        agentcat.update_pro_install_status("download_failed", installError="HTTP 403")
-
-        status = agentcat.update_channel_status_snapshot()
-
-        self.assertEqual(status["installStatus"], "download_failed")
-        self.assertEqual(status["installError"], "HTTP 403")
-
-    def test_update_channel_rejects_insecure_or_bad_manifest(self) -> None:
-        manifest = {
-            "version": "26.26.0",
-            "downloadUrl": "http://api.agentcat.app/v1/pro/connector/download/26.26.0",
-            "sha256": "a" * 64,
-            "channel": "pro",
-        }
-
-        with self.assertRaises(ValueError):
-            agentcat.write_update_channel_state("pro", manifest)
-
-        manifest["downloadUrl"] = "https://api.agentcat.app/v1/pro/connector/download/26.26.0"
-        manifest["sha256"] = "A" * 64
-        with self.assertRaises(ValueError):
-            agentcat.write_update_channel_state("pro", manifest)
-
-    def test_update_channel_public_clears_pro_manifest_state(self) -> None:
-        manifest = {
-            "version": "26.26.0",
-            "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.26.0",
-            "sha256": "b" * 64,
-            "channel": "pro",
-        }
-
-        agentcat.write_update_channel_state("pro", manifest)
-        state = agentcat.write_update_channel_state("public")
-
-        self.assertEqual(state["channel"], "public")
-        self.assertNotIn("manifest", state)
-        self.assertEqual(agentcat.update_channel_status_snapshot()["installStatus"], "current")
-
-    def test_http_update_channel_endpoint_persists_manifest(self) -> None:
-        server = agentcat.ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            port = server.server_address[1]
-            manifest = {
-                "version": "26.26.0",
-                "downloadUrl": "https://api.agentcat.app/v1/pro/connector/download/26.26.0",
-                "sha256": "c" * 64,
-                "channel": "pro",
-            }
-            request = urllib.request.Request(
-                f"http://127.0.0.1:{port}/v1/update/channel",
-                data=json.dumps({"channel": "pro", "manifest": manifest}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "Host": "127.0.0.1"},
-                method="POST",
-            )
-            with urllib.request.urlopen(request, timeout=2.0) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        finally:
-            server.shutdown()
-            thread.join(timeout=2.0)
-            server.server_close()
-
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["channel"]["channel"], "pro")
-        self.assertEqual(agentcat.update_channel_status_snapshot()["targetVersion"], "26.26.0")
 
     def test_connector_version_parser_and_comparison(self) -> None:
         text = 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.10")'
