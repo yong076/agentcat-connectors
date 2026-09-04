@@ -6,6 +6,7 @@ import subprocess
 import datetime as dt
 import json
 import sqlite3
+import sys
 import tempfile
 import threading
 import urllib.error
@@ -17,6 +18,9 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from typing import List
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sandbox import assert_sandboxed, redirect_module_paths, restore_module_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -78,55 +82,49 @@ class AgentCatConnectorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.old_paths = {
-            "HOME": agentcat.HOME,
-            "AGENTCAT_HOME": agentcat.AGENTCAT_HOME,
-            "EVENTS_DB": agentcat.EVENTS_DB,
-            "LATEST_SNAPSHOT": agentcat.LATEST_SNAPSHOT,
-            "LIMITS_FILE": agentcat.LIMITS_FILE,
-            "GEMINI_TELEMETRY": agentcat.GEMINI_TELEMETRY,
-            "GEMINI_USAGE_CACHE": agentcat.GEMINI_USAGE_CACHE,
-            "ANTIGRAVITY_CLI_DIR": agentcat.ANTIGRAVITY_CLI_DIR,
-            "ANTIGRAVITY_TELEMETRY": agentcat.ANTIGRAVITY_TELEMETRY,
-            "ANTIGRAVITY_USAGE_CACHE": agentcat.ANTIGRAVITY_USAGE_CACHE,
-            "ANTIGRAVITY_OAUTH_TOKEN": agentcat.ANTIGRAVITY_OAUTH_TOKEN,
-            "ANTIGRAVITY_CLIENT_CACHE": agentcat.ANTIGRAVITY_CLIENT_CACHE,
-            "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
-            "JOURNAL_CURSOR_FILE": agentcat.JOURNAL_CURSOR_FILE,
-            "CODEX_SESSIONS_CURSOR_FILE": agentcat.CODEX_SESSIONS_CURSOR_FILE,
-            "CLAUDE_PROJECTS_DIR": agentcat.CLAUDE_PROJECTS_DIR,
-            "_GEMINI_CACHE_KEY": agentcat._GEMINI_CACHE_KEY,
-            "_GEMINI_CACHE_VALUE": agentcat._GEMINI_CACHE_VALUE,
-            "_GEMINI_CACHE_LOADED_AT": agentcat._GEMINI_CACHE_LOADED_AT,
-        }
-
         home = self.root / "home"
         agentcat_home = self.root / "agentcat"
         home.mkdir()
         agentcat_home.mkdir()
-        agentcat.HOME = home
-        agentcat.AGENTCAT_HOME = agentcat_home
-        agentcat.EVENTS_DB = agentcat_home / "events.sqlite"
-        agentcat.LATEST_SNAPSHOT = agentcat_home / "latest-snapshot.json"
-        agentcat.LIMITS_FILE = agentcat_home / "limits.json"
-        agentcat.GEMINI_TELEMETRY = agentcat_home / "gemini" / "telemetry.log"
-        agentcat.GEMINI_USAGE_CACHE = agentcat_home / "gemini-usage-cache.json"
-        agentcat.ANTIGRAVITY_CLI_DIR = home / ".gemini" / "antigravity-cli"
-        agentcat.ANTIGRAVITY_TELEMETRY = agentcat_home / "gemini" / "antigravity-telemetry.log"
-        agentcat.ANTIGRAVITY_USAGE_CACHE = agentcat_home / "antigravity-usage-cache.json"
-        agentcat.ANTIGRAVITY_OAUTH_TOKEN = agentcat.ANTIGRAVITY_CLI_DIR / "antigravity-oauth-token"
-        agentcat.ANTIGRAVITY_CLIENT_CACHE = agentcat_home / "antigravity-oauth-client.json"
-        agentcat.LIVE_LIMITS_CACHE = agentcat_home / "live-limits-cache.json"
-        agentcat.JOURNAL_CURSOR_FILE = agentcat_home / "jsonl-cursor.json"
-        agentcat.CODEX_SESSIONS_CURSOR_FILE = agentcat_home / "codex-sessions-cursor.json"
-        agentcat.CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
+        self.old_paths = redirect_module_paths(agentcat, home, agentcat_home)
+        assert_sandboxed(agentcat, home, agentcat_home)
+        self.old_paths.update({
+            "_GEMINI_CACHE_KEY": agentcat._GEMINI_CACHE_KEY,
+            "_GEMINI_CACHE_VALUE": agentcat._GEMINI_CACHE_VALUE,
+            "_GEMINI_CACHE_LOADED_AT": agentcat._GEMINI_CACHE_LOADED_AT,
+        })
         agentcat._GEMINI_CACHE_KEY = None
         agentcat._GEMINI_CACHE_VALUE = None
         agentcat._GEMINI_CACHE_LOADED_AT = 0.0
+        self.env_patch = patch.dict(os.environ, {}, clear=False)
+        self.env_patch.start()
+        for key in (
+            "AGENTCAT_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "GEMINI_CLI_HOME",
+            "GROK_HOME",
+            "KIMI_HOME",
+        ):
+            os.environ.pop(key, None)
+        original_check_output = agentcat.subprocess.check_output
+
+        def sandboxed_check_output(command, *args, **kwargs):
+            if command and str(command[0]).endswith("security"):
+                raise agentcat.subprocess.CalledProcessError(44, command)
+            return original_check_output(command, *args, **kwargs)
+
+        self.keychain_patch = patch.object(
+            agentcat.subprocess,
+            "check_output",
+            side_effect=sandboxed_check_output,
+        )
+        self.keychain_patch.start()
 
     def tearDown(self) -> None:
-        for name, value in self.old_paths.items():
-            setattr(agentcat, name, value)
+        self.keychain_patch.stop()
+        self.env_patch.stop()
+        restore_module_paths(agentcat, self.old_paths)
         self.tmp.cleanup()
 
     def test_percent_parser_clamps_and_rejects_invalid_values(self) -> None:
