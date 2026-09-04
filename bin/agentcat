@@ -9984,6 +9984,117 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def antigravity_history_days() -> set:
+    days = set()
+    path = ANTIGRAVITY_CLI_DIR / "history.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return days
+    for line in lines[-2000:]:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        when = parse_timestamp(payload.get("timestamp"))
+        day = day_key_for_timestamp(when)
+        if day:
+            days.add(day)
+    return days
+
+
+def antigravity_inference_days(activity: Optional[Dict[str, Any]]) -> set:
+    days = antigravity_history_days()
+    counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
+    if isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0 and int(counts.get("gemini") or 0) <= 0:
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        today_utc = day_key_for_timestamp(now_utc)
+        today_local = day_key_for_timestamp(now_utc.astimezone())
+        if today_utc:
+            days.add(today_utc)
+        if today_local:
+            days.add(today_local)
+    return days
+
+
+def _hour_day_key(raw: str) -> str:
+    return str(raw or "")[:10]
+
+
+def filter_google_usage_days(usage: Dict[str, Any], days: set, *, include: bool) -> Dict[str, Any]:
+    daily_tokens = {
+        day: amount
+        for day, amount in int_map(usage.get("dailyTokens")).items()
+        if (day in days) == include
+    }
+    hourly_tokens = {
+        hour: amount
+        for hour, amount in int_map(usage.get("hourlyTokens")).items()
+        if (_hour_day_key(hour) in days) == include
+    }
+    model_daily_raw = usage.get("modelDailyTokens") if isinstance(usage.get("modelDailyTokens"), dict) else {}
+    source_models = usage.get("models") if isinstance(usage.get("models"), dict) else {}
+    models: Dict[str, Dict[str, int]] = {}
+    model_daily_tokens: Dict[str, Dict[str, int]] = {}
+    for model, raw_days in model_daily_raw.items():
+        model_days = {
+            day: amount
+            for day, amount in int_map(raw_days).items()
+            if (day in days) == include
+        }
+        model_total = sum(model_days.values())
+        if model_total <= 0:
+            continue
+        source_model_tokens = int_map(source_models.get(model))
+        original_model_total = (
+            source_model_tokens.get("totalTokens")
+            or source_model_tokens.get("all")
+            or sum(source_model_tokens.get(key, 0) for key in TOKEN_CLASS_KEYS)
+        )
+        periods = periods_from_daily_tokens(model_days)
+        periods["all"] = model_total
+        model_tokens = {
+            key: _scaled_token_class(source_model_tokens.get(key, 0), model_total, original_model_total)
+            for key in TOKEN_CLASS_KEYS
+        }
+        for key, amount in periods.items():
+            if amount > 0:
+                model_tokens[key] = amount
+        models[str(model)] = {key: amount for key, amount in model_tokens.items() if amount > 0}
+        model_daily_tokens[str(model)] = model_days
+
+    total = sum(daily_tokens.values())
+    tokens: Dict[str, int] = {}
+    source_tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else {}
+    original_total = int(source_tokens.get("totalTokens") or source_tokens.get("all") or 0)
+    if total > 0:
+        for key in TOKEN_CLASS_KEYS:
+            amount = _scaled_token_class(int(source_tokens.get(key) or 0), total, original_total)
+            if amount > 0:
+                tokens[key] = amount
+        tokens["totalTokens"] = total
+        periods = periods_from_daily_tokens(daily_tokens)
+        periods["all"] = total
+        for key, amount in periods.items():
+            if amount > 0:
+                tokens[key] = amount
+
+    filtered = {
+        "tokens": tokens,
+        "models": models,
+        "dailyTokens": daily_tokens,
+        "hourlyTokens": hourly_tokens,
+        "modelDailyTokens": model_daily_tokens,
+        "events": int(usage.get("events") or 0) if total > 0 and total == original_total else 0,
+        "cache": copy.deepcopy(usage.get("cache") or {"source": "filtered"}),
+    }
+    if total > 0 and total != original_total:
+        filtered["cache"]["source"] = "filtered-by-antigravity-history"
+    return filtered
+
+
 def google_usage_total(usage: Optional[Dict[str, Any]]) -> int:
     if not isinstance(usage, dict):
         return 0
@@ -10259,6 +10370,9 @@ def split_google_cli_snapshots(
     # there is no honest way to attribute Gemini-CLI tokens to it. Emit Antigravity
     # as its own provider with empty tokens rather than borrowing Gemini's usage.
     counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
+    inference_days = antigravity_inference_days(activity)
+    if inference_days:
+        antigravity_source_status["historyDays"] = len(inference_days)
     antigravity_installed = bool(antigravity_source_status.get("installed"))
     antigravity_active = isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0
     status_if_empty = "no_telemetry_yet" if (antigravity_installed or antigravity_active) else "not_found"
