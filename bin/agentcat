@@ -10426,7 +10426,9 @@ def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
     if not conversations.exists():
         return None
     try:
-        databases = sorted(path for path in conversations.glob("*.db") if path.is_file())
+        # Do not preflight candidates with Path.is_file(): on older pathlib
+        # versions it uses Path.stat(), which can hide an otherwise readable DB.
+        databases = sorted(conversations.glob("*.db"))
     except OSError:
         return None
     result = empty_provider_usage(source=str(conversations))

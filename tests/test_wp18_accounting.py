@@ -843,7 +843,11 @@ class AntigravityMtimeTests(SandboxedCase):
                 raise OSError("mtime unavailable")
             return original_stat(path, *args, **kwargs)
 
-        with patch.object(Path, "stat", stat_with_failed_database_mtime):
+        with patch.object(
+            Path,
+            "is_file",
+            side_effect=AssertionError("database discovery must not require stat"),
+        ), patch.object(Path, "stat", stat_with_failed_database_mtime):
             usage = agentcat.antigravity_sqlite_usage()
 
         self.assertIsNotNone(usage)
