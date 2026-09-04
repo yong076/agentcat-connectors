@@ -9420,11 +9420,29 @@ def merge_token_maps(target: Dict[str, int], source: Any) -> None:
         target[key] = int(target.get(key) or 0) + value
 
 
+def gemini_period_map(raw: Any) -> Dict[str, int]:
+    values = int_map(raw)
+    periods = {**empty_periods(), **values}
+    lifetime = int(values.get("all") or values.get("totalTokens") or 0)
+    if lifetime <= 0:
+        lifetime = sum(int(values.get(key) or 0) for key in TOKEN_CLASS_KEYS)
+    if lifetime <= 0:
+        lifetime = max((int(values.get(key) or 0) for key in ("today", "week", "month")), default=0)
+    periods["all"] = lifetime
+    return periods
+
+
 def merge_gemini_usage(usages: List[Dict[str, Any]]) -> Dict[str, Any]:
     if len(usages) == 1:
-        return copy.deepcopy(usages[0])
+        merged = copy.deepcopy(usages[0])
+        merged["tokens"] = gemini_period_map(merged.get("tokens"))
+        for model, raw_tokens in list((merged.get("models") or {}).items()):
+            model_tokens = gemini_period_map(raw_tokens)
+            if model_tokens["all"] > 0:
+                merged["models"][model] = model_tokens
+        return merged
     merged = {
-        "tokens": {},
+        "tokens": empty_periods(),
         "models": {},
         "dailyTokens": {},
         "hourlyTokens": {},
@@ -9432,13 +9450,13 @@ def merge_gemini_usage(usages: List[Dict[str, Any]]) -> Dict[str, Any]:
         "cache": {"source": "multi-source-full-log-index", "sources": []},
     }
     for usage in usages:
-        merge_token_maps(merged["tokens"], usage.get("tokens", {}))
+        merge_token_maps(merged["tokens"], gemini_period_map(usage.get("tokens")))
         merge_token_maps(merged["dailyTokens"], usage.get("dailyTokens", {}))
         merge_token_maps(merged["hourlyTokens"], usage.get("hourlyTokens", {}))
         merged["events"] += int(usage.get("events") or 0)
         for model, raw_tokens in (usage.get("models") or {}).items():
-            model_tokens = merged["models"].setdefault(str(model), {})
-            merge_token_maps(model_tokens, raw_tokens)
+            model_tokens = merged["models"].setdefault(str(model), empty_periods())
+            merge_token_maps(model_tokens, gemini_period_map(raw_tokens))
         merged["cache"]["sources"].append(usage.get("cache", {"source": "unknown"}))
     return merged
 
@@ -9454,7 +9472,7 @@ def gemini_snapshot() -> Dict[str, Any]:
         "providerLabel": "Gemini",
         "displayName": "Gemini",
         "sources": {str(source["id"]): gemini_source_status(source) for source in sources},
-        "tokens": {},
+        "tokens": empty_periods(),
         "models": {},
         "dailyTokens": {},
         "hourlyTokens": {},
@@ -9695,7 +9713,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
     for identity, token_key, model, amount, when, start_when in records:
         by_identity.setdefault(identity, []).append((token_key, model, amount, when, start_when))
 
-    tokens: Dict[str, int] = {}
+    tokens: Dict[str, int] = empty_periods()
     models: Dict[str, Dict[str, int]] = {}
     daily_tokens: Dict[str, int] = {}
     hourly_tokens: Dict[str, int] = {}
@@ -9726,7 +9744,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
 
             events += 1
             tokens[token_key] = tokens.get(token_key, 0) + delta
-            model_tokens = models.setdefault(model, {})
+            model_tokens = models.setdefault(model, empty_periods())
             model_tokens[token_key] = model_tokens.get(token_key, 0) + delta
             add_to_periods(model_tokens, delta, bucket_when)
             add_to_periods(periods, delta, bucket_when)
@@ -9737,8 +9755,7 @@ def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[st
     if total > 0:
         tokens["totalTokens"] = total
         for key, amount in periods.items():
-            if amount > 0:
-                tokens[key] = amount
+            tokens[key] = amount
     return tokens, models, daily_tokens, hourly_tokens, events
 
 
@@ -10060,30 +10077,29 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
     daily_tokens = int_map(state.get("dailyTokens"))
     hourly_tokens = int_map(state.get("hourlyTokens"))
 
-    tokens = dict(token_classes)
+    tokens = {**empty_periods(), **token_classes}
     total = sum(token_classes.values())
     if total > 0:
         tokens["totalTokens"] = total
         periods = periods_from_daily_tokens(daily_tokens)
         periods["all"] = total
         for key, amount in periods.items():
-            if amount > 0:
-                tokens[key] = amount
+            tokens[key] = amount
 
     models: Dict[str, Dict[str, int]] = {}
     raw_models = state.get("models") if isinstance(state.get("models"), dict) else {}
     raw_model_daily = state.get("modelDailyTokens") if isinstance(state.get("modelDailyTokens"), dict) else {}
     for model, raw_model_tokens in raw_models.items():
-        model_tokens = int_map(raw_model_tokens)
-        model_total = sum(model_tokens.values())
+        raw_token_classes = int_map(raw_model_tokens)
+        model_total = sum(raw_token_classes.values())
         if model_total <= 0:
             continue
+        model_tokens = {**empty_periods(), **raw_token_classes}
         model_daily = int_map(raw_model_daily.get(model)) if isinstance(raw_model_daily, dict) else {}
         periods = periods_from_daily_tokens(model_daily)
         periods["all"] = model_total
         for key, amount in periods.items():
-            if amount > 0:
-                model_tokens[key] = amount
+            model_tokens[key] = amount
         models[str(model)] = model_tokens
 
     return {
@@ -10175,18 +10191,18 @@ def filter_google_usage_days(usage: Dict[str, Any], days: set, *, include: bool)
         )
         periods = periods_from_daily_tokens(model_days)
         periods["all"] = model_total
-        model_tokens = {
+        model_tokens = empty_periods()
+        model_tokens.update({
             key: _scaled_token_class(source_model_tokens.get(key, 0), model_total, original_model_total)
             for key in TOKEN_CLASS_KEYS
-        }
+        })
         for key, amount in periods.items():
-            if amount > 0:
-                model_tokens[key] = amount
-        models[str(model)] = {key: amount for key, amount in model_tokens.items() if amount > 0}
+            model_tokens[key] = amount
+        models[str(model)] = model_tokens
         model_daily_tokens[str(model)] = model_days
 
     total = sum(daily_tokens.values())
-    tokens: Dict[str, int] = {}
+    tokens: Dict[str, int] = empty_periods()
     source_tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else {}
     original_total = int(source_tokens.get("totalTokens") or source_tokens.get("all") or 0)
     if total > 0:
@@ -10198,8 +10214,7 @@ def filter_google_usage_days(usage: Dict[str, Any], days: set, *, include: bool)
         periods = periods_from_daily_tokens(daily_tokens)
         periods["all"] = total
         for key, amount in periods.items():
-            if amount > 0:
-                tokens[key] = amount
+            tokens[key] = amount
 
     filtered = {
         "tokens": tokens,
@@ -10225,8 +10240,15 @@ def google_usage_total(usage: Optional[Dict[str, Any]]) -> int:
 def apply_google_usage(snapshot: Dict[str, Any], usage: Optional[Dict[str, Any]], *, status_if_empty: Optional[str] = None) -> Dict[str, Any]:
     out = copy.deepcopy(snapshot)
     usage = usage if isinstance(usage, dict) else {}
-    out["tokens"] = copy.deepcopy(usage.get("tokens") or {})
-    out["models"] = copy.deepcopy(usage.get("models") or {})
+    if out.get("providerLabel") == "Antigravity" and google_usage_total(usage) <= 0:
+        out["tokens"] = {}
+    else:
+        out["tokens"] = gemini_period_map(usage.get("tokens"))
+    out["models"] = {}
+    for model, raw_tokens in (usage.get("models") or {}).items():
+        model_tokens = gemini_period_map(raw_tokens)
+        if model_tokens["all"] > 0:
+            out["models"][str(model)] = model_tokens
     out["dailyTokens"] = copy.deepcopy(usage.get("dailyTokens") or {})
     out["hourlyTokens"] = copy.deepcopy(usage.get("hourlyTokens") or {})
     out["events"] = int(usage.get("events") or 0)

@@ -662,3 +662,48 @@ class ClaudeDailyFloorTests(SandboxedCase):
         self.assertEqual(snapshot["tokens"]["all"], daily_sum)
         self.assertEqual(snapshot["tokens"]["totalTokens"], daily_sum)
 
+
+class GeminiZeroWindowTests(SandboxedCase):
+    def test_no_telemetry_and_old_state_emit_all_period_keys(self) -> None:
+        empty = agentcat.gemini_snapshot()
+        self.assertEqual(
+            {key: empty["tokens"][key] for key in ("today", "week", "month", "all")},
+            agentcat.empty_periods(),
+        )
+
+        old_day = (dt.datetime.now().astimezone().date() - dt.timedelta(days=40)).isoformat()
+        usage = agentcat.gemini_usage_result_from_state(
+            {
+                "tokenClasses": {"inputTokens": 25},
+                "models": {"gemini-fixture": {"inputTokens": 25}},
+                "dailyTokens": {old_day: 25},
+                "modelDailyTokens": {"gemini-fixture": {old_day: 25}},
+            }
+        )
+
+        self.assertEqual(
+            {key: usage["tokens"][key] for key in ("today", "week", "month", "all")},
+            {"today": 0, "week": 0, "month": 0, "all": 25},
+        )
+        self.assertEqual(
+            {key: usage["models"]["gemini-fixture"][key] for key in ("today", "week", "month", "all")},
+            {"today": 0, "week": 0, "month": 0, "all": 25},
+        )
+
+    def test_multi_source_and_filtered_empty_usage_keep_zero_windows(self) -> None:
+        first = agentcat.gemini_usage_result_from_state(
+            {"tokenClasses": {"inputTokens": 3}, "models": {"m": {"inputTokens": 3}}}
+        )
+        second = agentcat.gemini_usage_result_from_state(
+            {"tokenClasses": {"outputTokens": 4}, "models": {"m": {"outputTokens": 4}}}
+        )
+        merged = agentcat.merge_gemini_usage([first, second])
+
+        self.assertEqual(merged["tokens"]["all"], 7)
+        self.assertEqual(merged["models"]["m"]["all"], 7)
+        for target in (merged["tokens"], merged["models"]["m"]):
+            self.assertTrue(all(key in target for key in ("today", "week", "month", "all")))
+
+        filtered = agentcat.filter_google_usage_days(merged, {"2099-01-01"}, include=True)
+        applied = agentcat.apply_google_usage({}, filtered)
+        self.assertEqual(applied["tokens"], agentcat.empty_periods())
