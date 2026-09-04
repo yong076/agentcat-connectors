@@ -11891,6 +11891,25 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             "latestByProvider": latest_by_provider,
         },
     }
+    for data in providers.values():
+        try:
+            burn_rate = provider_burn_rate(data)
+            if burn_rate:
+                data["burnRate"] = burn_rate
+        except Exception as exc:
+            logging.debug("provider_burn_rate failed: %s", exc)
+        try:
+            auto_quota = provider_auto_quota(data)
+            if auto_quota:
+                data["autoQuota"] = auto_quota
+        except Exception as exc:
+            logging.debug("provider_auto_quota failed: %s", exc)
+    try:
+        recommendation = snapshot_recommendation(providers)
+        if recommendation:
+            snapshot["recommendation"] = recommendation
+    except Exception as exc:
+        logging.debug("snapshot_recommendation failed: %s", exc)
     # Independent login/quota pools (capability "providerInstances.v1").
     # Additive and local-only: legacy clients keep reading providers.<id>, while
     # newer clients can render N peer connections without summing percentages.
@@ -11918,14 +11937,15 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         snapshot["pricing"] = pricing_status_snapshot()
     except Exception as exc:
         logging.debug("pricing_status_snapshot failed: %s", exc)
-    # Slice C: embed pre-derived insights so clients (Mac/Windows) decode
-    # rather than re-derive. Failure here must NOT block the snapshot write —
-    # degrade to insights.status = error and let the client render fallback.
-    try:
-        derived = derive_insights(snapshot, period="week")
-        snapshot["insights"] = {"status": "ok", **derived}
-    except Exception as exc:
-        snapshot["insights"] = {"status": "error", "error": str(exc)}
+    insights_by_period: Dict[str, Any] = {}
+    for period in ("today", "week", "month", "all"):
+        try:
+            derived = derive_insights(snapshot, period=period)
+            insights_by_period[period] = {"status": "ok", **derived}
+        except Exception as exc:
+            insights_by_period[period] = {"status": "error", "error": str(exc)}
+    snapshot["insightsByPeriod"] = insights_by_period
+    snapshot["insights"] = insights_by_period["week"]
     write_json_atomic(LATEST_SNAPSHOT, snapshot)
     return snapshot
 
