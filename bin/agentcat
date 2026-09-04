@@ -11653,6 +11653,9 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     # block the snapshot write.
     try:
         snapshot["projectsDaily"] = update_project_daily(providers)
+        today_key = day_key_for_timestamp(dt.datetime.now(dt.timezone.utc))
+        today = dt.date.fromisoformat(today_key) if today_key else dt.datetime.now().astimezone().date()
+        snapshot["projectsDailyCost"] = project_daily_cost_snapshot_slice(load_project_daily(), today)
     except Exception as exc:
         logging.debug("update_project_daily failed: %s", exc)
     # LiteLLM pricing feed metadata (capability "pricing.feed"). Additive and
