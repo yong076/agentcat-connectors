@@ -9053,6 +9053,8 @@ def _claude_snapshot_with_current_windows(result: Dict[str, Any]) -> Dict[str, A
     tokens = result.setdefault("tokens", {})
     for key in ("today", "week", "month"):
         tokens[key] = periods[key]
+    tokens["all"] = max(_insight_int(tokens.get("all")), periods["all"])
+    tokens["totalTokens"] = tokens["all"]
     return result
 
 

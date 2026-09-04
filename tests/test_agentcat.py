@@ -2218,8 +2218,8 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["tokens"]["today"], 15)
         self.assertEqual(snapshot["tokens"]["week"], 15)
         self.assertEqual(snapshot["tokens"]["month"], 15)
-        self.assertEqual(snapshot["tokens"]["all"], 15)
-        self.assertEqual(snapshot["tokens"]["totalTokens"], 15)
+        self.assertEqual(snapshot["tokens"]["all"], 1014)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 1014)
         self.assertEqual(snapshot["dailyTokens"][now.astimezone().date().isoformat()], 15)
         self.assertEqual(sum(snapshot["hourlyTokens"].values()), 15)
         model = snapshot["models"]["claude-sonnet-4-6"]

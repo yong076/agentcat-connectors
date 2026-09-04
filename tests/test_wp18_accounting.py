@@ -566,3 +566,56 @@ class ClaudeWindowTests(SandboxedCase):
         persisted_after = json.loads(agentcat.JOURNAL_CURSOR_FILE.read_text(encoding="utf-8"))
         self.assertEqual(persisted_after["offsets"][str(journal)], offset_before)
 
+
+class ClaudeDailyFloorTests(SandboxedCase):
+    def test_merged_daily_sum_floors_lifetime_headline(self) -> None:
+        claude_dir = self.home / ".claude"
+        claude_dir.mkdir(parents=True)
+        old_day = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=40)).date().isoformat()
+        (claude_dir / "stats-cache.json").write_text(
+            json.dumps(
+                {
+                    "dailyModelTokens": [
+                        {
+                            "date": old_day,
+                            "tokensByModel": {"claude-sonnet-4-6": 999},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        now = dt.datetime.now(dt.timezone.utc)
+        project = agentcat.CLAUDE_PROJECTS_DIR / "fixture"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "session.jsonl").write_text(
+            json.dumps(
+                {
+                    "timestamp": now.isoformat(),
+                    "cwd": str(self.home / "project"),
+                    "requestId": "request-current",
+                    "message": {
+                        "model": "claude-sonnet-4-6",
+                        "usage": {"input_tokens": 10, "output_tokens": 5},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(agentcat, "claude_usage_by_source", return_value={"status": "not_available"}),
+            patch.object(
+                agentcat,
+                "codexbar_cost_cache_snapshot",
+                return_value=agentcat.empty_provider_usage(),
+            ),
+        ):
+            snapshot = agentcat.claude_snapshot()
+
+        daily_sum = sum(snapshot["dailyTokens"].values())
+        self.assertEqual(daily_sum, 1_014)
+        self.assertEqual(snapshot["tokens"]["all"], daily_sum)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], daily_sum)
+
