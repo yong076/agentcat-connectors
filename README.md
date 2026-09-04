@@ -7,9 +7,9 @@ activity from Codex, Claude Code, Gemini CLI, and other supported agent tools.
 
 It installs a small local collector, keeps data under `~/.agentcat`, and patches
 supported CLI settings so future sessions can report activity without sending
-prompts to a remote server. This public connector powers the free product:
-local monitoring, provider breadth, quota state, basic costs, budget caps, and
-weekly report inputs.
+prompts to a remote server. This single public connector powers the product
+with local monitoring, provider breadth, quota state, basic costs, budget caps,
+and weekly report inputs.
 
 ## License
 
