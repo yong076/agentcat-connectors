@@ -7149,6 +7149,7 @@ def load_codex_sessions_cursor() -> Dict[str, Any]:
             clean_projects[str(cwd)] = {
                 "tokens": int(payload.get("tokens") or 0),
                 "last_active": payload.get("last_active"),
+                "models": _coerce_int_map(payload.get("models")),
             }
         cursor["projects"] = clean_projects
     cursor["turns"] = int(raw.get("turns") or 0)
@@ -7315,6 +7316,8 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
                         if cwd:
                             proj = projects.setdefault(cwd, {"tokens": 0, "last_active": None})
                             proj["tokens"] = int(proj.get("tokens") or 0) + total
+                            project_models = proj.setdefault("models", {})
+                            project_models[model] = int(project_models.get(model) or 0) + total
                             if when is not None:
                                 last_dt = parse_timestamp(proj.get("last_active"))
                                 if last_dt is None or when > last_dt:
@@ -7415,13 +7418,17 @@ def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any
         tok = int(payload.get("tokens") or 0)
         if tok <= 0:
             continue
-        items.append({
+        item = {
             "id": cwd,
             "path": cwd,
             "name": display_project_name(cwd),
             "tokens": tok,
             "lastActive": payload.get("last_active"),
-        })
+        }
+        project_models = _coerce_int_map(payload.get("models"))
+        if project_models:
+            item["models"] = project_models
+        items.append(item)
     items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
     if items:
         result["projects"] = {"status": "ok", "items": items[:20]}
@@ -7512,6 +7519,7 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
 
     models: Dict[str, Dict[str, int]] = {}
     project_tokens: Dict[str, int] = {}
+    project_models: Dict[str, Dict[str, int]] = {}
     project_last: Dict[str, dt.datetime] = {}
     rollout_model_cache: Dict[str, Optional[str]] = {}
     for tokens_raw, model_raw, updated_raw, rollout_raw, cwd_raw in rows:
@@ -7525,13 +7533,6 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
         add_to_periods(result["tokens"], tokens, when)
         add_to_daily(result["dailyTokens"], tokens, when)
         add_to_hourly(result["hourlyTokens"], tokens, when)
-        project_path = str(cwd_raw or "").strip()
-        if project_path:
-            project_tokens[project_path] = project_tokens.get(project_path, 0) + tokens
-            if when is not None:
-                current = project_last.get(project_path)
-                if current is None or when > current:
-                    project_last[project_path] = when
         model = normalized_model_name(model_raw)
         if model is None and rollout_raw:
             rollout_key = str(rollout_raw)
@@ -7542,6 +7543,15 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
             model = "unknown"
         model_periods = models.setdefault(model, empty_periods())
         add_to_periods(model_periods, tokens, when)
+        project_path = str(cwd_raw or "").strip()
+        if project_path:
+            project_tokens[project_path] = project_tokens.get(project_path, 0) + tokens
+            mix = project_models.setdefault(project_path, {})
+            mix[model] = mix.get(model, 0) + tokens
+            if when is not None:
+                current = project_last.get(project_path)
+                if current is None or when > current:
+                    project_last[project_path] = when
 
     result["status"] = "ok"
     result["threads"] = len(rows)
@@ -7550,13 +7560,16 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
         items = []
         for project_path, tokens in project_tokens.items():
             last_active = project_last.get(project_path)
-            items.append({
+            item = {
                 "id": project_path,
                 "path": project_path,
                 "name": display_project_name(project_path),
                 "tokens": tokens,
                 "lastActive": last_active.isoformat().replace("+00:00", "Z") if last_active else None,
-            })
+            }
+            if project_models.get(project_path):
+                item["models"] = dict(project_models[project_path])
+            items.append(item)
         items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
         result["projects"] = {"status": "ok", "items": items[:20]}
     # Codex SQLite gives us per-thread token totals but not per-tool
@@ -8524,12 +8537,18 @@ def _apply_record_to_totals(
     project_total = 0
     model = normalized_model_name(rec.get("model")) or "unknown"
     model_tokens = models.setdefault(model, {}) if models is not None else None
+    project_class_keys = {
+        "input": "input", "output": "output", "cache_read": "cacheRead",
+        "cache_write_1h": "cacheWrite", "cache_write_5m": "cacheWrite",
+    }
+    project_classes = {cls: 0 for cls in PROJECT_COST_CLASS_KEYS}
     for rec_key, tok_key, model_key in fields:
         raw_amount = rec.get(rec_key) or 0
         if raw_amount <= 0:
             continue
         amount = int(raw_amount) * sign
         project_total += amount
+        project_classes[project_class_keys[rec_key]] += amount
         totals[f"all_{tok_key}"] = totals.get(f"all_{tok_key}", 0) + amount
         if model_tokens is not None:
             model_tokens[model_key] = model_tokens.get(model_key, 0) + amount
@@ -8554,6 +8573,11 @@ def _apply_record_to_totals(
     if projects is not None and cwd:
         project = projects.setdefault(cwd, {"tokens": 0, "last_active": None})
         project["tokens"] = int(project.get("tokens") or 0) + project_total
+        project_models = project.setdefault("models", {})
+        model_classes = project_models.setdefault(model, {cls: 0 for cls in PROJECT_COST_CLASS_KEYS})
+        for cls, amount in project_classes.items():
+            if amount:
+                model_classes[cls] = int(model_classes.get(cls) or 0) + amount
         if ts is not None:
             last_active = project.get("last_active")
             last_dt = parse_timestamp(last_active)
@@ -8755,6 +8779,27 @@ def _merge_journal_models(target: Dict[str, Dict[str, int]], source: Dict[str, D
                 model_tokens[key] = max(model_tokens.get(key, 0), amount)
 
 
+def _journal_project_item_models(raw: Any) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for model, classes in raw.items():
+        if not isinstance(classes, dict):
+            continue
+        inp = int(classes.get("input") or 0)
+        outp = int(classes.get("output") or 0)
+        cache_read = int(classes.get("cacheRead") or 0)
+        cache_write = int(classes.get("cacheWrite") or 0)
+        total = inp + outp + cache_read + cache_write
+        if total > 0:
+            out[str(model)] = {
+                "inputTokens": inp, "outputTokens": outp,
+                "cacheReadInputTokens": cache_read,
+                "cacheCreationInputTokens": cache_write, "totalTokens": total,
+            }
+    return out
+
+
 def _journal_projects_snapshot(projects: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     items = []
     for path, payload in projects.items():
@@ -8763,13 +8808,17 @@ def _journal_projects_snapshot(projects: Dict[str, Dict[str, Any]]) -> Dict[str,
         tokens = int(payload.get("tokens") or 0)
         if tokens <= 0:
             continue
-        items.append({
+        item = {
             "id": path,
             "path": path,
             "name": display_project_name(path),
             "tokens": tokens,
             "lastActive": payload.get("last_active"),
-        })
+        }
+        models = _journal_project_item_models(payload.get("models"))
+        if models:
+            item["models"] = models
+        items.append(item)
     items.sort(key=lambda entry: int(entry.get("tokens") or 0), reverse=True)
     return {"status": "ok", "items": items[:20]}
 
