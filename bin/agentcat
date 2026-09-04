@@ -12,6 +12,7 @@ import email.utils
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -3980,6 +3981,15 @@ def codex_usage_breakdown_request(access_token: str, account_id: str, url: str) 
     return payload if isinstance(payload, dict) else {}
 
 
+def finite_float_value(raw: Any) -> Optional[float]:
+    """Coerce one numeric value without permitting JSON-invalid NaN/Infinity."""
+    try:
+        value = float_value(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if value is not None and math.isfinite(value) else None
+
+
 def codex_usage_breakdown_from_response(payload: Any, source: str = "codex-daily-usage-api") -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "status": "not_available", "units": "credits", "bySurface": {},
@@ -4003,7 +4013,7 @@ def codex_usage_breakdown_from_response(payload: Any, source: str = "codex-daily
         raw_surfaces = entry.get("product_surface_usage_values")
         if isinstance(raw_surfaces, dict):
             for surface, raw_value in raw_surfaces.items():
-                value = float_value(raw_value)
+                value = finite_float_value(raw_value)
                 if value is None:
                     continue
                 key = str(surface)
@@ -4015,7 +4025,7 @@ def codex_usage_breakdown_from_response(payload: Any, source: str = "codex-daily
             for model_entry in raw_models:
                 if not isinstance(model_entry, dict):
                     continue
-                credits = float_value(model_entry.get("credits"))
+                credits = finite_float_value(model_entry.get("credits"))
                 if credits is None:
                     continue
                 model = str(model_entry.get("model") if model_entry.get("model") is not None else "unknown")
@@ -4032,27 +4042,87 @@ def codex_usage_breakdown_from_response(payload: Any, source: str = "codex-daily
     return result
 
 
-def codex_usage_breakdown() -> Dict[str, Any]:
-    not_available = {
+def empty_codex_usage_breakdown() -> Dict[str, Any]:
+    return {
         "status": "not_available", "units": "credits", "bySurface": {},
         "byModel": [], "daily": [], "source": "codex-daily-usage-api",
     }
+
+
+def validated_codex_usage_breakdown(raw: Any) -> Optional[Dict[str, Any]]:
+    """Return a detached, finite cached breakdown or reject the whole blob."""
+    if not isinstance(raw, dict):
+        return None
+    if not isinstance(raw.get("status"), str):
+        return None
+    if not isinstance(raw.get("units"), str) or not isinstance(raw.get("source"), str):
+        return None
+    by_surface = raw.get("bySurface")
+    by_model = raw.get("byModel")
+    daily = raw.get("daily")
+    if not isinstance(by_surface, dict) or not isinstance(by_model, list) or not isinstance(daily, list):
+        return None
+    for key, value in by_surface.items():
+        if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, (int, float)) or finite_float_value(value) is None:
+            return None
+    for entry in by_model:
+        if not isinstance(entry, dict) or not isinstance(entry.get("model"), str):
+            return None
+        speed = entry.get("speed")
+        credits = entry.get("credits")
+        if speed is not None and not isinstance(speed, str):
+            return None
+        if isinstance(credits, bool) or not isinstance(credits, (int, float)) or finite_float_value(credits) is None:
+            return None
+    for entry in daily:
+        if not isinstance(entry, dict) or not isinstance(entry.get("surfaces"), dict):
+            return None
+        date = entry.get("date")
+        if date is not None and not isinstance(date, str):
+            return None
+        for key, value in entry["surfaces"].items():
+            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, (int, float)) or finite_float_value(value) is None:
+                return None
+    try:
+        # Enforce the same strict JSON numeric contract Swift's decoder expects.
+        json.dumps(raw, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return copy.deepcopy(raw)
+
+
+def _codex_usage_breakdown_impl() -> Dict[str, Any]:
+    not_available = empty_codex_usage_breakdown()
     cached = read_json(CODEX_USAGE_BREAKDOWN_CACHE)
-    if isinstance(cached, dict) and isinstance(cached.get("data"), dict):
-        age = int(time.time()) - int(cached.get("fetched_at") or 0)
+    cached_data = validated_codex_usage_breakdown(cached.get("data")) if isinstance(cached, dict) else None
+    fetched_at: Optional[int] = None
+    if isinstance(cached, dict):
+        raw_fetched_at = cached.get("fetched_at")
+        if not isinstance(raw_fetched_at, bool):
+            try:
+                candidate = int(raw_fetched_at)
+            except (TypeError, ValueError, OverflowError):
+                candidate = -1
+            if candidate >= 0:
+                fetched_at = candidate
+    if cached_data is not None and fetched_at is not None:
+        age = int(time.time()) - fetched_at
         if 0 <= age < CODEX_USAGE_BREAKDOWN_TTL_SECONDS:
-            return cached["data"]
+            return cached_data
 
     def cache_and_return(data: Dict[str, Any]) -> Dict[str, Any]:
+        validated = validated_codex_usage_breakdown(data)
+        if validated is None:
+            return not_available
         try:
-            write_json_atomic(CODEX_USAGE_BREAKDOWN_CACHE, {"fetched_at": int(time.time()), "data": data})
+            write_json_atomic(CODEX_USAGE_BREAKDOWN_CACHE, {"fetched_at": int(time.time()), "data": validated})
         except Exception:
             pass
-        return data
+        return validated
 
     def stale_or_unavailable() -> Dict[str, Any]:
-        if isinstance(cached, dict) and isinstance(cached.get("data"), dict):
-            stale = dict(cached["data"])
+        if cached_data is not None:
+            stale = dict(cached_data)
             stale["stale"] = True
             return stale
         return not_available
@@ -4063,7 +4133,10 @@ def codex_usage_breakdown() -> Dict[str, Any]:
         return stale_or_unavailable()
     if not auth:
         return stale_or_unavailable()
-    tokens = oauth_tokens(auth)
+    try:
+        tokens = oauth_tokens(auth)
+    except Exception:
+        return stale_or_unavailable()
     access_token = tokens.get("access_token")
     account_id = tokens.get("account_id") or auth.get("account_id") or ""
     if not isinstance(access_token, str) or not access_token:
@@ -4085,6 +4158,28 @@ def codex_usage_breakdown() -> Dict[str, Any]:
         except Exception:
             return stale_or_unavailable()
     return stale_or_unavailable()
+
+
+def codex_usage_breakdown() -> Dict[str, Any]:
+    """Return account usage without ever risking the parent Codex snapshot."""
+    try:
+        return _codex_usage_breakdown_impl()
+    except Exception as exc:
+        logging.debug("codex usage breakdown failed: %s", exc)
+        return empty_codex_usage_breakdown()
+
+
+def attach_codex_usage_breakdown(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the optional section fail-soft while preserving existing fields."""
+    if "codexUsageBreakdown" in snapshot:
+        return snapshot
+    try:
+        breakdown = codex_usage_breakdown()
+    except Exception as exc:
+        logging.debug("codex usage breakdown attachment failed: %s", exc)
+        breakdown = empty_codex_usage_breakdown()
+    snapshot["codexUsageBreakdown"] = breakdown
+    return snapshot
 
 
 def claude_config_dir() -> Path:
@@ -7697,8 +7792,7 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
     if rows:
         result["breakdown"]["chat"] = len(rows)
         result["breakdown"]["status"] = "ok"
-    result["codexUsageBreakdown"] = codex_usage_breakdown()
-    return result
+    return attach_codex_usage_breakdown(result)
 
 
 def _codex_tokens_all(snapshot: Dict[str, Any]) -> int:
@@ -8188,7 +8282,7 @@ def merge_codex_sessions_with_sqlite(sessions: Dict[str, Any], sqlite: Dict[str,
             changed = True
 
     if "codexUsageBreakdown" in sqlite and "codexUsageBreakdown" not in merged:
-        merged["codexUsageBreakdown"] = sqlite.get("codexUsageBreakdown")
+        merged["codexUsageBreakdown"] = copy.deepcopy(sqlite.get("codexUsageBreakdown"))
 
     if changed:
         merged["source"] = f"{sessions.get('source')} + {sqlite.get('source')}"
@@ -8236,11 +8330,10 @@ def codex_snapshot() -> Dict[str, Any]:
 
     codexbar_cache = codexbar_cost_cache_snapshot("codex")
     if sessions.get("status") == "ok":
-        sessions["codexUsageBreakdown"] = (
-            sqlite["codexUsageBreakdown"]
-            if "codexUsageBreakdown" in sqlite
-            else codex_usage_breakdown()
-        )
+        if "codexUsageBreakdown" in sqlite:
+            sessions["codexUsageBreakdown"] = copy.deepcopy(sqlite["codexUsageBreakdown"])
+        else:
+            attach_codex_usage_breakdown(sessions)
         if sqlite.get("status") == "ok":
             local = merge_codex_sessions_with_sqlite(sessions, sqlite)
             merged = merge_provider_with_usage_floor(
@@ -8248,20 +8341,26 @@ def codex_snapshot() -> Dict[str, Any]:
                 codexbar_cache,
                 strategy="codexbar_cost_cache_floor",
             )
-            return attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+            return attach_codex_usage_breakdown(
+                attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+            )
         merged = merge_provider_with_usage_floor(
             sessions,
             codexbar_cache,
             strategy="codexbar_cost_cache_floor",
         )
-        return attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+        return attach_codex_usage_breakdown(
+            attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+        )
 
     merged = merge_provider_with_usage_floor(
         sqlite,
         codexbar_cache,
         strategy="codexbar_cost_cache_floor",
     )
-    return attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+    return attach_codex_usage_breakdown(
+        attach_codex_usage_coverage(merged, sessions, sqlite, codexbar_cache)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -10292,14 +10391,20 @@ def antigravity_provider_snapshot(
     )
     has_usage = google_usage_total(usage) > 0
     if usage and has_usage:
-        # Antigravity only reports real tokens when it has its own dedicated
-        # telemetry outfile; Gemini-CLI tokens are never borrowed.
-        source_status["status"] = "ok"
+        source_status["status"] = (
+            "inferred_from_history"
+            if source_note == "history-day-inference"
+            else "ok"
+        )
         source_status["tokens"] = google_usage_total(usage)
         source_status["events"] = int(usage.get("events") or source_status.get("events") or 0)
     source_status.setdefault(
         "collectionMethod",
-        "dedicated_otel_token_metrics" if has_usage else "server_side_only_no_local_token_stream",
+        "history_day_inference"
+        if source_note == "history-day-inference"
+        else "dedicated_otel_token_metrics"
+        if has_usage
+        else "server_side_only_no_local_token_stream",
     )
     out = {
         "status": "ok" if google_usage_total(usage) > 0 else status_if_empty,
@@ -10366,15 +10471,46 @@ def split_google_cli_snapshots(
         )
         return gemini_provider, antigravity_provider
 
-    # Antigravity bills server-side and never writes a local telemetry outfile, so
-    # there is no honest way to attribute Gemini-CLI tokens to it. Emit Antigravity
-    # as its own provider with empty tokens rather than borrowing Gemini's usage.
+    # Tier 2: older Antigravity installs could share Google's common telemetry
+    # stream. Only an explicitly unconfigured Gemini telemetry source is
+    # eligible; a missing flag is unknown and stays Gemini-owned. Within that
+    # legacy stream, attribute complete days corroborated by Antigravity's own
+    # history (or an unambiguous currently-active process), remove those days
+    # from Gemini, and label the result as inference. Dedicated OTEL and local
+    # trajectory SQLite above always win and are never filtered.
     counts = activity.get("countsByProvider") if isinstance(activity, dict) else {}
     inference_days = antigravity_inference_days(activity)
     if inference_days:
         antigravity_source_status["historyDays"] = len(inference_days)
     antigravity_installed = bool(antigravity_source_status.get("installed"))
     antigravity_active = isinstance(counts, dict) and int(counts.get("antigravity") or 0) > 0
+    if (
+        inference_days
+        and google_usage_total(common_usage) > 0
+        and (antigravity_installed or antigravity_active)
+        and gemini_source_status.get("telemetryConfigured") is False
+    ):
+        inferred_usage = filter_google_usage_days(common_usage, inference_days, include=True)
+        if google_usage_total(inferred_usage) > 0:
+            gemini_usage = filter_google_usage_days(common_usage, inference_days, include=False)
+            gemini_provider = apply_google_usage(
+                gemini_snapshot_data,
+                gemini_usage,
+                status_if_empty="no_token_events_yet",
+            )
+            inferred_source_status = dict(antigravity_source_status)
+            inferred_source_status["source"] = gemini_source_path or str(GEMINI_TELEMETRY)
+            inferred_source_status["collectionMethod"] = "history_day_inference"
+            antigravity_provider = antigravity_provider_snapshot(
+                gemini_snapshot_data,
+                inferred_usage,
+                status_if_empty="no_token_events_yet",
+                source_note="history-day-inference",
+                source_status_override=inferred_source_status,
+            )
+            return gemini_provider, antigravity_provider
+
+    # Without corroborated days there is no honest fallback attribution.
     status_if_empty = "no_telemetry_yet" if (antigravity_installed or antigravity_active) else "not_found"
     antigravity_provider = antigravity_provider_snapshot(
         gemini_snapshot_data,
@@ -11208,8 +11344,8 @@ def load_project_daily_state() -> Dict[str, Any]:
     {"baselines": {"provider|projectId": cumulativeTokens},
      "modelBaselines": {"provider|projectId": {model: {"tokens": int,
      "classes": {input, output, cacheRead, cacheWrite} | None}}}}.
-    v1 state files (baselines only) load with empty model baselines, so the
-    first v2 pass seeds models without booking history onto today.
+    Legacy state files (baselines only) load with empty model baselines, so the
+    first rich-ledger pass seeds models without booking history onto today.
     """
     raw = read_json(project_daily_state_file())
     baselines: Dict[str, int] = {}
@@ -11411,8 +11547,14 @@ def _project_model_deltas(
                 cls: int(cur_classes.get(cls) or 0) - int(prev_classes.get(cls) or 0)
                 for cls in PROJECT_COST_CLASS_KEYS
             }
-            if all(value >= 0 for value in candidate.values()):
-                class_deltas = candidate
+            if any(value < 0 for value in candidate.values()):
+                # A class counter reset makes the aggregate model delta
+                # unattributable. Rebase the whole model and resume booking
+                # only from this coherent baseline on the next snapshot.
+                baseline_models[model] = _model_baseline_value(current)
+                changed = True
+                continue
+            class_deltas = candidate
         new_baseline = _model_baseline_value(current)
         if new_baseline != prev:
             baseline_models[model] = new_baseline
@@ -11444,13 +11586,14 @@ def update_project_daily(
     must not land on today), and a shrinking counter rebases the baseline
     without ever booking a negative delta.
 
-    v2 adds per-provider splits per day/label plus estimated cost: the same
+    The rich ledger adds per-provider splits per day/label plus estimated cost: the same
     delta rules run per model where the provider rollup attributes models
     (Claude journal carries the full class split, Codex sessions model totals
     only), class deltas are priced through estimate_cost (LiteLLM feed over
     the bundled table), and estCostUSD stays null when nothing is
     attributable — a partial value covers only the priced share, never a
-    blended guess. Returns {"v1": 14-day flat slice, "v2": 30-day rich slice}.
+    blended guess. The return value deliberately remains the public 14-day
+    flat slice; the 30-day rich slice is loaded separately for the snapshot.
     """
     if now is None:
         now = dt.datetime.now(dt.timezone.utc)
@@ -11864,6 +12007,39 @@ def host_header_allowed(host: Optional[str]) -> bool:
     return _host_from_header(host) in ALLOWED_HOST_HEADERS
 
 
+def local_http_origin_allowed(origin: Optional[str]) -> bool:
+    """Allow absent native-client origins or explicit HTTP(S) loopback origins."""
+    if origin is None or not origin.strip():
+        return True
+    try:
+        parsed = urllib.parse.urlparse(origin.strip())
+        parsed.port  # force validation of a present port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and (parsed.hostname or "").lower() in ALLOWED_HOST_HEADERS
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path in {"", "/"}
+    )
+
+
+def key_mutation_request_error(headers: Any) -> Optional[Tuple[int, str]]:
+    """Reject simple/cross-site browser writes while preserving native loopback JSON."""
+    content_type = str(headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        return 415, "json_content_type_required"
+    fetch_site = str(headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if fetch_site and fetch_site not in {"same-origin", "same-site", "none"}:
+        return 403, "cross_site_request"
+    if not local_http_origin_allowed(headers.get("Origin")):
+        return 403, "foreign_origin"
+    return None
+
+
 class AgentCatHandler(BaseHTTPRequestHandler):
     server_version = "AgentCat/1"
 
@@ -12002,6 +12178,11 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/keys":
+            guard_error = key_mutation_request_error(self.headers)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "key_write_forbidden", "message": reason})
+                return
             try:
                 payload = self.read_json_body(max_bytes=16 * 1024)
                 provider = str(payload.get("provider") or "openai").strip().lower()
