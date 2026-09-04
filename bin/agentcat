@@ -3970,6 +3970,123 @@ def provider_instances_snapshot(
     return codex_provider_instances(resolved_limits.get("codex"))
 
 
+def codex_usage_breakdown_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json", "User-Agent": "AgentCat/1.0"}
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def codex_usage_breakdown_from_response(payload: Any, source: str = "codex-daily-usage-api") -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "status": "not_available", "units": "credits", "bySurface": {},
+        "byModel": [], "daily": [], "source": source,
+    }
+    if not isinstance(payload, dict):
+        return result
+    units = payload.get("units")
+    if isinstance(units, str) and units.strip():
+        result["units"] = units.strip()
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return result
+    by_surface: Dict[str, float] = {}
+    by_model: Dict[Tuple[str, Optional[str]], float] = {}
+    daily: List[Dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        surfaces: Dict[str, float] = {}
+        raw_surfaces = entry.get("product_surface_usage_values")
+        if isinstance(raw_surfaces, dict):
+            for surface, raw_value in raw_surfaces.items():
+                value = float_value(raw_value)
+                if value is None:
+                    continue
+                key = str(surface)
+                surfaces[key] = surfaces.get(key, 0.0) + value
+                by_surface[key] = by_surface.get(key, 0.0) + value
+        daily.append({"date": str(entry["date"]) if entry.get("date") is not None else None, "surfaces": surfaces})
+        raw_models = entry.get("models")
+        if isinstance(raw_models, list):
+            for model_entry in raw_models:
+                if not isinstance(model_entry, dict):
+                    continue
+                credits = float_value(model_entry.get("credits"))
+                if credits is None:
+                    continue
+                model = str(model_entry.get("model") if model_entry.get("model") is not None else "unknown")
+                speed_raw = model_entry.get("speed")
+                speed = str(speed_raw) if isinstance(speed_raw, str) and speed_raw.strip() else None
+                by_model[(model, speed)] = by_model.get((model, speed), 0.0) + credits
+    result["status"] = "ok"
+    result["bySurface"] = {key: round(value, 6) for key, value in by_surface.items()}
+    result["daily"] = daily
+    result["byModel"] = sorted(
+        ({"model": model, "speed": speed, "credits": round(credits, 6)} for (model, speed), credits in by_model.items()),
+        key=lambda item: item["credits"], reverse=True,
+    )
+    return result
+
+
+def codex_usage_breakdown() -> Dict[str, Any]:
+    not_available = {
+        "status": "not_available", "units": "credits", "bySurface": {},
+        "byModel": [], "daily": [], "source": "codex-daily-usage-api",
+    }
+    cached = read_json(CODEX_USAGE_BREAKDOWN_CACHE)
+    if isinstance(cached, dict) and isinstance(cached.get("data"), dict):
+        age = int(time.time()) - int(cached.get("fetched_at") or 0)
+        if 0 <= age < CODEX_USAGE_BREAKDOWN_TTL_SECONDS:
+            return cached["data"]
+
+    def cache_and_return(data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            write_json_atomic(CODEX_USAGE_BREAKDOWN_CACHE, {"fetched_at": int(time.time()), "data": data})
+        except Exception:
+            pass
+        return data
+
+    def stale_or_unavailable() -> Dict[str, Any]:
+        if isinstance(cached, dict) and isinstance(cached.get("data"), dict):
+            stale = dict(cached["data"])
+            stale["stale"] = True
+            return stale
+        return not_available
+
+    try:
+        auth = read_codex_auth()
+    except Exception:
+        return stale_or_unavailable()
+    if not auth:
+        return stale_or_unavailable()
+    tokens = oauth_tokens(auth)
+    access_token = tokens.get("access_token")
+    account_id = tokens.get("account_id") or auth.get("account_id") or ""
+    if not isinstance(access_token, str) or not access_token:
+        return stale_or_unavailable()
+    for attempt in range(2):
+        try:
+            payload = codex_usage_breakdown_request(access_token, str(account_id), CODEX_USAGE_BREAKDOWN_URL)
+            return cache_and_return(codex_usage_breakdown_from_response(payload))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and attempt == 0:
+                try:
+                    refreshed = refresh_codex_access_token(auth)
+                except Exception:
+                    refreshed = None
+                if refreshed:
+                    access_token = refreshed
+                    continue
+            return stale_or_unavailable()
+        except Exception:
+            return stale_or_unavailable()
+    return stale_or_unavailable()
+
+
 def claude_config_dir() -> Path:
     """Resolve Claude Code's config directory at call time.
 
@@ -7580,6 +7697,7 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
     if rows:
         result["breakdown"]["chat"] = len(rows)
         result["breakdown"]["status"] = "ok"
+    result["codexUsageBreakdown"] = codex_usage_breakdown()
     return result
 
 
@@ -8069,6 +8187,9 @@ def merge_codex_sessions_with_sqlite(sessions: Dict[str, Any], sqlite: Dict[str,
             merged_breakdown["status"] = "ok"
             changed = True
 
+    if "codexUsageBreakdown" in sqlite and "codexUsageBreakdown" not in merged:
+        merged["codexUsageBreakdown"] = sqlite.get("codexUsageBreakdown")
+
     if changed:
         merged["source"] = f"{sessions.get('source')} + {sqlite.get('source')}"
         merged["sources"] = {
@@ -8115,6 +8236,11 @@ def codex_snapshot() -> Dict[str, Any]:
 
     codexbar_cache = codexbar_cost_cache_snapshot("codex")
     if sessions.get("status") == "ok":
+        sessions["codexUsageBreakdown"] = (
+            sqlite["codexUsageBreakdown"]
+            if "codexUsageBreakdown" in sqlite
+            else codex_usage_breakdown()
+        )
         if sqlite.get("status") == "ok":
             local = merge_codex_sessions_with_sqlite(sessions, sqlite)
             merged = merge_provider_with_usage_floor(
@@ -8200,18 +8326,17 @@ def fetch_llm_usage_fresh() -> Dict[str, Any]:
     instead of waiting out the error backoff. Never refreshes or writes a provider's token,
     so an expired token yields a reason (token_expired / …), not a silent blank.
     """
-    return {
-        "generatedAt": now_iso(),
-        "source": "on-demand-oauth",
-        "providers": {
+    providers = {
             "claude": live_usage_provider_from_limits(claude_live_limits(force=True)),
             "codex": live_usage_provider_from_limits(codex_live_limits(force=True)),
             "gemini": live_usage_provider_from_limits(gemini_live_limits(force=True)),
             "antigravity": live_usage_provider_from_limits(antigravity_live_limits(force=True)),
             "grok": live_usage_provider_from_limits(grok_live_limits(force=True)),
             "kimi": live_usage_provider_from_limits(kimi_live_limits(force=True)),
-        },
     }
+    if read_provider_key("openai"):
+        providers["openai"] = openai_usage_live()
+    return {"generatedAt": now_iso(), "source": "on-demand-oauth", "providers": providers}
 
 
 # ---------------------------------------------------------------------------
@@ -11969,6 +12094,9 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(500, {"error": "usage_failed", "message": str(exc)})
             return
+        if path == "/v1/keys":
+            self.send_json(200, {"openai": {"configured": bool(read_provider_key("openai"))}})
+            return
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
@@ -12028,6 +12156,26 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                     "installScheduled": scheduled,
                 },
             )
+            return
+
+        if path == "/v1/keys":
+            try:
+                payload = self.read_json_body(max_bytes=16 * 1024)
+                provider = str(payload.get("provider") or "openai").strip().lower()
+                if provider != "openai":
+                    raise ValueError("unsupported provider")
+                clear = bool(payload.get("clear"))
+                key = payload.get("key")
+                if not clear and (not isinstance(key, str) or not key.strip()):
+                    raise ValueError("provide key or clear")
+                write_provider_key(provider, None if clear else key.strip())
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_key", "message": str(exc)})
+                return
+            except Exception:
+                self.send_json(500, {"error": "key_write_failed"})
+                return
+            self.send_json(200, {"ok": True, provider: {"configured": not clear}})
             return
 
         if path != "/v1/events":
@@ -12814,6 +12962,111 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if report["status"] == "ok" else 1
 
 
+def _month_start_unix() -> int:
+    now = dt.datetime.now().astimezone()
+    return int(now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def read_provider_key(provider: str) -> Optional[str]:
+    env = os.environ.get(f"AGENTCAT_{provider.upper()}_KEY")
+    if env:
+        return env
+    raw = read_json(AGENTCAT_KEYS_FILE)
+    if isinstance(raw, dict) and not raw.get("_agentcat_error"):
+        value = raw.get(provider)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def write_provider_key(provider: str, key: Optional[str]) -> None:
+    ensure_dirs()
+    raw = read_json(AGENTCAT_KEYS_FILE)
+    keys = dict(raw) if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+    if key:
+        keys[provider] = key
+    else:
+        keys.pop(provider, None)
+    write_json_atomic(AGENTCAT_KEYS_FILE, keys)
+    _chmod_quiet(AGENTCAT_KEYS_FILE, 0o600)
+
+
+def command_set_key(args: argparse.Namespace) -> int:
+    provider = str(args.provider).strip().lower()
+    if getattr(args, "clear", False):
+        write_provider_key(provider, None)
+        print(f"cleared {provider} key")
+        return 0
+    key = (args.key or "").strip()
+    if not key:
+        print("provide --key <value> or --clear", file=sys.stderr)
+        return 1
+    write_provider_key(provider, key)
+    print(f"stored {provider} key locally (0600; only ever sent to {provider}'s own API)")
+    return 0
+
+
+def _openai_get(url: str, key: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        f"{url}?{urllib.parse.urlencode(params)}",
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _openai_paginate(url: str, key: str, params: Dict[str, Any], max_pages: int = 6) -> Iterable[Dict[str, Any]]:
+    page_params = dict(params)
+    for _ in range(max_pages):
+        payload = _openai_get(url, key, page_params)
+        for bucket in payload.get("data") or []:
+            if isinstance(bucket, dict):
+                for result in bucket.get("results") or []:
+                    if isinstance(result, dict):
+                        yield result
+        if not payload.get("has_more") or not payload.get("next_page"):
+            return
+        page_params["page"] = payload["next_page"]
+
+
+def openai_usage_live() -> Dict[str, Any]:
+    key = read_provider_key("openai")
+    base: Dict[str, Any] = {
+        "status": "not_configured", "source": "openai-usage-api", "model": None,
+        "tokens": {"total": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+        "cost_usd": None, "quota": None, "updated_at": now_iso(),
+    }
+    if not key:
+        base["reason"] = "no_api_key"
+        return base
+    start = _month_start_unix()
+    try:
+        tokens_in = tokens_out = tokens_cached = 0
+        for result in _openai_paginate(OPENAI_USAGE_URL, key, {"start_time": start, "bucket_width": "1d", "limit": 31}):
+            tokens_in += int(result.get("input_tokens") or 0)
+            tokens_out += int(result.get("output_tokens") or 0)
+            tokens_cached += int(result.get("input_cached_tokens") or 0)
+        cost = 0.0
+        for result in _openai_paginate(OPENAI_COSTS_URL, key, {"start_time": start, "bucket_width": "1d", "limit": 31}):
+            amount = result.get("amount") if isinstance(result.get("amount"), dict) else {}
+            cost += float(amount.get("value") or 0.0)
+    except urllib.error.HTTPError as exc:
+        base["status"] = "error"
+        base["reason"] = "http_401" if exc.code in (401, 403) else "http_error"
+        return base
+    except Exception:
+        base["status"] = "error"
+        base["reason"] = "http_error"
+        return base
+    return {
+        "status": "ok", "source": "openai-usage-api", "model": None,
+        "tokens": {"total": tokens_in + tokens_out, "input": tokens_in, "output": tokens_out,
+                   "cache_read": tokens_cached, "cache_write": 0},
+        "cost_usd": round(cost, 4), "quota": None, "updated_at": now_iso(),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentcat")
     subparsers = parser.add_subparsers(dest="command")
@@ -12830,6 +13083,13 @@ def build_parser() -> argparse.ArgumentParser:
     usage = subparsers.add_parser("usage")
     usage.add_argument("--json", action="store_true")
     usage.set_defaults(func=command_usage)
+
+    set_key = subparsers.add_parser("set-key")
+    set_key.add_argument("--provider", choices=("openai",), default="openai")
+    set_key_group = set_key.add_mutually_exclusive_group(required=True)
+    set_key_group.add_argument("--key")
+    set_key_group.add_argument("--clear", action="store_true")
+    set_key.set_defaults(func=command_set_key)
 
     event = subparsers.add_parser("event")
     event.add_argument("--provider", required=True)
