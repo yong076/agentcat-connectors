@@ -112,6 +112,14 @@ agentcat setup-prompt
 | Gemini CLI | 로컬 telemetry + Gemini Code Assist quota API | Google 로그인 Gemini CLI 세션에서 모델별 Code Assist request quota 남은 비율을 표시합니다. |
 | Antigravity | 전용 telemetry 또는 read-only 로컬 대화 SQLite | Gemini CLI 사용량을 빌리지 않고 별도 표시합니다. Windows에서는 generation별 실제 token metadata를 방어적으로 읽고, 로컬 스키마가 달라지면 quota/activity만 표시합니다. |
 
+## 포함된 인사이트 엔진
+
+하나의 공개 커넥터에서 오늘/주간/월간/전체 기간 인사이트, burn rate, 자동 quota
+추정과 provider 추천, 프로젝트별 일일 비용을 제공합니다. OpenAI API 키 사용량과
+키를 로컬에 안전하게 저장·삭제하는 `set-key` 명령, Codex 사용 출처별 분석,
+Antigravity 사용 기록도 포함합니다. 모델별 기준값은 counter가 초기화될 때 이를 새
+사용량으로 잘못 기록하지 않도록 안전하게 다시 설정합니다.
+
 ## Provider 홈이 여러 개인 경우
 
 한 머신에서 provider 사용량이 여러 홈에 나뉘어 저장될 수 있습니다. `$CODEX_HOME`

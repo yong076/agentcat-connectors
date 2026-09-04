@@ -79,22 +79,6 @@ archive only when URL, version, and SHA-256 are supplied together via
 `AGENTCAT_CONNECTORS_ARCHIVE_URL`, `AGENTCAT_CONNECTORS_VERSION`, and
 `AGENTCAT_CONNECTORS_SHA256`.
 
-Pro connector safe-swap QA (local/private builds only):
-
-```bash
-python3 scripts/pro_channel_install.py \
-  --archive /path/to/agentcat-connectors-pro.tgz \
-  --manifest /path/to/pro-manifest.json \
-  --install-dir "$TMPDIR/agentcat-pro-connectors" \
-  --event-log "$TMPDIR/agentcat-pro-connector-events.jsonl"
-```
-
-The optional event log records `pro_connector_swap_started`,
-`pro_connector_swap_succeeded`, and `pro_connector_swap_rolled_back` without
-contacting the Pro API. App-led installs can additionally pass
-`--event-api-url`, `--event-bearer`, and `--device-id` after entitlement checks.
-Those flags are observability only; install success never depends on them.
-
 Development on Windows from a cloned checkout:
 
 ```powershell
@@ -130,6 +114,14 @@ agentcat setup-prompt
 | Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
 | Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
 | Antigravity | dedicated telemetry or read-only local conversation SQLite | Keeps Antigravity separate from Gemini CLI. On Windows, reads defensive per-generation token metadata and falls back to quota/activity only if the upstream local schema changes. |
+
+## Included Insights Engine
+
+The single public connector includes today/week/month/all-time insights; burn
+rate, automatic quota estimates, and provider recommendations; per-project
+daily cost; OpenAI API-key usage with a secure local `set-key` command; Codex
+usage-source breakdowns; Antigravity history; and reset-safe model baselines
+that avoid recording counter resets as new usage.
 
 ## Multiple Provider Homes
 
