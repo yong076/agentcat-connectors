@@ -850,3 +850,92 @@ class AntigravityMtimeTests(SandboxedCase):
         self.assertEqual(usage["dailyTokens"], {agentcat.day_key_for_timestamp(embedded): 15})
         self.assertEqual(usage["tokens"]["all"], 15)
 
+
+class CopilotEstimateTests(SandboxedCase):
+    def _write_transcript(self, events) -> None:
+        transcript_dir = (
+            agentcat.copilot_workspace_storage_dirs()[0]
+            / "workspace-fixture"
+            / "GitHub.copilot-chat"
+            / "transcripts"
+        )
+        transcript_dir.mkdir(parents=True)
+        (transcript_dir / "fixture.jsonl").write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+    def test_estimated_share_is_token_weighted_across_exact_and_estimated_usage(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        legacy_dir = self.home / ".copilot" / "session-state" / "legacy-fixture"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "events.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "session.model_change", "data": {"newModel": "gpt-4.1"}}),
+                    json.dumps({"type": "assistant.message", "data": {"outputTokens": 20}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self._write_transcript(
+            [
+                {"type": "session.start", "timestamp": now, "data": {"producer": "copilot-agent"}},
+                {"type": "user.message", "timestamp": now, "data": {"content": "abcdefgh"}},
+                {
+                    "type": "assistant.message",
+                    "timestamp": now,
+                    "data": {
+                        "outputTokens": 8,
+                        "content": "this explicit output content must not be estimated",
+                        "reasoningText": "abcd",
+                    },
+                },
+            ]
+        )
+
+        snapshot = agentcat.copilot_snapshot()
+
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 31)
+        self.assertIs(snapshot["tokens"]["estimated"], True)
+        self.assertAlmostEqual(snapshot["tokens"]["estimatedShare"], 3 / 31)
+        serialized = json.dumps(snapshot)
+        self.assertNotIn("this explicit output content", serialized)
+        self.assertNotIn("estimatedTokens", serialized)
+
+    def test_explicit_only_usage_omits_estimate_markers(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_transcript(
+            [
+                {"type": "session.start", "timestamp": now, "data": {"producer": "copilot-agent"}},
+                {
+                    "type": "assistant.message",
+                    "timestamp": now,
+                    "data": {"outputTokens": 10, "content": "not an estimate"},
+                },
+            ]
+        )
+
+        snapshot = agentcat.copilot_snapshot()
+
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 10)
+        self.assertNotIn("estimated", snapshot["tokens"])
+        self.assertNotIn("estimatedShare", snapshot["tokens"])
+
+    def test_estimated_input_counts_when_assistant_output_is_zero(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._write_transcript(
+            [
+                {"type": "session.start", "timestamp": now, "data": {"producer": "copilot-agent"}},
+                {"type": "user.message", "timestamp": now, "data": {"content": "abcdefgh"}},
+                {"type": "assistant.message", "timestamp": now, "data": {"outputTokens": 0}},
+            ]
+        )
+
+        snapshot = agentcat.copilot_snapshot()
+
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 2)
+        self.assertIs(snapshot["tokens"]["estimated"], True)
+        self.assertEqual(snapshot["tokens"]["estimatedShare"], 1.0)

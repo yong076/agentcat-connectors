@@ -6852,14 +6852,14 @@ def char_token_estimate(text: Any) -> int:
     return max(1, int(ascii_count / 4 + wide_count / 1.6))
 
 
-def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
+def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> Tuple[int, int]:
     events = list(iter_jsonl_file(path))
     if not events:
-        return 0
+        return 0, 0
     first = events[0]
     first_data = first.get("data") if isinstance(first.get("data"), dict) else {}
     if first.get("type") != "session.start" or first_data.get("producer") != "copilot-agent":
-        return 0
+        return 0, 0
 
     model = infer_copilot_transcript_model(events)
     try:
@@ -6868,6 +6868,7 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
         file_when = None
     pending_input_tokens = 0
     parsed = 0
+    estimated_tokens = 0
     for event in events:
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         if event.get("type") == "user.message":
@@ -6875,12 +6876,21 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
             continue
         if event.get("type") != "assistant.message":
             continue
-        content_tokens = nonnegative_int(data.get("outputTokens"))
-        if content_tokens is None:
-            content_tokens = char_token_estimate(data.get("content"))
+        explicit_output_tokens = nonnegative_int(data.get("outputTokens"))
+        estimated_content_tokens = (
+            char_token_estimate(data.get("content"))
+            if explicit_output_tokens is None
+            else 0
+        )
+        content_tokens = explicit_output_tokens if explicit_output_tokens is not None else estimated_content_tokens
         reasoning_tokens = char_token_estimate(data.get("reasoningText"))
         tool_requests = data.get("toolRequests")
-        if content_tokens <= 0 and reasoning_tokens <= 0 and not isinstance(tool_requests, list):
+        if (
+            pending_input_tokens <= 0
+            and content_tokens <= 0
+            and reasoning_tokens <= 0
+            and not isinstance(tool_requests, list)
+        ):
             continue
         metrics = {
             "inputTokens": pending_input_tokens,
@@ -6889,6 +6899,7 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
         }
         if add_usage_metrics(result, model, metrics, parse_timestamp(event.get("timestamp")) or file_when):
             parsed += 1
+            estimated_tokens += pending_input_tokens + estimated_content_tokens + reasoning_tokens
         # PR-C: copilot transcript carries the same toolRequests shape
         # opencode does — feed the breakdown counters.
         tool_names: List[str] = []
@@ -6901,7 +6912,7 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> int:
                     tool_names.append(str(name))
         update_breakdown(result["breakdown"], chat=1, tools=tool_names)
         pending_input_tokens = 0
-    return parsed
+    return parsed, estimated_tokens
 
 
 def copilot_workspace_folder(workspace_dir: Path) -> Optional[str]:
@@ -6993,6 +7004,7 @@ def copilot_snapshot() -> Dict[str, Any]:
 
     result["status"] = "ok"
     events = 0
+    estimated_tokens = 0
     project_totals: Dict[str, int] = {}
     for path in legacy_files:
         before = int(result["tokens"].get("totalTokens") or 0)
@@ -7003,12 +7015,20 @@ def copilot_snapshot() -> Dict[str, Any]:
             project_totals[project] = project_totals.get(project, 0) + (after - before)
     for path in transcript_files:
         before = int(result["tokens"].get("totalTokens") or 0)
-        events += parse_copilot_transcript_file(path, result)
+        parsed_events, parsed_estimated_tokens = parse_copilot_transcript_file(path, result)
+        events += parsed_events
+        estimated_tokens += parsed_estimated_tokens
         after = int(result["tokens"].get("totalTokens") or 0)
         project = copilot_project_for_path(path)
         if project and after > before:
             project_totals[project] = project_totals.get(project, 0) + (after - before)
     result["events"] = events
+    total_tokens = int(result["tokens"].get("totalTokens") or 0)
+    if estimated_tokens > 0 and total_tokens > 0:
+        result["tokens"]["estimated"] = True
+        result["tokens"]["estimatedShare"] = max(
+            0.0, min(1.0, estimated_tokens / total_tokens)
+        )
     if project_totals:
         items = [
             {
