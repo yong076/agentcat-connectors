@@ -769,7 +769,7 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
     model_entries: list = []
     provider_tokens: Dict[str, int] = {}
     provider_cost: Dict[str, float] = {}
-    pc_costs: Dict[str, Dict[str, float]] = {}
+    provider_class_costs: Dict[str, Dict[str, float]] = {}
     pricing_known = False
     findings: list = []
 
@@ -786,15 +786,6 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             continue
 
         ptokens = provider.get("tokens") or {}
-        if "inputTokens" in ptokens:
-            total_input += int(ptokens["inputTokens"] or 0); any_input = True
-        if "outputTokens" in ptokens:
-            total_output += int(ptokens["outputTokens"] or 0); any_output = True
-        if "cacheReadInputTokens" in ptokens:
-            total_cache_read += int(ptokens["cacheReadInputTokens"] or 0); any_cache_read = True
-        if "cacheCreationInputTokens" in ptokens:
-            total_cache_write += int(ptokens["cacheCreationInputTokens"] or 0); any_cache_write = True
-
         models = provider.get("models") or {}
         for model_name, model_data in models.items():
             if not isinstance(model_data, dict):
@@ -814,6 +805,15 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             if model_total == 0:
                 continue
 
+            total_input += i
+            total_output += o
+            total_cache_read += cr
+            total_cache_write += cw
+            any_input = any_input or "inputTokens" in bucket
+            any_output = any_output or "outputTokens" in bucket
+            any_cache_read = any_cache_read or "cacheReadInputTokens" in bucket
+            any_cache_write = any_cache_write or "cacheCreationInputTokens" in bucket
+
             cost = estimate_cost(model_name, i, o, cr, cw)
             if cost is None:
                 findings.append({
@@ -827,6 +827,12 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             else:
                 cost_total = cost["total"]
                 provider_cost[kind] = provider_cost.get(kind, 0.0) + cost_total
+                class_cost = provider_class_costs.setdefault(
+                    kind,
+                    {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0},
+                )
+                for key in class_cost:
+                    class_cost[key] += cost.get(key, 0.0)
                 pricing_known = True
 
             provider_tokens[kind] = provider_tokens.get(kind, 0) + model_total
@@ -882,7 +888,7 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             if pc_cost:
                 provider_cost[kind] = pc_cost["total"]
                 pricing_known = True
-                pc_costs[kind] = pc_cost
+                provider_class_costs[kind] = pc_cost
 
     # Normalize share %
     total_tokens = sum(provider_tokens.values())
@@ -903,19 +909,19 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
             "share_percent": (tokens_val / total_tokens * 100.0) if total_tokens > 0 else 0.0,
         })
 
-    total_cost = sum(provider_cost.values())
     top_provider = provider_summaries[0]["kind"] if provider_summaries else None
     top_model = model_entries[0]["name"] if model_entries else None
 
-    # Aggregate per-class costs from JournalScanner data across all providers
+    # Aggregate per-class model costs, including provider period-class overrides.
     sum_input_cost = sum_output_cost = sum_cr_cost = sum_cw_cost = 0.0
     any_pc_cost = False
-    for pc in pc_costs.values():
+    for pc in provider_class_costs.values():
         sum_input_cost += pc.get("input", 0.0)
         sum_output_cost += pc.get("output", 0.0)
         sum_cr_cost += pc.get("cache_read", 0.0)
         sum_cw_cost += pc.get("cache_write", 0.0)
         any_pc_cost = True
+    total_cost = sum_input_cost + sum_output_cost + sum_cr_cost + sum_cw_cost
 
     cache_hit = None
     if any_cache_read or any_input:

@@ -336,6 +336,88 @@ class PeriodWindowTests(SandboxedCase):
             time.tzset()
 
 
+class PeriodInsightTests(SandboxedCase):
+    def test_summary_uses_period_classes_and_costs_every_priced_provider(self) -> None:
+        snapshot = {
+            "providers": {
+                "first": {
+                    "tokens": {
+                        "inputTokens": 90_000,
+                        "outputTokens": 80_000,
+                        "cacheReadInputTokens": 70_000,
+                        "cacheCreationInputTokens": 60_000,
+                    },
+                    "models": {
+                        "gpt-5": {
+                            "week": {
+                                "inputTokens": 10,
+                                "outputTokens": 20,
+                                "cacheReadInputTokens": 30,
+                                "cacheCreationInputTokens": 40,
+                            }
+                        }
+                    },
+                },
+                "second": {
+                    "tokens": {
+                        "inputTokens": 50_000,
+                        "week_input": 7,
+                        "week_output": 8,
+                        "week_cacheRead": 9,
+                        "week_cacheWrite_1h": 10,
+                        "week_cacheWrite_5m": 11,
+                    },
+                    "models": {
+                        "claude-sonnet-4-6": {
+                            "week": {
+                                "inputTokens": 1,
+                                "outputTokens": 2,
+                                "cacheReadInputTokens": 3,
+                                "cacheCreationInputTokens": 4,
+                            }
+                        }
+                    },
+                },
+            }
+        }
+
+        def priced(_model, inp, out, cache_read, cache_write):
+            costs = {
+                "input": float(inp),
+                "output": float(out * 2),
+                "cache_read": float(cache_read * 3),
+                "cache_write": float(cache_write * 4),
+            }
+            return {**costs, "total": sum(costs.values())}
+
+        with patch.object(agentcat, "estimate_cost", side_effect=priced):
+            result = agentcat.derive_insights(snapshot, period="week")
+
+        summary = result["summary"]
+        self.assertEqual(summary["input_tokens"], 11)
+        self.assertEqual(summary["output_tokens"], 22)
+        self.assertEqual(summary["cache_read_tokens"], 33)
+        self.assertEqual(summary["cache_write_tokens"], 44)
+        # The exact provider period classes replace only that provider's
+        # per-model cost contribution; the first provider remains included.
+        self.assertEqual(summary["input_cost_usd"], 17.0)
+        self.assertEqual(summary["output_cost_usd"], 56.0)
+        self.assertEqual(summary["cache_read_cost_usd"], 117.0)
+        self.assertEqual(summary["cache_write_cost_usd"], 244.0)
+        self.assertEqual(
+            summary["estimated_cost_usd"],
+            sum(
+                summary[key]
+                for key in (
+                    "input_cost_usd",
+                    "output_cost_usd",
+                    "cache_read_cost_usd",
+                    "cache_write_cost_usd",
+                )
+            ),
+        )
+
+
 class ClaudeWindowTests(SandboxedCase):
     def _write_usage(self, when: dt.datetime) -> Path:
         project = agentcat.CLAUDE_PROJECTS_DIR / "fixture"
