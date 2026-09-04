@@ -4144,7 +4144,13 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
     for attempt in range(2):
         try:
             payload = codex_usage_breakdown_request(access_token, str(account_id), CODEX_USAGE_BREAKDOWN_URL)
-            return cache_and_return(codex_usage_breakdown_from_response(payload))
+            parsed = codex_usage_breakdown_from_response(payload)
+            if parsed.get("status") != "ok":
+                # A 200 with an unknown schema is still a failed refresh. Keep
+                # the last known-good cache rather than replacing it with an
+                # empty section. A legitimate data: [] response parses as ok.
+                return stale_or_unavailable()
+            return cache_and_return(parsed)
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and attempt == 0:
                 try:

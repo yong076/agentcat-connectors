@@ -389,6 +389,27 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
         self.assertEqual(cached["data"], result)
         json.dumps(cached, allow_nan=False)
 
+    def test_schema_drift_preserves_stale_good_cache_and_empty_data_is_cacheable(self):
+        section = self.section()
+        original = {"fetched_at": 1, "data": section}
+        agentcat.write_json_atomic(agentcat.CODEX_USAGE_BREAKDOWN_CACHE, original)
+        with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), patch.object(
+            agentcat, "codex_usage_breakdown_request", return_value={"unexpected": "shape"}
+        ):
+            result = agentcat.codex_usage_breakdown()
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["bySurface"], section["bySurface"])
+        self.assertEqual(json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text()), original)
+
+        agentcat.CODEX_USAGE_BREAKDOWN_CACHE.unlink()
+        with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), patch.object(
+            agentcat, "codex_usage_breakdown_request", return_value={"units": "credits", "data": []}
+        ):
+            empty = agentcat.codex_usage_breakdown()
+        self.assertEqual(empty["status"], "ok")
+        self.assertEqual(empty["daily"], [])
+        self.assertEqual(json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text())["data"], empty)
+
     def test_malformed_cache_timestamp_and_data_never_raise_or_leak_nonfinite(self):
         section = self.section()
         for malformed_timestamp in ("not-a-time", None, True, float("nan"), float("inf")):
