@@ -9,6 +9,7 @@ import unittest
 import urllib.parse
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from typing import Optional, Union
 from unittest.mock import patch
 
 from tests.sandbox import redirect_module_paths, restore_module_paths
@@ -786,13 +787,13 @@ class AntigravityMtimeTests(SandboxedCase):
         return bytes(encoded)
 
     @classmethod
-    def _field(cls, number: int, value: int | bytes) -> bytes:
+    def _field(cls, number: int, value: Union[int, bytes]) -> bytes:
         if isinstance(value, int):
             return cls._varint(number << 3) + cls._varint(value)
         return cls._varint((number << 3) | 2) + cls._varint(len(value)) + value
 
     @classmethod
-    def _blob(cls, timestamp: int | None = None) -> bytes:
+    def _blob(cls, timestamp: Optional[int] = None) -> bytes:
         usage = cls._field(2, 10) + cls._field(3, 5)
         message = cls._field(4, usage) + cls._field(21, b"antigravity-fixture")
         if timestamp is not None:
