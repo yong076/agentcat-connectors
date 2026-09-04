@@ -771,6 +771,7 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
     provider_tokens: Dict[str, int] = {}
     provider_cost: Dict[str, float] = {}
     provider_class_costs: Dict[str, Dict[str, float]] = {}
+    provider_representatives: Dict[str, Tuple[int, str]] = {}
     pricing_known = False
     findings: list = []
 
@@ -837,6 +838,12 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
                 pricing_known = True
 
             provider_tokens[kind] = provider_tokens.get(kind, 0) + model_total
+            representative = provider_representatives.get(kind)
+            candidate = (model_total, str(model_name))
+            if representative is None or candidate[0] > representative[0] or (
+                candidate[0] == representative[0] and candidate[1] < representative[1]
+            ):
+                provider_representatives[kind] = candidate
             model_entries.append({
                 "name": model_name,
                 "provider": kind,
@@ -890,10 +897,10 @@ def derive_insights(snapshot: Dict[str, Any], period: str = "week") -> Dict[str,
         pc_cw5m = int(ptokens.get(f"{period}_cacheWrite_5m") or 0)
         if pc_inp or pc_out or pc_cr or pc_cw1h or pc_cw5m:
             # Pick pricing from the dominant model for this provider
-            rep_model = model_entries[-1]["name"] if model_entries else kind
+            representative = provider_representatives.get(kind)
+            rep_model = representative[1] if representative is not None else kind
             pc_cost = estimate_cost(rep_model, pc_inp, pc_out, pc_cr, pc_cw1h + pc_cw5m)
             if pc_cost:
-                provider_cost[kind] = pc_cost["total"]
                 pricing_known = True
                 provider_class_costs[kind] = pc_cost
 

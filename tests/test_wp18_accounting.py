@@ -736,3 +736,39 @@ class CodexUndatedFloorTests(SandboxedCase):
         agentcat.attach_codex_usage_coverage(snapshot, {}, {})
 
         self.assertEqual(snapshot["tokens"]["undatedFloor"], 0)
+
+
+class ProviderCostTests(SandboxedCase):
+    def test_provider_sum_and_period_classes_use_distinct_cost_sources(self) -> None:
+        snapshot = {
+            "providers": {
+                "claude": {
+                    "tokens": {"week_input": 3_000_000},
+                    "models": {
+                        "claude-opus-4-6": {"week": {"inputTokens": 2_000_000}},
+                        "claude-sonnet-4-6": {"week": {"inputTokens": 1_000_000}},
+                    },
+                }
+            }
+        }
+        calls = []
+
+        def priced(model, input_tokens, output_tokens, cache_read, cache_write):
+            calls.append((model, input_tokens))
+            rate = 10.0 if model == "claude-opus-4-6" else 1.0
+            cost = input_tokens / 1_000_000 * rate
+            return {
+                "input": cost,
+                "output": 0.0,
+                "cache_read": 0.0,
+                "cache_write": 0.0,
+                "total": cost,
+            }
+
+        with patch.object(agentcat, "estimate_cost", side_effect=priced):
+            result = agentcat.derive_insights(snapshot, period="week")
+
+        self.assertIn(("claude-opus-4-6", 3_000_000), calls)
+        self.assertEqual(result["providers"][0]["estimated_cost_usd"], 21.0)
+        self.assertEqual(result["summary"]["input_cost_usd"], 30.0)
+        self.assertEqual(result["summary"]["estimated_cost_usd"], 30.0)
