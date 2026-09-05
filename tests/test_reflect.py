@@ -793,6 +793,19 @@ class AnalyzerTests(ReflectTestCase):
             with self.assertRaises(agentcat.ReflectRunnerError):
                 runner.run("p")
 
+    def test_runner_factory_applies_configured_timeout(self):
+        runner = agentcat.reflect_runner({"runner": "claude-native", "analyzerTimeoutSeconds": 900})
+        self.assertEqual(runner.timeout_seconds, 900.0)
+        self.assertEqual(agentcat.reflect_runner({"runner": "claude-native"}).timeout_seconds, agentcat.REFLECT_ANALYZER_TIMEOUT_SECONDS)
+
+    def test_analyzer_timeout_defaults_and_clamps(self):
+        self.assertEqual(agentcat.reflect_analyzer_timeout(None), agentcat.REFLECT_ANALYZER_TIMEOUT_SECONDS)
+        self.assertEqual(agentcat.reflect_analyzer_timeout("soon"), agentcat.REFLECT_ANALYZER_TIMEOUT_SECONDS)
+        self.assertEqual(agentcat.reflect_analyzer_timeout(5), agentcat.REFLECT_ANALYZER_TIMEOUT_MIN_SECONDS)
+        self.assertEqual(agentcat.reflect_analyzer_timeout(10_000), agentcat.REFLECT_ANALYZER_TIMEOUT_MAX_SECONDS)
+        self.assertEqual(agentcat.reflect_analyzer_timeout("300"), 300.0)
+        self.assertEqual(agentcat.reflect_config()["analyzerTimeoutSeconds"], agentcat.REFLECT_ANALYZER_TIMEOUT_SECONDS)
+
     def test_runner_factory(self):
         self.assertIsInstance(agentcat.reflect_runner({"runner": "claude-native"}), agentcat.ClaudeNativeRunner)
         with self.assertRaises(agentcat.ReflectRunnerError):
