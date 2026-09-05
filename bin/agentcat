@@ -163,7 +163,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.36.8")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.36.9")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -13293,12 +13293,21 @@ def reflect_is_orca_workspace(cwd: Any) -> bool:
 
 
 def reflect_claude_automated_marker(entry: Dict[str, Any]) -> bool:
+    """Provenance of an initiating prompt, not a later worker notification."""
     entrypoint = str(entry.get("entrypoint") or "").strip().lower()
+    prompt_source = str(entry.get("promptSource") or "").strip().lower()
+    return (
+        entrypoint in {"sdk", "sdk-cli"}
+        or prompt_source in {"sdk", "agent"}
+    )
+
+
+def reflect_claude_injected_message(entry: Dict[str, Any]) -> bool:
+    """System/hook completion messages must not become the owner's prompts."""
     prompt_source = str(entry.get("promptSource") or "").strip().lower()
     origin = entry.get("origin") if isinstance(entry.get("origin"), dict) else {}
     return (
-        entrypoint in {"sdk", "sdk-cli"}
-        or prompt_source in {"sdk", "system", "hook", "agent"}
+        prompt_source in {"system", "hook"}
         or str(origin.get("kind") or "").strip().lower() == "task-notification"
     )
 
@@ -13508,14 +13517,14 @@ def reflect_parse_claude_session(path: Path) -> Optional[Dict[str, Any]]:
     usage_records: Dict[str, Dict[str, Any]] = {}
     anonymous_usage: List[Dict[str, Any]] = []
     cwd: Optional[str] = None
+    prompt_origin_seen = False
+    injected_messages_seen = False
     for obj in _reflect_iter_jsonl(path, _REFLECT_CLAUDE_NEEDLES):
         entry_type = obj.get("type")
         if entry_type not in ("user", "assistant"):
             continue
         if obj.get("isSidechain"):
             continue
-        if reflect_claude_automated_marker(obj):
-            digest["automated"] = True
         if cwd is None and isinstance(obj.get("cwd"), str) and obj.get("cwd"):
             cwd = str(obj["cwd"])
         ts = _reflect_ts(obj.get("timestamp"))
@@ -13528,11 +13537,17 @@ def reflect_parse_claude_session(path: Path) -> Optional[Dict[str, Any]]:
             continue
         content = message.get("content")
         if entry_type == "user":
+            if reflect_claude_injected_message(obj):
+                injected_messages_seen = True
+                continue
             if obj.get("isMeta"):
                 continue
             text = _reflect_text_blocks(content, ("text",)).strip()
             if not text or reflect_is_system_text(text):
                 continue
+            if not prompt_origin_seen:
+                digest["automated"] = reflect_claude_automated_marker(obj)
+                prompt_origin_seen = True
             builder.user(text, ts)
             continue
         text = _reflect_text_blocks(content, ("text",)).strip()
@@ -13559,10 +13574,11 @@ def reflect_parse_claude_session(path: Path) -> Optional[Dict[str, Any]]:
         bucket["cache_read"] += int(record.get("cache_read") or 0)
         bucket["cache_write"] += int(record.get("cache_write_1h") or 0) + int(record.get("cache_write_5m") or 0)
     digest["project"] = reflect_project_name(cwd)
-    digest["automated"] = bool(digest["automated"] or reflect_is_orca_workspace(cwd))
+    digest["automated"] = bool(digest["automated"] or reflect_is_orca_workspace(cwd)
+                               or (injected_messages_seen and not prompt_origin_seen))
     if cwd and reflect_project_name(cwd) == REFLECT_SCRATCH_DIR.name:
         return None  # the analyzer's own sessions
-    return _reflect_finish_digest(digest, builder, usage_by_model)
+    return _reflect_finish_digest(digest, builder, usage_by_model, allow_counts_only=injected_messages_seen)
 
 
 def reflect_parse_codex_session(path: Path) -> Optional[Dict[str, Any]]:
@@ -14680,6 +14696,13 @@ def reflect_init_db() -> None:
             """
         )
         conn.execute("create table if not exists state (key text primary key, value text not null)")
+        # Reclassify unchanged journals once after upgrading. Preserve analyses;
+        # this is a local index refresh and does not invoke the paid analyzer.
+        provenance_key = "claude_prompt_provenance_v1"
+        if conn.execute("select 1 from state where key = ?", (provenance_key,)).fetchone() is None:
+            migrated = conn.execute("insert or ignore into state (key, value) values (?, '1')", (provenance_key,))
+            if migrated.rowcount:
+                conn.execute("update sessions set file_mtime = 0, file_size = -1 where tool = 'claude'")
         conn.commit()
     _chmod_quiet(REFLECT_DB, 0o600)
 
@@ -14698,6 +14721,22 @@ def _reflect_local_day(now: Optional[dt.datetime] = None) -> str:
 
 def reflect_upsert_session(row: Dict[str, Any], file_mtime: float, file_size: int) -> None:
     with closing(_reflect_connect()) as conn:
+        # An upgrade can shrink a journal's prompt bucket after notifications
+        # stop counting, including when a few new human turns also arrived.
+        # Retain its existing coaching cache so nightly analysis does not run
+        # solely because injected messages stopped counting as human prompts.
+        previous = conn.execute("select tool, user_turns, file_size from sessions where id = ?", (row["id"],)).fetchone()
+        corrected_turns = int(row.get("user_turns") or 0)
+        if (previous is not None and previous["tool"] == "claude" and previous["file_size"] == -1
+                and 0 < corrected_turns < previous["user_turns"]):
+            old_bucket = reflect_length_bucket(previous["user_turns"])
+            new_bucket = reflect_length_bucket(corrected_turns)
+            if old_bucket != new_bucket:
+                conn.execute(
+                    """update analyses set length_bucket = ? where session_id = ? and length_bucket = ?
+                    and not exists (select 1 from analyses where session_id = ? and length_bucket = ?)""",
+                    (new_bucket, row["id"], old_bucket, row["id"], new_bucket),
+                )
         conn.execute(
             """
             insert into sessions (id, tool, project, path, started_at, ended_at, turns, user_turns,
@@ -14920,7 +14959,7 @@ def reflect_all_analyses() -> List[Dict[str, Any]]:
     return [
         {"session": sessions[session_id], "analysis": record["analysis"], "created_at": record["created_at"]}
         for session_id, record in latest.items()
-        if session_id in sessions
+        if session_id in sessions and not sessions[session_id].get("counts_only")
     ]
 
 
