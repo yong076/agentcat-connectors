@@ -204,6 +204,9 @@ class ReflectTestCase(unittest.TestCase):
         self.subprocess_calls = []
 
         def _no_subprocess(*args, **kwargs):
+            command = args[0] if args else kwargs.get("args")
+            if command == ["defaults", "read", "-g", "AppleLocale"]:
+                return subprocess.CompletedProcess(command, 0, stdout="en_US\n", stderr="")
             self.subprocess_calls.append((args, kwargs))
             raise AssertionError("subprocess.run must not be called with a stubbed runner")
 
@@ -668,6 +671,51 @@ class AnalyzerTests(ReflectTestCase):
         nudged = agentcat.reflect_build_prompt({"turn_list": []}, nudge="Return only JSON.")
         self.assertEqual(nudged.splitlines()[1], "Return only JSON.")
 
+    def test_prompt_names_reader_language_and_preserves_quotes(self):
+        names = {
+            "ko": "Korean",
+            "en": "English",
+            "ja": "Japanese",
+            "zh-Hans": "Simplified Chinese",
+        }
+        for lang, name in names.items():
+            prompt = agentcat.reflect_build_prompt({"turn_list": []}, lang=lang)
+            self.assertIn(
+                "Write `note`, `after`, `working_style`, and `candidate_rules` in {}; "
+                "keep quoted `evidence` and `before` verbatim in their original language.".format(name),
+                prompt,
+            )
+
+    def test_reader_language_maps_apple_locale_with_patched_runner(self):
+        cases = {
+            "ko_KR": "ko",
+            "ja_JP": "ja",
+            "zh-Hans_KR": "zh-Hans",
+            "zh_CN": "zh-Hans",
+            "fr_FR": "en",
+        }
+        with patch.object(agentcat.sys, "platform", "darwin"):
+            for locale_name, expected in cases.items():
+                completed = subprocess.CompletedProcess(
+                    ["defaults", "read", "-g", "AppleLocale"], 0,
+                    stdout=locale_name + "\n", stderr="",
+                )
+                with patch.object(agentcat.subprocess, "run", return_value=completed) as run:
+                    self.assertEqual(agentcat.reflect_reader_lang({}), expected)
+                run.assert_called_once_with(
+                    ["defaults", "read", "-g", "AppleLocale"],
+                    capture_output=True, text=True, timeout=2.0,
+                    creationflags=agentcat.CREATE_NO_WINDOW,
+                )
+        with patch.object(agentcat.subprocess, "run", side_effect=AssertionError("must not run")):
+            self.assertEqual(agentcat.reflect_reader_lang({"lang": "ja"}), "ja")
+        with patch.object(agentcat.sys, "platform", "linux"):
+            with patch.object(agentcat.subprocess, "run", side_effect=AssertionError("must not run")):
+                self.assertEqual(agentcat.reflect_reader_lang({}), "en")
+        with patch.object(agentcat.sys, "platform", "darwin"):
+            with patch.object(agentcat.subprocess, "run", side_effect=OSError("synthetic failure")):
+                self.assertEqual(agentcat.reflect_reader_lang({}), "en")
+
     def test_prompt_payload_is_clean(self):
         path = self.write_claude_session([
             claude_user("token " + SEEDED_SECRETS[2] + " lives in /Users/alice/Code/my-repo/.env", 0),
@@ -724,6 +772,43 @@ class AnalyzerTests(ReflectTestCase):
         self.assertEqual(errors, [])
         self.assertEqual(analysis["candidate_rules"], ["a", "b", "c"])
         self.assertEqual(len(analysis["frictions"][0]["evidence"]), agentcat.REFLECT_EVIDENCE_MAX_CHARS)
+
+    def test_duplicate_findings_merge_counts_and_keep_earliest_turn(self):
+        raw = valid_analysis(
+            frictions=[
+                {"category": "missing_context", "attribution": "user_actionable", "evidence": "same quote", "turn": 8, "note": "first note"},
+                {"category": "missing_context", "attribution": "ai_capability", "evidence": "same quote", "turn": 2, "note": "second note"},
+                {"category": "missing_context", "attribution": "user_actionable", "evidence": "different quote", "turn": 3},
+            ],
+            patterns=[
+                {"category": "context_provided", "evidence": "same pattern", "turn": 7},
+                {"category": "context_provided", "evidence": "same pattern", "turn": 1},
+            ],
+        )
+        analysis, errors = agentcat.reflect_validate_analysis(raw)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(analysis["frictions"]), 2)
+        self.assertEqual(analysis["frictions"][0]["count"], 2)
+        self.assertEqual(analysis["frictions"][0]["turn"], 2)
+        self.assertEqual(analysis["frictions"][0]["note"], "first note")
+        self.assertEqual(analysis["frictions"][1]["count"], 1)
+        self.assertEqual(len(analysis["patterns"]), 1)
+        self.assertEqual(analysis["patterns"][0]["count"], 2)
+
+        # Presentation repeats the merge for rows stored before WP37.
+        legacy = copy.deepcopy(raw)
+        legacy["frictions"] = legacy["frictions"][:2]
+        presented = agentcat.reflect_present_analysis(
+            legacy,
+            {"id": "synthetic:session", "tokens": 100, "cost_usd": 1.0, "length_bucket": "short"},
+            {"runner": "stub", "lang": "ko"},
+        )
+        self.assertEqual(len(presented["frictions"]), 1)
+        self.assertEqual(presented["frictions"][0]["count"], 2)
+        self.assertEqual(presented["frictions"][0]["turn"], 2)
+        self.assertEqual(len(presented["patterns"]), 1)
+        self.assertEqual(presented["patterns"][0]["count"], 2)
+        self.assertEqual(presented["lang"], "ko")
 
     def test_retry_once_with_nudge_then_success(self):
         runner = StubRunner(responses=["I think the answer is: not json", json.dumps(valid_analysis())])
@@ -819,6 +904,26 @@ class AnalyzerTests(ReflectTestCase):
 
 
 class StoreTests(ReflectTestCase):
+    def test_init_db_migrates_analysis_language_column(self):
+        with closing(sqlite3.connect(agentcat.REFLECT_DB)) as conn:
+            conn.execute(
+                """
+                create table analyses (
+                  id integer primary key autoincrement, session_id text not null,
+                  length_bucket text not null, analysis_json text not null,
+                  runner text, model text, prompt_quality real,
+                  frictions integer not null default 0, patterns integer not null default 0,
+                  created_at text not null, created_day text not null,
+                  unique(session_id, length_bucket)
+                )
+                """
+            )
+            conn.commit()
+        agentcat.reflect_init_db()
+        with closing(sqlite3.connect(agentcat.REFLECT_DB)) as conn:
+            columns = {row[1] for row in conn.execute("pragma table_info(analyses)")}
+        self.assertIn("lang", columns)
+
     def test_sync_indexes_and_skips_unchanged(self):
         self.write_claude_session()
         self.write_codex_session()
@@ -838,15 +943,17 @@ class StoreTests(ReflectTestCase):
 
     def test_store_analysis_is_idempotent_per_bucket(self):
         analysis, _ = agentcat.reflect_validate_analysis(valid_analysis())
-        agentcat.reflect_store_analysis("claude:x", "short", analysis, {"runner": "stub", "model": "m"})
-        agentcat.reflect_store_analysis("claude:x", "short", analysis, {"runner": "stub", "model": "m"})
-        agentcat.reflect_store_analysis("claude:x", "long", analysis, {"runner": "stub", "model": "m"})
+        meta = {"runner": "stub", "model": "m", "lang": "ko"}
+        agentcat.reflect_store_analysis("claude:x", "short", analysis, meta)
+        agentcat.reflect_store_analysis("claude:x", "short", analysis, meta)
+        agentcat.reflect_store_analysis("claude:x", "long", analysis, meta)
         with agentcat.closing(agentcat._reflect_connect()) as conn:
             rows = conn.execute("select session_id, length_bucket from analyses order by id").fetchall()
         self.assertEqual([(row[0], row[1]) for row in rows], [("claude:x", "short"), ("claude:x", "long")])
         record = agentcat.reflect_get_analysis("claude:x", "short")
         self.assertEqual(record["analysis"]["prompt_quality_mean"], 3.6)
         self.assertEqual(record["runner"], "stub")
+        self.assertEqual(record["lang"], "ko")
         self.assertEqual(agentcat.reflect_get_analysis("claude:x")["length_bucket"], "long")
         self.assertIsNone(agentcat.reflect_get_analysis("claude:y"))
 
@@ -859,8 +966,16 @@ class StoreTests(ReflectTestCase):
         self.assertEqual(result["session"]["project"], "my-repo")
         self.assertEqual(result["analysis"]["prompt_quality_mean"], 3.6)
         self.assertEqual(result["meta"]["attempts"], 1)
+        self.assertEqual(result["meta"]["lang"], "en")
         again = agentcat.reflect_analyze_session("claude:" + CLAUDE_UUID, runner=StubRunner(responses=[]))
         self.assertTrue(again["cached"])
+        localized_runner = StubRunner()
+        localized = agentcat.reflect_analyze_session(
+            "claude:" + CLAUDE_UUID, runner=localized_runner, lang="ko"
+        )
+        self.assertFalse(localized["cached"])
+        self.assertEqual(localized["meta"]["lang"], "ko")
+        self.assertIn("in Korean; keep quoted", localized_runner.prompts[0])
         forced = agentcat.reflect_analyze_session("claude:" + CLAUDE_UUID, runner=StubRunner(), force=True)
         self.assertFalse(forced["cached"])
         self.assertEqual(self.subprocess_calls, [])
@@ -1162,14 +1277,19 @@ class HttpTests(ReflectTestCase):
     def test_post_analyze_uses_configured_runner(self):
         self.write_codex_session()
         session_id = "codex:" + CODEX_UUID
-        with patch.object(agentcat, "reflect_runner", return_value=StubRunner()):
-            status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={})
+        runner = StubRunner()
+        with patch.object(agentcat, "reflect_runner", return_value=runner):
+            status, payload = self.request("/reflect/analyze/" + session_id + "?lang=ko", method="POST", body={})
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertFalse(payload["cached"])
         self.assertEqual(payload["session"]["project"], "codex-repo")
+        self.assertEqual(payload["analysis_meta"]["lang"], "ko")
+        self.assertEqual(payload["analysis"]["lang"], "ko")
+        self.assertEqual(payload["meta"]["lang"], "ko")
+        self.assertIn("in Korean; keep quoted", runner.prompts[0])
         with patch.object(agentcat, "reflect_runner", return_value=StubRunner(responses=[])):
-            status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={})
+            status, payload = self.request("/reflect/analyze/" + session_id + "?lang=ko", method="POST", body={})
         self.assertTrue(payload["cached"])
         with patch.object(agentcat, "reflect_runner", return_value=StubRunner()):
             status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={"force": True})
@@ -1182,6 +1302,8 @@ class HttpTests(ReflectTestCase):
         with patch.object(agentcat, "reflect_runner", return_value=StubRunner(responses=["{}", "{}"])):
             status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={"force": True})
         self.assertEqual((status, payload["error"]), (502, "analysis_failed"))
+        status, payload = self.request("/reflect/analyze/" + session_id + "?lang=xx", method="POST", body={})
+        self.assertEqual((status, payload["error"]), (400, "reflect_bad_request"))
         self.assertEqual(self.subprocess_calls, [])
 
     def test_post_sync(self):
@@ -1232,14 +1354,17 @@ class CliTests(ReflectTestCase):
         code, out = self.run_cli(["reflect", "sync", "--json"])
         self.assertEqual(json.loads(out)["skipped"], 1)
 
-        with patch.object(agentcat, "reflect_runner", return_value=StubRunner()):
-            code, out = self.run_cli(["reflect", "analyze", "claude:" + CLAUDE_UUID])
+        runner = StubRunner()
+        with patch.object(agentcat, "reflect_runner", return_value=runner):
+            code, out = self.run_cli(["reflect", "analyze", "claude:" + CLAUDE_UUID, "--lang", "zh-Hans"])
         self.assertEqual(code, 0)
         payload = json.loads(out)
         self.assertFalse(payload["cached"])
         self.assertEqual(payload["analysis"]["candidate_rules"], valid_analysis()["candidate_rules"])
         self.assertEqual(payload["tool"], "claude-code")
         self.assertEqual(payload["analysis"]["runner"], "stub")
+        self.assertEqual(payload["analysis_meta"]["lang"], "zh-Hans")
+        self.assertIn("in Simplified Chinese; keep quoted", runner.prompts[0])
 
         week = agentcat.reflect_week_of(ts(0))
         code, out = self.run_cli(["reflect", "week", week])
@@ -1453,6 +1578,7 @@ class SchedulerTests(ReflectTestCase):
         self.assertFalse(raw["enabled"])
         self.assertEqual(raw["runner"], "claude-native")
         self.assertEqual(raw["dailyCap"], 20)
+        self.assertEqual(raw["lang"], "en")
         config = agentcat.reflect_config()
         self.assertFalse(config["enabled"])
         agentcat.REFLECT_CONFIG_FILE.write_text(json.dumps({"enabled": True, "dailyCap": "3", "unknown": 1}))
@@ -1485,7 +1611,7 @@ class SchedulerTests(ReflectTestCase):
 
     def test_nightly_waits_for_idle_then_runs_once(self):
         self.write_claude_session()
-        config = {**agentcat.reflect_config(), "enabled": True}
+        config = {**agentcat.reflect_config(), "enabled": True, "lang": "ja"}
         now = dt.datetime(2026, 9, 7, 3, 0)
         busy = agentcat.reflect_scheduler_tick(now=now, config=config, runner=StubRunner(), idle=False)
         self.assertEqual(busy["ran"], [])
@@ -1496,6 +1622,7 @@ class SchedulerTests(ReflectTestCase):
         self.assertEqual(ran["ran"], ["nightly"])
         self.assertEqual(ran["nightly"]["analyzed"], ["claude:" + CLAUDE_UUID])
         self.assertEqual(agentcat.reflect_state_get("last_nightly_date"), "2026-09-07")
+        self.assertIn("in Japanese; keep quoted", runner.prompts[0])
         again = agentcat.reflect_scheduler_tick(now=now + dt.timedelta(minutes=10), config=config, runner=StubRunner(responses=[]), idle=True)
         self.assertEqual(again["ran"], [])
         self.assertEqual(len(runner.prompts), 1)
