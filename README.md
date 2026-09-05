@@ -152,6 +152,41 @@ number the product reports, so it stays an explicit choice. Adopted homes are
 deduplicated by inode and session identity, so a mirror that hardlinks or copies
 its sessions is counted once, never twice.
 
+### Orca Claude account quotas
+
+When the local Orca IDE CLI is available, the connector reads `orca account list
+--json` at most once per minute and adds host Claude profiles to `providerInstances`.
+The selected system-default profile and each managed profile have separate quota
+rows. Active quotas are matched against both the host selection and the quota's
+own authentication provenance, so a pending account switch cannot attach the
+previous profile's quota to the new one. Inactive quotas require the same exact
+profile/provenance match. Missing quotas stay unknown, not zero or a copy of the
+default quota. Session, weekly, and Fable weekly windows are normalized separately.
+
+IDs are device-local HMACs and labels are masked (`Claude · Orca · …`). Orca profile
+IDs are not verified native Claude account IDs: `identityConfidence` is
+`profile_only`, and the default row represents a mutable system-default slot.
+There is no cross-source account deduplication by email, label, or quota similarity.
+`active` means selected in Orca, **not** that a terminal is running. This bridge
+does not attribute terminals, tokens, costs, or historical sessions to accounts,
+and does not adopt additional transcript homes. WSL profiles are not imported yet.
+
+Only normalized quota rows are cached in memory. The raw account response,
+emails, organization IDs, authentication provenance, credential paths, and error
+text are neither logged nor persisted. Source data older than five minutes is
+marked stale; after fifteen minutes (or without a valid source timestamp), quotas
+are hidden. A CLI failure clears bridge rows and leaves the existing single-account
+Claude collector unchanged. Calls time out after two seconds and failed probes
+also wait one minute before retrying. The bridge never launches the Orca app,
+reads credential files, changes accounts, or refreshes OAuth credentials itself.
+
+Set `AGENTCAT_ORCA_ACCOUNTS=0` in the daemon environment to disable discovery.
+`AGENTCAT_ORCA_CLI` optionally names a single executable path (no shell arguments).
+Otherwise the bridge respects `ORCA_CLI_COMMAND`/`ORCA_DEV_REPO_ROOT`, then searches
+PATH and `~/.local/bin`. Linux uses `orca-ide`, never the GNOME `orca` screen reader.
+The host CLI contract was verified with Orca 1.4.193 on macOS; incompatible/missing
+CLI versions safely fall back to the existing collector.
+
 ## Privacy
 
 The connector is local-first.

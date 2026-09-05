@@ -155,7 +155,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.36.3")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.36.4")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -4018,12 +4018,201 @@ def codex_provider_instances(current_limits: Optional[Dict[str, Any]] = None) ->
     )
 
 
+# Only normalized, privacy-safe rows are cached, never Orca's raw account list.
+ORCA_ACCOUNTS_ENABLED = True
+ORCA_ACCOUNTS_TTL_SECONDS = 60
+ORCA_ACCOUNTS_TIMEOUT_SECONDS = 2
+_ORCA_ACCOUNTS_LOCK = threading.Lock()
+_ORCA_ACCOUNTS_CACHE: List[Dict[str, Any]] = []
+_ORCA_ACCOUNTS_CHECKED_AT: Optional[float] = None
+
+
+def orca_account_cli() -> Optional[str]:
+    """Resolve a local CLI without launching Orca or a shell.
+
+    Linux's bare `orca` is commonly the GNOME screen reader, not the IDE.
+    A launchd daemon may not inherit the interactive shell's ~/.local/bin PATH.
+    Explicit overrides select one runtime and must never fall through on failure.
+    """
+    override = os.environ.get("AGENTCAT_ORCA_CLI") or os.environ.get("ORCA_CLI_COMMAND")
+    if override:
+        return override
+    name = "orca-dev" if os.environ.get("ORCA_DEV_REPO_ROOT") else (
+        "orca-ide" if sys.platform.startswith("linux") else "orca"
+    )
+    found = shutil.which(name)
+    if found:
+        return found
+    local = HOME / ".local" / "bin" / name
+    return str(local) if local.is_file() and os.access(local, os.X_OK) else None
+
+
+def orca_quota_timestamp(raw: Any) -> Optional[int]:
+    # Orca emits epoch milliseconds; reject non-finite and malformed values.
+    value = finite_float_value(raw)
+    return reset_epoch(value) if value is not None else None
+
+
+def orca_claude_limits(raw: Any, now: float) -> Dict[str, Any]:
+    """Allowlist Orca quota buckets; never propagate errors or usageMetadata."""
+    source = "orca-account-list"
+    limits = empty_limits(status="not_configured", reason="orca_quota_unavailable")
+    limits["source"] = source
+    if not isinstance(raw, dict) or raw.get("provider") != "claude":
+        return limits
+    updated = orca_quota_timestamp(raw.get("updatedAt"))
+    # Unknown/old source timestamps must not be refreshed merely by polling Orca.
+    if updated is None or updated <= 0 or updated > now + 60 or now - updated > 900:
+        limits["reason"] = "orca_quota_stale"
+        return limits
+    usage: Dict[str, Any] = {}
+    for name, key in (("session", "five_hour"), ("weekly", "seven_day"),
+                      ("fableWeekly", "seven_day_fable")):
+        bucket = raw.get(name)
+        if not isinstance(bucket, dict):
+            continue
+        percent = finite_float_value(bucket.get("usedPercent"))
+        if percent is None or not 0 <= percent <= 100:
+            continue
+        # The CLI names these windows explicitly. Reject changed window semantics.
+        expected_minutes = 300 if name == "session" else 10080
+        if bucket.get("windowMinutes") != expected_minutes:
+            continue
+        reset_at = orca_quota_timestamp(bucket.get("resetsAt"))
+        if name == "fableWeekly":
+            usage["limits"] = [{"percent": percent, "resets_at": reset_at, "group": "weekly",
+                                "scope": {"model": {"id": "fable", "display_name": "Fable"}}}]
+        else:
+            usage[key] = {"utilization": percent, "resets_at": reset_at}
+    if not usage:
+        return limits
+    limits = claude_limits_from_usage_response(usage, source=source)
+    limits["updatedAt"] = iso_from_timestamp(updated)
+    limits["stale"] = bool(now - updated > 300 or raw.get("error") or raw.get("status") != "ok")
+    if limits["stale"]:
+        limits["reason"] = "orca_quota_stale"
+    return limits
+
+
+def orca_claude_instances_from_accounts(payload: Any, now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Map explicit host profile IDs, not emails, quota similarity, or sessions.
+
+    Orca IDs identify managed profiles, not verified native Claude identities.
+    The system-default row identifies a mutable slot, not a durable account.
+    WSL scopes are deliberately excluded until their identity contract is supported.
+    """
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise ValueError("orca_account_list_invalid")
+    result = payload.get("result")
+    claude = result.get("claude") if isinstance(result, dict) else None
+    rates = result.get("rateLimits") if isinstance(result, dict) else None
+    if not isinstance(claude, dict) or not isinstance(claude.get("accounts"), list) or not isinstance(rates, dict):
+        raise ValueError("orca_account_list_invalid")
+    now = time.time() if now is None else now
+    accounts = {
+        row["id"]: row for row in claude["accounts"]
+        if isinstance(row, dict) and isinstance(row.get("id"), str)
+        and 0 < len(row["id"]) <= 256 and row.get("managedAuthRuntime") == "host"
+    }
+    target = rates.get("claudeTarget")
+    target_is_host = isinstance(target, dict) and target.get("runtime") == "host"
+    by_runtime = claude.get("activeAccountIdsByRuntime")
+    if isinstance(by_runtime, dict) and "host" in by_runtime:
+        active_id = by_runtime["host"]
+        selection_known = active_id is None or isinstance(active_id, str)
+    else:
+        active_id = claude.get("activeAccountId")
+        selection_known = target_is_host and "activeAccountId" in claude and (
+            active_id is None or isinstance(active_id, str)
+        )
+    inactive: Dict[str, Dict[str, Any]] = {}
+    inactive_rows = rates.get("inactiveClaudeAccounts")
+    for row in inactive_rows if isinstance(inactive_rows, list) else []:
+        if not isinstance(row, dict) or not isinstance(row.get("accountId"), str):
+            continue
+        account_id, quota = row["accountId"], row.get("rateLimits")
+        if account_id not in accounts or not isinstance(quota, dict):
+            continue
+        previous = inactive.get(account_id)
+        if previous is None or (orca_quota_timestamp(quota.get("updatedAt")) or 0) > (orca_quota_timestamp(previous.get("updatedAt")) or 0):
+            inactive[account_id] = quota
+
+    def verified_quota(raw: Any, expected: str) -> Any:
+        metadata = raw.get("usageMetadata") if isinstance(raw, dict) else None
+        # Selection and quota refresh are asynchronous. The quota's own auth
+        # provenance must agree; otherwise a switch could label A's limits as B's.
+        return raw if isinstance(metadata, dict) and metadata.get("authProvenance") == expected else None
+
+    profiles = [(account_id, False) for account_id in accounts]
+    if selection_known and active_id is None and target_is_host:
+        # A missing/expired default quota carries no identity evidence. Let the
+        # legacy provider continue to describe that case instead of inventing a row.
+        if orca_claude_limits(verified_quota(rates.get("claude"), "system"), now).get("quotas"):
+            profiles.append(("system-default", True))
+    instances = []
+    for account_id, system_default in profiles:
+        selected = selection_known and (active_id is None if system_default else active_id == account_id)
+        raw = rates.get("claude") if selected and target_is_host else (
+            None if selected else inactive.get(account_id)
+        )
+        raw = verified_quota(raw, "system" if system_default else f"managed:{account_id}")
+        limits = orca_claude_limits(raw, now)
+        seed = "orca:host:system-default" if system_default else f"orca:host:managed:{account_id}"
+        instance_id = provider_instance_id("claude", seed)
+        suffix = instance_id.rsplit(":", 1)[-1][-4:].upper()
+        instances.append({
+            "id": instance_id,
+            "providerID": "claude",
+            "label": f"Claude · Orca {'default · ' if system_default else ''}{suffix}",
+            "identityConfidence": "profile_only",
+            "source": "orca-account-list",
+            "profileCount": 1,
+            # Tracked here means quota polling, never transcript adoption.
+            "tracked": bool(limits.get("quotas")),
+            "active": bool(selected),
+            "status": "connected" if limits.get("quotas") else "discovered",
+            "limits": limits,
+        })
+    return sorted(instances, key=lambda row: (not row["active"], row["id"]))
+
+
+def orca_claude_provider_instances() -> List[Dict[str, Any]]:
+    """Optional, failure-isolated read bridge. Never starts Orca or refreshes auth."""
+    global _ORCA_ACCOUNTS_CHECKED_AT, _ORCA_ACCOUNTS_CACHE
+    if not ORCA_ACCOUNTS_ENABLED or os.environ.get("AGENTCAT_ORCA_ACCOUNTS", "1").lower() in ("0", "false", "off"):
+        return []
+    with _ORCA_ACCOUNTS_LOCK:
+        now = time.monotonic()
+        if _ORCA_ACCOUNTS_CHECKED_AT is not None and 0 <= now - _ORCA_ACCOUNTS_CHECKED_AT < ORCA_ACCOUNTS_TTL_SECONDS:
+            return copy.deepcopy(_ORCA_ACCOUNTS_CACHE)
+        rows: List[Dict[str, Any]] = []
+        try:
+            executable = orca_account_cli()
+            if executable:
+                completed = subprocess.run(
+                    [executable, "account", "list", "--json"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=ORCA_ACCOUNTS_TIMEOUT_SECONDS, check=True,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                if len(completed.stdout) > 2 * 1024 * 1024:
+                    raise ValueError("orca_account_list_too_large")
+                rows = orca_claude_instances_from_accounts(json.loads(completed.stdout))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # Raw exceptions can contain CLI stdout, paths, emails, or auth errors.
+            # Clear rows rather than presenting a previous account selection as live.
+            logging.debug("Orca account bridge unavailable; using legacy provider collection")
+        _ORCA_ACCOUNTS_CACHE = rows
+        _ORCA_ACCOUNTS_CHECKED_AT = time.monotonic()
+        return copy.deepcopy(rows)
+
+
 def provider_instances_snapshot(
     limits_by_provider: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Provider-neutral additive surface; Codex is the first 26.35 adapter."""
+    """Provider-neutral additive surface; optional Orca Claude quota profiles."""
     resolved_limits = limits_by_provider if isinstance(limits_by_provider, dict) else {}
-    return codex_provider_instances(resolved_limits.get("codex"))
+    return codex_provider_instances(resolved_limits.get("codex")) + orca_claude_provider_instances()
 
 
 def codex_usage_breakdown_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
