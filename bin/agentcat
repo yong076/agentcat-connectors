@@ -122,6 +122,10 @@ GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECON
 LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_BYTES", str(16 * 1024 * 1024)))
 LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
 LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
+ADAPTIVE_LIVE_LIMITS_POLL_SECONDS = 120
+ADAPTIVE_LIVE_LIMITS_THRESHOLD_PERCENT = 10.0
+ADAPTIVE_LIVE_LIMITS_RESET_SIGNAL_SECONDS = 2 * 60 * 60
+ADAPTIVE_LIVE_LIMITS_RECOVERY_SECONDS = 30 * 60
 LIVE_LIMITS_ERROR_BACKOFF_BASE_SECONDS = 30
 LIVE_LIMITS_ERROR_BACKOFF_MAX_SECONDS = 900
 # A "no quota for this account" answer is cached to stop the per-tick reprobe loop, but on
@@ -2973,6 +2977,92 @@ def live_limits_error_backoff_seconds(failure_streak: int) -> int:
     )
 
 
+def tracked_limit_remaining_percentages(limits: Dict[str, Any]) -> List[float]:
+    values: List[float] = []
+    quotas = limits.get("quotas")
+    if isinstance(quotas, list):
+        for quota in quotas:
+            if not isinstance(quota, dict):
+                continue
+            remaining = float_percent(quota.get("remainingPercent"))
+            if remaining is not None:
+                values.append(remaining)
+    if not values:
+        for key in ("shortUsedPercent", "weeklyUsedPercent"):
+            used = float_percent(limits.get(key))
+            if used is not None:
+                values.append(100.0 - used)
+    return values
+
+
+def adaptive_limit_poll_policy(
+    limits: Dict[str, Any],
+    *,
+    now: int,
+    normal_interval_seconds: int = LIVE_LIMITS_MAX_AGE_SECONDS,
+    previous_state: Optional[Dict[str, Any]] = None,
+    reset_signal_at: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Pure provider-local polling policy with recovery hysteresis."""
+    state = previous_state if isinstance(previous_state, dict) else {}
+    was_accelerated = state.get("accelerated") is True
+    previous_above = int_limit(state.get("aboveThresholdSince"))
+    remaining = tracked_limit_remaining_percentages(limits)
+    has_low_window = any(value < ADAPTIVE_LIVE_LIMITS_THRESHOLD_PERCENT for value in remaining)
+    all_windows_recovered = bool(remaining) and all(
+        value >= ADAPTIVE_LIVE_LIMITS_THRESHOLD_PERCENT for value in remaining
+    )
+    signal_at = int_limit(reset_signal_at)
+    recent_reset = bool(
+        signal_at is not None
+        and 0 <= now - signal_at < ADAPTIVE_LIVE_LIMITS_RESET_SIGNAL_SECONDS
+    )
+
+    if has_low_window:
+        return {
+            "accelerated": True,
+            "intervalSeconds": ADAPTIVE_LIVE_LIMITS_POLL_SECONDS,
+            "reason": "low_remaining",
+            "aboveThresholdSince": None,
+        }
+
+    above_since = previous_above
+    if all_windows_recovered and above_since is None and (was_accelerated or recent_reset):
+        above_since = now
+    if recent_reset:
+        return {
+            "accelerated": True,
+            "intervalSeconds": ADAPTIVE_LIVE_LIMITS_POLL_SECONDS,
+            "reason": "recent_reset",
+            "aboveThresholdSince": above_since,
+        }
+
+    if was_accelerated:
+        if not all_windows_recovered:
+            return {
+                "accelerated": True,
+                "intervalSeconds": ADAPTIVE_LIVE_LIMITS_POLL_SECONDS,
+                "reason": "awaiting_headroom",
+                "aboveThresholdSince": None,
+            }
+        if above_since is None:
+            above_since = now
+        if now - above_since < ADAPTIVE_LIVE_LIMITS_RECOVERY_SECONDS:
+            return {
+                "accelerated": True,
+                "intervalSeconds": ADAPTIVE_LIVE_LIMITS_POLL_SECONDS,
+                "reason": "recovering",
+                "aboveThresholdSince": above_since,
+            }
+
+    return {
+        "accelerated": False,
+        "intervalSeconds": int(normal_interval_seconds),
+        "reason": "normal",
+        "aboveThresholdSince": None,
+    }
+
+
 def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = False) -> Optional[Dict[str, Any]]:
     raw = read_json(LIVE_LIMITS_CACHE)
     if not isinstance(raw, dict) or raw.get("_agentcat_error"):
@@ -2987,6 +3077,14 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     now = int(time.time())
     age = now - cached_at
     failure_streak = int_count(entry.get("failureStreak")) or 0
+    poll_policy = adaptive_limit_poll_policy(
+        limits,
+        now=now,
+        normal_interval_seconds=max_age_seconds,
+        previous_state=entry.get("pollPolicy"),
+        reset_signal_at=int_limit(entry.get("resetSignalAt")),
+    )
+    adaptive_max_age = int(poll_policy["intervalSeconds"])
     retry_at = int_limit(limits.get("retryAt"))
     if retry_at is not None:
         if retry_at > now:
@@ -3000,13 +3098,20 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     elif limits.get("status") == "not_configured" and limits.get("reason") == "not_applicable":
         effective_max_age = LIVE_LIMITS_NOT_APPLICABLE_TTL
     else:
-        effective_max_age = max_age_seconds
-    if age > effective_max_age and not allow_stale:
+        effective_max_age = adaptive_max_age
+    adaptive_due = (
+        poll_policy.get("accelerated") is True
+        and effective_max_age == ADAPTIVE_LIVE_LIMITS_POLL_SECONDS
+        and retry_at is None
+        and failure_streak == 0
+    )
+    expired = age >= effective_max_age if adaptive_due else age > effective_max_age
+    if expired and not allow_stale:
         return None
     out = dict(limits)
     out["cachedAt"] = cached_at
     out["cacheAgeSeconds"] = max(age, 0)
-    if age > effective_max_age:
+    if expired:
         out["stale"] = True
     return out
 
@@ -3043,11 +3148,23 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
             limits = merged
         previous_streak = int_count(previous.get("failureStreak")) or 0
         failed = status == "error" or bool(limits.get("liveError"))
+        now = int(time.time())
+        reset_signal_at = int_limit(previous.get("resetSignalAt"))
+        poll_policy = adaptive_limit_poll_policy(
+            limits,
+            now=now,
+            normal_interval_seconds=LIVE_LIMITS_MAX_AGE_SECONDS,
+            previous_state=previous.get("pollPolicy"),
+            reset_signal_at=reset_signal_at,
+        )
         cache[provider] = {
-            "cachedAt": int(time.time()),
+            "cachedAt": now,
             "failureStreak": previous_streak + 1 if failed else 0,
             "limits": limits,
+            "pollPolicy": poll_policy,
         }
+        if reset_signal_at is not None:
+            cache[provider]["resetSignalAt"] = reset_signal_at
         tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
         with tmp_path.open("w", encoding="utf-8") as fh:
             json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -3055,6 +3172,34 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
         tmp_path.replace(LIVE_LIMITS_CACHE)
     except Exception:
         pass
+
+
+def record_live_limit_reset_signal(provider: str, observed_at: Optional[int] = None) -> None:
+    """Mark a provider reset without storing a signal id, source, or identity."""
+    try:
+        ensure_dirs()
+        raw = read_json(LIVE_LIMITS_CACHE)
+        cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+        entry = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
+        entry = dict(entry)
+        signal_at = int(observed_at if observed_at is not None else time.time())
+        limits = entry.get("limits") if isinstance(entry.get("limits"), dict) else {}
+        entry["resetSignalAt"] = signal_at
+        entry["pollPolicy"] = adaptive_limit_poll_policy(
+            limits,
+            now=signal_at,
+            normal_interval_seconds=LIVE_LIMITS_MAX_AGE_SECONDS,
+            previous_state=entry.get("pollPolicy"),
+            reset_signal_at=signal_at,
+        )
+        cache[provider] = entry
+        tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        tmp_path.replace(LIVE_LIMITS_CACHE)
+    except Exception:
+        logging.debug("failed to record live-limit reset signal for %s", provider)
 
 
 def serve_stale_live_limits(
@@ -4038,6 +4183,7 @@ def consume_codex_reset_credit(credit_id: Any, confirmation: Any) -> Dict[str, A
 
     windows_reset = int_count(consume_payload.get("windows_reset"))
     limits = codex_live_limits(force=True)
+    record_live_limit_reset_signal("codex")
     log_codex_reset_credit_diagnostic(True, windows_reset=windows_reset)
     return {
         "ok": True,

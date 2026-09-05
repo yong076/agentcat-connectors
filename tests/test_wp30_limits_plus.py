@@ -122,12 +122,15 @@ class CodexResetCreditTests(WP30TestCase):
         ) as request, patch.object(
             agentcat, "codex_live_limits", return_value=refreshed
         ) as refresh, patch.object(
+            agentcat, "record_live_limit_reset_signal"
+        ) as reset_signal, patch.object(
             agentcat, "store_event", side_effect=lambda *args: events.append(args) or {"id": 1}
         ):
             result = agentcat.consume_codex_reset_credit("credit-secret", "nonce-secret")
 
         request.assert_called_once_with("token", "account-secret", "credit-secret", "nonce-secret")
         refresh.assert_called_once_with(force=True)
+        reset_signal.assert_called_once_with("codex")
         self.assertEqual(result["windowsReset"], 1)
         self.assertEqual(result["credit"]["id"], "credit-secret")
         self.assertEqual(result["limits"], refreshed)
@@ -382,6 +385,72 @@ class CopilotQuotaTests(WP30TestCase):
         self.assertEqual(not_applicable["planType"], "business")
         self.assertEqual(not_applicable["reason"], "not_applicable")
         self.assertEqual(not_applicable["quotas"], [])
+
+
+class AdaptiveLimitPollingTests(WP30TestCase):
+    @staticmethod
+    def limits(remaining):
+        limits = agentcat.empty_limits(status="auto")
+        limits["quotas"] = [
+            {"id": "fixture:window", "remainingPercent": remaining, "usedPercent": 100 - remaining}
+        ]
+        return limits
+
+    def test_low_window_and_recent_reset_use_120_second_polling(self):
+        low = agentcat.adaptive_limit_poll_policy(self.limits(9.99), now=10_000)
+        reset = agentcat.adaptive_limit_poll_policy(
+            self.limits(80), now=10_000, reset_signal_at=10_000 - 7_199
+        )
+
+        self.assertEqual(low["intervalSeconds"], 120)
+        self.assertEqual(low["reason"], "low_remaining")
+        self.assertEqual(reset["intervalSeconds"], 120)
+        self.assertEqual(reset["reason"], "recent_reset")
+
+    def test_recovery_requires_30_minutes_at_or_above_ten_percent(self):
+        low = agentcat.adaptive_limit_poll_policy(self.limits(5), now=1_000)
+        recovering = agentcat.adaptive_limit_poll_policy(
+            self.limits(10), now=1_120, previous_state=low
+        )
+        still_recovering = agentcat.adaptive_limit_poll_policy(
+            self.limits(80), now=2_919, previous_state=recovering
+        )
+        normal = agentcat.adaptive_limit_poll_policy(
+            self.limits(80), now=2_920, previous_state=recovering
+        )
+
+        self.assertEqual(recovering["reason"], "recovering")
+        self.assertEqual(recovering["aboveThresholdSince"], 1_120)
+        self.assertEqual(still_recovering["intervalSeconds"], 120)
+        self.assertEqual(normal["intervalSeconds"], agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
+        self.assertEqual(normal["reason"], "normal")
+
+    def test_cache_expires_at_adaptive_interval_per_provider(self):
+        with patch.object(agentcat.time, "time", return_value=10_000):
+            agentcat.write_live_limits_cache("claude", self.limits(5))
+            agentcat.write_live_limits_cache("copilot", self.limits(80))
+
+        with patch.object(agentcat.time, "time", return_value=10_120):
+            self.assertIsNone(
+                agentcat.cached_live_limits("claude", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
+            )
+            self.assertIsNotNone(
+                agentcat.cached_live_limits("copilot", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
+            )
+
+    def test_recorded_reset_signal_accelerates_only_that_provider(self):
+        with patch.object(agentcat.time, "time", return_value=20_000):
+            agentcat.write_live_limits_cache("codex", self.limits(90))
+            agentcat.write_live_limits_cache("claude", self.limits(90))
+            agentcat.record_live_limit_reset_signal("codex", observed_at=20_000)
+
+        with patch.object(agentcat.time, "time", return_value=20_120):
+            self.assertIsNone(
+                agentcat.cached_live_limits("codex", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
+            )
+            self.assertIsNotNone(
+                agentcat.cached_live_limits("claude", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
+            )
 
 
 if __name__ == "__main__":
