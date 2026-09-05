@@ -9,7 +9,7 @@ WP37 removes duplicate analysis findings and makes analyzer coaching use the rea
 - `reflect.json` now includes `"lang"`, one of `ko`, `en`, `ja`, or `zh-Hans`. A missing or invalid value resolves from macOS `AppleLocale` (`ko*` → `ko`, `ja*` → `ja`, `zh-Hans*` or `zh_CN` → `zh-Hans`, otherwise `en`); non-macOS systems and command failures use `en`. The generated default config stores the resolved value.
 - `POST /reflect/analyze/{id}?lang=ko` and `agentcat reflect analyze <id> --lang ko` override the config language. Unsupported HTTP values return `400` with `error: "reflect_bad_request"`. The nightly scheduler resolves and uses the configured reader language.
 - The analyzer prompt names the selected language for `note`, `after`, `working_style`, and `candidate_rules`, while requiring `evidence` and `before` quotes to remain verbatim in their original language. The analyzer JSON schema itself is unchanged.
-- Analysis metadata has a backward-compatible SQLite `lang` column migration. A cached analysis is reused only when its stored language matches the requested language; otherwise it is regenerated in the requested language.
+- Analysis metadata has a backward-compatible SQLite `lang` column migration. A cached analysis is reused when its stored language matches the requested language or when it predates WP37 (no stored language); otherwise it is regenerated in the requested language.
 
 ## JSON fields added
 

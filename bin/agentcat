@@ -14910,7 +14910,8 @@ def reflect_analyze_session(
         pass
     bucket = reflect_length_bucket(int(digest["user_turns"]))
     existing = reflect_get_analysis(session_id, bucket)
-    if existing is not None and not force and existing.get("lang") == reader_lang:
+    # Rows stored before WP37 carry no language; reuse them rather than paying for a regeneration.
+    if existing is not None and not force and existing.get("lang") in (None, reader_lang):
         return {
             "session_id": session_id,
             "length_bucket": bucket,
