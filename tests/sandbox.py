@@ -47,6 +47,10 @@ def _redirect(home: Path, agentcat_home: Path) -> dict:
 def redirect_module_paths(module, home: Path, agentcat_home: Path) -> dict:
     """Point every path constant at the sandbox. Returns the originals."""
     originals = {}
+    # Snapshot tests must never call the developer's running Orca account API.
+    if hasattr(module, "ORCA_ACCOUNTS_ENABLED"):
+        originals["ORCA_ACCOUNTS_ENABLED"] = module.ORCA_ACCOUNTS_ENABLED
+        module.ORCA_ACCOUNTS_ENABLED = False
     for name, sandboxed in _redirect(home, agentcat_home).items():
         if not hasattr(module, name):
             continue  # constant renamed or removed upstream; nothing to redirect
