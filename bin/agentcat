@@ -12902,7 +12902,11 @@ REFLECT_KIMI_HOME = HOME / ".kimi-code"
 REFLECT_SCRATCH_DIR = AGENTCAT_HOME / "reflect-scratch"
 REFLECT_MARKER = "AGENTCAT_REFLECT_ANALYSIS_REQUEST"
 REFLECT_DAILY_CAP = 20
-REFLECT_ANALYZER_TIMEOUT_SECONDS = 120.0
+# Measured 2026-09-05: a 100-user-turn session (35k-char prompt) takes ~110 s on
+# `claude -p --model sonnet`; 120 s cut every real session off at the edge.
+REFLECT_ANALYZER_TIMEOUT_SECONDS = 600.0
+REFLECT_ANALYZER_TIMEOUT_MIN_SECONDS = 60.0
+REFLECT_ANALYZER_TIMEOUT_MAX_SECONDS = 1800.0
 REFLECT_TEXT_PER_TURN = 400
 REFLECT_SAMPLE_USER_TURNS = 30
 REFLECT_MAX_ASSISTANT_TURNS_PER_EXCHANGE = 6
@@ -12913,6 +12917,7 @@ REFLECT_DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": False,
     "runner": "claude-native",
     "dailyCap": REFLECT_DAILY_CAP,
+    "analyzerTimeoutSeconds": REFLECT_ANALYZER_TIMEOUT_SECONDS,
     "nightlyHour": 3,
     "weeklyWeekday": 6,  # Monday=0 … Sunday=6
     "weeklyHour": 18,
@@ -13049,7 +13054,19 @@ def reflect_config() -> Dict[str, Any]:
         merged["dailyCap"] = max(0, int(merged.get("dailyCap") or 0))
     except (TypeError, ValueError):
         merged["dailyCap"] = REFLECT_DAILY_CAP
+    merged["analyzerTimeoutSeconds"] = reflect_analyzer_timeout(merged.get("analyzerTimeoutSeconds"))
     return merged
+
+
+def reflect_analyzer_timeout(value: Any) -> float:
+    """Clamp a configured analyzer timeout to [60, 1800] s; anything unparsable → default."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return REFLECT_ANALYZER_TIMEOUT_SECONDS
+    if seconds != seconds:  # NaN
+        return REFLECT_ANALYZER_TIMEOUT_SECONDS
+    return min(REFLECT_ANALYZER_TIMEOUT_MAX_SECONDS, max(REFLECT_ANALYZER_TIMEOUT_MIN_SECONDS, seconds))
 
 
 def reflect_write_default_config() -> bool:
@@ -14341,7 +14358,7 @@ def reflect_runner(config: Optional[Dict[str, Any]] = None) -> ReflectRunner:
     resolved = config if config is not None else reflect_config()
     name = str(resolved.get("runner") or "claude-native")
     if name == "claude-native":
-        return ClaudeNativeRunner()
+        return ClaudeNativeRunner(timeout_seconds=reflect_analyzer_timeout(resolved.get("analyzerTimeoutSeconds")))
     raise ReflectRunnerError(f"unknown reflect runner: {name}")
 
 

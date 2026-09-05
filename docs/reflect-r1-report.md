@@ -261,7 +261,7 @@ Automated sessions still contribute sessions, tokens, cost, rework, friction, an
 ### Config `~/.agentcat/reflect.json`
 
 ```json
-{"enabled": false, "runner": "claude-native", "dailyCap": 20, "nightlyHour": 3,
+{"enabled": false, "runner": "claude-native", "dailyCap": 20, "analyzerTimeoutSeconds": 600, "nightlyHour": 3,
  "weeklyWeekday": 6, "weeklyHour": 18, "lookbackDays": 14, "indexDays": 30}
 ```
 
