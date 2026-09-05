@@ -1,0 +1,4 @@
+{ "rules": [
+  { "id": "r1", "text": "Name the surface and the gesture before describing a UX bug.", "target": "AGENTS.md", "evidenceSessionIds": ["s-001", "s-005"] },
+  { "id": "r2", "text": "Quote globs and use absolute paths.", "target": ".cursorrules", "evidenceSessionIds": [] }
+] }

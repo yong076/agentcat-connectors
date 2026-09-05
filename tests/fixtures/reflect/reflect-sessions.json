@@ -1,0 +1,14 @@
+{
+  "sessions": [
+    { "id": "s-001", "tool": "claude-code", "project": "agent-cat", "startedAt": "2026-09-05T01:10:00Z", "endedAt": "2026-09-05T03:42:00Z",
+      "turns": 41, "userTurns": 12, "toolCalls": 31, "tokens": 1832000, "costUSD": 3.1,
+      "analysis": { "promptQuality": 4.1, "frictionCount": 2, "patternCount": 3, "headline": "Constraints landed early; one retry after a missing surface name." } },
+    { "id": "s-002", "tool": "codex", "project": "agentcat-connectors", "startedAt": "2026-09-04T22:00:00.000Z", "endedAt": "2026-09-04T23:05:00.000Z", "automated": true,
+      "turns": 18, "userTurns": 6, "toolCalls": 12, "tokens": 640000, "costUSD": 0.0,
+      "analysis": { "promptQuality": 3.2, "frictionCount": 3, "patternCount": 1, "headline": "Scope widened twice before the fix shipped." } },
+    { "id": "s-003", "tool": "gemini", "project": "musicmap", "startedAt": "2026-09-04T10:00:00Z", "endedAt": "2026-09-04T10:20:00Z",
+      "turns": 9, "userTurns": 4, "toolCalls": 5, "tokens": 120000, "costUSD": 0.2, "analysis": null },
+    { "id": "s-004", "tool": "kimi", "startedAt": "2026-09-03T08:00:00Z", "automated": "false",
+      "turns": 5, "userTurns": 2, "toolCalls": 1, "tokens": 40000 }
+  ]
+}

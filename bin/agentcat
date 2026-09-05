@@ -12928,6 +12928,17 @@ REFLECT_DEFAULT_CONFIG: Dict[str, Any] = {
     "indexDays": 30,
 }
 REFLECT_TOOLS = ("claude", "codex", "opencode", "copilot", "grok", "gemini", "cursor", "kimi")
+REFLECT_APP_TOOL_IDS = {
+    "claude": "claude-code",
+    "claude-code": "claude-code",
+    "codex": "codex",
+    "gemini": "gemini",
+    "kimi": "kimi",
+    "cursor": "cursor",
+    "opencode": "opencode",
+    "copilot": "copilot",
+    "grok": "grok",
+}
 
 REFLECT_FRICTION_CATEGORIES = (
     "missing_context",
@@ -13025,6 +13036,10 @@ class ReflectError(Exception):
 
 
 class ReflectNotFound(ReflectError):
+    pass
+
+
+class ReflectDisabled(ReflectError):
     pass
 
 
@@ -14658,7 +14673,8 @@ def reflect_list_sessions(days: int = 7, now: Optional[dt.datetime] = None) -> L
         analyses = {
             row["session_id"]: row
             for row in conn.execute(
-                "select session_id, length_bucket, prompt_quality, frictions, patterns, created_at from analyses "
+                "select session_id, length_bucket, prompt_quality, frictions, patterns, created_at, analysis_json, "
+                "runner, model from analyses "
                 "order by created_at asc"
             )
         }
@@ -14671,6 +14687,18 @@ def reflect_list_sessions(days: int = 7, now: Optional[dt.datetime] = None) -> L
         session["frictions"] = int(latest["frictions"]) if latest is not None else None
         session["patterns"] = int(latest["patterns"]) if latest is not None else None
         session["analyzed_bucket"] = latest["length_bucket"] if latest is not None else None
+        if latest is not None:
+            try:
+                parsed_analysis = json.loads(latest["analysis_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                parsed_analysis = {}
+            session["_analysis_record"] = {
+                "analysis": parsed_analysis if isinstance(parsed_analysis, dict) else {},
+                "runner": latest["runner"],
+                "model": latest["model"],
+                "created_at": latest["created_at"],
+                "length_bucket": latest["length_bucket"],
+            }
         out.append(session)
     return out
 
@@ -15055,6 +15083,391 @@ def reflect_synthesize_week(
     }
 
 
+def reflect_app_tool_id(tool: Any) -> str:
+    """Public Reflect tool id understood by the app."""
+    normalized = str(tool or "").strip().lower()
+    return REFLECT_APP_TOOL_IDS.get(normalized, normalized)
+
+
+def _reflect_app_category(category: Any) -> str:
+    return str(category or "").strip().replace("_", "-")
+
+
+def _reflect_app_attribution(attribution: Any) -> str:
+    return {
+        "user_actionable": "user-actionable",
+        "ai_capability": "ai-capability",
+        "environmental": "environment",
+    }.get(str(attribution or ""), _reflect_app_category(attribution))
+
+
+def _reflect_short_quote(value: Any, max_words: int = 20) -> str:
+    words = str(value or "").strip().split()
+    return " ".join(words[:max_words])
+
+
+def _reflect_first_sentence(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
+
+
+def _reflect_present_rule(rule: Any, index: int) -> Dict[str, Any]:
+    if isinstance(rule, dict):
+        text = str(rule.get("text") or "").strip()
+        evidence = list(rule.get("evidenceSessionIds") or rule.get("sessions") or [])
+        count = int(rule.get("count") or max(1, len(evidence)))
+        target = str(rule.get("target") or "AGENTS.md")
+        rule_id = str(rule.get("id") or "r{}".format(index + 1))
+    else:
+        text = str(rule or "").strip()
+        evidence = []
+        count = 1
+        target = "AGENTS.md"
+        rule_id = "r{}".format(index + 1)
+    # ``count`` and ``sessions`` are the R1 compatibility fields. They remain
+    # on the enriched rule object for one release because ``rules`` itself is
+    # shared by both contracts.
+    return {
+        "id": rule_id,
+        "text": text,
+        "target": target,
+        "evidenceSessionIds": evidence,
+        "count": count,
+        "sessions": evidence,
+    }
+
+
+def reflect_present_analysis(
+    analysis: Dict[str, Any],
+    session: Dict[str, Any],
+    record: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Add the app's full-analysis contract while retaining R1 snake_case."""
+    raw = analysis if isinstance(analysis, dict) else {}
+    presented: Dict[str, Any] = dict(raw)
+    session_id = str(session.get("id") or "")
+    tokens = int(session.get("tokens") or 0)
+    cost = float(session.get("cost_usd") or 0.0)
+    raw_frictions = [item for item in (raw.get("frictions") or []) if isinstance(item, dict)]
+    share_count = max(1, len(raw_frictions))
+    quality = raw.get("prompt_quality") if isinstance(raw.get("prompt_quality"), dict) else {}
+    fallback_fix = ""
+    for name in REFLECT_PROMPT_DIMENSIONS:
+        dimension = quality.get(name)
+        if isinstance(dimension, dict) and dimension.get("after"):
+            fallback_fix = str(dimension["after"])
+            break
+
+    frictions: List[Dict[str, Any]] = []
+    for item in raw_frictions:
+        note = str(item.get("note") or "").strip()
+        legacy_category = str(item.get("category") or "")
+        legacy_attribution = str(item.get("attribution") or "")
+        frictions.append({
+            "category": _reflect_app_category(legacy_category),
+            "count": 1,
+            "attribution": _reflect_app_attribution(legacy_attribution),
+            "costTokens": int(round(float(tokens) / share_count)),
+            "costUSD": round(cost / share_count, 4),
+            "example": {
+                "sessionId": session_id,
+                "quote": _reflect_short_quote(item.get("evidence")),
+                "fix": note or fallback_fix,
+            },
+            "evidence": str(item.get("evidence") or ""),
+            "turn": item.get("turn") if isinstance(item.get("turn"), int) else None,
+            "note": note,
+            "category_snake": legacy_category,
+            "attribution_snake": legacy_attribution,
+        })
+
+    patterns: List[Dict[str, Any]] = []
+    for item in (raw.get("patterns") or []):
+        if not isinstance(item, dict):
+            continue
+        legacy_category = str(item.get("category") or "")
+        driver = "ai-driven" if legacy_category == "delegation_to_tools" else "user-driven"
+        presented_pattern = {
+            "category": _reflect_app_category(legacy_category),
+            "count": 1,
+            "driver": driver,
+            "example": {
+                "sessionId": session_id,
+                "quote": _reflect_short_quote(item.get("evidence")),
+            },
+            "evidence": str(item.get("evidence") or ""),
+            "turn": item.get("turn") if isinstance(item.get("turn"), int) else None,
+            "note": str(item.get("note") or ""),
+            "category_snake": legacy_category,
+        }
+        for key in ("tool", "savedTurns", "savedTokens"):
+            if key in item:
+                presented_pattern[key] = (
+                    reflect_app_tool_id(item[key]) if key == "tool" else item[key]
+                )
+        patterns.append(presented_pattern)
+
+    prompt_quality: Dict[str, Any] = {}
+    for name in REFLECT_PROMPT_DIMENSIONS:
+        dimension = quality.get(name) if isinstance(quality, dict) else None
+        prompt_quality["successCriteria" if name == "success_criteria" else name] = (
+            dict(dimension) if isinstance(dimension, dict) else {"score": None, "before": "", "after": ""}
+        )
+
+    raw_rules = raw.get("candidate_rules") or raw.get("rules") or []
+    rules = [_reflect_present_rule(rule, index) for index, rule in enumerate(raw_rules)]
+    meta = record or {}
+    presented.update({
+        "frictions": frictions,
+        "patterns": patterns,
+        "promptQuality": prompt_quality,
+        "workingStyle": str(raw.get("working_style") or raw.get("workingStyle") or ""),
+        "rules": rules,
+        "analyzedAt": meta.get("created_at") or meta.get("analyzedAt"),
+        "runner": meta.get("runner"),
+        "lengthBucket": meta.get("length_bucket") or meta.get("lengthBucket") or session.get("length_bucket"),
+    })
+    return presented
+
+
+def reflect_present_session(
+    session: Dict[str, Any],
+    analysis_record: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """App session row plus the one-release R1 compatibility fields."""
+    presented = {key: value for key, value in session.items() if key != "_analysis_record"}
+    record = analysis_record if analysis_record is not None else session.get("_analysis_record")
+    raw_analysis = record.get("analysis") if isinstance(record, dict) else None
+    summary: Optional[Dict[str, Any]] = None
+    if isinstance(raw_analysis, dict) and raw_analysis:
+        quality = raw_analysis.get("prompt_quality_mean")
+        if not isinstance(quality, (int, float)):
+            quality = session.get("prompt_quality")
+        summary = {
+            "promptQuality": float(quality) if isinstance(quality, (int, float)) else None,
+            "frictionCount": len(raw_analysis.get("frictions") or []),
+            "patternCount": len(raw_analysis.get("patterns") or []),
+            "headline": _reflect_first_sentence(raw_analysis.get("working_style")),
+        }
+    presented.update({
+        "tool": reflect_app_tool_id(session.get("tool")),
+        "startedAt": session.get("started_at"),
+        "endedAt": session.get("ended_at"),
+        "userTurns": int(session.get("user_turns") or 0),
+        "toolCalls": int(session.get("tool_calls") or 0),
+        "costUSD": float(session.get("cost_usd") or 0.0),
+        "analysis": summary,
+    })
+    return presented
+
+
+def reflect_present_detail(session: Dict[str, Any], record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Flatten session detail at the root as required by TED §4.1."""
+    row = reflect_present_session(session, record)
+    full = None
+    if isinstance(record, dict) and isinstance(record.get("analysis"), dict) and record.get("analysis"):
+        full = reflect_present_analysis(record["analysis"], session, record)
+    row["analysis"] = full
+    # The wrapper and meta are retained for one release for R1 clients.
+    row["session"] = reflect_present_session(session, record)
+    row["analysis_meta"] = (
+        {
+            "runner": record.get("runner"),
+            "model": record.get("model"),
+            "created_at": record.get("created_at"),
+            "length_bucket": record.get("length_bucket"),
+        }
+        if isinstance(record, dict) else None
+    )
+    return row
+
+
+def reflect_present_analyze(result: Dict[str, Any]) -> Dict[str, Any]:
+    if result.get("queued") is True:
+        return {"queued": True}
+    session = result.get("session") if isinstance(result.get("session"), dict) else {}
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    record = {
+        "analysis": result.get("analysis") if isinstance(result.get("analysis"), dict) else {},
+        "runner": meta.get("runner"),
+        "model": meta.get("model"),
+        "created_at": meta.get("created_at") or now_iso(),
+        "length_bucket": result.get("length_bucket"),
+    }
+    presented = reflect_present_detail(session, record)
+    presented.update({
+        "ok": True,
+        "session_id": result.get("session_id"),
+        "length_bucket": result.get("length_bucket"),
+        "cached": bool(result.get("cached")),
+        "meta": meta,
+    })
+    return presented
+
+
+def reflect_recent_week_keys(week: str, count: int = 8) -> List[str]:
+    match = re.fullmatch(r"(\d{4})-W(\d{2})", week)
+    if match is None:
+        raise ReflectError("invalid ISO week: {}".format(week))
+    try:
+        monday = dt.date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1)
+    except ValueError:
+        raise ReflectError("invalid ISO week: {}".format(week))
+    return [
+        reflect_iso_week_key(dt.datetime.combine(monday - dt.timedelta(weeks=offset), dt.time.min))
+        for offset in range(max(0, count - 1), -1, -1)
+    ]
+
+
+def reflect_count_sessions_for_week(week: str) -> int:
+    with closing(_reflect_connect()) as conn:
+        rows = conn.execute("select started_at from sessions where started_at is not null").fetchall()
+    return sum(1 for row in rows if reflect_week_of(row["started_at"]) == week)
+
+
+def reflect_present_week(
+    synthesis: Dict[str, Any],
+    all_items: List[Dict[str, Any]],
+    sessions_total: int,
+    lang: str = "ko",
+) -> Dict[str, Any]:
+    """App weekly contract over the internal R1 synthesis."""
+    presented = dict(synthesis)
+    week = str(synthesis.get("week") or "")
+    current_items = [
+        item for item in all_items
+        if reflect_week_of((item.get("session") or {}).get("started_at")) == week
+    ]
+    by_dimension = ((synthesis.get("prompt_quality") or {}).get("by_dimension") or {})
+    prompt_quality = {
+        "clarity": by_dimension.get("clarity"),
+        "context": by_dimension.get("context"),
+        "constraints": by_dimension.get("constraints"),
+        "successCriteria": by_dimension.get("success_criteria"),
+        "scope": by_dimension.get("scope"),
+    }
+
+    friction_rows: Dict[str, Dict[str, Any]] = {}
+    pattern_rows: Dict[str, Dict[str, Any]] = {}
+    working_styles: List[Tuple[str, str]] = []
+    for item in current_items:
+        session = item.get("session") or {}
+        analysis = item.get("analysis") or {}
+        session_id = str(session.get("id") or "")
+        started_at = str(session.get("started_at") or "")
+        style = str(analysis.get("working_style") or "").strip()
+        if style:
+            working_styles.append((started_at, style))
+        seen_frictions: Set[str] = set()
+        for finding in analysis.get("frictions") or []:
+            if not isinstance(finding, dict):
+                continue
+            category = str(finding.get("category") or "")
+            if not category:
+                continue
+            row = friction_rows.setdefault(category, {
+                "category": _reflect_app_category(category),
+                "count": 0,
+                "costTokens": 0,
+                "costUSD": 0.0,
+                "_attributions": {},
+                "example": None,
+            })
+            row["count"] += 1
+            attribution = str(finding.get("attribution") or "")
+            row["_attributions"][attribution] = row["_attributions"].get(attribution, 0) + 1
+            if category not in seen_frictions:
+                seen_frictions.add(category)
+                row["costTokens"] += int(session.get("tokens") or 0)
+                row["costUSD"] += float(session.get("cost_usd") or 0.0)
+            if row["example"] is None:
+                texts = REFLECT_NEXT_CHECKS_BY_CATEGORY.get(category, {}).get(lang, ())
+                row["example"] = {
+                    "sessionId": session_id,
+                    "quote": _reflect_short_quote(finding.get("evidence")),
+                    "fix": str(finding.get("note") or (texts[0] if texts else "")),
+                }
+        for finding in analysis.get("patterns") or []:
+            if not isinstance(finding, dict):
+                continue
+            category = str(finding.get("category") or "")
+            if not category:
+                continue
+            row = pattern_rows.setdefault(category, {
+                "category": _reflect_app_category(category),
+                "count": 0,
+                "driver": "ai-driven" if category == "delegation_to_tools" else "user-driven",
+                "example": None,
+            })
+            row["count"] += 1
+            if "tool" in finding:
+                row["tool"] = reflect_app_tool_id(finding.get("tool"))
+            if "savedTurns" in finding and isinstance(finding.get("savedTurns"), int):
+                row["savedTurns"] = int(finding["savedTurns"])
+            if "savedTokens" in finding and isinstance(finding.get("savedTokens"), int):
+                row["savedTokens"] = int(finding["savedTokens"])
+            if row["example"] is None:
+                row["example"] = {
+                    "sessionId": session_id,
+                    "quote": _reflect_short_quote(finding.get("evidence")),
+                }
+
+    frictions: List[Dict[str, Any]] = []
+    for row in friction_rows.values():
+        counts = row.pop("_attributions")
+        attribution = max(
+            REFLECT_ATTRIBUTIONS,
+            key=lambda name: (int(counts.get(name) or 0), -REFLECT_ATTRIBUTIONS.index(name)),
+        )
+        row["attribution"] = _reflect_app_attribution(attribution)
+        row["costUSD"] = round(float(row["costUSD"]), 4)
+        frictions.append(row)
+    frictions.sort(key=lambda row: (-row["count"], -row["costTokens"], row["category"]))
+    patterns = list(pattern_rows.values())
+    patterns.sort(key=lambda row: (-row["count"], row["category"]))
+
+    by_tool = []
+    for source in synthesis.get("byTool") or []:
+        row = dict(source)
+        row["tool"] = reflect_app_tool_id(source.get("tool"))
+        by_tool.append(row)
+    checks = []
+    for source in synthesis.get("nextChecks") or []:
+        row = dict(source)
+        row["derivedFrom"] = _reflect_app_category(source.get("derivedFrom"))
+        checks.append(row)
+
+    grouped = {
+        key: [item for item in all_items if reflect_week_of((item.get("session") or {}).get("started_at")) == key]
+        for key in reflect_recent_week_keys(week)
+    }
+    trend = []
+    for trend_week in reflect_recent_week_keys(week):
+        week_synthesis = synthesis if trend_week == week else reflect_synthesize_week(trend_week, grouped[trend_week], lang=lang)
+        trend.append({"week": trend_week, "fluencyScore": week_synthesis.get("fluency_score")})
+
+    working_styles.sort(key=lambda pair: pair[0])
+    rules = [_reflect_present_rule(rule, index) for index, rule in enumerate(synthesis.get("rules") or [])]
+    presented.update({
+        "generatedAt": synthesis.get("generated_at"),
+        "sessionsAnalyzed": int(synthesis.get("sessions_analyzed") or 0),
+        "sessionsTotal": int(sessions_total),
+        "fluencyScore": synthesis.get("fluency_score"),
+        "promptQuality": prompt_quality,
+        "trend": trend,
+        "frictions": frictions,
+        "patterns": patterns,
+        "byTool": by_tool,
+        "toolComparison": synthesis.get("toolComparison"),
+        "nextChecks": checks,
+        "workingStyle": working_styles[-1][1] if working_styles else "",
+        "rules": rules,
+    })
+    return presented
+
+
 def reflect_week_items(week: str) -> List[Dict[str, Any]]:
     return [item for item in reflect_all_analyses() if reflect_week_of((item.get("session") or {}).get("started_at")) == week]
 
@@ -15064,7 +15477,13 @@ def reflect_week(week: Optional[str] = None, store: bool = False, lang: str = "k
     resolved = week or reflect_iso_week_key(dt.datetime.now().astimezone())
     if not re.fullmatch(r"\d{4}-W\d{2}", resolved):
         raise ReflectError(f"invalid ISO week: {resolved}")
-    synthesis = reflect_synthesize_week(resolved, reflect_week_items(resolved), lang=lang)
+    all_items = reflect_all_analyses()
+    synthesis = reflect_synthesize_week(
+        resolved,
+        [item for item in all_items if reflect_week_of((item.get("session") or {}).get("started_at")) == resolved],
+        lang=lang,
+    )
+    synthesis = reflect_present_week(synthesis, all_items, reflect_count_sessions_for_week(resolved), lang=lang)
     if store:
         reflect_store_synthesis(synthesis)
         synthesis["stored"] = True
@@ -15198,20 +15617,33 @@ def reflect_report_html(week: Optional[str] = None, lang: str = "ko") -> str:
 
 
 def _reflect_error_payload(exc: Exception) -> Tuple[int, Dict[str, Any]]:
+    if isinstance(exc, ReflectDisabled):
+        return 403, {"error": "reflect_disabled", "legacy_error": "reflect_bad_request", "message": str(exc)}
     if isinstance(exc, ReflectNotFound):
-        return 404, {"error": "not_found", "message": str(exc)}
+        return 404, {"error": "session_not_found", "legacy_error": "not_found", "message": str(exc)}
     if isinstance(exc, ReflectRunnerError):
-        return 503, {"error": "reflect_runner_unavailable", "message": str(exc)}
+        return 503, {"error": "runner_unavailable", "legacy_error": "reflect_runner_unavailable", "message": str(exc)}
     if isinstance(exc, ReflectAnalysisError):
-        return 502, {"error": "reflect_analysis_invalid", "message": str(exc), "details": exc.errors}
+        return 502, {"error": "analysis_failed", "legacy_error": "reflect_analysis_invalid", "message": str(exc), "details": exc.errors}
     if isinstance(exc, ReflectError):
         return 400, {"error": "reflect_bad_request", "message": str(exc)}
     return 500, {"error": "reflect_failed", "message": str(exc)}
 
 
+def reflect_require_http_enabled() -> None:
+    """An explicit disabled config is an app-visible state.
+
+    A missing file is allowed for direct unit/CLI use; the daemon creates the
+    default file before serving and therefore reports ``reflect_disabled``.
+    """
+    if REFLECT_CONFIG_FILE.exists() and not bool(reflect_config().get("enabled")):
+        raise ReflectDisabled("Reflect is disabled")
+
+
 def reflect_http_get(path: str, query: Dict[str, List[str]]) -> Tuple[int, Dict[str, Any]]:
     """Route a GET under /reflect/. Returns (status, payload); never raises."""
     try:
+        reflect_require_http_enabled()
         if path == "/reflect/week":
             iso = (query.get("iso") or [""])[0].strip() or None
             lang = (query.get("lang") or ["ko"])[0].strip() or "ko"
@@ -15222,7 +15654,8 @@ def reflect_http_get(path: str, query: Dict[str, List[str]]) -> Tuple[int, Dict[
                 days = max(1, min(365, int(raw_days)))
             except ValueError:
                 raise ReflectError(f"invalid days: {raw_days}")
-            return 200, {"days": days, "sessions": reflect_list_sessions(days)}
+            sessions = [reflect_present_session(row) for row in reflect_list_sessions(days)]
+            return 200, {"days": days, "sessions": sessions}
         if path == "/reflect/rules":
             iso = (query.get("week") or [""])[0].strip() or None
             synthesis = reflect_week(iso)
@@ -15235,15 +15668,7 @@ def reflect_http_get(path: str, query: Dict[str, List[str]]) -> Tuple[int, Dict[
             if session is None:
                 raise ReflectNotFound(f"unknown session: {session_id}")
             record = reflect_get_analysis(session_id)
-            return 200, {
-                "session": session,
-                "analysis": record["analysis"] if record else None,
-                "analysis_meta": (
-                    {"runner": record["runner"], "model": record["model"], "created_at": record["created_at"],
-                     "length_bucket": record["length_bucket"]}
-                    if record else None
-                ),
-            }
+            return 200, reflect_present_detail(session, record)
         return 404, {"error": "not_found"}
     except Exception as exc:  # noqa: BLE001 — every failure becomes a JSON error
         return _reflect_error_payload(exc)
@@ -15252,11 +15677,12 @@ def reflect_http_get(path: str, query: Dict[str, List[str]]) -> Tuple[int, Dict[
 def reflect_http_post(path: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     try:
         if path.startswith("/reflect/analyze/"):
+            reflect_require_http_enabled()
             session_id = urllib.parse.unquote(path[len("/reflect/analyze/"):]).strip()
             if not session_id:
                 raise ReflectError("missing session id")
             result = reflect_analyze_session(session_id, force=bool(body.get("force")))
-            return 200, {"ok": True, **result}
+            return 200, reflect_present_analyze(result)
         if path == "/reflect/sync":
             return 200, {"ok": True, **reflect_sync()}
         return 404, {"error": "not_found"}
@@ -15275,7 +15701,9 @@ def command_reflect(args: argparse.Namespace) -> int:
             if not target:
                 print("usage: agentcat reflect analyze <session-id>", file=sys.stderr)
                 return 2
-            payload = reflect_analyze_session(str(target), force=bool(getattr(args, "force", False)))
+            payload = reflect_present_analyze(
+                reflect_analyze_session(str(target), force=bool(getattr(args, "force", False)))
+            )
         elif action == "week":
             payload = reflect_week(str(target) if target else None, store=bool(getattr(args, "store", False)))
         else:
@@ -15610,6 +16038,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             week = (query.get("week") or [""])[0].strip() or None
             lang = (query.get("lang") or ["ko"])[0].strip() or "ko"
             try:
+                reflect_require_http_enabled()
                 self.send_html(200, reflect_report_html(week, lang))
             except Exception as exc:  # noqa: BLE001
                 status, payload = _reflect_error_payload(exc)

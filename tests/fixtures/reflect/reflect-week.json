@@ -1,0 +1,45 @@
+{
+  "week": "2026-W36",
+  "generatedAt": "2026-09-05T09:12:44.512Z",
+  "sessionsAnalyzed": 12,
+  "sessionsTotal": 19,
+  "fluencyScore": 0.71,
+  "promptQuality": { "clarity": 4.2, "context": 3.6, "constraints": 4.4, "successCriteria": 3.5, "scope": 3.9 },
+  "trend": [
+    { "week": "2026-W33", "fluencyScore": 0.58 },
+    { "week": "2026-W34", "fluencyScore": 0.62 },
+    { "week": "2026-W35", "fluencyScore": 0.66 }
+  ],
+  "frictions": [
+    { "category": "missing-context", "count": 4, "attribution": "user-actionable", "costTokens": 41000000, "costUSD": 12.4,
+      "example": { "sessionId": "s-001", "quote": "just fix the popover thing", "fix": "Name the surface and the gesture in the first message." } },
+    { "category": "scope-creep", "count": 3, "attribution": "ai-capability", "costTokens": 18000000, "costUSD": 5.1,
+      "example": { "sessionId": "s-002", "quote": "stay on the reported bug", "fix": "Ask before touching adjacent code." } },
+    { "category": "environment", "count": 2, "attribution": "environment", "costTokens": 6000000, "costUSD": 1.9,
+      "example": { "sessionId": "s-003", "quote": "zsh: no matches found", "fix": "Quote globs." } },
+    { "category": "tool-failure", "count": 1, "attribution": "environment", "costTokens": 900000, "costUSD": 0.3 }
+  ],
+  "patterns": [
+    { "category": "constraint-first", "count": 6, "driver": "user-driven", "tool": "claude-code", "savedTurns": 3, "savedTokens": 780000, "example": { "sessionId": "s-001", "quote": "do not touch DiscoverAPI" } },
+    { "category": "verification-loop", "count": 5, "driver": "user-driven", "tool": "codex", "savedTurns": 2, "savedTokens": 320000, "example": { "sessionId": "s-004", "quote": "show me the failing output" } },
+    { "category": "delegation", "count": 3, "driver": "ai-driven" },
+    { "category": "example-driven", "count": 2, "driver": "user-driven" }
+  ],
+  "byTool": [
+    { "tool": "claude-code", "sessions": 7, "tokens": 512000000, "costUSD": 41.2, "reworkRate": 0.09, "promptQuality": 4.2 },
+    { "tool": "codex", "sessions": 5, "tokens": 284000000, "costUSD": 18.6, "reworkRate": 0.18, "promptQuality": 3.8 }
+  ],
+  "toolComparison": "Codex sessions had twice the rework rate of Claude sessions.",
+  "nextChecks": [
+    { "id": "c1", "text": "Name the surface and gesture in the first sentence.", "derivedFrom": "missing-context", "evidenceSessionIds": ["s-001", "s-005"] },
+    { "id": "c2", "text": "State the completion count before starting.", "derivedFrom": "scope-creep", "evidenceSessionIds": ["s-002"] },
+    { "id": "c3", "text": "Quote every shell glob.", "derivedFrom": "environment", "evidenceSessionIds": ["s-003"] },
+    { "id": "c4", "text": "Open the final PNG before calling the UI done.", "derivedFrom": "verification-gap", "evidenceSessionIds": ["s-001"] }
+  ],
+  "workingStyle": "You open with constraints and ask for evidence before accepting a result. Sessions drift when the surface is not named up front. Most cost lands in the first retry after a missing-context turn.",
+  "rules": [
+    { "id": "r1", "text": "Name the surface (popover / dashboard / notch) and the gesture before describing a UX bug.", "target": "AGENTS.md", "evidenceSessionIds": ["s-001", "s-005"] },
+    { "id": "r2", "text": "Quote globs and use absolute paths in every shell command.", "target": "AGENTS.md", "evidenceSessionIds": ["s-003"] },
+    { "id": "r3", "text": "Stay on the reported bug; ask before adjacent refactors.", "target": "CLAUDE.md", "evidenceSessionIds": ["s-002"] }
+  ]
+}
