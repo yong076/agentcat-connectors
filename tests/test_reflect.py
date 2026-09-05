@@ -411,6 +411,58 @@ class IndexerTests(ReflectTestCase):
         agentcat.reflect_sync(files=[("codex", codex_path)])
         self.assertTrue(agentcat.reflect_get_session("codex:" + CODEX_UUID)["automated"])
 
+    def test_claude_notifications_do_not_hide_human_session_or_count_as_prompts(self):
+        for marker in ({"promptSource": "system"}, {"promptSource": "hook"},
+                       {"origin": {"kind": "task-notification"}},
+                       {"promptSource": "system", "origin": {"kind": "task-notification"}}):
+            with self.subTest(marker=marker):
+                path = self.write_claude_session([
+                    claude_user("inspect the panel", 0, entrypoint="cli"),
+                    claude_assistant("Checking.", 1, tools=("Read",)),
+                    claude_user("Background task completed", 2, **marker),
+                    claude_assistant("Task result checked.", 3, tools=("Bash",)),
+                    claude_user("verify Escape closes it", 4),
+                    claude_assistant("Verified.", 5),
+                ])
+                digest = agentcat.reflect_parse_claude_session(path)
+                self.assertFalse(digest["automated"])
+                self.assertEqual(digest["user_turns"], 2)
+                self.assertEqual(digest["tool_call_counts"], {"Read": 1, "Bash": 1})
+                self.assertEqual(digest["tokens"], 4500)
+                self.assertNotIn("Background task completed", json.dumps(digest["turn_list"]))
+                analysis, _ = agentcat.reflect_validate_analysis(valid_analysis())
+                week = agentcat.reflect_synthesize_week("2026-W36", [{"session": digest, "analysis": analysis}])
+                self.assertEqual(week["prompt_quality"]["mean"], 3.6)
+
+    def test_claude_first_real_prompt_decides_worker_provenance(self):
+        for origin, automated in (({"entrypoint": "cli"}, False),
+                                  ({"entrypoint": "sdk-cli"}, True),
+                                  ({"entrypoint": "sdk"}, True),
+                                  ({"promptSource": "sdk"}, True),
+                                  ({"promptSource": "agent"}, True)):
+            with self.subTest(origin=origin):
+                path = self.write_claude_session([
+                    claude_user("Early task notification", 0, promptSource="system"),
+                    claude_user("first real request", 1, **origin),
+                    claude_assistant("done", 2),
+                    claude_user("later request", 3, entrypoint="cli"),
+                    claude_assistant("done again", 4),
+                ])
+                digest = agentcat.reflect_parse_claude_session(path)
+                self.assertEqual(digest["automated"], automated)
+                self.assertEqual(digest["user_turns"], 2)
+
+    def test_claude_notification_only_journal_has_no_human_analysis(self):
+        path = self.write_claude_session([
+            claude_user("Worker complete", 0, origin={"kind": "task-notification"}),
+            claude_assistant("Acknowledged.", 1),
+        ])
+        digest = agentcat.reflect_parse_claude_session(path)
+        self.assertTrue(digest["counts_only"])
+        self.assertTrue(digest["automated"])
+        self.assertEqual(digest["user_turns"], 0)
+        self.assertEqual(digest["turn_list"], [])
+
     def test_codex_digest_shape(self):
         path = self.write_codex_session()
         digest = agentcat.reflect_parse_codex_session(path)
@@ -904,6 +956,72 @@ class AnalyzerTests(ReflectTestCase):
 
 
 class StoreTests(ReflectTestCase):
+    def test_upgrade_reindexes_unchanged_claude_provenance_once_and_keeps_analysis(self):
+        path = self.write_claude_session([
+            claude_user("inspect the panel", 0, entrypoint="cli"),
+            claude_assistant("Done.", 1),
+            claude_user("Worker complete", 2, promptSource="system"),
+        ])
+        codex = self.write_codex_session()
+        agentcat.reflect_sync(files=[("claude", path), ("codex", codex)])
+        session_id = "claude:" + CLAUDE_UUID
+        analysis, _ = agentcat.reflect_validate_analysis(valid_analysis())
+        agentcat.reflect_store_analysis(session_id, "short", analysis, {"runner": "stub"})
+        # Model a pre-upgrade index, including unchanged file metadata.
+        with closing(sqlite3.connect(agentcat.REFLECT_DB)) as conn:
+            conn.execute("delete from state where key = 'claude_prompt_provenance_v1'")
+            conn.execute("update sessions set automated = 1, user_turns = 2 where id = ?", (session_id,))
+            conn.commit()
+        refreshed = agentcat.reflect_sync(files=[("claude", path), ("codex", codex)])
+        self.assertEqual((refreshed["indexed"], refreshed["skipped"]), (1, 1))
+        row = agentcat.reflect_get_session(session_id)
+        self.assertFalse(row["automated"])
+        self.assertEqual(row["user_turns"], 1)
+        self.assertEqual(agentcat.reflect_get_analysis(session_id)["analysis"], analysis)
+        repeated = agentcat.reflect_sync(files=[("claude", path), ("codex", codex)])
+        self.assertEqual((repeated["indexed"], repeated["skipped"]), (0, 2))
+        self.assertEqual(self.subprocess_calls, [])
+
+    def test_upgrade_preserves_analysis_coverage_after_prompt_bucket_shrinks(self):
+        path = self.write_claude_session()
+        agentcat.reflect_sync(files=[("claude", path)])
+        session_id = "claude:" + CLAUDE_UUID
+        analysis, _ = agentcat.reflect_validate_analysis(valid_analysis())
+        old_turns = 25
+        old_bucket = agentcat.reflect_length_bucket(old_turns)
+        agentcat.reflect_store_analysis(session_id, old_bucket, analysis, {"runner": "stub"})
+        with closing(sqlite3.connect(agentcat.REFLECT_DB)) as conn:
+            conn.execute("delete from state where key = 'claude_prompt_provenance_v1'")
+            conn.execute("update sessions set automated = 1, user_turns = ? where id = ?", (old_turns, session_id))
+            conn.commit()
+        agentcat.reflect_sync(files=[("claude", path)])
+        self.assertEqual(agentcat.reflect_pending_sessions(7, now=BASE_TS + dt.timedelta(days=1)), [])
+        result = agentcat.reflect_analyze_session(session_id, runner=StubRunner(responses=[]))
+        self.assertTrue(result["cached"])
+        self.assertEqual(result["analysis"], analysis)
+        self.assertEqual(self.subprocess_calls, [])
+
+    def test_upgrade_notification_only_row_keeps_counts_without_coaching(self):
+        path = self.write_claude_session([
+            claude_user("Task completed", 0, promptSource="system"),
+            claude_assistant("Acknowledged.", 1),
+        ])
+        agentcat.reflect_sync(files=[("claude", path)])
+        session_id = "claude:" + CLAUDE_UUID
+        analysis, _ = agentcat.reflect_validate_analysis(valid_analysis())
+        agentcat.reflect_store_analysis(session_id, "short", analysis, {"runner": "stub"})
+        with closing(sqlite3.connect(agentcat.REFLECT_DB)) as conn:
+            conn.execute("delete from state where key = 'claude_prompt_provenance_v1'")
+            conn.execute("update sessions set user_turns = 1, counts_only = 0 where id = ?", (session_id,))
+            conn.commit()
+        refreshed = agentcat.reflect_sync(files=[("claude", path)])
+        self.assertEqual(refreshed["indexed"], 1)
+        self.assertTrue(agentcat.reflect_get_session(session_id)["counts_only"])
+        self.assertEqual(agentcat.reflect_all_analyses(), [])
+        self.assertEqual(agentcat.reflect_get_analysis(session_id)["analysis"], analysis)
+        self.assertEqual(agentcat.reflect_pending_sessions(7, now=BASE_TS + dt.timedelta(days=1)), [])
+        self.assertEqual(agentcat.reflect_sync(files=[("claude", path)])["skipped"], 1)
+
     def test_init_db_migrates_analysis_language_column(self):
         with closing(sqlite3.connect(agentcat.REFLECT_DB)) as conn:
             conn.execute(
