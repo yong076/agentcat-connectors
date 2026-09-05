@@ -163,7 +163,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.36.6")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.36.7")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -4324,6 +4324,105 @@ def orca_quota_timestamp(raw: Any) -> Optional[int]:
     return reset_epoch(value) if value is not None else None
 
 
+def orca_claude_plan_type(metadata: Dict[str, Any]) -> Optional[str]:
+    """Only explicit subscription metadata, never quota percentages or model access.
+
+    Keep the bounded values display-ready for already released instance cards.
+    Unknown individual tiers do not inherit an organization's Max multiplier.
+    """
+    plans = {"claude_max": "Max", "claude_pro": "Pro", "claude_team": "Team",
+             "claude_enterprise": "Enterprise", "claude_free": "Free"}
+    organization_type = metadata.get("organizationType")
+    plan = plans.get(organization_type) if isinstance(organization_type, str) else None
+    if plan == "Max":
+        tier = metadata.get("userRateLimitTier")
+        if tier is None:
+            tier = metadata.get("organizationRateLimitTier")
+        if tier == "default_claude_max_5x":
+            return "Max 5x"
+        if tier == "default_claude_max_20x":
+            return "Max 20x"
+    return plan
+
+
+def orca_claude_profile_plan(account: Optional[Dict[str, Any]], now: float) -> Optional[Dict[str, str]]:
+    """Read profile metadata only; no OAuth tokens, Keychain, or auth CLI calls.
+
+    None denotes the system-default *slot*. Callers may use it only after the
+    Orca quota provenance and host selection have both identified that slot.
+    Managed profiles require directory marker + email + organization agreement.
+    These checks bind metadata to a profile; they never merge distinct profiles.
+    """
+    if os.environ.get("AGENTCAT_ORCA_PLANS", "1").lower() in ("0", "false", "off"):
+        return None
+    # Dev runtimes have a separate data directory. Do not silently read production
+    # metadata when the selected CLI is not the production runtime.
+    data_override = os.environ.get("AGENTCAT_ORCA_DATA_DIR")
+    cli_override = os.environ.get("AGENTCAT_ORCA_CLI") or os.environ.get("ORCA_CLI_COMMAND")
+    if not data_override and (os.environ.get("ORCA_DEV_REPO_ROOT") or cli_override):
+        return None
+    try:
+        if account is None:
+            path = HOME / ".claude.json"
+        else:
+            account_id = account.get("id")
+            if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", account_id):
+                return None
+            if account.get("managedAuthRuntime") != "host":
+                return None
+            if data_override:
+                root = Path(data_override).expanduser()
+            elif sys.platform == "darwin":
+                root = HOME / "Library" / "Application Support" / "orca"
+            elif IS_WINDOWS:
+                root = Path(os.environ.get("APPDATA") or HOME / "AppData" / "Roaming") / "orca"
+            else:
+                root = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "orca"
+            profile = root / "claude-accounts" / account_id / "auth"
+            path = profile / "oauth-account.json"
+            # Reject symlinks escaping this profile, not just lexical traversal.
+            profile_root = root.resolve() / "claude-accounts" / account_id
+            path.resolve().relative_to(profile_root)
+            marker = profile / ".orca-managed-claude-auth"
+            marker.resolve().relative_to(profile_root)
+            with marker.open("r", encoding="utf-8") as handle:
+                if handle.read(257).strip() != account_id:
+                    return None
+        with path.open("rb") as handle:
+            raw = handle.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            return None
+        metadata = json.loads(raw)
+        if account is None and isinstance(metadata, dict):
+            metadata = metadata.get("oauthAccount")
+        if not isinstance(metadata, dict):
+            return None
+        for key in ("accountUuid", "organizationUuid", "emailAddress"):
+            if not isinstance(metadata.get(key), str) or not metadata[key].strip():
+                return None
+        if account is not None:
+            if metadata["emailAddress"] != account.get("email") or metadata["organizationUuid"] != account.get("organizationUuid"):
+                return None
+        updated = orca_quota_timestamp(metadata.get("profileFetchedAt"))
+        if updated is None or updated > now + 60 or now - updated > 86400:
+            return None
+        if account is not None:
+            authenticated = orca_quota_timestamp(account.get("lastAuthenticatedAt"))
+            # Orca fetches the profile before committing the login record (1.72s
+            # apart in the verified host fixture). Permit that bounded write skew,
+            # not metadata left over from an earlier authentication.
+            if authenticated is not None and updated < authenticated - 5:
+                return None
+        plan = orca_claude_plan_type(metadata)
+        if plan:
+            return {"planType": plan, "planSource": "local-profile-metadata",
+                    "planUpdatedAt": iso_from_timestamp(updated)}
+    except (OSError, ValueError, RuntimeError):
+        # No raw errors, names, addresses, IDs, or paths enter the snapshot/cache.
+        pass
+    return None
+
+
 def orca_claude_limits(raw: Any, now: float) -> Dict[str, Any]:
     """Allowlist Orca quota buckets; never propagate errors or usageMetadata."""
     source = "orca-account-list"
@@ -4431,7 +4530,7 @@ def orca_claude_instances_from_accounts(payload: Any, now: Optional[float] = Non
         seed = "orca:host:system-default" if system_default else f"orca:host:managed:{account_id}"
         instance_id = provider_instance_id("claude", seed)
         suffix = instance_id.rsplit(":", 1)[-1][-4:].upper()
-        instances.append({
+        entry = {
             "id": instance_id,
             "providerID": "claude",
             "label": f"Claude · Orca {'default · ' if system_default else ''}{suffix}",
@@ -4443,7 +4542,12 @@ def orca_claude_instances_from_accounts(payload: Any, now: Optional[float] = Non
             "active": bool(selected),
             "status": "connected" if limits.get("quotas") else "discovered",
             "limits": limits,
-        })
+        }
+        plan = orca_claude_profile_plan(None if system_default else accounts[account_id], now)
+        if plan:
+            entry.update(plan)
+            limits["planType"] = plan["planType"]
+        instances.append(entry)
     return sorted(instances, key=lambda row: (not row["active"], row["id"]))
 
 

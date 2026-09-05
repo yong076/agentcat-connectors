@@ -77,6 +77,181 @@ class OrcaAccountsTests(unittest.TestCase):
     def response(self):
         return subprocess.CompletedProcess([], 0, json.dumps(self.payload).encode())
 
+    def plan_metadata(self, multiplier="5x"):
+        return {"accountUuid": "native-private-account", "emailAddress": "private@example.test",
+                "organizationUuid": "private-org", "organizationType": "claude_max",
+                "organizationRateLimitTier": "default_claude_max_" + multiplier,
+                "profileFetchedAt": NOW * 1000}
+
+    def write_plan(self, metadata=None, system=False):
+        metadata = self.plan_metadata("20x" if system else "5x") if metadata is None else metadata
+        if system:
+            path = agentcat.HOME / ".claude.json"
+            payload = {"oauthAccount": metadata}
+        else:
+            data_root = agentcat.HOME / "orca-data"
+            os.environ["AGENTCAT_ORCA_DATA_DIR"] = str(data_root)
+            path = data_root / "claude-accounts" / "managed-a" / "auth" / "oauth-account.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            (path.parent / ".orca-managed-claude-auth").write_text("managed-a\n", encoding="utf-8")
+            payload = metadata
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_plans_stay_per_profile_and_display_max_multiplier(self):
+        self.write_plan(system=True)
+        self.write_plan()
+        rows = self.rows()
+        self.assertEqual(rows[0]["planType"], "Max 20x")
+        self.assertEqual(self.managed(rows)["planType"], "Max 5x")
+        self.assertEqual(rows[0]["limits"]["planType"], "Max 20x")
+        self.assertEqual(self.managed(rows)["limits"]["planType"], "Max 5x")
+        self.assertEqual(rows[0]["planSource"], "local-profile-metadata")
+        self.assertIn("planUpdatedAt", rows[0])
+        serialized = json.dumps(rows)
+        for secret in ("native-private-account", "private@example.test", "private-org", "orca-data", "default_claude_max"):
+            self.assertNotIn(secret, serialized)
+
+    def test_selected_managed_does_not_inherit_default_plan(self):
+        self.write_plan(system=True)
+        self.write_plan()
+        self.payload["result"]["claude"]["activeAccountIdsByRuntime"]["host"] = "managed-a"
+        self.payload["result"]["rateLimits"]["claude"] = quota(42, "managed:managed-a")
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["planType"], "Max 5x")
+
+    def test_missing_managed_plan_never_inherits_system(self):
+        self.write_plan(system=True)
+        self.assertEqual(self.rows()[0]["planType"], "Max 20x")
+        self.assertNotIn("planType", self.managed())
+
+    def test_missing_system_plan_never_inherits_managed(self):
+        self.write_plan()
+        self.assertNotIn("planType", self.rows()[0])
+        self.assertEqual(self.managed()["planType"], "Max 5x")
+
+    def test_plan_can_survive_missing_quota_without_inventing_usage(self):
+        self.write_plan()
+        self.payload["result"]["rateLimits"]["inactiveClaudeAccounts"] = []
+        row = self.managed()
+        self.assertEqual(row["planType"], "Max 5x")
+        self.assertEqual(row["limits"]["quotas"], [])
+        self.assertFalse(row["tracked"])
+
+    def test_plan_identity_mismatch_or_missing_identity_is_unknown(self):
+        for key, value in (("emailAddress", "other@example.test"), ("organizationUuid", "other-org"),
+                           ("emailAddress", ""), ("accountUuid", None), ("organizationUuid", [])):
+            with self.subTest(key=key, value=value):
+                metadata = self.plan_metadata()
+                metadata[key] = value
+                self.write_plan(metadata)
+                self.assertNotIn("planType", self.managed())
+
+    def test_missing_or_wrong_marker_is_unknown(self):
+        path = self.write_plan()
+        marker = path.parent / ".orca-managed-claude-auth"
+        marker.write_text("different-profile", encoding="utf-8")
+        self.assertNotIn("planType", self.managed())
+        marker.unlink()
+        self.assertNotIn("planType", self.managed())
+
+    def test_plan_path_traversal_and_wsl_are_rejected_before_io(self):
+        account = copy.deepcopy(self.payload["result"]["claude"]["accounts"][0])
+        with patch.object(Path, "open", side_effect=AssertionError("unexpected read")):
+            for account_id in ("../elsewhere", "/absolute", "..\\elsewhere", "a/b", "", "a" * 129):
+                account["id"] = account_id
+                self.assertIsNone(agentcat.orca_claude_profile_plan(account, NOW))
+            account.update(id="managed-a", managedAuthRuntime="wsl")
+            self.assertIsNone(agentcat.orca_claude_profile_plan(account, NOW))
+
+    def test_plan_symlink_outside_profile_is_rejected(self):
+        path = self.write_plan()
+        outside = agentcat.HOME / "outside-metadata.json"
+        outside.write_text(json.dumps(self.plan_metadata()), encoding="utf-8")
+        path.unlink()
+        try:
+            path.symlink_to(outside)
+        except OSError:
+            self.skipTest("symlinks unavailable on this host")
+        self.assertNotIn("planType", self.managed())
+
+    def test_plan_freshness_and_authentication_boundary(self):
+        for stamp in (None, True, float("inf"), (NOW - 86401) * 1000, (NOW + 61) * 1000):
+            with self.subTest(stamp=stamp):
+                metadata = self.plan_metadata()
+                metadata["profileFetchedAt"] = stamp
+                self.write_plan(metadata)
+                self.assertNotIn("planType", self.managed())
+        self.write_plan()
+        self.payload["result"]["claude"]["accounts"][0]["lastAuthenticatedAt"] = (NOW + 6) * 1000
+        self.assertNotIn("planType", self.managed())
+
+    def test_profile_fetch_can_precede_login_commit_by_five_seconds(self):
+        self.write_plan()
+        self.payload["result"]["claude"]["accounts"][0]["lastAuthenticatedAt"] = (NOW + 2) * 1000
+        self.assertEqual(self.managed()["planType"], "Max 5x")
+
+    def test_unknown_plan_or_tier_is_not_guessed(self):
+        for organization in (None, [], "private@example.test", "unrecognized_plan"):
+            metadata = self.plan_metadata()
+            metadata["organizationType"] = organization
+            self.write_plan(metadata)
+            self.assertNotIn("planType", self.managed())
+        metadata = self.plan_metadata()
+        metadata["userRateLimitTier"] = "unrecognized_individual_tier"
+        self.write_plan(metadata)
+        self.assertEqual(self.managed()["planType"], "Max")
+
+    def test_individual_tier_overrides_organization_multiplier(self):
+        metadata = self.plan_metadata("20x")
+        metadata["userRateLimitTier"] = "default_claude_max_5x"
+        self.write_plan(metadata)
+        self.assertEqual(self.managed()["planType"], "Max 5x")
+
+    def test_coarse_plans_do_not_inherit_max_multiplier(self):
+        for kind, expected in (("claude_pro", "Pro"), ("claude_team", "Team"),
+                               ("claude_enterprise", "Enterprise"), ("claude_free", "Free")):
+            metadata = self.plan_metadata("20x")
+            metadata["organizationType"] = kind
+            self.write_plan(metadata)
+            self.assertEqual(self.managed()["planType"], expected)
+
+    def test_malformed_and_oversized_plan_files_leave_quotas_intact(self):
+        path = self.write_plan()
+        for body in ("not-json", "[]", "x" * (2 * 1024 * 1024 + 1)):
+            path.write_text(body, encoding="utf-8")
+            row = self.managed()
+            self.assertNotIn("planType", row)
+            self.assertEqual(row["limits"]["shortUsedPercent"], 100)
+
+    def test_plan_permission_error_leaves_quotas_intact(self):
+        self.write_plan()
+        # Keep HMAC identity generation outside the mocked metadata reads.
+        with patch.object(Path, "open", side_effect=PermissionError("private-path")):
+            account = self.payload["result"]["claude"]["accounts"][0]
+            self.assertIsNone(agentcat.orca_claude_profile_plan(account, NOW))
+
+    def test_plan_opt_out_does_not_disable_quotas(self):
+        self.write_plan()
+        self.write_plan(system=True)
+        os.environ["AGENTCAT_ORCA_PLANS"] = "0"
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all("planType" not in row for row in rows))
+        self.assertEqual(self.managed(rows)["limits"]["shortUsedPercent"], 100)
+
+    def test_cli_overrides_require_explicit_metadata_scope(self):
+        self.write_plan(system=True)
+        for variable in ("ORCA_DEV_REPO_ROOT", "ORCA_CLI_COMMAND", "AGENTCAT_ORCA_CLI"):
+            with patch.dict(os.environ, {variable: "/different/runtime"}):
+                self.assertNotIn("planType", self.rows()[0])
+
+    def test_default_plan_ignores_shell_claude_config_override(self):
+        self.write_plan(system=True)
+        os.environ["CLAUDE_CONFIG_DIR"] = str(agentcat.HOME / "unrelated-profile")
+        self.assertEqual(self.rows()[0]["planType"], "Max 20x")
+
     def test_default_and_managed_are_separate_private_profiles(self):
         rows = self.rows()
         self.assertEqual(len(rows), 2)
