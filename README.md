@@ -187,6 +187,32 @@ PATH and `~/.local/bin`. Linux uses `orca-ide`, never the GNOME `orca` screen re
 The host CLI contract was verified with Orca 1.4.193 on macOS; incompatible/missing
 CLI versions safely fall back to the existing collector.
 
+Account cards also receive `planType` from local **profile metadata**, not usage
+percentages. The selected system-default slot reads `~/.claude.json`'s
+`oauthAccount`; managed profiles read only
+`<Orca data directory>/claude-accounts/<profile>/auth/oauth-account.json`.
+Managed metadata must have the matching directory marker, email, and organization
+from Orca's account list. Those identifiers never leave the reader. This is not
+account deduplication, and a missing managed plan never inherits the default plan.
+OAuth credential files and Keychain are not read by this bridge.
+
+Explicit Max tiers render as `Max 5x` / `Max 20x`; otherwise only a recognized
+coarse plan is shown. An individual tier takes precedence over the organization's
+tier. Unknown plans remain absent. Metadata must have been fetched in the last
+24 hours and must not predate the managed profile's latest authentication by more
+than five seconds (Orca fetches profile metadata before committing the login).
+`planSource` and `planUpdatedAt` describe this cached metadata observation; they
+are not a live billing lookup. Quota freshness is checked independently.
+
+Set `AGENTCAT_ORCA_PLANS=0` to disable only plan discovery. The standard Orca data
+directory is `~/Library/Application Support/orca` on macOS, `%APPDATA%/orca` on
+Windows, or `$XDG_CONFIG_HOME/orca` (default `~/.config/orca`) on Linux.
+`AGENTCAT_ORCA_DATA_DIR` selects another local data directory. CLI/dev-runtime
+overrides require this explicit metadata directory before plan discovery runs,
+so they cannot silently attach production profile metadata to another runtime.
+The metadata layout was verified on macOS; missing/incompatible layouts on other
+hosts leave plans unknown without affecting quota discovery.
+
 ## Privacy
 
 The connector is local-first.
