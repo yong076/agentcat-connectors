@@ -3536,6 +3536,79 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(agentcat.classify_process("grok --prompt hello"), "grok")
         self.assertEqual(agentcat.classify_process("grock --prompt hello"), "grok")
 
+    def test_hermes_snapshot_reads_sqlite_sessions_and_preserves_unknown_cost(self) -> None:
+        hermes_home = self.root / "hermes-home"
+        hermes_home.mkdir(parents=True)
+        db_path = hermes_home / "state.db"
+        now_s = dt.datetime.now(dt.timezone.utc).timestamp()
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY, model TEXT, started_at REAL,
+                  input_tokens INTEGER, output_tokens INTEGER,
+                  cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+                  reasoning_tokens INTEGER, estimated_cost_usd REAL,
+                  actual_cost_usd REAL
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("trusted", "claude-sonnet-4-6", now_s, 1200, 300, 50, 20, 10, 0.12, 0.34),
+                    ("skip", "claude-sonnet-4-6", now_s, 0, 0, 0, 0, 0, 0, 0),
+                    ("included", "claude-sonnet-4-6", now_s, 10, 0, 0, 0, 0, 0, 0),
+                    ("unknown", "model-without-pricing", now_s, 25, 5, 0, 0, 0, 0, 0),
+                ],
+            )
+            conn.commit()
+
+        missing_home = self.root / "missing-hermes-home"
+        alias_home = self.root / "hermes-alias"
+        alias_home.symlink_to(hermes_home, target_is_directory=True)
+        with patch.dict(agentcat.os.environ, {"HERMES_HOME": f"{missing_home},{hermes_home},{alias_home}"}):
+            snapshot = agentcat.hermes_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 3)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 1235)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 305)
+        self.assertEqual(snapshot["tokens"]["totalTokens"], 1620)
+        self.assertAlmostEqual(snapshot["actualCostUsd"], 0.34)
+        self.assertAlmostEqual(snapshot["costUsd"], 0.34)
+        self.assertNotIn("costUsd", snapshot["models"]["model-without-pricing"])
+
+    def test_hermes_snapshot_missing_db_is_not_found(self) -> None:
+        missing_home = self.root / "missing-hermes-home"
+        with patch.dict(agentcat.os.environ, {"HERMES_HOME": str(missing_home)}):
+            snapshot = agentcat.hermes_snapshot()
+        self.assertEqual(snapshot["status"], "not_found")
+        self.assertEqual(snapshot["events"], 0)
+        self.assertEqual(snapshot["tokens"].get("totalTokens", 0), 0)
+
+    def test_hermes_snapshot_accepts_reduced_sessions_schema(self) -> None:
+        hermes_home = self.root / "reduced-hermes-home"
+        hermes_home.mkdir(parents=True)
+        with closing(sqlite3.connect(hermes_home / "state.db")) as conn:
+            conn.execute(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, input_tokens INTEGER, output_tokens INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+                ("reduced", "model-without-pricing", 40, 5),
+            )
+            conn.commit()
+
+        with patch.dict(agentcat.os.environ, {"HERMES_HOME": str(hermes_home)}):
+            snapshot = agentcat.hermes_snapshot()
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["events"], 1)
+        self.assertEqual(snapshot["tokens"]["inputTokens"], 40)
+        self.assertEqual(snapshot["tokens"]["outputTokens"], 5)
+        self.assertNotIn("costUsd", snapshot)
+
     def test_opencode_snapshot_reads_sqlite_message_tokens(self) -> None:
         data_home = agentcat.HOME / ".local" / "share"
         opencode_dir = data_home / "opencode"
