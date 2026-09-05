@@ -30,6 +30,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 
 def resolve_user_home_env() -> str:
@@ -77,6 +78,7 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/api/codex/usage",
 )
 CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+CODEX_RESET_CREDITS_CONSUME_URL = f"{CODEX_RESET_CREDITS_URL}/consume"
 CODEX_USAGE_BREAKDOWN_URL = "https://chatgpt.com/backend-api/wham/usage/daily-token-usage-breakdown"
 CODEX_USAGE_BREAKDOWN_CACHE = AGENTCAT_HOME / "codex-usage-breakdown-cache.json"
 CODEX_USAGE_BREAKDOWN_TTL_SECONDS = int(os.environ.get("AGENTCAT_CODEX_USAGE_TTL_SECONDS", "900"))
@@ -95,6 +97,7 @@ GROK_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=cr
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+COPILOT_USAGE_URL = "https://api.github.com/copilot_internal/user"
 # Epoch values below this are seconds; Kimi CLI 0.39.x env files may use ms.
 KIMI_EXPIRES_AT_MS_THRESHOLD = 10 ** 11
 GROK_MEDIA_TOOL_NAMES = {
@@ -119,6 +122,10 @@ GEMINI_CACHE_MIN_SECONDS = float(os.environ.get("AGENTCAT_GEMINI_CACHE_MIN_SECON
 LOCAL_PROVIDER_PARSE_BYTES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_PARSE_BYTES", str(16 * 1024 * 1024)))
 LOCAL_PROVIDER_MAX_FILES = int(os.environ.get("AGENTCAT_LOCAL_PROVIDER_MAX_FILES", "10000"))
 LIVE_LIMITS_MAX_AGE_SECONDS = int(os.environ.get("AGENTCAT_LIVE_LIMITS_MAX_AGE_SECONDS", "900"))
+ADAPTIVE_LIVE_LIMITS_POLL_SECONDS = 120
+ADAPTIVE_LIVE_LIMITS_THRESHOLD_PERCENT = 10.0
+ADAPTIVE_LIVE_LIMITS_RESET_SIGNAL_SECONDS = 2 * 60 * 60
+ADAPTIVE_LIVE_LIMITS_RECOVERY_SECONDS = 30 * 60
 LIVE_LIMITS_ERROR_BACKOFF_BASE_SECONDS = 30
 LIVE_LIMITS_ERROR_BACKOFF_MAX_SECONDS = 900
 # A "no quota for this account" answer is cached to stop the per-tick reprobe loop, but on
@@ -2970,6 +2977,92 @@ def live_limits_error_backoff_seconds(failure_streak: int) -> int:
     )
 
 
+def tracked_limit_remaining_percentages(limits: Dict[str, Any]) -> List[float]:
+    values: List[float] = []
+    quotas = limits.get("quotas")
+    if isinstance(quotas, list):
+        for quota in quotas:
+            if not isinstance(quota, dict):
+                continue
+            remaining = float_percent(quota.get("remainingPercent"))
+            if remaining is not None:
+                values.append(remaining)
+    if not values:
+        for key in ("shortUsedPercent", "weeklyUsedPercent"):
+            used = float_percent(limits.get(key))
+            if used is not None:
+                values.append(100.0 - used)
+    return values
+
+
+def adaptive_limit_poll_policy(
+    limits: Dict[str, Any],
+    *,
+    now: int,
+    normal_interval_seconds: int = LIVE_LIMITS_MAX_AGE_SECONDS,
+    previous_state: Optional[Dict[str, Any]] = None,
+    reset_signal_at: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Pure provider-local polling policy with recovery hysteresis."""
+    state = previous_state if isinstance(previous_state, dict) else {}
+    was_accelerated = state.get("accelerated") is True
+    previous_above = int_limit(state.get("aboveThresholdSince"))
+    remaining = tracked_limit_remaining_percentages(limits)
+    has_low_window = any(value < ADAPTIVE_LIVE_LIMITS_THRESHOLD_PERCENT for value in remaining)
+    all_windows_recovered = bool(remaining) and all(
+        value >= ADAPTIVE_LIVE_LIMITS_THRESHOLD_PERCENT for value in remaining
+    )
+    signal_at = int_limit(reset_signal_at)
+    recent_reset = bool(
+        signal_at is not None
+        and 0 <= now - signal_at < ADAPTIVE_LIVE_LIMITS_RESET_SIGNAL_SECONDS
+    )
+
+    if has_low_window:
+        return {
+            "accelerated": True,
+            "intervalSeconds": ADAPTIVE_LIVE_LIMITS_POLL_SECONDS,
+            "reason": "low_remaining",
+            "aboveThresholdSince": None,
+        }
+
+    above_since = previous_above
+    if all_windows_recovered and above_since is None and (was_accelerated or recent_reset):
+        above_since = now
+    if recent_reset:
+        return {
+            "accelerated": True,
+            "intervalSeconds": ADAPTIVE_LIVE_LIMITS_POLL_SECONDS,
+            "reason": "recent_reset",
+            "aboveThresholdSince": above_since,
+        }
+
+    if was_accelerated:
+        if not all_windows_recovered:
+            return {
+                "accelerated": True,
+                "intervalSeconds": ADAPTIVE_LIVE_LIMITS_POLL_SECONDS,
+                "reason": "awaiting_headroom",
+                "aboveThresholdSince": None,
+            }
+        if above_since is None:
+            above_since = now
+        if now - above_since < ADAPTIVE_LIVE_LIMITS_RECOVERY_SECONDS:
+            return {
+                "accelerated": True,
+                "intervalSeconds": ADAPTIVE_LIVE_LIMITS_POLL_SECONDS,
+                "reason": "recovering",
+                "aboveThresholdSince": above_since,
+            }
+
+    return {
+        "accelerated": False,
+        "intervalSeconds": int(normal_interval_seconds),
+        "reason": "normal",
+        "aboveThresholdSince": None,
+    }
+
+
 def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = False) -> Optional[Dict[str, Any]]:
     raw = read_json(LIVE_LIMITS_CACHE)
     if not isinstance(raw, dict) or raw.get("_agentcat_error"):
@@ -2984,6 +3077,14 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     now = int(time.time())
     age = now - cached_at
     failure_streak = int_count(entry.get("failureStreak")) or 0
+    poll_policy = adaptive_limit_poll_policy(
+        limits,
+        now=now,
+        normal_interval_seconds=max_age_seconds,
+        previous_state=entry.get("pollPolicy"),
+        reset_signal_at=int_limit(entry.get("resetSignalAt")),
+    )
+    adaptive_max_age = int(poll_policy["intervalSeconds"])
     retry_at = int_limit(limits.get("retryAt"))
     if retry_at is not None:
         if retry_at > now:
@@ -2997,13 +3098,20 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     elif limits.get("status") == "not_configured" and limits.get("reason") == "not_applicable":
         effective_max_age = LIVE_LIMITS_NOT_APPLICABLE_TTL
     else:
-        effective_max_age = max_age_seconds
-    if age > effective_max_age and not allow_stale:
+        effective_max_age = adaptive_max_age
+    adaptive_due = (
+        poll_policy.get("accelerated") is True
+        and effective_max_age == ADAPTIVE_LIVE_LIMITS_POLL_SECONDS
+        and retry_at is None
+        and failure_streak == 0
+    )
+    expired = age >= effective_max_age if adaptive_due else age > effective_max_age
+    if expired and not allow_stale:
         return None
     out = dict(limits)
     out["cachedAt"] = cached_at
     out["cacheAgeSeconds"] = max(age, 0)
-    if age > effective_max_age:
+    if expired:
         out["stale"] = True
     return out
 
@@ -3040,11 +3148,23 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
             limits = merged
         previous_streak = int_count(previous.get("failureStreak")) or 0
         failed = status == "error" or bool(limits.get("liveError"))
+        now = int(time.time())
+        reset_signal_at = int_limit(previous.get("resetSignalAt"))
+        poll_policy = adaptive_limit_poll_policy(
+            limits,
+            now=now,
+            normal_interval_seconds=LIVE_LIMITS_MAX_AGE_SECONDS,
+            previous_state=previous.get("pollPolicy"),
+            reset_signal_at=reset_signal_at,
+        )
         cache[provider] = {
-            "cachedAt": int(time.time()),
+            "cachedAt": now,
             "failureStreak": previous_streak + 1 if failed else 0,
             "limits": limits,
+            "pollPolicy": poll_policy,
         }
+        if reset_signal_at is not None:
+            cache[provider]["resetSignalAt"] = reset_signal_at
         tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
         with tmp_path.open("w", encoding="utf-8") as fh:
             json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -3052,6 +3172,34 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
         tmp_path.replace(LIVE_LIMITS_CACHE)
     except Exception:
         pass
+
+
+def record_live_limit_reset_signal(provider: str, observed_at: Optional[int] = None) -> None:
+    """Mark a provider reset without storing a signal id, source, or identity."""
+    try:
+        ensure_dirs()
+        raw = read_json(LIVE_LIMITS_CACHE)
+        cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+        entry = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
+        entry = dict(entry)
+        signal_at = int(observed_at if observed_at is not None else time.time())
+        limits = entry.get("limits") if isinstance(entry.get("limits"), dict) else {}
+        entry["resetSignalAt"] = signal_at
+        entry["pollPolicy"] = adaptive_limit_poll_policy(
+            limits,
+            now=signal_at,
+            normal_interval_seconds=LIVE_LIMITS_MAX_AGE_SECONDS,
+            previous_state=entry.get("pollPolicy"),
+            reset_signal_at=signal_at,
+        )
+        cache[provider] = entry
+        tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        tmp_path.replace(LIVE_LIMITS_CACHE)
+    except Exception:
+        logging.debug("failed to record live-limit reset signal for %s", provider)
 
 
 def serve_stale_live_limits(
@@ -3463,7 +3611,7 @@ def refresh_codex_access_token(auth: Dict[str, Any]) -> Optional[str]:
     return token if isinstance(token, str) and token else None
 
 
-def codex_usage_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
+def codex_request_headers(access_token: str, account_id: str) -> Dict[str, str]:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
@@ -3471,23 +3619,45 @@ def codex_usage_request(access_token: str, account_id: str, url: str) -> Dict[st
         "OpenAI-Beta": "codex-1",
     }
     if account_id:
-        headers["chatgpt-account-id"] = account_id
-    req = urllib.request.Request(url, headers=headers)
+        headers["ChatGPT-Account-Id"] = account_id
+    return headers
+
+
+def codex_usage_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
+    req = urllib.request.Request(url, headers=codex_request_headers(access_token, account_id))
     with urllib.request.urlopen(req, timeout=12) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload if isinstance(payload, dict) else {}
 
 
 def codex_reset_credits_request(access_token: str, account_id: str) -> Dict[str, Any]:
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-        "User-Agent": "codex-cli",
-        "OpenAI-Beta": "codex-1",
-    }
-    if account_id:
-        headers["chatgpt-account-id"] = account_id
-    req = urllib.request.Request(CODEX_RESET_CREDITS_URL, headers=headers)
+    req = urllib.request.Request(
+        CODEX_RESET_CREDITS_URL,
+        headers=codex_request_headers(access_token, account_id),
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def codex_reset_credit_consume_request(
+    access_token: str,
+    account_id: str,
+    credit_id: str,
+    redeem_request_id: str,
+) -> Dict[str, Any]:
+    body = json.dumps(
+        {"credit_id": credit_id, "redeem_request_id": redeem_request_id},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    headers = codex_request_headers(access_token, account_id)
+    headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        CODEX_RESET_CREDITS_CONSUME_URL,
+        data=body,
+        headers=headers,
+        method="POST",
+    )
     with urllib.request.urlopen(req, timeout=12) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload if isinstance(payload, dict) else {}
@@ -3727,6 +3897,7 @@ def codex_reset_credit_summaries(raw: Any) -> List[Dict[str, Any]]:
             continue
         summary: Dict[str, Any] = {}
         for source, target in (
+            ("id", "id"),
             ("status", "status"),
             ("title", "title"),
             ("description", "description"),
@@ -3738,6 +3909,7 @@ def codex_reset_credit_summaries(raw: Any) -> List[Dict[str, Any]]:
         for source, target in (
             ("granted_at", "grantedAt"),
             ("expires_at", "expiresAt"),
+            ("redeem_started_at", "redeemStartedAt"),
             ("redeemed_at", "redeemedAt"),
         ):
             value = item.get(source)
@@ -3924,6 +4096,101 @@ def codex_live_limits(force: bool = False) -> Dict[str, Any]:
         return empty_limits()
     # Keep the legacy provider-level key for installed clients and migrations.
     return codex_live_limits_for_auth(auth, "codex", force=force)
+
+
+def _codex_consumed_credit(
+    credit_id: str,
+    consume_payload: Dict[str, Any],
+    limits: Dict[str, Any],
+) -> Dict[str, Any]:
+    summaries = codex_reset_credit_summaries([consume_payload.get("credit")])
+    if summaries:
+        return summaries[0]
+    credits = limits.get("resetCredits")
+    if isinstance(credits, list):
+        for credit in credits:
+            if isinstance(credit, dict) and credit.get("id") == credit_id:
+                return dict(credit)
+    return {"id": credit_id}
+
+
+def log_codex_reset_credit_diagnostic(
+    ok: bool,
+    *,
+    windows_reset: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> None:
+    payload: Dict[str, Any] = {"ok": bool(ok)}
+    if windows_reset is not None:
+        payload["windowsReset"] = windows_reset
+    if reason:
+        payload["reason"] = reason
+    try:
+        # Deliberately omit account, credit, token, and confirmation identifiers.
+        store_event("codex", "agentcat-reset-credit", "reset-credit-consume", payload)
+    except Exception:
+        logging.debug("failed to persist Codex reset-credit diagnostic")
+
+
+def consume_codex_reset_credit(credit_id: Any, confirmation: Any) -> Dict[str, Any]:
+    if not isinstance(credit_id, str) or not credit_id.strip() or len(credit_id) > 512:
+        raise ValueError("creditId must be a non-empty string")
+    if not isinstance(confirmation, str) or not confirmation.strip() or len(confirmation) > 512:
+        raise ValueError("confirmation must be a non-empty nonce")
+    credit_id = credit_id.strip()
+    confirmation = confirmation.strip()
+
+    auth = read_codex_auth()
+    if not auth:
+        log_codex_reset_credit_diagnostic(False, reason="token_missing")
+        raise RuntimeError("Codex OAuth credentials are not configured")
+    tokens = oauth_tokens(auth)
+    access_token = tokens.get("access_token")
+    account_id = tokens.get("account_id") or auth.get("account_id") or ""
+    if not isinstance(access_token, str) or not access_token:
+        log_codex_reset_credit_diagnostic(False, reason="token_missing")
+        raise RuntimeError("Codex OAuth credentials are not configured")
+
+    try:
+        consume_payload = codex_reset_credit_consume_request(
+            access_token,
+            str(account_id),
+            credit_id,
+            confirmation,
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            log_codex_reset_credit_diagnostic(False, reason="upstream_http_error")
+            raise
+        exc.close()
+        try:
+            refreshed = refresh_codex_access_token(auth)
+        except Exception:
+            refreshed = None
+        if not refreshed:
+            log_codex_reset_credit_diagnostic(False, reason="token_expired")
+            raise RuntimeError("Codex OAuth token expired")
+        try:
+            consume_payload = codex_reset_credit_consume_request(
+                refreshed,
+                str(account_id),
+                credit_id,
+                confirmation,
+            )
+        except Exception:
+            log_codex_reset_credit_diagnostic(False, reason="upstream_http_error")
+            raise
+
+    windows_reset = int_count(consume_payload.get("windows_reset"))
+    limits = codex_live_limits(force=True)
+    record_live_limit_reset_signal("codex")
+    log_codex_reset_credit_diagnostic(True, windows_reset=windows_reset)
+    return {
+        "ok": True,
+        "windowsReset": windows_reset if windows_reset is not None else 0,
+        "credit": _codex_consumed_credit(credit_id, consume_payload, limits),
+        "limits": limits,
+    }
 
 
 def _resolved_path_key(path: Path) -> str:
@@ -4729,22 +4996,45 @@ def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, st
     return normalized_model, f"{scope_name} {window_label}", window, group or None
 
 
+def claude_plan_type_from_usage_response(payload: Dict[str, Any]) -> Optional[str]:
+    for key in ("plan_type", "planType", "subscription_type", "subscriptionType", "plan"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def claude_subscription_type_fallback() -> Optional[str]:
+    raw = read_json(HOME / ".claude.json")
+    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+        return None
+    value = raw.get("subscriptionType")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "claude-oauth-usage-api") -> Dict[str, Any]:
     limits = empty_limits(status="auto")
     limits["source"] = source
+    limits["planType"] = claude_plan_type_from_usage_response(payload)
     quotas: List[Dict[str, Any]] = []
 
     for key, entry in payload.items():
         if not isinstance(entry, dict):
             continue
-        if entry.get("is_enabled") is False:
-            continue
 
         if key == "extra_usage" or entry.get("monthly_limit") is not None:
             limit = float_value(entry.get("monthly_limit"))
-            used = float_value(entry.get("used_credits")) or 0.0
-            currency = str(entry.get("currency") or "credits")
-            if limit and limit > 0:
+            raw_used = float_value(entry.get("used_credits"))
+            used = raw_used or 0.0
+            currency = str(entry.get("currency") or "USD").strip() or "USD"
+            enabled = entry.get("is_enabled") is True
+            limits["extraUsage"] = {
+                "enabled": enabled,
+                "usedUSD": raw_used,
+                "monthlyLimitUSD": limit,
+                "currency": currency,
+            }
+            if enabled and limit and limit > 0:
                 remaining = max(limit - used, 0.0)
                 used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
                 quotas.append(
@@ -4761,6 +5051,9 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
                         source=source,
                     )
                 )
+            continue
+
+        if entry.get("is_enabled") is False:
             continue
 
         used = float_percent(first_present(entry.get("utilization"), entry.get("used_percentage")))
@@ -4879,6 +5172,8 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
         try:
             payload = claude_usage_request(token)
             limits = claude_limits_from_usage_response(payload, source=CLAUDE_USAGE_URL)
+            if not limits.get("planType"):
+                limits["planType"] = claude_subscription_type_fallback()
             credentialed(limits)
             write_live_limits_cache("claude", limits)
             return limits
@@ -6132,6 +6427,154 @@ def kimi_live_limits(force: bool = False) -> Dict[str, Any]:
     return limits
 
 
+def copilot_oauth_token() -> Optional[str]:
+    """Read the GitHub OAuth token already stored by GitHub Copilot.
+
+    hosts.json and apps.json have varied slightly across Copilot clients, so
+    search nested dictionaries for the known OAuth key spellings. The token is
+    used only for the live request and is never added to a snapshot or cache.
+    """
+    root = HOME / ".config" / "github-copilot"
+
+    def token_in(raw: Any, depth: int = 0) -> Optional[str]:
+        if not isinstance(raw, dict) or depth > 4:
+            return None
+        for key in ("oauth_token", "oauthToken", "access_token"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        github = raw.get("github.com")
+        if isinstance(github, dict):
+            found = token_in(github, depth + 1)
+            if found:
+                return found
+        for value in raw.values():
+            if isinstance(value, dict):
+                found = token_in(value, depth + 1)
+                if found:
+                    return found
+        return None
+
+    for name in ("hosts.json", "apps.json"):
+        raw = read_json(root / name)
+        token = token_in(raw)
+        if token:
+            return token
+    return None
+
+
+def copilot_usage_request(token: str) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        COPILOT_USAGE_URL,
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/json",
+            "Editor-Version": "vscode/1.96.2",
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "X-Github-Api-Version": "2025-04-01",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def first_of_next_month_epoch(now: Optional[dt.datetime] = None) -> int:
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    current = current.astimezone(dt.timezone.utc)
+    if current.month == 12:
+        reset = dt.datetime(current.year + 1, 1, 1, tzinfo=dt.timezone.utc)
+    else:
+        reset = dt.datetime(current.year, current.month + 1, 1, tzinfo=dt.timezone.utc)
+    return int(reset.timestamp())
+
+
+def copilot_limits_from_user_response(
+    payload: Dict[str, Any],
+    *,
+    source: str = COPILOT_USAGE_URL,
+    now: Optional[dt.datetime] = None,
+) -> Dict[str, Any]:
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    plan = first_present(payload.get("copilotPlan"), payload.get("copilot_plan"))
+    limits["planType"] = plan.strip() if isinstance(plan, str) and plan.strip() else None
+    snapshots = first_present(payload.get("quotaSnapshots"), payload.get("quota_snapshots"))
+    snapshots = snapshots if isinstance(snapshots, dict) else {}
+    reset_at = first_of_next_month_epoch(now)
+    quotas: List[Dict[str, Any]] = []
+
+    def append_quota(keys: Tuple[str, ...], quota_id: str, label: str) -> None:
+        raw = None
+        for key in keys:
+            if isinstance(snapshots.get(key), dict):
+                raw = snapshots[key]
+                break
+        if not isinstance(raw, dict):
+            return
+        entitlement = float_value(raw.get("entitlement"))
+        remaining = float_value(raw.get("remaining"))
+        percent_remaining = float_percent(
+            first_present(raw.get("percentRemaining"), raw.get("percent_remaining"))
+        )
+        # Business/token-billing seats expose explicit zero-value placeholders.
+        if entitlement == 0 and remaining == 0:
+            return
+        if percent_remaining is None and entitlement is not None and entitlement > 0 and remaining is not None:
+            percent_remaining = float_percent((remaining / entitlement) * 100.0)
+        if percent_remaining is None:
+            return
+        used = None
+        if entitlement is not None and remaining is not None:
+            used = max(entitlement - remaining, 0.0)
+        quotas.append(
+            quota_entry(
+                quota_id,
+                label,
+                used_percent=100.0 - percent_remaining,
+                used=used,
+                remaining=remaining,
+                limit=entitlement,
+                unit="requests",
+                window="month",
+                reset_at=reset_at,
+                source=source,
+            )
+        )
+
+    append_quota(("premiumInteractions", "premium_interactions"), "copilot:premium_interactions", "Premium interactions")
+    append_quota(("chat",), "copilot:chat", "Chat")
+    limits["quotas"] = quotas
+    if not quotas:
+        limits["status"] = "not_configured"
+        limits["reason"] = "not_applicable"
+    return limits
+
+
+def copilot_live_limits(force: bool = False) -> Dict[str, Any]:
+    cached = None if force else cached_live_limits("copilot", LIVE_LIMITS_MAX_AGE_SECONDS)
+    if cached:
+        return cached
+    token = copilot_oauth_token()
+    if not token:
+        return empty_limits(reason="token_missing")
+    try:
+        payload = copilot_usage_request(token)
+        limits = copilot_limits_from_user_response(payload)
+        write_live_limits_cache("copilot", limits)
+        return limits
+    except Exception as exc:
+        stale = cached_live_limits("copilot", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+        if stale:
+            return serve_stale_live_limits("copilot", stale, exc)
+        limits = live_limit_error(exc, COPILOT_USAGE_URL)
+        write_live_limits_cache("copilot", limits)
+        return limits
+
+
 def prefer_live_limits(live: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
     if live.get("status") in {"auto", "ok"} and (
         live.get("quotas") or any(live.get(key) is not None for key in ("weeklyUsedPercent", "shortUsedPercent"))
@@ -6172,6 +6615,7 @@ def runtime_limits() -> Dict[str, Dict[str, Any]]:
         "antigravity": _safe(antigravity_live_limits),
         "grok": _safe(grok_live_limits),
         "kimi": _safe(kimi_live_limits),
+        "copilot": _safe(copilot_live_limits),
     }
 
 
@@ -15174,6 +15618,34 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             status, payload = reflect_http_post(path, body)
             self.send_json(status, payload)
             return
+        if path == "/providers/codex/reset-credits/consume":
+            guard_error = key_mutation_request_error(self.headers)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "reset_credit_forbidden", "message": reason})
+                return
+            try:
+                payload = self.read_json_body(max_bytes=16 * 1024)
+                response = consume_codex_reset_credit(
+                    payload.get("creditId"),
+                    payload.get("confirmation"),
+                )
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_reset_credit_request", "message": str(exc)})
+                return
+            except RuntimeError as exc:
+                self.send_json(409, {"error": "codex_not_configured", "message": str(exc)})
+                return
+            except urllib.error.HTTPError as exc:
+                status = int(exc.code)
+                exc.close()
+                self.send_json(502, {"error": "reset_credit_consume_failed", "upstreamStatus": status})
+                return
+            except Exception:
+                self.send_json(500, {"error": "reset_credit_consume_failed"})
+                return
+            self.send_json(200, response)
+            return
         if path == "/v1/config":
             try:
                 payload = self.read_json_body()
@@ -15391,6 +15863,16 @@ def command_codex_notify(args: argparse.Namespace) -> int:
     payload = read_stdin_payload()
     runtime_mode = codex_runtime_mode_event(payload)
     store_event("codex", "codex-notify", "notify", codex_notify_storage_payload(payload, runtime_mode))
+    return 0
+
+
+def command_codex_reset_credit_consume(args: argparse.Namespace) -> int:
+    try:
+        payload = consume_codex_reset_credit(args.credit_id, str(uuid.uuid4()))
+    except Exception as exc:
+        print(f"agentcat codex reset-credit consume: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
@@ -16173,6 +16655,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     codex_notify = subparsers.add_parser("codex-notify")
     codex_notify.set_defaults(func=command_codex_notify)
+
+    codex = subparsers.add_parser("codex")
+    codex_commands = codex.add_subparsers(dest="codex_command", required=True)
+    reset_credit = codex_commands.add_parser("reset-credit")
+    reset_credit_commands = reset_credit.add_subparsers(dest="reset_credit_command", required=True)
+    reset_credit_consume = reset_credit_commands.add_parser("consume")
+    reset_credit_consume.add_argument("credit_id")
+    reset_credit_consume.set_defaults(func=command_codex_reset_credit_consume)
 
     setup_prompt = subparsers.add_parser("setup-prompt")
     setup_prompt.set_defaults(func=command_setup_prompt)

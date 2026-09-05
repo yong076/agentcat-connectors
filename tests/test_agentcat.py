@@ -334,7 +334,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["resetCreditsAvailable"], 2)
         self.assertEqual(limits["resetCredits"][0]["status"], "available")
         self.assertEqual(limits["resetCredits"][0]["title"], "One rate limit reset")
-        self.assertNotIn("id", limits["resetCredits"][0])
+        self.assertEqual(limits["resetCredits"][0]["id"], "secret-credit-id")
         self.assertNotIn("profile_user_id", limits["resetCredits"][0])
         self.assertNotIn("profile_image_url", limits["resetCredits"][0])
 
