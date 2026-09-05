@@ -1,0 +1,204 @@
+"""Regression tests for WP30 provider limits and reset-credit support."""
+
+import importlib.util
+import http.client
+import io
+import json
+import os
+import tempfile
+import threading
+import unittest
+from contextlib import redirect_stdout
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from unittest.mock import patch
+
+from tests.sandbox import assert_sandboxed, redirect_module_paths, restore_module_paths
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LOADER = SourceFileLoader("agentcat_module_wp30", str(REPO_ROOT / "bin" / "agentcat"))
+SPEC = importlib.util.spec_from_loader("agentcat_module_wp30", LOADER)
+agentcat = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(agentcat)
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class WP30TestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.agentcat_home = self.root / "agentcat"
+        self.home.mkdir()
+        self.agentcat_home.mkdir()
+        self.old_paths = redirect_module_paths(agentcat, self.home, self.agentcat_home)
+        assert_sandboxed(agentcat, self.home, self.agentcat_home)
+        self.env = patch.dict(os.environ, {"HOME": str(self.home)}, clear=False)
+        self.env.start()
+        self.network = patch.object(
+            agentcat.urllib.request,
+            "urlopen",
+            side_effect=AssertionError("network must be stubbed in WP30 tests"),
+        )
+        self.network.start()
+
+    def tearDown(self):
+        self.network.stop()
+        self.env.stop()
+        restore_module_paths(agentcat, self.old_paths)
+        self.tmp.cleanup()
+
+
+class CodexResetCreditTests(WP30TestCase):
+    def test_credit_summary_includes_id_but_omits_account_identity(self):
+        summaries = agentcat.codex_reset_credit_summaries(
+            [{
+                "id": "RateLimitResetCredit_fixture",
+                "status": "available",
+                "profile_user_id": "user-secret",
+                "profile_image_url": "https://example.test/private.png",
+            }]
+        )
+
+        self.assertEqual(summaries, [{"id": "RateLimitResetCredit_fixture", "status": "available"}])
+
+    def test_consume_request_uses_selected_credit_nonce_and_codex_headers(self):
+        observed = {}
+
+        def fake_urlopen(request, timeout):
+            observed["request"] = request
+            observed["timeout"] = timeout
+            return FakeResponse({"code": "reset", "windows_reset": 2})
+
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = agentcat.codex_reset_credit_consume_request(
+                "access-token", "account-id", "credit-id", "confirmation-nonce"
+            )
+
+        request = observed["request"]
+        self.assertEqual(request.full_url, agentcat.CODEX_RESET_CREDITS_CONSUME_URL)
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(json.loads(request.data), {
+            "credit_id": "credit-id",
+            "redeem_request_id": "confirmation-nonce",
+        })
+        self.assertEqual(request.get_header("Authorization"), "Bearer access-token")
+        self.assertEqual(request.get_header("Chatgpt-account-id"), "account-id")
+        self.assertEqual(result["windows_reset"], 2)
+
+    def test_consume_refreshes_limits_and_logs_identity_free_diagnostic(self):
+        auth = {"tokens": {"access_token": "token", "account_id": "account-secret"}}
+        refreshed = agentcat.empty_limits(status="auto")
+        refreshed["quotas"] = [{"id": "codex:5h", "remainingPercent": 100.0}]
+        consumed = {
+            "code": "reset",
+            "windows_reset": 1,
+            "credit": {
+                "id": "credit-secret",
+                "status": "redeemed",
+                "redeemed_at": "2026-09-05T00:00:00Z",
+                "profile_user_id": "identity-secret",
+            },
+        }
+        events = []
+        with patch.object(agentcat, "read_codex_auth", return_value=auth), patch.object(
+            agentcat, "codex_reset_credit_consume_request", return_value=consumed
+        ) as request, patch.object(
+            agentcat, "codex_live_limits", return_value=refreshed
+        ) as refresh, patch.object(
+            agentcat, "store_event", side_effect=lambda *args: events.append(args) or {"id": 1}
+        ):
+            result = agentcat.consume_codex_reset_credit("credit-secret", "nonce-secret")
+
+        request.assert_called_once_with("token", "account-secret", "credit-secret", "nonce-secret")
+        refresh.assert_called_once_with(force=True)
+        self.assertEqual(result["windowsReset"], 1)
+        self.assertEqual(result["credit"]["id"], "credit-secret")
+        self.assertEqual(result["limits"], refreshed)
+        diagnostic_text = json.dumps(events)
+        self.assertNotIn("account-secret", diagnostic_text)
+        self.assertNotIn("credit-secret", diagnostic_text)
+        self.assertNotIn("nonce-secret", diagnostic_text)
+        self.assertEqual(events[0][3], {"ok": True, "windowsReset": 1})
+
+    def test_http_consume_is_host_guarded_and_validates_confirmation(self):
+        server = agentcat.ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            connection.request(
+                "POST",
+                "/providers/codex/reset-credits/consume",
+                body=json.dumps({"creditId": "credit"}),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 400)
+            response.read()
+            connection.close()
+
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            connection.request(
+                "POST",
+                "/providers/codex/reset-credits/consume",
+                body=json.dumps({"creditId": "credit", "confirmation": "nonce"}),
+                headers={"Content-Type": "application/json", "Host": "evil.example"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 403)
+            response.read()
+            connection.close()
+
+            expected = {"ok": True, "windowsReset": 2, "credit": {"id": "credit"}, "limits": {}}
+            with patch.object(agentcat, "consume_codex_reset_credit", return_value=expected) as consume:
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                connection.request(
+                    "POST",
+                    "/providers/codex/reset-credits/consume",
+                    body=json.dumps({"creditId": "credit", "confirmation": "nonce"}),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.read())
+                connection.close()
+            self.assertEqual(payload, expected)
+            consume.assert_called_once_with("credit", "nonce")
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
+    def test_cli_shape_generates_confirmation_nonce(self):
+        args = agentcat.build_parser().parse_args(
+            ["codex", "reset-credit", "consume", "credit-id"]
+        )
+        output = io.StringIO()
+        with patch.object(
+            agentcat, "consume_codex_reset_credit", return_value={"ok": True}
+        ) as consume, patch.object(agentcat.uuid, "uuid4", return_value="generated-nonce"), redirect_stdout(output):
+            status = args.func(args)
+
+        self.assertEqual(status, 0)
+        consume.assert_called_once_with("credit-id", "generated-nonce")
+        self.assertEqual(json.loads(output.getvalue()), {"ok": True})
+
+
+if __name__ == "__main__":
+    unittest.main()
