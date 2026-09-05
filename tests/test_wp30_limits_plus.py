@@ -8,6 +8,7 @@ import os
 import tempfile
 import threading
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -268,6 +269,119 @@ class ClaudeExtraUsageTests(WP30TestCase):
             limits = agentcat.claude_live_limits(force=True)
 
         self.assertEqual(limits["planType"], "pro")
+
+
+class CopilotQuotaTests(WP30TestCase):
+    def usage_fixture(self):
+        return {
+            "copilot_plan": "free",
+            "quota_snapshots": {
+                "premium_interactions": {
+                    "entitlement": 500,
+                    "remaining": 450,
+                    "percent_remaining": 90,
+                    "quota_id": "premium_interactions",
+                },
+                "chat": {
+                    "entitlement": 300,
+                    "remaining": 150,
+                    "percent_remaining": 50,
+                    "quota_id": "chat",
+                },
+            },
+        }
+
+    def test_documented_fixture_maps_monthly_quotas_plan_and_reset(self):
+        now = agentcat.dt.datetime(2026, 12, 15, 9, 30, tzinfo=agentcat.dt.timezone.utc)
+        limits = agentcat.copilot_limits_from_user_response(self.usage_fixture(), now=now)
+
+        self.assertEqual(limits["status"], "auto")
+        self.assertEqual(limits["planType"], "free")
+        self.assertEqual([q["id"] for q in limits["quotas"]], [
+            "copilot:premium_interactions", "copilot:chat",
+        ])
+        premium, chat = limits["quotas"]
+        self.assertEqual(premium["remainingPercent"], 90.0)
+        self.assertEqual(premium["usedPercent"], 10.0)
+        self.assertEqual(premium["remaining"], 450.0)
+        self.assertEqual(premium["limit"], 500.0)
+        self.assertEqual(chat["remainingPercent"], 50.0)
+        self.assertEqual(premium["window"], "month")
+        self.assertEqual(
+            premium["resetAt"],
+            int(agentcat.dt.datetime(2027, 1, 1, tzinfo=agentcat.dt.timezone.utc).timestamp()),
+        )
+
+    def test_hosts_and_apps_oauth_token_shapes_are_supported(self):
+        root = agentcat.HOME / ".config" / "github-copilot"
+        root.mkdir(parents=True)
+        (root / "apps.json").write_text(
+            json.dumps({"github.com": {"oauth_token": "apps-token"}}), encoding="utf-8"
+        )
+        self.assertEqual(agentcat.copilot_oauth_token(), "apps-token")
+
+        (root / "hosts.json").write_text(
+            json.dumps({"github.com": {"oauth_token": "hosts-token"}}), encoding="utf-8"
+        )
+        self.assertEqual(agentcat.copilot_oauth_token(), "hosts-token")
+
+    def test_live_request_uses_github_oauth_headers_and_fifteen_minute_cache(self):
+        root = agentcat.HOME / ".config" / "github-copilot"
+        root.mkdir(parents=True)
+        (root / "hosts.json").write_text(
+            json.dumps({"github.com": {"oauth_token": "ghu-fixture"}}), encoding="utf-8"
+        )
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            return FakeResponse(self.usage_fixture())
+
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen):
+            first = agentcat.copilot_live_limits()
+            second = agentcat.copilot_live_limits()
+
+        self.assertEqual(first["planType"], "free")
+        self.assertEqual(second["planType"], "free")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].full_url, agentcat.COPILOT_USAGE_URL)
+        self.assertEqual(requests[0].get_method(), "GET")
+        self.assertEqual(requests[0].get_header("Authorization"), "token ghu-fixture")
+        cached = agentcat.cached_live_limits("copilot", 15 * 60)
+        self.assertIsNotNone(cached)
+
+    def test_missing_expired_and_non_applicable_reasons_use_limit_classifier(self):
+        missing = agentcat.copilot_live_limits(force=True)
+        self.assertEqual(missing["reason"], "token_missing")
+
+        root = agentcat.HOME / ".config" / "github-copilot"
+        root.mkdir(parents=True)
+        (root / "hosts.json").write_text(
+            json.dumps({"github.com": {"oauth_token": "expired-token"}}), encoding="utf-8"
+        )
+        error = urllib.error.HTTPError(
+            agentcat.COPILOT_USAGE_URL, 401, "Unauthorized", {}, io.BytesIO(b"{}")
+        )
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=error):
+            expired = agentcat.copilot_live_limits(force=True)
+        self.assertEqual(expired["reason"], "token_expired")
+
+        not_applicable = agentcat.copilot_limits_from_user_response(
+            {
+                "copilot_plan": "business",
+                "token_based_billing": True,
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 0,
+                        "remaining": 0,
+                        "percent_remaining": 100,
+                    }
+                },
+            }
+        )
+        self.assertEqual(not_applicable["planType"], "business")
+        self.assertEqual(not_applicable["reason"], "not_applicable")
+        self.assertEqual(not_applicable["quotas"], [])
 
 
 if __name__ == "__main__":

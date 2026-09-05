@@ -97,6 +97,7 @@ GROK_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=cr
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+COPILOT_USAGE_URL = "https://api.github.com/copilot_internal/user"
 # Epoch values below this are seconds; Kimi CLI 0.39.x env files may use ms.
 KIMI_EXPIRES_AT_MS_THRESHOLD = 10 ** 11
 GROK_MEDIA_TOOL_NAMES = {
@@ -6280,6 +6281,154 @@ def kimi_live_limits(force: bool = False) -> Dict[str, Any]:
     return limits
 
 
+def copilot_oauth_token() -> Optional[str]:
+    """Read the GitHub OAuth token already stored by GitHub Copilot.
+
+    hosts.json and apps.json have varied slightly across Copilot clients, so
+    search nested dictionaries for the known OAuth key spellings. The token is
+    used only for the live request and is never added to a snapshot or cache.
+    """
+    root = HOME / ".config" / "github-copilot"
+
+    def token_in(raw: Any, depth: int = 0) -> Optional[str]:
+        if not isinstance(raw, dict) or depth > 4:
+            return None
+        for key in ("oauth_token", "oauthToken", "access_token"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        github = raw.get("github.com")
+        if isinstance(github, dict):
+            found = token_in(github, depth + 1)
+            if found:
+                return found
+        for value in raw.values():
+            if isinstance(value, dict):
+                found = token_in(value, depth + 1)
+                if found:
+                    return found
+        return None
+
+    for name in ("hosts.json", "apps.json"):
+        raw = read_json(root / name)
+        token = token_in(raw)
+        if token:
+            return token
+    return None
+
+
+def copilot_usage_request(token: str) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        COPILOT_USAGE_URL,
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/json",
+            "Editor-Version": "vscode/1.96.2",
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "X-Github-Api-Version": "2025-04-01",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def first_of_next_month_epoch(now: Optional[dt.datetime] = None) -> int:
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    current = current.astimezone(dt.timezone.utc)
+    if current.month == 12:
+        reset = dt.datetime(current.year + 1, 1, 1, tzinfo=dt.timezone.utc)
+    else:
+        reset = dt.datetime(current.year, current.month + 1, 1, tzinfo=dt.timezone.utc)
+    return int(reset.timestamp())
+
+
+def copilot_limits_from_user_response(
+    payload: Dict[str, Any],
+    *,
+    source: str = COPILOT_USAGE_URL,
+    now: Optional[dt.datetime] = None,
+) -> Dict[str, Any]:
+    limits = empty_limits(status="auto")
+    limits["source"] = source
+    plan = first_present(payload.get("copilotPlan"), payload.get("copilot_plan"))
+    limits["planType"] = plan.strip() if isinstance(plan, str) and plan.strip() else None
+    snapshots = first_present(payload.get("quotaSnapshots"), payload.get("quota_snapshots"))
+    snapshots = snapshots if isinstance(snapshots, dict) else {}
+    reset_at = first_of_next_month_epoch(now)
+    quotas: List[Dict[str, Any]] = []
+
+    def append_quota(keys: Tuple[str, ...], quota_id: str, label: str) -> None:
+        raw = None
+        for key in keys:
+            if isinstance(snapshots.get(key), dict):
+                raw = snapshots[key]
+                break
+        if not isinstance(raw, dict):
+            return
+        entitlement = float_value(raw.get("entitlement"))
+        remaining = float_value(raw.get("remaining"))
+        percent_remaining = float_percent(
+            first_present(raw.get("percentRemaining"), raw.get("percent_remaining"))
+        )
+        # Business/token-billing seats expose explicit zero-value placeholders.
+        if entitlement == 0 and remaining == 0:
+            return
+        if percent_remaining is None and entitlement is not None and entitlement > 0 and remaining is not None:
+            percent_remaining = float_percent((remaining / entitlement) * 100.0)
+        if percent_remaining is None:
+            return
+        used = None
+        if entitlement is not None and remaining is not None:
+            used = max(entitlement - remaining, 0.0)
+        quotas.append(
+            quota_entry(
+                quota_id,
+                label,
+                used_percent=100.0 - percent_remaining,
+                used=used,
+                remaining=remaining,
+                limit=entitlement,
+                unit="requests",
+                window="month",
+                reset_at=reset_at,
+                source=source,
+            )
+        )
+
+    append_quota(("premiumInteractions", "premium_interactions"), "copilot:premium_interactions", "Premium interactions")
+    append_quota(("chat",), "copilot:chat", "Chat")
+    limits["quotas"] = quotas
+    if not quotas:
+        limits["status"] = "not_configured"
+        limits["reason"] = "not_applicable"
+    return limits
+
+
+def copilot_live_limits(force: bool = False) -> Dict[str, Any]:
+    cached = None if force else cached_live_limits("copilot", LIVE_LIMITS_MAX_AGE_SECONDS)
+    if cached:
+        return cached
+    token = copilot_oauth_token()
+    if not token:
+        return empty_limits(reason="token_missing")
+    try:
+        payload = copilot_usage_request(token)
+        limits = copilot_limits_from_user_response(payload)
+        write_live_limits_cache("copilot", limits)
+        return limits
+    except Exception as exc:
+        stale = cached_live_limits("copilot", LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+        if stale:
+            return serve_stale_live_limits("copilot", stale, exc)
+        limits = live_limit_error(exc, COPILOT_USAGE_URL)
+        write_live_limits_cache("copilot", limits)
+        return limits
+
+
 def prefer_live_limits(live: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
     if live.get("status") in {"auto", "ok"} and (
         live.get("quotas") or any(live.get(key) is not None for key in ("weeklyUsedPercent", "shortUsedPercent"))
@@ -6320,6 +6469,7 @@ def runtime_limits() -> Dict[str, Dict[str, Any]]:
         "antigravity": _safe(antigravity_live_limits),
         "grok": _safe(grok_live_limits),
         "kimi": _safe(kimi_live_limits),
+        "copilot": _safe(copilot_live_limits),
     }
 
 
