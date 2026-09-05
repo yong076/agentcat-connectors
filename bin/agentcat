@@ -4849,22 +4849,45 @@ def claude_scoped_quota_metadata(item: Dict[str, Any]) -> Optional[Tuple[str, st
     return normalized_model, f"{scope_name} {window_label}", window, group or None
 
 
+def claude_plan_type_from_usage_response(payload: Dict[str, Any]) -> Optional[str]:
+    for key in ("plan_type", "planType", "subscription_type", "subscriptionType", "plan"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def claude_subscription_type_fallback() -> Optional[str]:
+    raw = read_json(HOME / ".claude.json")
+    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+        return None
+    value = raw.get("subscriptionType")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "claude-oauth-usage-api") -> Dict[str, Any]:
     limits = empty_limits(status="auto")
     limits["source"] = source
+    limits["planType"] = claude_plan_type_from_usage_response(payload)
     quotas: List[Dict[str, Any]] = []
 
     for key, entry in payload.items():
         if not isinstance(entry, dict):
             continue
-        if entry.get("is_enabled") is False:
-            continue
 
         if key == "extra_usage" or entry.get("monthly_limit") is not None:
             limit = float_value(entry.get("monthly_limit"))
-            used = float_value(entry.get("used_credits")) or 0.0
-            currency = str(entry.get("currency") or "credits")
-            if limit and limit > 0:
+            raw_used = float_value(entry.get("used_credits"))
+            used = raw_used or 0.0
+            currency = str(entry.get("currency") or "USD").strip() or "USD"
+            enabled = entry.get("is_enabled") is True
+            limits["extraUsage"] = {
+                "enabled": enabled,
+                "usedUSD": raw_used,
+                "monthlyLimitUSD": limit,
+                "currency": currency,
+            }
+            if enabled and limit and limit > 0:
                 remaining = max(limit - used, 0.0)
                 used_percent = min(max((used / limit) * 100.0, 0.0), 100.0)
                 quotas.append(
@@ -4881,6 +4904,9 @@ def claude_limits_from_usage_response(payload: Dict[str, Any], source: str = "cl
                         source=source,
                     )
                 )
+            continue
+
+        if entry.get("is_enabled") is False:
             continue
 
         used = float_percent(first_present(entry.get("utilization"), entry.get("used_percentage")))
@@ -4999,6 +5025,8 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
         try:
             payload = claude_usage_request(token)
             limits = claude_limits_from_usage_response(payload, source=CLAUDE_USAGE_URL)
+            if not limits.get("planType"):
+                limits["planType"] = claude_subscription_type_fallback()
             credentialed(limits)
             write_live_limits_cache("claude", limits)
             return limits

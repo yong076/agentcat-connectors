@@ -200,5 +200,75 @@ class CodexResetCreditTests(WP30TestCase):
         self.assertEqual(json.loads(output.getvalue()), {"ok": True})
 
 
+class ClaudeExtraUsageTests(WP30TestCase):
+    def test_usage_fixture_emits_extra_usage_and_oauth_plan(self):
+        limits = agentcat.claude_limits_from_usage_response(
+            {
+                "subscription_type": "max",
+                "five_hour": {
+                    "utilization": 12.5,
+                    "resets_at": "2026-09-05T12:00:00Z",
+                },
+                "extra_usage": {
+                    "used_credits": 17.25,
+                    "monthly_limit": 100,
+                    "currency": "USD",
+                    "is_enabled": True,
+                },
+            }
+        )
+
+        self.assertEqual(limits["planType"], "max")
+        self.assertEqual(limits["extraUsage"], {
+            "enabled": True,
+            "usedUSD": 17.25,
+            "monthlyLimitUSD": 100.0,
+            "currency": "USD",
+        })
+        extra_quota = next(q for q in limits["quotas"] if q["id"] == "claude:extra_usage")
+        self.assertEqual(extra_quota["used"], 17.25)
+        self.assertEqual(extra_quota["limit"], 100.0)
+
+    def test_disabled_extra_usage_is_emitted_without_a_quota(self):
+        limits = agentcat.claude_limits_from_usage_response(
+            {
+                "five_hour": {"utilization": 1, "resets_at": "2026-09-05T12:00:00Z"},
+                "extra_usage": {
+                    "used_credits": 0,
+                    "monthly_limit": 50,
+                    "currency": "USD",
+                    "is_enabled": False,
+                },
+            }
+        )
+
+        self.assertEqual(limits["extraUsage"], {
+            "enabled": False,
+            "usedUSD": 0.0,
+            "monthlyLimitUSD": 50.0,
+            "currency": "USD",
+        })
+        self.assertNotIn("claude:extra_usage", [q["id"] for q in limits["quotas"]])
+
+    def test_live_limits_fall_back_to_claude_json_subscription_type(self):
+        (agentcat.HOME / ".claude.json").write_text(
+            json.dumps({"subscriptionType": "pro"}), encoding="utf-8"
+        )
+        usage = {
+            "five_hour": {"utilization": 3, "resets_at": "2026-09-05T12:00:00Z"},
+        }
+        credentials = {
+            "oauth": {"accessToken": "fixture-token"},
+            "reason": None,
+            "credentialSource": "fixture",
+        }
+        with patch.object(agentcat, "read_claude_oauth_credentials", return_value=credentials), patch.object(
+            agentcat, "claude_usage_request", return_value=usage
+        ):
+            limits = agentcat.claude_live_limits(force=True)
+
+        self.assertEqual(limits["planType"], "pro")
+
+
 if __name__ == "__main__":
     unittest.main()
