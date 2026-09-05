@@ -27,6 +27,7 @@ from tests.sandbox import assert_sandboxed, redirect_module_paths, restore_modul
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+REFLECT_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "reflect"
 LOADER = SourceFileLoader("agentcat_module_reflect", str(REPO_ROOT / "bin" / "agentcat"))
 SPEC = importlib.util.spec_from_loader("agentcat_module_reflect", LOADER)
 agentcat = importlib.util.module_from_spec(SPEC)
@@ -1072,6 +1073,14 @@ class HttpTests(ReflectTestCase):
         status, _ = self.request("/reflect/analyze/x", method="POST", body={}, host="evil.example.com")
         self.assertEqual(status, 403)
 
+    def test_explicit_disabled_config_returns_app_error(self):
+        agentcat.REFLECT_CONFIG_FILE.write_text(json.dumps({"enabled": False}), encoding="utf-8")
+        for path in ("/reflect/week", "/reflect/sessions", "/reflect/rules", "/reflect/session/s-001", "/reflect/report.html"):
+            status, payload = self.request(path)
+            self.assertEqual((status, payload["error"]), (403, "reflect_disabled"), path)
+        status, payload = self.request("/reflect/analyze/s-001", method="POST", body={})
+        self.assertEqual((status, payload["error"]), (403, "reflect_disabled"))
+
     def test_week_sessions_session_rules_endpoints(self):
         self.write_claude_session()
         agentcat.reflect_sync()
@@ -1085,7 +1094,10 @@ class HttpTests(ReflectTestCase):
         self.assertEqual(payload["sessions_analyzed"], 1)
         self.assertFalse(payload["stored"])
         self.assertIsNotNone(payload["fluency_score"])
-        self.assertEqual(payload["byTool"][0]["tool"], "claude")
+        self.assertEqual(payload["byTool"][0]["tool"], "claude-code")
+        self.assertEqual(payload["sessionsAnalyzed"], 1)
+        self.assertEqual(len(payload["trend"]), 8)
+        self.assertEqual(set(payload["promptQuality"]), {"clarity", "context", "constraints", "successCriteria", "scope"})
         self.assertEqual(len(payload["nextChecks"]), 3)
 
         status, payload = self.request("/reflect/week?iso=" + week + "&lang=en")
@@ -1115,12 +1127,16 @@ class HttpTests(ReflectTestCase):
 
         status, payload = self.request("/reflect/session/" + session_id)
         self.assertEqual(status, 200)
+        self.assertEqual(payload["id"], session_id)
+        self.assertEqual(payload["tool"], "claude-code")
         self.assertEqual(payload["session"]["id"], session_id)
         self.assertEqual(payload["analysis"]["prompt_quality_mean"], 3.6)
+        self.assertEqual(payload["analysis"]["promptQuality"]["successCriteria"]["score"], 2)
         self.assertEqual(payload["analysis_meta"]["runner"], "stub")
         self.assertNotIn("turn_list", json.dumps(payload))
         status, payload = self.request("/reflect/session/claude:missing")
-        self.assertEqual((status, payload["error"]), (404, "not_found"))
+        self.assertEqual((status, payload["error"]), (404, "session_not_found"))
+        self.assertEqual(payload["legacy_error"], "not_found")
 
         status, payload = self.request("/reflect/rules?week=" + week)
         self.assertEqual(status, 200)
@@ -1146,13 +1162,13 @@ class HttpTests(ReflectTestCase):
             status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={"force": True})
         self.assertFalse(payload["cached"])
         status, payload = self.request("/reflect/analyze/claude:missing", method="POST", body={})
-        self.assertEqual((status, payload["error"]), (404, "not_found"))
+        self.assertEqual((status, payload["error"]), (404, "session_not_found"))
         with patch.object(agentcat, "reflect_find_claude_binary", return_value=None):
             status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={"force": True})
-        self.assertEqual((status, payload["error"]), (503, "reflect_runner_unavailable"))
+        self.assertEqual((status, payload["error"]), (503, "runner_unavailable"))
         with patch.object(agentcat, "reflect_runner", return_value=StubRunner(responses=["{}", "{}"])):
             status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={"force": True})
-        self.assertEqual((status, payload["error"]), (502, "reflect_analysis_invalid"))
+        self.assertEqual((status, payload["error"]), (502, "analysis_failed"))
         self.assertEqual(self.subprocess_calls, [])
 
     def test_post_sync(self):
@@ -1209,11 +1225,15 @@ class CliTests(ReflectTestCase):
         payload = json.loads(out)
         self.assertFalse(payload["cached"])
         self.assertEqual(payload["analysis"]["candidate_rules"], valid_analysis()["candidate_rules"])
+        self.assertEqual(payload["tool"], "claude-code")
+        self.assertEqual(payload["analysis"]["runner"], "stub")
 
         week = agentcat.reflect_week_of(ts(0))
         code, out = self.run_cli(["reflect", "week", week])
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out)["sessions_analyzed"], 1)
+        week_payload = json.loads(out)
+        self.assertEqual(week_payload["sessions_analyzed"], 1)
+        self.assertEqual(week_payload["sessionsAnalyzed"], 1)
         code, out = self.run_cli(["reflect", "week", week, "--store"])
         self.assertTrue(json.loads(out)["stored"])
         self.assertIsNotNone(agentcat.reflect_get_synthesis(week))
@@ -1224,6 +1244,187 @@ class CliTests(ReflectTestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["reflect", "dance"])
         self.assertEqual(self.subprocess_calls, [])
+
+
+# ---------------------------------------------------------------------------
+# 6b. daemon -> app fixture contract
+# ---------------------------------------------------------------------------
+
+
+class ReflectContractTests(ReflectTestCase):
+    """The app fixtures are the executable TED §4.1 presentation contract."""
+
+    def fixture(self, name):
+        return json.loads((REFLECT_FIXTURES / name).read_text(encoding="utf-8"))
+
+    def assert_fixture_shape(self, expected, actual, path="$"):
+        if isinstance(expected, dict):
+            self.assertIsInstance(actual, dict, path)
+            for key, value in expected.items():
+                self.assertIn(key, actual, path + "." + key)
+                self.assert_fixture_shape(value, actual[key], path + "." + key)
+            return
+        if isinstance(expected, list):
+            self.assertIsInstance(actual, list, path)
+            for index, (value, actual_value) in enumerate(zip(expected, actual)):
+                self.assert_fixture_shape(value, actual_value, "{}[{}]".format(path, index))
+            return
+        self.assertIs(type(actual), type(expected), path)  # bool and int must not be conflated
+
+    def contract_analysis(self, score=4.0, friction="missing_context", pattern="explicit_constraints"):
+        return {
+            "schema_version": 1,
+            "frictions": [{
+                "category": friction,
+                "attribution": "user_actionable",
+                "evidence": "name the affected surface before changing it",
+                "turn": 1,
+                "note": "Name the surface and gesture first.",
+            }],
+            "patterns": [{
+                "category": pattern,
+                "evidence": "do not touch the adjacent API",
+                "turn": 2,
+                "note": "",
+            }],
+            "prompt_quality": {
+                name: {"score": score, "before": "fix it", "after": "Fix the popover overlap and run tests."}
+                for name in agentcat.REFLECT_PROMPT_DIMENSIONS
+            },
+            "prompt_quality_mean": score,
+            "working_style": "Opens with constraints. Verifies the result. Corrects scope quickly.",
+            "candidate_rules": [
+                "Name the surface and gesture before describing a UX bug.",
+                "Quote globs and use absolute paths.",
+                "Stay on the reported bug.",
+            ],
+        }
+
+    def session(self, session_id, tool="claude", started=None, automated=False):
+        return {
+            "id": session_id,
+            "tool": tool,
+            "project": "agent-cat",
+            "path": "/private/synthetic/{}.jsonl".format(session_id),
+            "started_at": started or "2026-09-05T01:10:00Z",
+            "ended_at": "2026-09-05T03:42:00Z",
+            "turns": 41,
+            "user_turns": 12,
+            "tool_calls": 31,
+            "tokens": 1832000,
+            "cost_usd": 3.1,
+            "tool_call_counts": {"Read": 1},
+            "model": "synthetic",
+            "counts_only": False,
+            "automated": automated,
+            "length_bucket": "long",
+        }
+
+    def test_week_fixture_keys_and_types(self):
+        week = "2026-W36"
+        week_keys = agentcat.reflect_recent_week_keys(week)
+        items = []
+        for index, historical_week in enumerate(week_keys[:-1]):
+            monday = dt.date.fromisocalendar(int(historical_week[:4]), int(historical_week[-2:]), 1)
+            started = dt.datetime.combine(monday, dt.time(10), tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            items.append({
+                "session": self.session("history-{}".format(index), "codex", started),
+                "analysis": self.contract_analysis(score=3.0 + index / 10.0),
+            })
+
+        current_specs = [
+            ("s-001", "claude", "missing_context", "clear_goal_upfront"),
+            ("s-002", "codex", "scope_creep", "delegation_to_tools"),
+            ("s-003", "gemini", "tool_or_environment_failure", "explicit_constraints"),
+            ("s-004", "kimi", "wrong_or_buggy_output", "verification_requested"),
+        ]
+        current_items = []
+        for index, (session_id, tool, friction, pattern) in enumerate(current_specs):
+            analysis = self.contract_analysis(score=3.5 + index / 10.0, friction=friction, pattern=pattern)
+            analysis["patterns"][0].update({
+                "tool": tool,
+                "savedTurns": index + 1,
+                "savedTokens": 1000 * (index + 1),
+            })
+            current_items.append({"session": self.session(session_id, tool), "analysis": analysis})
+        items.extend(current_items)
+        synthesis = agentcat.reflect_synthesize_week(week, current_items, lang="en")
+        actual = agentcat.reflect_present_week(synthesis, items, sessions_total=19, lang="en")
+        self.assert_fixture_shape(self.fixture("reflect-week.json"), actual)
+        self.assertEqual(len(actual["trend"]), 8)
+        self.assertEqual(actual["byTool"][0]["tool"], "claude-code")
+        self.assertLessEqual(len(actual["frictions"][0]["example"]["quote"].split()), 20)
+        for legacy_key in (
+            "fluency_score", "sessions_analyzed", "frictions_top", "patterns_top",
+            "prompt_quality", "generated_at", "friction_rate_per_10_turns",
+        ):
+            self.assertIn(legacy_key, actual)
+
+    def test_sessions_fixture_keys_and_types(self):
+        rows = []
+        fixture = self.fixture("reflect-sessions.json")
+        tools = ("claude", "codex", "gemini", "kimi")
+        for index, expected in enumerate(fixture["sessions"]):
+            row = self.session("s-00{}".format(index + 1), tools[index], automated=expected.get("automated", False))
+            if "project" not in expected:
+                row.pop("project")
+            record = None
+            if expected.get("analysis") is not None and "analysis" in expected:
+                score = float(expected["analysis"]["promptQuality"])
+                analysis = self.contract_analysis(score=score)
+                # Match fixture cardinality while exercising computed summaries.
+                analysis["frictions"] *= int(expected["analysis"]["frictionCount"])
+                analysis["patterns"] *= int(expected["analysis"]["patternCount"])
+                record = {"analysis": analysis, "runner": "stub", "model": "stub", "created_at": ts(0), "length_bucket": "long"}
+            rows.append(agentcat.reflect_present_session(row, record))
+        actual = {"sessions": rows}
+        self.assert_fixture_shape(fixture, actual)
+        self.assertIsNone(actual["sessions"][2]["analysis"])
+        self.assertIsNone(actual["sessions"][3]["analysis"])
+        self.assertIn("user_turns", actual["sessions"][0])
+        self.assertIn("cost_usd", actual["sessions"][0])
+
+    def test_session_detail_fixture_keys_and_types(self):
+        session = self.session("s-001")
+        analysis = self.contract_analysis(score=4)
+        analysis["prompt_quality"]["context"]["score"] = 3.5
+        analysis["frictions"] *= 2
+        analysis["patterns"] *= 3
+        record = {
+            "analysis": analysis,
+            "runner": "claude-native",
+            "model": "sonnet",
+            "created_at": "2026-09-05T04:00:12.001Z",
+            "length_bucket": "long",
+        }
+        actual = agentcat.reflect_present_detail(session, record)
+        self.assert_fixture_shape(self.fixture("reflect-session-detail.json"), actual)
+        self.assertEqual(actual["id"], "s-001")
+        self.assertIn("session", actual)
+        self.assertIn("analysis_meta", actual)
+
+    def test_rules_error_and_queued_fixture_keys_and_types(self):
+        rules = [
+            agentcat._reflect_present_rule("Name the surface and the gesture before describing a UX bug.", 0),
+            agentcat._reflect_present_rule("Quote globs and use absolute paths.", 1),
+        ]
+        self.assert_fixture_shape(self.fixture("reflect-rules.json"), {"rules": rules})
+
+        agentcat.REFLECT_CONFIG_FILE.write_text(json.dumps({"enabled": False}), encoding="utf-8")
+        status, disabled = agentcat.reflect_http_get("/reflect/week", {})
+        self.assertEqual(status, 403)
+        self.assert_fixture_shape(self.fixture("reflect-error-disabled.json"), disabled)
+
+        agentcat.REFLECT_CONFIG_FILE.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+        with patch.object(agentcat, "reflect_analyze_session", return_value={"queued": True}):
+            status, queued = agentcat.reflect_http_post("/reflect/analyze/s-001", {})
+        self.assertEqual(status, 200)
+        self.assert_fixture_shape(self.fixture("reflect-analyze-queued.json"), queued)
+
+    def test_all_tool_values_use_app_ids(self):
+        expected = {"claude-code", "codex", "gemini", "kimi", "cursor", "opencode", "copilot", "grok"}
+        actual = {agentcat.reflect_app_tool_id(tool) for tool in agentcat.REFLECT_TOOLS}
+        self.assertEqual(actual, expected)
 
 
 # ---------------------------------------------------------------------------

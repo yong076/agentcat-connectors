@@ -1,0 +1,31 @@
+{
+  "id": "s-001", "tool": "claude-code", "project": "agent-cat", "startedAt": "2026-09-05T01:10:00Z", "endedAt": "2026-09-05T03:42:00Z",
+  "turns": 41, "userTurns": 12, "toolCalls": 31, "tokens": 1832000, "costUSD": 3.1, "automated": false,
+  "analysis": {
+    "frictions": [
+      { "category": "missing-context", "count": 1, "attribution": "user-actionable", "costTokens": 410000, "costUSD": 0.7,
+        "example": { "sessionId": "s-001", "quote": "just fix the popover thing", "fix": "Name the surface and the gesture in the first message." } },
+      { "category": "verification-gap", "count": 1, "attribution": "ai-capability", "costTokens": 220000, "costUSD": 0.4,
+        "example": { "sessionId": "s-001", "quote": "did you actually run it?", "fix": "Paste the test output before claiming done." } }
+    ],
+    "patterns": [
+      { "category": "constraint-first", "count": 2, "driver": "user-driven", "example": { "sessionId": "s-001", "quote": "do not touch DiscoverAPI" } },
+      { "category": "verification-loop", "count": 1, "driver": "user-driven" },
+      { "category": "delegation", "count": 1, "driver": "ai-driven" }
+    ],
+    "promptQuality": {
+      "clarity": { "score": 4, "before": "fix the popover thing", "after": "In the popover, the recap card overlaps the provider strip after Esc — fix the layout." },
+      "context": { "score": 3.5, "before": "it broke again", "after": "After 26.36.0 the recap card overlaps the strip; it was fine in 26.35.0." },
+      "constraints": { "score": 5 },
+      "successCriteria": { "score": 4, "before": "make it work", "after": "Done when the dump PNG shows no overlap in ko and en." },
+      "scope": { "score": 4 }
+    },
+    "workingStyle": "Opens with hard constraints, verifies with PNGs, corrects scope drift quickly.",
+    "rules": [
+      { "id": "r1", "text": "Name the surface (popover / dashboard / notch) and the gesture before describing a UX bug.", "target": "AGENTS.md", "evidenceSessionIds": ["s-001"] }
+    ],
+    "analyzedAt": "2026-09-05T04:00:12.001Z",
+    "runner": "claude-native",
+    "lengthBucket": "long"
+  }
+}

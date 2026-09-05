@@ -4,7 +4,7 @@ Slice R1 of *Agent Cat Reflect (돌아보기)* (TED: `agent-cat/docs/ted/agentca
 Branch `yong076/reflect-r1` on connector 26.36.3; nine `[R1]` commits followed by five `[R1b]` commits, one per requested step; `CONNECTOR_VERSION` not bumped.
 
 Everything lives in `bin/agentcat` (single-file daemon, section `# Reflect (돌아보기)` placed just before the
-loopback host guard) plus `tests/test_reflect.py` (69 tests) and ten Reflect sandbox paths in `tests/sandbox.py`.
+loopback host guard) plus `tests/test_reflect.py` (75 tests), the copied app fixtures under `tests/fixtures/reflect/`, and ten Reflect sandbox paths in `tests/sandbox.py`.
 
 ## 1. Files and functions
 
@@ -55,11 +55,12 @@ Error classes: `ReflectError` → `ReflectNotFound` (404), `ReflectRunnerError` 
 | Telemetry-shaped struct is exactly `{week, fluency_score, friction_top_category, pattern_top_category, sessions_analyzed}`; the runner is the only outbound shape | `PrivacyTests.test_telemetry_summary_has_exactly_five_fields`, `test_only_the_runner_leaves_the_process` (network patched to raise, `subprocess.run` patched to raise in every test's `setUp`) |
 | Weekly per-tool rows contain sessions/tokens/cost/rework/prompt quality; comparison exists only for 2+ tools; checks are localized and evidence-backed; `rules` remains | `SynthesisTests.test_counts_costs_rates_and_fluency`, `test_next_checks_and_comparison_are_localized`, `test_empty_week`, `HttpTests.test_week_sessions_session_rules_endpoints` |
 | Self-contained report HTML renders the four localized headings plus tool comparison, with inline CSS and no external URLs/assets | `HttpTests.test_self_contained_html_report_has_localized_four_parts` |
+| TED §4.1 presentation keys and JSON types match all six app fixtures; detail is flat, unanalyzed rows carry `analysis: null`, history contains eight weeks, and tool ids use the app vocabulary | `ReflectContractTests` |
 | OpenCode, Copilot, Grok, Gemini, and Cursor readers yield exactly `{role,text,tool,ts}`; Cursor is copied before SQLite open | `IndexerTests.test_opencode_reader_yields_shared_turns_and_digest`, `test_copilot_reader_yields_shared_turns_and_digest`, `test_grok_reader_yields_shared_turns_and_digest`, `test_gemini_reader_yields_shared_turns_and_digest`, `test_cursor_reader_copies_sqlite_and_yields_shared_turns` |
 | Every new reader path is discovered; unknown schemas and Kimi wire-without-user-text become counts-only rows instead of aborting sync | `IndexerTests.test_session_files_cover_all_multi_tool_readers`, `test_kimi_wire_and_unknown_format_are_counts_only` |
 | Claude SDK/system provenance, Codex `codex_exec`, and Orca-dispatched workspaces set `automated: true`; rows remain listed and prompt-quality averages exclude them by default | `IndexerTests.test_automated_markers_cover_claude_codex_and_orca_workers`, `SynthesisTests.test_automated_sessions_are_listed_but_excluded_from_quality_averages` |
 
-Suite: `python3 -m unittest discover -s tests < /dev/null` → **Ran 500 tests, OK** (431 before Reflect + 69 Reflect tests). The Reflect module also passes under `/usr/bin/python3` 3.9.6 (`Ran 69 tests, OK`).
+Suite: `python3 -m unittest discover -s tests < /dev/null` → **Ran 546 tests, OK** (75 Reflect tests). The implementation stays within Python 3.9 syntax and was also checked with `py_compile`.
 
 ## 3. Live smoke on this Mac (2026-09-05)
 
@@ -143,7 +144,7 @@ Scheduler windows: nightly fires during the 03:xx local hour once per day when i
 - The analyzer's own `claude -p` sessions (cwd `~/.agentcat/reflect-scratch`, prompt prefixed with `AGENTCAT_REFLECT_ANALYSIS_REQUEST`) are never indexed, so Reflect cannot analyze itself.
 - Codex token accounting sums `last_token_usage` per `token_count` event (the competitors' delta); it does not replay the connector's divergent-totals correction, so a Codex session's `cost_usd` can differ slightly from the ledger on sessions where Codex rewrote its totals.
 - Unknown models price at 0 (`estimate_cost` returns `None`); `tokens` still counts them.
-- On-demand `POST /reflect/analyze/{id}` and `agentcat reflect analyze` run regardless of `enabled` — an explicit request is user intent; only the scheduler is gated.
+- `agentcat reflect analyze` remains an explicit CLI action and runs regardless of `enabled`; app-facing HTTP reads, report HTML, and analyze return `reflect_disabled` when the config file explicitly disables Reflect. The scheduler remains gated as before.
 - Weekly synthesis is computed on request (`GET /reflect/week`) and only persisted by the Sunday job or `reflect week --store`; `stored` in the payload says which.
 
 ### Reader capability matrix
@@ -159,11 +160,96 @@ Scheduler windows: nightly fires during the 03:xx local hour once per day when i
 | Cursor | Full | Cursor chat `store.db` JSON blobs and workspace `state.vscdb` `ItemTable`; always copied to a private temp directory and opened read-only |
 | Kimi | Counts-only | `~/.kimi-code/sessions/**/wire.jsonl`; token/status records only because real wire files contain no user text |
 
-## 6. JSON shapes for the app (R2)
+## 6. Final JSON shapes for the app (WP35)
 
 All timestamps are UTC ISO-8601 with `Z`. `null` is possible wherever marked. Responses use the daemon's existing envelope (`Content-Type: application/json`, keys sorted, 2-space indent).
 
-### Session row (`/reflect/sessions[]`, `session` in other payloads)
+The camelCase TED §4.1 fields below are now the authoritative presentation contract for both `/reflect/*` and `agentcat reflect ... --json`. Tool ids are exactly `claude-code`, `codex`, `gemini`, `kimi`, `cursor`, `opencode`, `copilot`, or `grok`; the storage id `claude` is presented as `claude-code`.
+
+### Authoritative presentation contract
+
+`GET /reflect/week?iso=2026-W36`:
+
+```json
+{
+  "week": "2026-W36",
+  "generatedAt": "2026-09-05T09:12:44.512Z",
+  "sessionsAnalyzed": 12,
+  "sessionsTotal": 19,
+  "fluencyScore": 0.71,
+  "promptQuality": {
+    "clarity": 4.2, "context": 3.6, "constraints": 4.4,
+    "successCriteria": 3.5, "scope": 3.9
+  },
+  "trend": [{"week": "2026-W29", "fluencyScore": 0.58}],
+  "frictions": [{
+    "category": "missing-context", "count": 4, "attribution": "user-actionable",
+    "costTokens": 41000000, "costUSD": 12.4,
+    "example": {"sessionId": "claude:<uuid>", "quote": "≤ 20 words", "fix": "…"}
+  }],
+  "patterns": [{
+    "category": "explicit-constraints", "count": 6, "driver": "user-driven",
+    "example": {"sessionId": "claude:<uuid>", "quote": "…"}
+  }],
+  "byTool": [{
+    "tool": "claude-code", "sessions": 7, "tokens": 512000000,
+    "costUSD": 41.2, "reworkRate": 0.09, "promptQuality": 4.2
+  }],
+  "toolComparison": "one sentence or null",
+  "nextChecks": [{
+    "id": "c1", "text": "…", "derivedFrom": "missing-context",
+    "evidenceSessionIds": ["claude:<uuid>"]
+  }],
+  "workingStyle": "Three sentences from the latest analyzed session in the week.",
+  "rules": [{
+    "id": "r1", "text": "…", "target": "AGENTS.md",
+    "evidenceSessionIds": ["claude:<uuid>"]
+  }]
+}
+```
+
+`trend` always contains the eight ISO weeks ending in the requested week, oldest first; a week without analyzable data has `fluencyScore: null`. `sessionsTotal` counts indexed sessions in the requested week. Category token and USD costs count a session once per category. Weekly examples use the first evidence-bearing occurrence, and quotes are capped at 20 words.
+
+`GET /reflect/sessions?days=7` returns `{"sessions": [row, ...]}` (and the compatibility `days` field), where a row is:
+
+```json
+{
+  "id": "claude:<uuid>", "tool": "claude-code", "project": "agent-cat",
+  "startedAt": "…Z", "endedAt": "…Z", "turns": 41, "userTurns": 12,
+  "toolCalls": 31, "tokens": 1832000, "costUSD": 3.1, "automated": false,
+  "analysis": null
+}
+```
+
+An analyzed row replaces `null` with `{"promptQuality": 4.1, "frictionCount": 2, "patternCount": 3, "headline": "one sentence"}`. `analysis` is always present and exactly `null` for an unanalyzed session.
+
+`GET /reflect/session/{id}` is the row itself at the response root. Its `analysis` is `null` or the full shape:
+
+```json
+{
+  "frictions": [{"category": "…", "count": 1, "attribution": "…", "costTokens": 100, "costUSD": 0.01,
+                 "example": {"sessionId": "…", "quote": "…", "fix": "…"}}],
+  "patterns": [{"category": "…", "count": 1, "driver": "user-driven",
+                "example": {"sessionId": "…", "quote": "…"}}],
+  "promptQuality": {
+    "clarity": {"score": 4, "before": "…", "after": "…"},
+    "context": {"score": 4, "before": "…", "after": "…"},
+    "constraints": {"score": 4, "before": "…", "after": "…"},
+    "successCriteria": {"score": 4, "before": "…", "after": "…"},
+    "scope": {"score": 4, "before": "…", "after": "…"}
+  },
+  "workingStyle": "…", "rules": [{"id": "r1", "text": "…", "target": "AGENTS.md", "evidenceSessionIds": ["…"]}],
+  "analyzedAt": "…Z", "runner": "claude-native", "lengthBucket": "long"
+}
+```
+
+`POST /reflect/analyze/{id}` returns `{"queued": true}` when queued, otherwise the same flattened detail with compatibility execution metadata. `GET /reflect/rules?week=...` returns the presentation `rules` array above. An explicitly disabled `reflect.json` makes app-facing GETs, report HTML, and analyze return `403 {"error": "reflect_disabled"}`. Other app error ids are `session_not_found`, `runner_unavailable`, and `analysis_failed`.
+
+### One-release compatibility fields (deprecated)
+
+For connector 26.36.x compatibility, the current snake_case R1 fields remain alongside the presentation fields for one release. This includes `sessions_analyzed`, `fluency_score`, `prompt_quality`, `frictions_top`, `patterns_top`, `generated_at`, `started_at`, `user_turns`, `tool_calls`, `cost_usd`, the wrapped detail `session`, and `analysis_meta`. Enriched `rules`, `frictions`, and `patterns` retain their old member data (`count`/`sessions`, and `evidence`/`turn`/`note`) where the old and new contracts share an array key. Error payloads carry the former id in `legacy_error`. These compatibility fields are deprecated and may be removed in the release after WP35.
+
+### Deprecated R1 session fields
 
 ```json
 {
@@ -188,7 +274,7 @@ All timestamps are UTC ISO-8601 with `Z`. `null` is possible wherever marked. Re
 
 `GET /reflect/sessions?days=7` → `{"days": 7, "sessions": [row, …]}` newest first.
 
-### Analysis (`analysis` in `/reflect/session/{id}` and `/reflect/analyze/{id}`)
+### Deprecated R1 analysis fields
 
 ```json
 {
@@ -209,11 +295,11 @@ All timestamps are UTC ISO-8601 with `Z`. `null` is possible wherever marked. Re
 Friction categories: `missing_context, unclear_request, scope_creep, ai_misunderstanding, wrong_or_buggy_output, tool_or_environment_failure, repeated_corrections, permission_or_approval_stalls, context_loss_or_compaction`.
 Pattern categories: `clear_goal_upfront, context_provided, explicit_constraints, verification_requested, incremental_scoping, good_correction, reuse_of_prior_work, delegation_to_tools`.
 
-`GET /reflect/session/{id}` → `{"session": row, "analysis": analysis | null, "analysis_meta": {"runner", "model", "created_at", "length_bucket"} | null}`.
+Compatibility fields on `GET /reflect/session/{id}` also include `{"session": row, "analysis_meta": {"runner", "model", "created_at", "length_bucket"} | null}`; the authoritative session row and `analysis` are at the response root.
 
-`POST /reflect/analyze/{id}` (body `{}` or `{"force": true}`) → `{"ok": true, "session_id", "length_bucket", "cached": bool, "session": row, "analysis": analysis, "meta": {"runner": "claude-native", "model": "sonnet", "attempts": 1, "cost_usd": 0.21 | null, "duration_ms": 86759}}`; when `cached` is true, `meta` is `{"runner", "model", "created_at"}`. This call blocks for up to ~2 × 120 s.
+The synchronous analyze response retains `{"ok": true, "session_id", "length_bucket", "cached": bool, "session": row, "meta": {…}}` beside the authoritative flattened detail. When `cached` is true, `meta` is `{"runner", "model", "created_at"}`. This call blocks for up to ~2 × 120 s.
 
-### Week (`GET /reflect/week?iso=2026-W36&lang=ko`; `iso` omitted = current local ISO week)
+### Deprecated R1 weekly fields
 
 `lang` is `ko` (default), `en`, `ja`, or `zh-Hans`. It localizes `toolComparison` and `nextChecks[].text`; unsupported values return 400.
 
@@ -240,11 +326,11 @@ Pattern categories: `clear_goal_upfront, context_provided, explicit_constraints,
 }
 ```
 
-`cost_usd` on a category is the summed `cost_usd` of the sessions where it occurred (each session once per category). `reworkRate` is the share of analyzed sessions for a tool containing `ai_misunderstanding`, `wrong_or_buggy_output`, or `repeated_corrections`. `toolComparison` is non-null only with at least two tool rows. `nextChecks` has 3–5 rows when friction exists (empty for an empty/friction-free week), ranked by friction and backed by the sessions where that category occurred. `rules` is unchanged.
+`cost_usd` on a legacy category is the summed `cost_usd` of the sessions where it occurred (each session once per category). `reworkRate` is the share of analyzed sessions for a tool containing `ai_misunderstanding`, `wrong_or_buggy_output`, or `repeated_corrections`. `toolComparison` is non-null only with at least two tool rows. `nextChecks` has 3–5 rows when friction exists (empty for an empty/friction-free week), ranked by friction and backed by the sessions where that category occurred. Presentation rule objects retain legacy `count` and `sessions` members.
 
 Automated sessions still contribute sessions, tokens, cost, rework, friction, and pattern metrics. Their prompt scores remain in `prompt_quality.trend` with `automated: true`, but are excluded by default from the overall and `byTool[].promptQuality` averages. Fluency = `0.5 × (mean−1)/4 + 0.3 × (1 − clamp(friction_rate)) + 0.2 × clamp(pattern_rate)`.
 
-`GET /reflect/rules?week=2026-W36` → `{"week": "2026-W36", "rules": [{"text", "count", "sessions"}]}`.
+The rules endpoint retains `week`, while every rule carries both presentation members (`id`, `target`, `evidenceSessionIds`) and deprecated members (`count`, `sessions`).
 
 ### HTML report
 
@@ -252,7 +338,7 @@ Automated sessions still contribute sessions, tokens, cost, rework, friction, an
 
 ### Errors
 
-`{"error": "not_found" | "reflect_runner_unavailable" | "reflect_analysis_invalid" | "reflect_bad_request" | "reflect_failed", "message": "…", "details": [..] }` with 404 / 503 / 502 / 400 / 500; the host guard answers `403 {"error": "forbidden", "message": "host_not_allowed"}` like every other route.
+App-facing errors use `reflect_disabled`, `session_not_found`, `runner_unavailable`, or `analysis_failed`. During the compatibility release, renamed errors include the former value in `legacy_error`; validation details and messages remain additive. Bad input and unexpected failures retain `reflect_bad_request` and `reflect_failed`; the host guard still answers `403 {"error": "forbidden", "message": "host_not_allowed"}`.
 
 ### Telemetry-shaped summary (not sent by this slice; the only shape that ever may be)
 
