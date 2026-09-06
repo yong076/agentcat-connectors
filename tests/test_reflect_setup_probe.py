@@ -89,6 +89,37 @@ class ReflectSetupProbeTests(unittest.TestCase):
             self.assertEqual(payload["mode"], "manual")
             self.assertFalse(payload["execution"]["attempted"])
 
+    def test_http_setup_probe_is_get_only_explicit_and_authorized(self) -> None:
+        expected = {
+            "ok": True,
+            "mode": "manual",
+            "execution": {"attempted": False, "network": False},
+            "mcp": {},
+            "skills": {},
+            "agents": {},
+            "guidanceCodes": [],
+        }
+        with patch.object(agentcat, "reflect_setup_probe", return_value=expected) as probe, patch.object(
+            agentcat, "reflect_require_http_enabled"
+        ) as require_enabled:
+            status, payload = agentcat.reflect_http_get("/reflect/setup-probe", {})
+            self.assertEqual((status, payload), (200, expected))
+            self.assertEqual(set(payload), agentcat.REFLECT_SETUP_PROBE_ALLOWED_KEYS)
+            require_enabled.assert_called_once_with()
+            probe.assert_called_once_with()
+
+            status, _ = agentcat.reflect_http_post("/reflect/setup-probe", {})
+            self.assertEqual(status, 404)
+            self.assertEqual(probe.call_count, 1)
+
+    def test_http_setup_probe_respects_disabled_reflect_gate(self) -> None:
+        with patch.object(
+            agentcat, "reflect_require_http_enabled", side_effect=agentcat.ReflectDisabled("disabled")
+        ), patch.object(agentcat, "reflect_setup_probe") as probe:
+            status, payload = agentcat.reflect_http_get("/reflect/setup-probe", {})
+        self.assertEqual((status, payload["error"]), (403, "reflect_disabled"))
+        probe.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

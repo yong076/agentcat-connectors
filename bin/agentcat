@@ -16420,6 +16420,8 @@ def reflect_http_get(path: str, query: Dict[str, List[str]]) -> Tuple[int, Dict[
     """Route a GET under /reflect/. Returns (status, payload); never raises."""
     try:
         reflect_require_http_enabled()
+        if path == "/reflect/setup-probe":
+            return 200, reflect_setup_probe()
         if path == "/reflect/week":
             iso = (query.get("iso") or [""])[0].strip() or None
             lang = (query.get("lang") or ["ko"])[0].strip() or "ko"
