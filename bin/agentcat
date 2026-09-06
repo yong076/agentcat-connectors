@@ -13302,6 +13302,224 @@ def reflect_config() -> Dict[str, Any]:
     return merged
 
 
+# The setup probe is deliberately separate from the Reflect indexer. It may be
+# called by a user, but is never called by the daemon or a scheduled job. It
+# reads only syntax and presence metadata; it must not expose configuration,
+# prompt, token, or environment values.
+REFLECT_SETUP_PROBE_MAX_BYTES = 256 * 1024
+REFLECT_SETUP_PROBE_JSON_FILES = (
+    ".mcp.json",
+    ".claude.json",
+    ".claude/settings.json",
+    ".cursor/mcp.json",
+    ".gemini/settings.json",
+)
+REFLECT_SETUP_PROBE_SKILL_ROOTS = (
+    ".codex/skills",
+    ".claude/skills",
+    "skills",
+)
+REFLECT_SETUP_PROBE_ALLOWED_KEYS = {
+    "ok",
+    "mode",
+    "execution",
+    "mcp",
+    "skills",
+    "agents",
+    "guidanceCodes",
+}
+
+
+def _reflect_setup_probe_json(path: Path) -> Tuple[Optional[Any], bool, str]:
+    """Read one bounded JSON file, returning parsed metadata and duplicate state."""
+    duplicate_keys = False
+
+    def pairs(items: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        nonlocal duplicate_keys
+        result: Dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                duplicate_keys = True
+            result[key] = value
+        return result
+
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(REFLECT_SETUP_PROBE_MAX_BYTES + 1)
+        if len(raw) > REFLECT_SETUP_PROBE_MAX_BYTES:
+            return None, False, "oversize"
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs), duplicate_keys, "ok"
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, duplicate_keys, "invalid"
+
+
+def _reflect_setup_probe_mcp_commands(value: Any) -> List[str]:
+    """Return command metadata only; never return args, env, or config values."""
+    if not isinstance(value, dict):
+        return []
+    commands: List[str] = []
+    for key in ("mcpServers", "servers"):
+        servers = value.get(key)
+        if not isinstance(servers, dict):
+            continue
+        for server in servers.values():
+            if not isinstance(server, dict):
+                continue
+            command = server.get("command")
+            if isinstance(command, str) and command.strip():
+                commands.append(command.strip())
+    return commands
+
+
+def _reflect_setup_probe_executable(command: str) -> bool:
+    """Check command resolution without invoking the executable."""
+    try:
+        argv = shlex.split(command, posix=not IS_WINDOWS)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    candidate = Path(argv[0]).expanduser()
+    if candidate.is_absolute() or "/" in argv[0] or "\\" in argv[0]:
+        return candidate.is_file() and os.access(candidate, os.X_OK)
+    return shutil.which(argv[0]) is not None
+
+
+def _reflect_setup_probe_skill_file(path: Path) -> Tuple[bool, int]:
+    """Validate required frontmatter and count missing local markdown references."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            text = handle.read(REFLECT_SETUP_PROBE_MAX_BYTES + 1)
+    except (OSError, UnicodeError):
+        return False, 0
+    if len(text) > REFLECT_SETUP_PROBE_MAX_BYTES or not text.startswith("---\n"):
+        return False, 0
+    end = text.find("\n---", 4)
+    if end < 0:
+        return False, 0
+    frontmatter = text[4:end].splitlines()
+    keys = {line.split(":", 1)[0].strip() for line in frontmatter if ":" in line}
+    valid = {"name", "description"}.issubset(keys)
+    missing = 0
+    # Only inspect relative markdown links. Their text and all other body data
+    # are discarded immediately and never enter the result.
+    body = text[end + 4 :]
+    for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)|`([^`]+\.(?:md|json|toml|yaml|yml))`", body):
+        reference = (match.group(1) or match.group(2) or "").split("#", 1)[0].strip()
+        if not reference or reference.startswith(("/", "~", "http:", "https:")):
+            continue
+        if not (path.parent / reference).exists():
+            missing += 1
+    return valid, missing
+
+
+def reflect_setup_probe(root: Optional[Path] = None) -> Dict[str, Any]:
+    """Inspect local setup metadata without executing, storing, or transmitting it."""
+    project_root = (root or Path.cwd()).expanduser().resolve()
+    json_paths: List[Path] = []
+    for relative in REFLECT_SETUP_PROBE_JSON_FILES:
+        candidate = project_root / relative
+        if candidate.is_file() and candidate not in json_paths:
+            json_paths.append(candidate)
+    # User-level MCP files are explicit candidates, never a recursive scan.
+    for relative in (".claude.json", ".claude/settings.json", ".cursor/mcp.json", ".gemini/settings.json"):
+        candidate = HOME / relative
+        if candidate.is_file() and candidate not in json_paths:
+            json_paths.append(candidate)
+
+    mcp_invalid = 0
+    mcp_oversize = 0
+    mcp_duplicates = 0
+    command_count = 0
+    executable_found = 0
+    executable_missing = 0
+    for path in json_paths:
+        parsed, duplicate_keys, status = _reflect_setup_probe_json(path)
+        mcp_duplicates += int(duplicate_keys)
+        if status == "invalid":
+            mcp_invalid += 1
+        elif status == "oversize":
+            mcp_oversize += 1
+        for command in _reflect_setup_probe_mcp_commands(parsed):
+            command_count += 1
+            if _reflect_setup_probe_executable(command):
+                executable_found += 1
+            else:
+                executable_missing += 1
+
+    skill_files: List[Path] = []
+    for relative in REFLECT_SETUP_PROBE_SKILL_ROOTS:
+        base = project_root / relative
+        if not base.is_dir():
+            continue
+        for candidate in sorted(base.glob("*/SKILL.md")):
+            if candidate.is_file() and candidate not in skill_files:
+                skill_files.append(candidate)
+    skills_valid = 0
+    skills_invalid = 0
+    skill_missing_references = 0
+    for path in skill_files:
+        valid, missing = _reflect_setup_probe_skill_file(path)
+        skills_valid += int(valid)
+        skills_invalid += int(not valid)
+        skill_missing_references += missing
+
+    agents_present = 0
+    agents_readable = 0
+    agents_missing = 0
+    seen_agents: Set[Path] = set()
+    cursor = project_root
+    while True:
+        candidate = cursor / "AGENTS.md"
+        if candidate in seen_agents:
+            break
+        seen_agents.add(candidate)
+        if candidate.is_file():
+            agents_present += 1
+            try:
+                with candidate.open("rb") as handle:
+                    handle.read(1)
+                agents_readable += 1
+            except OSError:
+                pass
+        else:
+            agents_missing += 1
+        if cursor == cursor.parent or cursor == HOME:
+            break
+        cursor = cursor.parent
+
+    guidance_codes: List[str] = []
+    if agents_present == 0:
+        guidance_codes.append("agents_missing")
+    errors = mcp_invalid + mcp_oversize + mcp_duplicates + skills_invalid + skill_missing_references + executable_missing
+    return {
+        "mode": "manual",
+        "execution": {"attempted": False, "network": False},
+        "mcp": {
+            "filesChecked": len(json_paths),
+            "invalidFiles": mcp_invalid,
+            "oversizeFiles": mcp_oversize,
+            "duplicateKeys": mcp_duplicates,
+            "commandsChecked": command_count,
+            "executablesFound": executable_found,
+            "executablesMissing": executable_missing,
+        },
+        "skills": {
+            "filesChecked": len(skill_files),
+            "validFrontmatter": skills_valid,
+            "invalidFrontmatter": skills_invalid,
+            "missingReferences": skill_missing_references,
+        },
+        "agents": {
+            "present": agents_present,
+            "readable": agents_readable,
+            "missing": agents_missing,
+        },
+        "guidanceCodes": guidance_codes,
+        "ok": errors == 0,
+    }
+
+
 def reflect_reader_lang(config: Dict[str, Any]) -> str:
     """Resolve the configured reader language, defaulting from AppleLocale."""
     configured = config.get("lang") if isinstance(config, dict) else None
@@ -16305,15 +16523,24 @@ def command_reflect(args: argparse.Namespace) -> int:
                 store=bool(getattr(args, "store", False)),
                 lang=getattr(args, "lang", None) or "ko",
             )
+        elif action == "setup-probe":
+            payload = reflect_setup_probe(Path(args.root) if getattr(args, "root", None) else None)
         else:
-            print("usage: agentcat reflect {sync|analyze <session-id>|week [iso]}", file=sys.stderr)
+            print("usage: agentcat reflect {sync|analyze <session-id>|week [iso]|setup-probe}", file=sys.stderr)
             return 2
     except ReflectError as exc:
         status, error = _reflect_error_payload(exc)
         print(json.dumps(error, ensure_ascii=False, indent=2) if as_json else f"reflect: {exc}", file=sys.stderr)
         return 1
-    if as_json or action != "sync":
+    if as_json or action not in {"sync", "setup-probe"}:
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    elif action == "setup-probe":
+        print(
+            "reflect setup-probe: "
+            f"mcp {payload['mcp']['filesChecked']}, "
+            f"skills {payload['skills']['filesChecked']}, "
+            f"AGENTS {payload['agents']['present']}"
+        )
     else:
         print(
             f"reflect: indexed {payload['indexed']}, unchanged {payload['skipped']}, "
@@ -17734,8 +17961,9 @@ def build_parser() -> argparse.ArgumentParser:
     homes.set_defaults(func=command_homes)
 
     reflect = subparsers.add_parser("reflect")
-    reflect.add_argument("reflect_command", choices=("sync", "analyze", "week"))
+    reflect.add_argument("reflect_command", choices=("sync", "analyze", "week", "setup-probe"))
     reflect.add_argument("target", nargs="?", help="session id for analyze, ISO week (2026-W36) for week")
+    reflect.add_argument("--root", help="local project root for the manual setup probe")
     reflect.add_argument("--force", action="store_true", help="re-run an analysis that is already stored")
     reflect.add_argument("--lang", choices=REFLECT_LANGS, help="reader language for analysis or weekly output")
     reflect.add_argument("--store", action="store_true", help="persist the weekly synthesis and its rules")
