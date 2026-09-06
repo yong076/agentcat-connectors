@@ -608,6 +608,10 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
         self.assertNotIn(account_b, encoded)
         self.assertNotIn(str(agentcat.HOME), encoded)
         self.assertNotIn("@example.test", encoded)
+        native = [item for item in instances if item["profileCount"] == 2][0]
+        self.assertEqual(native["syncIdentity"], agentcat.provider_sync_identity("codex", account_a))
+        self.assertRegex(native["syncIdentity"], r"^[0-9a-f]{64}$")
+        self.assertNotIn(account_a, native["syncIdentity"])
 
     def test_profile_only_candidates_never_false_merge(self) -> None:
         self._codex_auth(agentcat.HOME / ".codex", None, "pro")
@@ -618,6 +622,7 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
         self.assertEqual(len(instances), 2)
         self.assertEqual({item["identityConfidence"] for item in instances}, {"profile_only"})
         self.assertEqual(len({item["id"] for item in instances}), 2)
+        self.assertTrue(all("syncIdentity" not in item for item in instances))
 
     def test_instance_count_is_not_capped_at_two(self) -> None:
         for index in range(5):
