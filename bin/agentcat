@@ -13193,6 +13193,7 @@ REFLECT_LANGUAGE_NAMES = {
     "zh-Hans": "Simplified Chinese",
 }
 REFLECT_REWORK_CATEGORIES = {"ai_misunderstanding", "wrong_or_buggy_output", "repeated_corrections"}
+_REFLECT_JOB_RECOVERY_DB: Optional[str] = None
 # Each observed friction can yield up to three concrete checks. The first pass
 # takes one check per category; later passes only fill the 3-check minimum when
 # a week has fewer than three distinct categories.
@@ -14732,6 +14733,7 @@ def reflect_analyze_payload(
 
 
 def reflect_init_db() -> None:
+    global _REFLECT_JOB_RECOVERY_DB
     ensure_dirs()
     with closing(sqlite3.connect(REFLECT_DB, timeout=5.0)) as conn:
         conn.execute("pragma journal_mode=WAL")
@@ -14811,6 +14813,44 @@ def reflect_init_db() -> None:
             """
         )
         conn.execute("create table if not exists state (key text primary key, value text not null)")
+        conn.execute(
+            """
+            create table if not exists reflect_jobs (
+              job_id text primary key,
+              session_id text not null,
+              length_bucket text,
+              status text not null,
+              force integer not null default 0,
+              lang text,
+              result_json text,
+              error_json text,
+              created_at text not null,
+              updated_at text not null,
+              started_at text,
+              completed_at text
+            )
+            """
+        )
+        conn.execute(
+            "create unique index if not exists idx_reflect_jobs_active_session "
+            "on reflect_jobs(session_id) where status in ('queued', 'running')"
+        )
+        if _REFLECT_JOB_RECOVERY_DB != str(REFLECT_DB):
+            # A new process cannot resume an in-flight analyzer safely. Keep
+            # the durable row and expose an explicit restart/unavailable state.
+            conn.execute(
+                "update reflect_jobs set status='interrupted', "
+                "error_json=?, updated_at=? where status in ('queued', 'running')",
+                (
+                    json.dumps({
+                        "error": "runner_unavailable",
+                        "reason": "restart",
+                        "message": "analysis interrupted by connector restart",
+                    }, sort_keys=True),
+                    now_iso(),
+                ),
+            )
+            _REFLECT_JOB_RECOVERY_DB = str(REFLECT_DB)
         # Reclassify unchanged journals once after upgrading. Preserve analyses;
         # this is a local index refresh and does not invoke the paid analyzer.
         provenance_key = "claude_prompt_provenance_v1"
@@ -14970,6 +15010,144 @@ def reflect_get_analysis(session_id: str, length_bucket: Optional[str] = None) -
                 (session_id,),
             ).fetchone()
     return _reflect_analysis_from_db(row) if row is not None else None
+
+
+def _reflect_job_from_db(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
+    try:
+        parsed = json.loads(row["result_json"]) if row["result_json"] else None
+        result = parsed if isinstance(parsed, dict) else None
+    except (TypeError, json.JSONDecodeError):
+        result = None
+    try:
+        parsed = json.loads(row["error_json"]) if row["error_json"] else None
+        error = parsed if isinstance(parsed, dict) else None
+    except (TypeError, json.JSONDecodeError):
+        error = {"error": "job_state_invalid"}
+    job = {
+        "job_id": row["job_id"],
+        "session_id": row["session_id"],
+        "length_bucket": row["length_bucket"],
+        "status": row["status"],
+        "lang": row["lang"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+    }
+    if result is not None:
+        job["result"] = result
+    if error is not None:
+        job["error"] = error
+    return job
+
+
+def reflect_get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    with closing(_reflect_connect()) as conn:
+        row = conn.execute("select * from reflect_jobs where job_id = ?", (job_id,)).fetchone()
+    return _reflect_job_from_db(row)
+
+
+def reflect_get_session_job(session_id: str, active_only: bool = False) -> Optional[Dict[str, Any]]:
+    query = "select * from reflect_jobs where session_id = ?"
+    params: List[Any] = [session_id]
+    if active_only:
+        query += " and status in ('queued', 'running')"
+    query += " order by created_at desc limit 1"
+    with closing(_reflect_connect()) as conn:
+        row = conn.execute(query, params).fetchone()
+    return _reflect_job_from_db(row)
+
+
+def _reflect_job_update(job_id: str, status: str, **fields: Any) -> None:
+    allowed = {"result_json", "error_json", "started_at", "completed_at", "length_bucket"}
+    updates: Dict[str, Any] = {key: value for key, value in fields.items() if key in allowed}
+    updates["status"] = status
+    updates["updated_at"] = now_iso()
+    assignments = ", ".join("{} = ?".format(key) for key in updates)
+    with closing(_reflect_connect()) as conn:
+        conn.execute(
+            "update reflect_jobs set {} where job_id = ?".format(assignments),
+            tuple(updates.values()) + (job_id,),
+        )
+        conn.commit()
+
+
+def _reflect_job_worker(job_id: str, runner: Optional[ReflectRunner], config: Dict[str, Any]) -> None:
+    _reflect_job_update(job_id, "running", started_at=now_iso())
+    job = reflect_get_job(job_id)
+    if job is None:
+        return
+    try:
+        result = reflect_analyze_session(
+            job["session_id"], runner=runner, force=bool(config.get("force")),
+            lang=config.get("lang"), config=config,
+        )
+        _reflect_job_update(
+            job_id, "completed", result_json=json.dumps(reflect_present_analyze(result), ensure_ascii=False, sort_keys=True),
+            completed_at=now_iso(),
+        )
+    except ReflectError as exc:
+        error = _reflect_error_payload(exc)[1]
+        _reflect_job_update(
+            job_id, "failed", error_json=json.dumps(error, ensure_ascii=False, sort_keys=True),
+            completed_at=now_iso(),
+        )
+    except Exception as exc:  # noqa: BLE001 — worker failures are durable job errors
+        _reflect_job_update(
+            job_id, "failed", error_json=json.dumps({"error": "reflect_failed", "message": str(exc)}),
+            completed_at=now_iso(),
+        )
+
+
+def reflect_enqueue_analysis(
+    session_id: str,
+    force: bool = False,
+    lang: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+    runner: Optional[ReflectRunner] = None,
+) -> Tuple[Dict[str, Any], bool]:
+    """Create one durable analyzer job per session, or return its active job."""
+    resolved = dict(config) if config is not None else reflect_config()
+    if lang is not None:
+        resolved["lang"] = lang
+    reflect_init_db()
+    now = now_iso()
+    job_id = str(uuid.uuid4())
+    with closing(_reflect_connect()) as conn:
+        conn.execute("begin immediate")
+        existing = conn.execute(
+            "select * from reflect_jobs where session_id = ? and status in ('queued', 'running')",
+            (session_id,),
+        ).fetchone()
+        if existing is not None:
+            conn.commit()
+            return _reflect_job_from_db(existing) or {}, True
+        if not force:
+            completed = conn.execute(
+                "select * from reflect_jobs where session_id = ? and status = 'completed' "
+                "order by created_at desc limit 1",
+                (session_id,),
+            ).fetchone()
+            if completed is not None and (lang is None or completed["lang"] in (None, lang)):
+                conn.commit()
+                return _reflect_job_from_db(completed) or {}, True
+        conn.execute(
+            "insert into reflect_jobs (job_id, session_id, status, force, lang, created_at, updated_at) "
+            "values (?, ?, 'queued', ?, ?, ?, ?)",
+            (job_id, session_id, 1 if force else 0, resolved.get("lang"), now, now),
+        )
+        conn.commit()
+    thread_config = dict(resolved)
+    thread_config["force"] = bool(force)
+    threading.Thread(
+        target=_reflect_job_worker, args=(job_id, runner, thread_config),
+        daemon=True, name="agentcat-reflect-{}".format(job_id[:8]),
+    ).start()
+    return reflect_get_job(job_id) or {}, False
 
 
 def reflect_store_analysis(
@@ -16040,6 +16218,22 @@ def reflect_http_get(path: str, query: Dict[str, List[str]]) -> Tuple[int, Dict[
             iso = (query.get("week") or [""])[0].strip() or None
             synthesis = reflect_week(iso)
             return 200, {"week": synthesis["week"], "rules": synthesis["rules"]}
+        if path.startswith("/reflect/analyze/") and path.endswith("/status"):
+            session_id = urllib.parse.unquote(path[len("/reflect/analyze/"):-len("/status")]).strip("/")
+            if not session_id:
+                raise ReflectError("missing session id")
+            job = reflect_get_session_job(session_id)
+            if job is None:
+                raise ReflectNotFound(f"no analysis job for session: {session_id}")
+            return 200, job
+        if path.startswith("/reflect/job/"):
+            job_id = urllib.parse.unquote(path[len("/reflect/job/"):]).strip()
+            if not job_id:
+                raise ReflectError("missing job id")
+            job = reflect_get_job(job_id)
+            if job is None:
+                raise ReflectNotFound(f"unknown analysis job: {job_id}")
+            return 200, job
         if path.startswith("/reflect/session/"):
             session_id = urllib.parse.unquote(path[len("/reflect/session/"):]).strip()
             if not session_id:
@@ -16062,14 +16256,24 @@ def reflect_http_post(
     try:
         if path.startswith("/reflect/analyze/"):
             reflect_require_http_enabled()
-            session_id = urllib.parse.unquote(path[len("/reflect/analyze/"):]).strip()
+            session_id = urllib.parse.unquote(path[len("/reflect/analyze/"):]).strip("/")
+            if session_id.endswith("/status"):
+                raise ReflectError("status requires GET")
             if not session_id:
                 raise ReflectError("missing session id")
             raw_lang = ((query or {}).get("lang") or [""])[0].strip() or None
             if raw_lang is not None and raw_lang not in REFLECT_LANGS:
                 raise ReflectError(f"unsupported reader language: {raw_lang}")
-            result = reflect_analyze_session(session_id, force=bool(body.get("force")), lang=raw_lang)
-            return 200, reflect_present_analyze(result)
+            # Validate the target before returning an asynchronous job. The
+            # analyzer itself still rechecks it in the worker after restart.
+            if reflect_get_session(session_id) is None:
+                reflect_sync()
+            if reflect_get_session(session_id) is None:
+                raise ReflectNotFound(f"unknown session: {session_id}")
+            job, existing = reflect_enqueue_analysis(
+                session_id, force=bool(body.get("force")), lang=raw_lang,
+            )
+            return 202, {"ok": True, "existing": existing, "job": job, **job}
         if path == "/reflect/sync":
             return 200, {"ok": True, **reflect_sync()}
         return 404, {"error": "not_found"}

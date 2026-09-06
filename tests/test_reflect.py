@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -1398,7 +1399,18 @@ class HttpTests(ReflectTestCase):
         runner = StubRunner()
         with patch.object(agentcat, "reflect_runner", return_value=runner):
             status, payload = self.request("/reflect/analyze/" + session_id + "?lang=ko", method="POST", body={})
+            self.assertEqual(status, 202)
+            self.assertTrue(payload["ok"])
+            job_id = payload["job_id"]
+            for _ in range(50):
+                status, job = self.request("/reflect/job/" + job_id)
+                if job["status"] == "completed":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("analysis job did not complete")
         self.assertEqual(status, 200)
+        payload = job["result"]
         self.assertTrue(payload["ok"])
         self.assertFalse(payload["cached"])
         self.assertEqual(payload["session"]["project"], "codex-repo")
@@ -1408,18 +1420,47 @@ class HttpTests(ReflectTestCase):
         self.assertIn("in Korean; keep quoted", runner.prompts[0])
         with patch.object(agentcat, "reflect_runner", return_value=StubRunner(responses=[])):
             status, payload = self.request("/reflect/analyze/" + session_id + "?lang=ko", method="POST", body={})
-        self.assertTrue(payload["cached"])
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["job"]["status"], "completed")
+        self.assertTrue(payload["existing"])
         with patch.object(agentcat, "reflect_runner", return_value=StubRunner()):
             status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={"force": True})
-        self.assertFalse(payload["cached"])
+            self.assertEqual(status, 202)
+            job_id = payload["job_id"]
+            for _ in range(50):
+                status, job = self.request("/reflect/job/" + job_id)
+                if job["status"] == "completed":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("forced analysis job did not complete")
+        self.assertFalse(job["result"]["cached"])
         status, payload = self.request("/reflect/analyze/claude:missing", method="POST", body={})
         self.assertEqual((status, payload["error"]), (404, "session_not_found"))
         with patch.object(agentcat, "reflect_find_claude_binary", return_value=None):
             status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={"force": True})
-        self.assertEqual((status, payload["error"]), (503, "runner_unavailable"))
+            self.assertEqual(status, 202)
+            job_id = payload["job_id"]
+            for _ in range(50):
+                status, job = self.request("/reflect/job/" + job_id)
+                if job["status"] == "failed":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("unavailable runner job did not fail")
+        self.assertEqual((status, job["error"]["error"]), (200, "runner_unavailable"))
         with patch.object(agentcat, "reflect_runner", return_value=StubRunner(responses=["{}", "{}"])):
             status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={"force": True})
-        self.assertEqual((status, payload["error"]), (502, "analysis_failed"))
+            self.assertEqual(status, 202)
+            job_id = payload["job_id"]
+            for _ in range(50):
+                status, job = self.request("/reflect/job/" + job_id)
+                if job["status"] == "failed":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("invalid analysis job did not fail")
+        self.assertEqual((status, job["error"]["error"]), (200, "analysis_failed"))
         status, payload = self.request("/reflect/analyze/" + session_id + "?lang=xx", method="POST", body={})
         self.assertEqual((status, payload["error"]), (400, "reflect_bad_request"))
         self.assertEqual(self.subprocess_calls, [])
@@ -1428,6 +1469,79 @@ class HttpTests(ReflectTestCase):
         self.write_claude_session()
         status, payload = self.request("/reflect/sync", method="POST", body={})
         self.assertEqual((status, payload["indexed"]), (200, 1))
+
+    def test_post_duplicate_active_job_returns_same_job(self):
+        self.write_claude_session()
+        session_id = "claude:" + CLAUDE_UUID
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingRunner(StubRunner):
+            def run(self, prompt):
+                entered.set()
+                self.assert_release()
+                return super().run(prompt)
+
+            def assert_release(self):
+                if not release.wait(2.0):
+                    raise AssertionError("fake runner was not released")
+
+        runner = BlockingRunner()
+        with patch.object(agentcat, "reflect_runner", return_value=runner):
+            status, first = self.request("/reflect/analyze/" + session_id, method="POST", body={})
+            self.assertEqual(status, 202)
+            self.assertTrue(entered.wait(2.0))
+            status, second = self.request("/reflect/analyze/" + session_id, method="POST", body={})
+            self.assertEqual(status, 202)
+            self.assertTrue(second["existing"])
+            self.assertEqual(second["job_id"], first["job_id"])
+            status, running = self.request("/reflect/analyze/" + session_id + "/status")
+            self.assertEqual(status, 200)
+            self.assertEqual(running["status"], "running")
+            release.set()
+            for _ in range(50):
+                status, completed = self.request("/reflect/job/" + first["job_id"])
+                if completed["status"] == "completed":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("deduplicated job did not complete")
+        self.assertEqual(len(runner.prompts), 1)
+
+    def test_job_failure_is_available_from_status_endpoint(self):
+        self.write_claude_session()
+        session_id = "claude:" + CLAUDE_UUID
+        with patch.object(agentcat, "reflect_runner", return_value=StubRunner(responses=["{}", "{}"])):
+            status, payload = self.request("/reflect/analyze/" + session_id, method="POST", body={})
+            self.assertEqual(status, 202)
+            job_id = payload["job_id"]
+            for _ in range(50):
+                status, job = self.request("/reflect/analyze/" + session_id + "/status")
+                if job["status"] == "failed":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("failed job did not settle")
+        self.assertEqual(status, 200)
+        self.assertEqual(job["job_id"], job_id)
+        self.assertEqual(job["error"]["error"], "analysis_failed")
+
+    def test_restart_marks_active_job_interrupted_and_unavailable(self):
+        agentcat.reflect_init_db()
+        now = agentcat.now_iso()
+        with closing(agentcat._reflect_connect()) as conn:
+            conn.execute(
+                "insert into reflect_jobs (job_id, session_id, status, created_at, updated_at) "
+                "values (?, ?, 'queued', ?, ?)",
+                ("restart-job", "claude:restart", now, now),
+            )
+            conn.commit()
+        agentcat._REFLECT_JOB_RECOVERY_DB = None
+        agentcat.reflect_init_db()
+        job = agentcat.reflect_get_job("restart-job")
+        self.assertEqual(job["status"], "interrupted")
+        self.assertEqual(job["error"]["error"], "runner_unavailable")
+        self.assertEqual(job["error"]["reason"], "restart")
 
     def test_self_contained_html_report_has_localized_four_parts(self):
         self.write_claude_session()
@@ -1672,10 +1786,18 @@ class ReflectContractTests(ReflectTestCase):
         self.assert_fixture_shape(self.fixture("reflect-error-disabled.json"), disabled)
 
         agentcat.REFLECT_CONFIG_FILE.write_text(json.dumps({"enabled": True}), encoding="utf-8")
-        with patch.object(agentcat, "reflect_analyze_session", return_value={"queued": True}):
-            status, queued = agentcat.reflect_http_post("/reflect/analyze/s-001", {})
-        self.assertEqual(status, 200)
-        self.assert_fixture_shape(self.fixture("reflect-analyze-queued.json"), queued)
+        self.write_claude_session()
+        agentcat.reflect_sync()
+        with patch.object(agentcat, "reflect_runner", return_value=StubRunner()):
+            status, queued = agentcat.reflect_http_post("/reflect/analyze/claude:" + CLAUDE_UUID, {})
+            for _ in range(50):
+                settled = agentcat.reflect_get_job(queued["job_id"])
+                if settled and settled["status"] in ("completed", "failed"):
+                    break
+                time.sleep(0.01)
+        self.assertEqual(status, 202)
+        self.assertTrue(queued["ok"])
+        self.assertIn(queued["job"]["status"], ("queued", "running", "completed"))
 
     def test_all_tool_values_use_app_ids(self):
         expected = {"claude-code", "codex", "gemini", "kimi", "cursor", "opencode", "copilot", "grok"}
