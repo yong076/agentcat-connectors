@@ -608,6 +608,10 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
         self.assertNotIn(account_b, encoded)
         self.assertNotIn(str(agentcat.HOME), encoded)
         self.assertNotIn("@example.test", encoded)
+        native = [item for item in instances if item["profileCount"] == 2][0]
+        self.assertEqual(native["syncIdentity"], agentcat.provider_sync_identity("codex", account_a))
+        self.assertRegex(native["syncIdentity"], r"^[0-9a-f]{64}$")
+        self.assertNotIn(account_a, native["syncIdentity"])
 
     def test_profile_only_candidates_never_false_merge(self) -> None:
         self._codex_auth(agentcat.HOME / ".codex", None, "pro")
@@ -618,6 +622,35 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
         self.assertEqual(len(instances), 2)
         self.assertEqual({item["identityConfidence"] for item in instances}, {"profile_only"})
         self.assertEqual(len({item["id"] for item in instances}), 2)
+        self.assertTrue(all("syncIdentity" not in item for item in instances))
+
+    def test_unreadable_codex_auth_makes_inventory_non_authoritative(self) -> None:
+        self._codex_auth(agentcat.HOME / ".codex", "acct-good", "pro")
+        broken = agentcat.HOME / ".codex-2"
+        broken.mkdir()
+        (broken / "auth.json").write_text("{not json", encoding="utf-8")
+
+        instances, complete = agentcat.codex_provider_instances_with_completeness({"status": "auto", "quotas": []})
+
+        self.assertEqual(len(instances), 1)
+        self.assertFalse(complete)
+
+    def test_capped_codex_home_scan_is_non_authoritative(self) -> None:
+        self._codex_auth(agentcat.HOME / ".codex", "acct-0", "pro")
+        for index in range(1, agentcat.HOME_DISCOVERY_MAX_CANDIDATES):
+            self._codex_auth(agentcat.HOME / f".codex-{index}", f"acct-{index}", "pro")
+
+        _, complete = agentcat.codex_provider_instances_with_completeness({"status": "auto", "quotas": []})
+
+        self.assertFalse(complete)
+
+    def test_snapshot_marks_only_complete_codex_inventory_authoritative(self) -> None:
+        self._codex_auth(agentcat.HOME / ".codex", "acct-good", "pro")
+
+        rows, complete_providers = agentcat.provider_instances_snapshot_with_completeness({"codex": {"status": "auto", "quotas": []}})
+
+        self.assertEqual(len([row for row in rows if row["providerID"] == "codex"]), 1)
+        self.assertEqual(complete_providers, {"codex"})
 
     def test_instance_count_is_not_capped_at_two(self) -> None:
         for index in range(5):

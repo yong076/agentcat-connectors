@@ -3587,6 +3587,20 @@ def provider_instance_id(provider: str, identity: str) -> str:
     return f"{provider}:{digest}"
 
 
+def provider_sync_identity(provider: str, native_account_id: str) -> str:
+    """Return a local-only stable seed for a verified provider account.
+
+    This deliberately is not the device-local instance id: an Agent Cat client
+    can scope it to its signed-in account before an upload, allowing the server
+    to recognize the same verified account on another machine.  It is a
+    deterministic fingerprint, not anonymous data and not a credential; the
+    raw native id never enters a snapshot or leaves this process.
+    """
+    return hashlib.sha256(
+        f"agentcat.provider-sync.v1:{provider}:{native_account_id}".encode("utf-8")
+    ).hexdigest()
+
+
 def refresh_codex_access_token(auth: Dict[str, Any]) -> Optional[str]:
     tokens = oauth_tokens(auth)
     refresh_token = tokens.get("refresh_token")
@@ -4208,14 +4222,34 @@ def codex_provider_instances(current_limits: Optional[Dict[str, Any]] = None) ->
     instance. Without a native ID we deliberately keep the profile separate;
     plan/email/quota similarity is never sufficient evidence for a merge.
     """
+    return codex_provider_instances_with_completeness(current_limits)[0]
+
+
+def codex_provider_instances_with_completeness(
+    current_limits: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Return Codex instances and whether every bounded home was readable.
+
+    A missing auth file is a normal unsigned-out home. A present but unreadable
+    or malformed auth file is not: omitting it must not authorize removal of
+    that home's current server rows.
+    """
+    candidates = provider_home_candidates("codex")
+    # Hitting the bounded discovery limit means there may be another home we
+    # did not inspect. Treat that snapshot as advisory.
+    complete = len(candidates) < HOME_DISCOVERY_MAX_CANDIDATES
     active_path = _resolved_path_key(default_provider_home("codex"))
     grouped: Dict[str, Dict[str, Any]] = {}
 
-    for candidate in provider_home_candidates("codex"):
+    for candidate in candidates:
         home = candidate.get("path")
         if not isinstance(home, Path) or not candidate.get("exists"):
             continue
-        auth = read_codex_auth(home)
+        raw_auth = read_json(home / "auth.json")
+        if isinstance(raw_auth, dict) and raw_auth.get("_agentcat_error"):
+            complete = False
+            continue
+        auth = raw_auth if isinstance(raw_auth, dict) else None
         if not auth:
             continue
         identity = codex_auth_identity(auth)
@@ -4224,9 +4258,11 @@ def codex_provider_instances(current_limits: Optional[Dict[str, Any]] = None) ->
         if native_id:
             identity_seed = f"native:{native_id}"
             confidence = "native_account_id"
+            sync_identity = provider_sync_identity("codex", native_id)
         else:
             identity_seed = f"profile:{home_key}"
             confidence = "profile_only"
+            sync_identity = None
         instance_id = provider_instance_id("codex", identity_seed)
         entry = grouped.get(instance_id)
         if entry is None:
@@ -4236,6 +4272,10 @@ def codex_provider_instances(current_limits: Optional[Dict[str, Any]] = None) ->
                 "providerID": "codex",
                 "label": f"Codex · {suffix}",
                 "identityConfidence": confidence,
+                # A deterministic local seed only for a verified native
+                # account. Clients must scope it before sync; do not send this
+                # field to any remote endpoint as-is.
+                **({"syncIdentity": sync_identity} if sync_identity else {}),
                 "planType": identity.get("planType"),
                 "profileCount": 0,
                 "tracked": False,
@@ -4286,7 +4326,7 @@ def codex_provider_instances(current_limits: Optional[Dict[str, Any]] = None) ->
             not bool(item.get("tracked")),
             str(item.get("label") or ""),
         ),
-    )
+    ), complete
 
 
 # Only normalized, privacy-safe rows are cached, never Orca's raw account list.
@@ -4586,8 +4626,22 @@ def provider_instances_snapshot(
     limits_by_provider: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Provider-neutral additive surface; optional Orca Claude quota profiles."""
+    return provider_instances_snapshot_with_completeness(limits_by_provider)[0]
+
+
+def provider_instances_snapshot_with_completeness(
+    limits_by_provider: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Any]], Set[str]]:
+    """Return local rows plus providers safe for authoritative replacement.
+
+    Orca's optional CLI bridge deliberately isolates failures, so it cannot
+    attest that its Claude inventory is complete. Codex is the sole provider
+    with a verified native identity inventory in this protocol version.
+    """
     resolved_limits = limits_by_provider if isinstance(limits_by_provider, dict) else {}
-    return codex_provider_instances(resolved_limits.get("codex")) + orca_claude_provider_instances()
+    codex_rows, codex_complete = codex_provider_instances_with_completeness(resolved_limits.get("codex"))
+    complete_providers = {"codex"} if codex_complete else set()
+    return codex_rows + orca_claude_provider_instances(), complete_providers
 
 
 def codex_usage_breakdown_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
@@ -12895,9 +12949,18 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     # Additive and local-only: legacy clients keep reading providers.<id>, while
     # newer clients can render N peer connections without summing percentages.
     try:
-        snapshot["providerInstances"] = provider_instances_snapshot(runtime_limits_by_provider)
+        provider_instances, complete_providers = provider_instances_snapshot_with_completeness(runtime_limits_by_provider)
+        snapshot["providerInstances"] = provider_instances
+        # Scalar completeness cannot safely describe the optional Orca bridge.
+        # Authority is explicitly per provider; only Codex can currently attest
+        # a complete native-account inventory.
+        snapshot["providerInstancesComplete"] = False
+        snapshot["providerInstancesCompleteProviders"] = sorted(complete_providers)
     except Exception as exc:
         logging.debug("provider_instances_snapshot failed: %s", exc)
+        snapshot["providerInstances"] = []
+        snapshot["providerInstancesComplete"] = False
+        snapshot["providerInstancesCompleteProviders"] = []
     # Where each provider's usage lives, and which of those homes we read
     # (capability "homes.discovery"). Diagnostic only — it never changes what
     # gets counted — and additive, so older app builds simply ignore it.
