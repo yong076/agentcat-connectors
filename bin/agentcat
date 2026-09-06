@@ -16131,13 +16131,15 @@ def reflect_daemon_idle() -> bool:
 
 
 def reflect_scheduler_due(config: Dict[str, Any], now_local: dt.datetime, state: Dict[str, Any]) -> List[str]:
-    """Which jobs are due at ``now_local``: ``nightly`` (03:00 local, once per day)
-    and/or ``weekly`` (Sunday 18:00 local, once per ISO week). Pure."""
+    """Return the weekly synthesis job due at ``now_local``, if any.
+
+    Reflect analysis is manual-only. In particular, ``enabled`` never makes
+    the daemon invoke an analyzer; only the explicit HTTP POST analysis route
+    may do that. Weekly synthesis is retained because it reads stored
+    analyses and does not invoke a runner.
+    """
     due: List[str] = []
-    today = now_local.date().isoformat()
     week = reflect_iso_week_key(now_local)
-    if now_local.hour == int(config.get("nightlyHour", 3)) and state.get("last_nightly_date") != today:
-        due.append("nightly")
     if (
         now_local.weekday() == int(config.get("weeklyWeekday", 6))
         and now_local.hour == int(config.get("weeklyHour", 18))
@@ -16223,7 +16225,7 @@ def reflect_scheduler_tick(
     runner: Optional[ReflectRunner] = None,
     idle: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """One scheduler step. Off unless reflect.json says enabled; nightly waits for idle."""
+    """Run scheduled weekly synthesis only; analysis is always manual-only."""
     resolved = config if config is not None else reflect_config()
     if not resolved.get("enabled"):
         return {"ran": [], "skipped": "disabled"}
@@ -16235,14 +16237,6 @@ def reflect_scheduler_tick(
     due = reflect_scheduler_due(resolved, now_local, state)
     ran: List[str] = []
     result: Dict[str, Any] = {"due": due}
-    if "nightly" in due:
-        is_idle = idle if idle is not None else reflect_daemon_idle()
-        if is_idle:
-            result["nightly"] = reflect_nightly(resolved, runner=runner, now=now_local)
-            reflect_state_set("last_nightly_date", now_local.date().isoformat())
-            ran.append("nightly")
-        else:
-            result["nightly"] = {"skipped": "busy"}
     if "weekly" in due:
         result["weekly"] = reflect_week(reflect_iso_week_key(now_local), store=True)
         reflect_state_set("last_weekly_week", reflect_iso_week_key(now_local))
