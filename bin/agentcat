@@ -3587,6 +3587,20 @@ def provider_instance_id(provider: str, identity: str) -> str:
     return f"{provider}:{digest}"
 
 
+def provider_sync_identity(provider: str, native_account_id: str) -> str:
+    """Return a local-only stable seed for a verified provider account.
+
+    This deliberately is not the device-local instance id: an Agent Cat client
+    can scope it to its signed-in account before an upload, allowing the server
+    to recognize the same verified account on another machine.  It is a
+    deterministic fingerprint, not anonymous data and not a credential; the
+    raw native id never enters a snapshot or leaves this process.
+    """
+    return hashlib.sha256(
+        f"agentcat.provider-sync.v1:{provider}:{native_account_id}".encode("utf-8")
+    ).hexdigest()
+
+
 def refresh_codex_access_token(auth: Dict[str, Any]) -> Optional[str]:
     tokens = oauth_tokens(auth)
     refresh_token = tokens.get("refresh_token")
@@ -4224,9 +4238,11 @@ def codex_provider_instances(current_limits: Optional[Dict[str, Any]] = None) ->
         if native_id:
             identity_seed = f"native:{native_id}"
             confidence = "native_account_id"
+            sync_identity = provider_sync_identity("codex", native_id)
         else:
             identity_seed = f"profile:{home_key}"
             confidence = "profile_only"
+            sync_identity = None
         instance_id = provider_instance_id("codex", identity_seed)
         entry = grouped.get(instance_id)
         if entry is None:
@@ -4236,6 +4252,10 @@ def codex_provider_instances(current_limits: Optional[Dict[str, Any]] = None) ->
                 "providerID": "codex",
                 "label": f"Codex · {suffix}",
                 "identityConfidence": confidence,
+                # A deterministic local seed only for a verified native
+                # account. Clients must scope it before sync; do not send this
+                # field to any remote endpoint as-is.
+                **({"syncIdentity": sync_identity} if sync_identity else {}),
                 "planType": identity.get("planType"),
                 "profileCount": 0,
                 "tracked": False,
@@ -12896,8 +12916,13 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     # newer clients can render N peer connections without summing percentages.
     try:
         snapshot["providerInstances"] = provider_instances_snapshot(runtime_limits_by_provider)
+        # Schema support is not proof that this particular discovery passed.
+        # Sync clients must require this before replacing server current rows.
+        snapshot["providerInstancesComplete"] = True
     except Exception as exc:
         logging.debug("provider_instances_snapshot failed: %s", exc)
+        snapshot["providerInstances"] = []
+        snapshot["providerInstancesComplete"] = False
     # Where each provider's usage lives, and which of those homes we read
     # (capability "homes.discovery"). Diagnostic only — it never changes what
     # gets counted — and additive, so older app builds simply ignore it.
