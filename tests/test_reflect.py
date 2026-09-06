@@ -723,7 +723,7 @@ class AnalyzerTests(ReflectTestCase):
         nudged = agentcat.reflect_build_prompt({"turn_list": []}, nudge="Return only JSON.")
         self.assertEqual(nudged.splitlines()[1], "Return only JSON.")
 
-    def test_prompt_names_reader_language_and_preserves_quotes(self):
+    def test_prompt_names_reader_language_and_rewrite_source_language(self):
         names = {
             "ko": "Korean",
             "en": "English",
@@ -733,10 +733,17 @@ class AnalyzerTests(ReflectTestCase):
         for lang, name in names.items():
             prompt = agentcat.reflect_build_prompt({"turn_list": []}, lang=lang)
             self.assertIn(
-                "Write `note`, `after`, `working_style`, and `candidate_rules` in {}; "
-                "keep quoted `evidence` and `before` verbatim in their original language.".format(name),
+                "Write `note`, `working_style`, and `candidate_rules` in {}; "
+                "keep quoted `evidence` and `before` verbatim in their original language. "
+                "For every prompt-quality rewrite, write `after` in the primary natural language of its paired `before`, even when that differs from the reader language. "
+                "When `before` mixes natural language with code, commands, logs, identifiers, paths, or exact literals, use the main human-language prose to choose `after`'s language and preserve those non-prose literals exactly.".format(name),
                 prompt,
             )
+
+    def test_rewrite_schema_requires_source_language_and_literal_preservation(self):
+        after = agentcat.reflect_analysis_schema()["properties"]["prompt_quality"]["properties"]["clarity"]["properties"]["after"]
+        self.assertIn("primary natural language of before", after["description"])
+        self.assertIn("preserve code, commands, logs, identifiers, paths, and exact literals", after["description"])
 
     def test_reader_language_maps_apple_locale_with_patched_runner(self):
         cases = {
