@@ -13359,6 +13359,30 @@ def reflect_write_default_config() -> bool:
         return False
 
 
+def reflect_enable() -> Dict[str, Any]:
+    """Enable Reflect without replacing the user's existing configuration.
+
+    This is intentionally a narrow mutation rather than a generic config API:
+    the macOS app may turn the feature on, but cannot modify its runner,
+    schedule, or any future settings. Unknown keys are retained verbatim.
+    """
+    raw = read_json(REFLECT_CONFIG_FILE)
+    if REFLECT_CONFIG_FILE.exists() and (
+        not isinstance(raw, dict) or "_agentcat_error" in raw
+    ):
+        raise ReflectError("reflect configuration is invalid; refusing to replace it")
+
+    config = dict(raw) if isinstance(raw, dict) else dict(REFLECT_DEFAULT_CONFIG)
+    if config.get("lang") is None:
+        config["lang"] = reflect_reader_lang(config)
+    config["enabled"] = True
+    try:
+        write_json_atomic(REFLECT_CONFIG_FILE, config)
+    except OSError as exc:
+        raise ReflectError(f"could not save Reflect settings: {exc}") from exc
+    return {"enabled": True}
+
+
 # --- indexer ------------------------------------------------------------------
 
 
@@ -16060,6 +16084,8 @@ def reflect_http_post(
     query: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     try:
+        if path == "/reflect/enable":
+            return 200, reflect_enable()
         if path.startswith("/reflect/analyze/"):
             reflect_require_http_enabled()
             session_id = urllib.parse.unquote(path[len("/reflect/analyze/"):]).strip()

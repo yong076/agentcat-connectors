@@ -1689,6 +1689,25 @@ class ReflectContractTests(ReflectTestCase):
 
 
 class SchedulerTests(ReflectTestCase):
+    def test_enable_preserves_existing_config_and_refuses_malformed_file(self):
+        original = {"enabled": False, "runner": "codex-exec", "unknown": {"keep": True}}
+        agentcat.REFLECT_CONFIG_FILE.write_text(json.dumps(original), encoding="utf-8")
+
+        status, payload = agentcat.reflect_http_post("/reflect/enable", {})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"enabled": True})
+        saved = json.loads(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertTrue(saved["enabled"])
+        self.assertEqual(saved["runner"], "codex-exec")
+        self.assertEqual(saved["unknown"], {"keep": True})
+
+        agentcat.REFLECT_CONFIG_FILE.write_text("{not json", encoding="utf-8")
+        status, payload = agentcat.reflect_http_post("/reflect/enable", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"], "reflect_bad_request")
+        self.assertEqual(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"), "{not json")
+
     def test_default_config_written_once_and_disabled(self):
         self.assertTrue(agentcat.reflect_write_default_config())
         self.assertFalse(agentcat.reflect_write_default_config())
