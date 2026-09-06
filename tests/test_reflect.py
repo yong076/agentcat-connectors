@@ -1713,13 +1713,12 @@ class SchedulerTests(ReflectTestCase):
         sunday_18 = dt.datetime(2026, 9, 6, 18, 5)  # Sunday
         self.assertEqual(agentcat.reflect_scheduler_due(config, sunday_18, {}), ["weekly"])
         monday_03 = dt.datetime(2026, 9, 7, 3, 30)
-        self.assertEqual(agentcat.reflect_scheduler_due(config, monday_03, {}), ["nightly"])
-        self.assertEqual(agentcat.reflect_scheduler_due(config, monday_03, {"last_nightly_date": "2026-09-07"}), [])
+        self.assertEqual(agentcat.reflect_scheduler_due(config, monday_03, {}), [])
         self.assertEqual(agentcat.reflect_scheduler_due(config, sunday_18, {"last_weekly_week": "2026-W36"}), [])
         self.assertEqual(agentcat.reflect_scheduler_due(config, dt.datetime(2026, 9, 7, 4, 0), {}), [])
         self.assertEqual(agentcat.reflect_scheduler_due(config, dt.datetime(2026, 9, 5, 18, 0), {}), [])  # Saturday
         both = dt.datetime(2026, 9, 6, 3, 0)
-        self.assertEqual(agentcat.reflect_scheduler_due({**config, "weeklyHour": 3}, both, {}), ["nightly", "weekly"])
+        self.assertEqual(agentcat.reflect_scheduler_due({**config, "weeklyHour": 3}, both, {}), ["weekly"])
 
     def test_tick_is_off_unless_enabled(self):
         self.write_claude_session()
@@ -1727,27 +1726,28 @@ class SchedulerTests(ReflectTestCase):
         self.assertEqual(result, {"ran": [], "skipped": "disabled"})
         self.assertFalse(agentcat.REFLECT_DB.exists())
 
-    def test_nightly_waits_for_idle_then_runs_once(self):
+    def test_enabled_scheduler_never_analyzes_without_manual_post(self):
         self.write_claude_session()
         config = {**agentcat.reflect_config(), "enabled": True, "lang": "ja"}
         now = dt.datetime(2026, 9, 7, 3, 0)
-        busy = agentcat.reflect_scheduler_tick(now=now, config=config, runner=StubRunner(), idle=False)
-        self.assertEqual(busy["ran"], [])
-        self.assertEqual(busy["nightly"], {"skipped": "busy"})
-        self.assertIsNone(agentcat.reflect_state_get("last_nightly_date"))
         runner = StubRunner()
-        ran = agentcat.reflect_scheduler_tick(now=now + dt.timedelta(minutes=5), config=config, runner=runner, idle=True)
-        self.assertEqual(ran["ran"], ["nightly"])
-        self.assertEqual(ran["nightly"]["analyzed"], ["claude:" + CLAUDE_UUID])
-        self.assertEqual(agentcat.reflect_state_get("last_nightly_date"), "2026-09-07")
-        self.assertIn("in Japanese; keep quoted", runner.prompts[0])
-        again = agentcat.reflect_scheduler_tick(now=now + dt.timedelta(minutes=10), config=config, runner=StubRunner(responses=[]), idle=True)
-        self.assertEqual(again["ran"], [])
-        self.assertEqual(len(runner.prompts), 1)
-        # idle probe is consulted only when a nightly is due and no override is given
-        with patch.object(agentcat, "reflect_daemon_idle", return_value=False) as probe:
-            agentcat.reflect_scheduler_tick(now=dt.datetime(2026, 9, 8, 3, 0), config=config, runner=StubRunner())
-        probe.assert_called_once()
+        result = agentcat.reflect_scheduler_tick(now=now, config=config, runner=runner, idle=True)
+        self.assertEqual(result, {"due": [], "ran": []})
+        self.assertEqual(runner.prompts, [])
+        with agentcat.closing(agentcat._reflect_connect()) as conn:
+            self.assertEqual(conn.execute("select count(*) from analyses").fetchone()[0], 0)
+
+    def test_weekly_scheduler_only_reads_existing_analysis(self):
+        self.write_claude_session()
+        manual_runner = StubRunner()
+        agentcat.reflect_analyze_session("claude:" + CLAUDE_UUID, runner=manual_runner)
+        config = {**agentcat.reflect_config(), "enabled": True}
+        scheduled_runner = StubRunner(responses=[])
+        result = agentcat.reflect_scheduler_tick(
+            now=dt.datetime(2026, 9, 6, 18, 0), config=config, runner=scheduled_runner
+        )
+        self.assertEqual(result["ran"], ["weekly"])
+        self.assertEqual(scheduled_runner.prompts, [])
 
     def test_nightly_cap_analyzes_twenty_and_queues_the_rest(self):
         for index in range(50):
