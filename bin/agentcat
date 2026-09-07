@@ -14542,6 +14542,17 @@ def reflect_analysis_schema() -> Dict[str, Any]:
     }
 
 
+def reflect_cli_json_schema() -> Dict[str, Any]:
+    """Return the analyzer contract in the dialect accepted by Claude Code.
+
+    The CLI validates an unversioned schema but currently rejects the
+    draft-2020-12 URI used in the human-readable prompt contract.
+    """
+    schema = dict(reflect_analysis_schema())
+    schema.pop("$schema", None)
+    return schema
+
+
 def reflect_build_prompt(payload: Dict[str, Any], nudge: Optional[str] = None, lang: str = "en") -> str:
     if lang not in REFLECT_LANGS:
         raise ReflectError(f"unsupported reader language: {lang}")
@@ -14791,6 +14802,13 @@ def reflect_parse_claude_cli_output(stdout: str) -> Dict[str, Any]:
         raise ReflectRunnerError("claude output carries no result object")
     if result_obj.get("is_error"):
         raise ReflectRunnerError(f"claude reported an error: {str(result_obj.get('result') or '')[:200]}")
+    structured = result_obj.get("structured_output")
+    if isinstance(structured, dict):
+        return {
+            "text": json.dumps(structured, ensure_ascii=False),
+            "cost_usd": float(result_obj["total_cost_usd"]) if isinstance(result_obj.get("total_cost_usd"), (int, float)) and not isinstance(result_obj.get("total_cost_usd"), bool) else None,
+            "session_id": result_obj.get("session_id") if isinstance(result_obj.get("session_id"), str) else None,
+        }
     result_text = result_obj.get("result")
     if not isinstance(result_text, str):
         raise ReflectRunnerError("claude result is not text")
@@ -14827,7 +14845,8 @@ class ClaudeNativeRunner(ReflectRunner):
         # dependency, and can otherwise alter a local analysis unexpectedly.
         return [
             str(self.binary), "-p", "--model", str(self.model), "--output-format", "json",
-            "--safe-mode", "--restricted", "--strict-mcp-config",
+            "--json-schema", json.dumps(reflect_cli_json_schema(), ensure_ascii=False),
+            "--safe-mode", "--strict-mcp-config",
             "--disable-slash-commands", "--no-session-persistence",
         ]
 
