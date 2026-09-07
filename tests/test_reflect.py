@@ -745,6 +745,12 @@ class AnalyzerTests(ReflectTestCase):
         self.assertIn("primary natural language of before", after["description"])
         self.assertIn("preserve code, commands, logs, identifiers, paths, and exact literals", after["description"])
 
+    def test_cli_schema_keeps_contract_without_unsupported_draft_uri(self):
+        schema = agentcat.reflect_cli_json_schema()
+        self.assertNotIn("$schema", schema)
+        self.assertEqual(schema["required"], agentcat.reflect_analysis_schema()["required"])
+        self.assertFalse(schema["additionalProperties"])
+
     def test_reader_language_maps_apple_locale_with_patched_runner(self):
         cases = {
             "ko_KR": "ko",
@@ -895,6 +901,10 @@ class AnalyzerTests(ReflectTestCase):
         self.assertEqual(agentcat.reflect_parse_claude_cli_output(json.dumps(events))["text"], "{\"ok\": true}")
         # progress line before the JSON
         self.assertEqual(agentcat.reflect_parse_claude_cli_output("warming up\n" + json.dumps(obj))["session_id"], "s1")
+        structured = {"type": "result", "is_error": False, "result": "ignored", "structured_output": valid_analysis(), "session_id": "structured"}
+        self.assertEqual(json.loads(agentcat.reflect_parse_claude_cli_output(json.dumps(structured))["text"]), valid_analysis())
+        with self.assertRaises(agentcat.ReflectRunnerError):
+            agentcat.reflect_parse_claude_cli_output(json.dumps({"type": "result", "is_error": False, "structured_output": "not-an-object"}))
         with self.assertRaises(agentcat.ReflectRunnerError):
             agentcat.reflect_parse_claude_cli_output(json.dumps({**obj, "is_error": True}))
         with self.assertRaises(agentcat.ReflectRunnerError):
@@ -917,9 +927,13 @@ class AnalyzerTests(ReflectTestCase):
                 self.assertTrue(runner.available())
                 result = runner.run("PROMPT")
         self.subprocess.start()
-        self.assertEqual(captured["cmd"], [
+        self.assertEqual(captured["cmd"][:6], [
             "/fake/claude", "-p", "--model", "sonnet", "--output-format", "json",
-            "--safe-mode", "--restricted", "--strict-mcp-config",
+        ])
+        self.assertEqual(json.loads(captured["cmd"][7]), agentcat.reflect_cli_json_schema())
+        self.assertEqual(captured["cmd"][6], "--json-schema")
+        self.assertEqual(captured["cmd"][8:], [
+            "--safe-mode", "--strict-mcp-config",
             "--disable-slash-commands", "--no-session-persistence",
         ])
         self.assertEqual(captured["kwargs"]["input"], "PROMPT")
