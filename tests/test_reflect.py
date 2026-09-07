@@ -1762,6 +1762,19 @@ class SchedulerTests(ReflectTestCase):
         self.assertEqual(invalid["error"], "reflect_bad_request")
         self.assertIn('"autoAnalyze": "false"', agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
 
+        agentcat.REFLECT_CONFIG_FILE.write_text('{"enabled": "false", "autoAnalyze": false, "runner": "codex-exec"}', encoding="utf-8")
+        status, disabled = agentcat.reflect_http_get("/reflect/sessions", {"days": ["7"]})
+        self.assertEqual(status, 403)
+        self.assertEqual(disabled["error"], "reflect_disabled")
+        status, invalid = agentcat.reflect_http_post("/reflect/enable", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["error"], "reflect_bad_request")
+        self.assertIn('"enabled": "false"', agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+        result = agentcat.reflect_scheduler_tick(
+            now=dt.datetime(2026, 9, 7, 3, 0), config=agentcat.reflect_config(), runner=StubRunner()
+        )
+        self.assertEqual(result, {"ran": [], "skipped": "disabled"})
+
     def test_manual_operations_remain_available_when_automatic_analysis_is_off(self):
         agentcat.REFLECT_CONFIG_FILE.write_text(
             json.dumps({"enabled": True, "autoAnalyze": False}), encoding="utf-8"
