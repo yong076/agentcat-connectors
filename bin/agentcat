@@ -13465,10 +13465,32 @@ def _reflect_save_config(config: Dict[str, Any]) -> None:
         raise ReflectError(f"could not save Reflect settings: {exc}") from exc
 
 
-def reflect_settings() -> Dict[str, bool]:
+def reflect_runner_readiness(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return the local analyzer prerequisite without probing credentials.
+
+    Existence of a CLI is useful for the UI, but does not prove that its user
+    is signed in or entitled to the selected model.  Keep that distinction
+    explicit rather than running a paid request just to populate settings.
+    """
+    resolved = config if config is not None else reflect_config()
+    name = str(resolved.get("runner") or "claude-native")
+    if name == "claude-native":
+        return {
+            "id": name,
+            "available": reflect_find_claude_binary() is not None,
+            "prerequisite": "claude_code_cli",
+        }
+    return {"id": name, "available": False, "prerequisite": "unsupported_runner"}
+
+
+def reflect_settings() -> Dict[str, Any]:
     with _REFLECT_CONFIG_LOCK:
         config = _reflect_mutable_config()
-        return {"enabled": _reflect_enabled(config), "autoAnalyze": _reflect_auto_analyze(config)}
+        return {
+            "enabled": _reflect_enabled(config),
+            "autoAnalyze": _reflect_auto_analyze(config),
+            "runner": reflect_runner_readiness(config),
+        }
 
 
 def reflect_enable() -> Dict[str, Any]:
@@ -14799,7 +14821,15 @@ class ClaudeNativeRunner(ReflectRunner):
         return bool(self.binary)
 
     def command(self) -> List[str]:
-        return [str(self.binary), "-p", "--model", str(self.model), "--output-format", "json"]
+        # Reflect needs only the model's JSON response.  Do not inherit the
+        # caller's skills, plugins, hooks, project instructions, or MCP
+        # servers: those are development conveniences, not a user runtime
+        # dependency, and can otherwise alter a local analysis unexpectedly.
+        return [
+            str(self.binary), "-p", "--model", str(self.model), "--output-format", "json",
+            "--safe-mode", "--restricted", "--strict-mcp-config",
+            "--disable-slash-commands", "--no-session-persistence",
+        ]
 
     def run(self, prompt: str) -> Dict[str, Any]:
         if not self.binary:
@@ -16151,7 +16181,14 @@ def _reflect_error_payload(exc: Exception) -> Tuple[int, Dict[str, Any]]:
     if isinstance(exc, ReflectNotFound):
         return 404, {"error": "session_not_found", "legacy_error": "not_found", "message": str(exc)}
     if isinstance(exc, ReflectRunnerError):
-        return 503, {"error": "runner_unavailable", "legacy_error": "reflect_runner_unavailable", "message": str(exc)}
+        message = str(exc)
+        if "timed out" in message:
+            code = "runner_timeout"
+        elif "CLI not found" in message or "runner unavailable" in message:
+            code = "runner_unavailable"
+        else:
+            code = "runner_failed"
+        return 503, {"error": code, "legacy_error": "reflect_runner_unavailable", "message": message}
     if isinstance(exc, ReflectAnalysisError):
         return 502, {"error": "analysis_failed", "legacy_error": "reflect_analysis_invalid", "message": str(exc), "details": exc.errors}
     if isinstance(exc, ReflectError):
