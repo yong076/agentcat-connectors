@@ -13197,6 +13197,8 @@ REFLECT_EVIDENCE_MAX_CHARS = 300
 REFLECT_SCHEMA_VERSION = 1
 REFLECT_DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": False,
+    # Scheduled analysis is a separate, explicit opt-in from opening Reflect.
+    "autoAnalyze": False,
     "runner": "claude-native",
     # ``None`` means derive the first default from macOS AppleLocale. The
     # daemon writes the resolved value so later calls do not consult the OS.
@@ -13347,6 +13349,16 @@ class ReflectAnalysisError(ReflectError):
 # --- config -----------------------------------------------------------------
 
 
+_REFLECT_CONFIG_LOCK = threading.RLock()
+
+
+def _reflect_auto_analyze(config: Dict[str, Any]) -> bool:
+    value = config.get("autoAnalyze", False)
+    if not isinstance(value, bool):
+        raise ReflectError("autoAnalyze must be a boolean")
+    return value
+
+
 def reflect_config() -> Dict[str, Any]:
     """Merged reflect.json over defaults. Missing or malformed file → defaults."""
     merged = dict(REFLECT_DEFAULT_CONFIG)
@@ -13356,6 +13368,9 @@ def reflect_config() -> Dict[str, Any]:
             if key in merged and value is not None:
                 merged[key] = value
     merged["enabled"] = bool(merged.get("enabled"))
+    # Only literal true authorizes automatic work; malformed legacy values
+    # cannot turn scheduling on.
+    merged["autoAnalyze"] = merged.get("autoAnalyze") is True
     try:
         merged["dailyCap"] = max(0, int(merged.get("dailyCap") or 0))
     except (TypeError, ValueError):
@@ -13422,28 +13437,60 @@ def reflect_write_default_config() -> bool:
         return False
 
 
-def reflect_enable() -> Dict[str, Any]:
-    """Enable Reflect without replacing the user's existing configuration.
-
-    This is intentionally a narrow mutation rather than a generic config API:
-    the macOS app may turn the feature on, but cannot modify its runner,
-    schedule, or any future settings. Unknown keys are retained verbatim.
-    """
+def _reflect_mutable_config() -> Dict[str, Any]:
     raw = read_json(REFLECT_CONFIG_FILE)
-    if REFLECT_CONFIG_FILE.exists() and (
-        not isinstance(raw, dict) or "_agentcat_error" in raw
-    ):
+    if REFLECT_CONFIG_FILE.exists() and (not isinstance(raw, dict) or "_agentcat_error" in raw):
         raise ReflectError("reflect configuration is invalid; refusing to replace it")
-
     config = dict(raw) if isinstance(raw, dict) else dict(REFLECT_DEFAULT_CONFIG)
     if config.get("lang") is None:
         config["lang"] = reflect_reader_lang(config)
-    config["enabled"] = True
+    _reflect_auto_analyze(config)
+    return config
+
+
+def _reflect_save_config(config: Dict[str, Any]) -> None:
     try:
         write_json_atomic(REFLECT_CONFIG_FILE, config)
     except OSError as exc:
         raise ReflectError(f"could not save Reflect settings: {exc}") from exc
-    return {"enabled": True}
+
+
+def reflect_settings() -> Dict[str, bool]:
+    with _REFLECT_CONFIG_LOCK:
+        config = _reflect_mutable_config()
+        return {"enabled": bool(config.get("enabled")), "autoAnalyze": _reflect_auto_analyze(config)}
+
+
+def reflect_enable() -> Dict[str, Any]:
+    """Enable Reflect without opting into scheduled analysis."""
+    with _REFLECT_CONFIG_LOCK:
+        config = _reflect_mutable_config()
+        config["enabled"] = True
+        config.setdefault("autoAnalyze", False)
+        _reflect_save_config(config)
+        return {"enabled": True, "autoAnalyze": _reflect_auto_analyze(config)}
+
+
+def reflect_disable() -> Dict[str, Any]:
+    """Disable the Reflect surface and all future scheduled jobs."""
+    with _REFLECT_CONFIG_LOCK:
+        config = _reflect_mutable_config()
+        config["enabled"] = False
+        _reflect_save_config(config)
+        return {"enabled": False, "autoAnalyze": _reflect_auto_analyze(config)}
+
+
+def reflect_set_auto_analyze(enabled: Any) -> Dict[str, Any]:
+    """Set scheduled analysis only; this never turns Reflect on implicitly."""
+    if not isinstance(enabled, bool):
+        raise ReflectError("autoAnalyze must be a boolean")
+    with _REFLECT_CONFIG_LOCK:
+        config = _reflect_mutable_config()
+        if not bool(config.get("enabled")):
+            raise ReflectDisabled("Reflect is disabled")
+        config["autoAnalyze"] = enabled
+        _reflect_save_config(config)
+        return {"enabled": True, "autoAnalyze": enabled}
 
 
 # --- indexer ------------------------------------------------------------------
@@ -16115,6 +16162,8 @@ def reflect_require_http_enabled() -> None:
 def reflect_http_get(path: str, query: Dict[str, List[str]]) -> Tuple[int, Dict[str, Any]]:
     """Route a GET under /reflect/. Returns (status, payload); never raises."""
     try:
+        if path == "/reflect/settings":
+            return 200, reflect_settings()
         reflect_require_http_enabled()
         if path == "/reflect/week":
             iso = (query.get("iso") or [""])[0].strip() or None
@@ -16154,6 +16203,10 @@ def reflect_http_post(
     try:
         if path == "/reflect/enable":
             return 200, reflect_enable()
+        if path == "/reflect/disable":
+            return 200, reflect_disable()
+        if path == "/reflect/automation":
+            return 200, reflect_set_auto_analyze(body.get("autoAnalyze"))
         if path.startswith("/reflect/analyze/"):
             reflect_require_http_enabled()
             session_id = urllib.parse.unquote(path[len("/reflect/analyze/"):]).strip()
@@ -16317,10 +16370,12 @@ def reflect_scheduler_tick(
     runner: Optional[ReflectRunner] = None,
     idle: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """One scheduler step. Off unless reflect.json says enabled; nightly waits for idle."""
+    """One scheduler step. Automatic work needs both master and explicit opt-in."""
     resolved = config if config is not None else reflect_config()
     if not resolved.get("enabled"):
         return {"ran": [], "skipped": "disabled"}
+    if not resolved.get("autoAnalyze"):
+        return {"ran": [], "skipped": "automatic_analysis_disabled"}
     now_local = now if now is not None else dt.datetime.now().astimezone()
     state = {
         "last_nightly_date": reflect_state_get("last_nightly_date"),
