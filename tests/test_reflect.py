@@ -917,7 +917,11 @@ class AnalyzerTests(ReflectTestCase):
                 self.assertTrue(runner.available())
                 result = runner.run("PROMPT")
         self.subprocess.start()
-        self.assertEqual(captured["cmd"], ["/fake/claude", "-p", "--model", "sonnet", "--output-format", "json"])
+        self.assertEqual(captured["cmd"], [
+            "/fake/claude", "-p", "--model", "sonnet", "--output-format", "json",
+            "--safe-mode", "--restricted", "--strict-mcp-config",
+            "--disable-slash-commands", "--no-session-persistence",
+        ])
         self.assertEqual(captured["kwargs"]["input"], "PROMPT")
         self.assertEqual(captured["kwargs"]["timeout"], agentcat.REFLECT_ANALYZER_TIMEOUT_SECONDS)
         self.assertEqual(captured["kwargs"]["cwd"], str(agentcat.REFLECT_SCRATCH_DIR))
@@ -1744,7 +1748,18 @@ class SchedulerTests(ReflectTestCase):
             json.dumps({"enabled": False, "autoAnalyze": False, "runner": "codex-exec"}), encoding="utf-8"
         )
         status, settings = agentcat.reflect_http_get("/reflect/settings", {})
-        self.assertEqual((status, settings), (200, {"enabled": False, "autoAnalyze": False}))
+        self.assertEqual(
+            (status, settings),
+            (200, {
+                "enabled": False,
+                "autoAnalyze": False,
+                "runner": {
+                    "id": "codex-exec",
+                    "available": False,
+                    "prerequisite": "unsupported_runner",
+                },
+            }),
+        )
 
         status, rejected = agentcat.reflect_http_post("/reflect/automation", {"autoAnalyze": True})
         self.assertEqual(status, 403)
@@ -1774,6 +1789,24 @@ class SchedulerTests(ReflectTestCase):
             now=dt.datetime(2026, 9, 7, 3, 0), config=agentcat.reflect_config(), runner=StubRunner()
         )
         self.assertEqual(result, {"ran": [], "skipped": "disabled"})
+
+    def test_settings_reports_local_runner_readiness_without_running_it(self):
+        agentcat.REFLECT_CONFIG_FILE.write_text(
+            json.dumps({"enabled": True, "autoAnalyze": False, "runner": "claude-native"}), encoding="utf-8"
+        )
+        with patch.object(agentcat, "reflect_find_claude_binary", return_value=None) as find_binary:
+            status, settings = agentcat.reflect_http_get("/reflect/settings", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            settings["runner"],
+            {"id": "claude-native", "available": False, "prerequisite": "claude_code_cli"},
+        )
+        find_binary.assert_called_once_with()
+
+    def test_runner_error_codes_distinguish_missing_timeout_and_failed_cli(self):
+        self.assertEqual(agentcat._reflect_error_payload(agentcat.ReflectRunnerError("reflect runner unavailable: claude-native"))[1]["error"], "runner_unavailable")
+        self.assertEqual(agentcat._reflect_error_payload(agentcat.ReflectRunnerError("claude timed out after 600s"))[1]["error"], "runner_timeout")
+        self.assertEqual(agentcat._reflect_error_payload(agentcat.ReflectRunnerError("claude exited 1: not signed in"))[1]["error"], "runner_failed")
 
     def test_manual_operations_remain_available_when_automatic_analysis_is_off(self):
         agentcat.REFLECT_CONFIG_FILE.write_text(
