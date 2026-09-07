@@ -13352,6 +13352,13 @@ class ReflectAnalysisError(ReflectError):
 _REFLECT_CONFIG_LOCK = threading.RLock()
 
 
+def _reflect_enabled(config: Dict[str, Any]) -> bool:
+    value = config.get("enabled", False)
+    if not isinstance(value, bool):
+        raise ReflectError("enabled must be a boolean")
+    return value
+
+
 def _reflect_auto_analyze(config: Dict[str, Any]) -> bool:
     value = config.get("autoAnalyze", False)
     if not isinstance(value, bool):
@@ -13367,7 +13374,9 @@ def reflect_config() -> Dict[str, Any]:
         for key, value in raw.items():
             if key in merged and value is not None:
                 merged[key] = value
-    merged["enabled"] = bool(merged.get("enabled"))
+    # Only literal true authorizes Reflect; malformed legacy values cannot
+    # expose local history or schedule analysis.
+    merged["enabled"] = merged.get("enabled") is True
     # Only literal true authorizes automatic work; malformed legacy values
     # cannot turn scheduling on.
     merged["autoAnalyze"] = merged.get("autoAnalyze") is True
@@ -13444,6 +13453,7 @@ def _reflect_mutable_config() -> Dict[str, Any]:
     config = dict(raw) if isinstance(raw, dict) else dict(REFLECT_DEFAULT_CONFIG)
     if config.get("lang") is None:
         config["lang"] = reflect_reader_lang(config)
+    _reflect_enabled(config)
     _reflect_auto_analyze(config)
     return config
 
@@ -13458,7 +13468,7 @@ def _reflect_save_config(config: Dict[str, Any]) -> None:
 def reflect_settings() -> Dict[str, bool]:
     with _REFLECT_CONFIG_LOCK:
         config = _reflect_mutable_config()
-        return {"enabled": bool(config.get("enabled")), "autoAnalyze": _reflect_auto_analyze(config)}
+        return {"enabled": _reflect_enabled(config), "autoAnalyze": _reflect_auto_analyze(config)}
 
 
 def reflect_enable() -> Dict[str, Any]:
@@ -13486,7 +13496,7 @@ def reflect_set_auto_analyze(enabled: Any) -> Dict[str, Any]:
         raise ReflectError("autoAnalyze must be a boolean")
     with _REFLECT_CONFIG_LOCK:
         config = _reflect_mutable_config()
-        if not bool(config.get("enabled")):
+        if not _reflect_enabled(config):
             raise ReflectDisabled("Reflect is disabled")
         config["autoAnalyze"] = enabled
         _reflect_save_config(config)
@@ -16372,7 +16382,7 @@ def reflect_scheduler_tick(
 ) -> Dict[str, Any]:
     """One scheduler step. Automatic work needs both master and explicit opt-in."""
     resolved = config if config is not None else reflect_config()
-    if not resolved.get("enabled"):
+    if resolved.get("enabled") is not True:
         return {"ran": [], "skipped": "disabled"}
     if not resolved.get("autoAnalyze"):
         return {"ran": [], "skipped": "automatic_analysis_disabled"}
