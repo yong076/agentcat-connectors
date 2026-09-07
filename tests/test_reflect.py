@@ -1703,7 +1703,7 @@ class SchedulerTests(ReflectTestCase):
         status, payload = agentcat.reflect_http_post("/reflect/enable", {})
 
         self.assertEqual(status, 200)
-        self.assertEqual(payload, {"enabled": True})
+        self.assertEqual(payload, {"enabled": True, "autoAnalyze": False})
         saved = json.loads(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
         self.assertTrue(saved["enabled"])
         self.assertEqual(saved["runner"], "codex-exec")
@@ -1715,11 +1715,77 @@ class SchedulerTests(ReflectTestCase):
         self.assertEqual(payload["error"], "reflect_bad_request")
         self.assertEqual(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"), "{not json")
 
+    def test_master_and_automatic_analysis_controls_preserve_config(self):
+        original = {"enabled": False, "runner": "codex-exec", "unknown": {"keep": True}}
+        agentcat.REFLECT_CONFIG_FILE.write_text(json.dumps(original), encoding="utf-8")
+
+        status, enabled = agentcat.reflect_http_post("/reflect/enable", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(enabled["enabled"])
+        self.assertFalse(enabled["autoAnalyze"])
+
+        status, automatic = agentcat.reflect_http_post("/reflect/automation", {"autoAnalyze": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(automatic, {"enabled": True, "autoAnalyze": True})
+
+        status, disabled = agentcat.reflect_http_post("/reflect/disable", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(disabled, {"enabled": False, "autoAnalyze": True})
+        saved = json.loads(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(saved["runner"], "codex-exec")
+        self.assertEqual(saved["unknown"], {"keep": True})
+
+        status, rejected = agentcat.reflect_http_post("/reflect/automation", {"autoAnalyze": True})
+        self.assertEqual(status, 403)
+        self.assertEqual(rejected["error"], "reflect_disabled")
+
+    def test_settings_are_readable_while_disabled_and_automation_does_not_enable_master(self):
+        agentcat.REFLECT_CONFIG_FILE.write_text(
+            json.dumps({"enabled": False, "autoAnalyze": False, "runner": "codex-exec"}), encoding="utf-8"
+        )
+        status, settings = agentcat.reflect_http_get("/reflect/settings", {})
+        self.assertEqual((status, settings), (200, {"enabled": False, "autoAnalyze": False}))
+
+        status, rejected = agentcat.reflect_http_post("/reflect/automation", {"autoAnalyze": True})
+        self.assertEqual(status, 403)
+        self.assertEqual(rejected["error"], "reflect_disabled")
+        saved = json.loads(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertFalse(saved["enabled"])
+        self.assertFalse(saved["autoAnalyze"])
+
+        agentcat.REFLECT_CONFIG_FILE.write_text('{"enabled": true, "autoAnalyze": "false", "runner": "codex-exec"}', encoding="utf-8")
+        status, invalid = agentcat.reflect_http_get("/reflect/settings", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["error"], "reflect_bad_request")
+        status, invalid = agentcat.reflect_http_post("/reflect/disable", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["error"], "reflect_bad_request")
+        self.assertIn('"autoAnalyze": "false"', agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+
+    def test_manual_operations_remain_available_when_automatic_analysis_is_off(self):
+        agentcat.REFLECT_CONFIG_FILE.write_text(
+            json.dumps({"enabled": True, "autoAnalyze": False}), encoding="utf-8"
+        )
+        with patch.object(agentcat, "reflect_list_sessions", return_value=[]) as sessions, \
+             patch.object(agentcat, "reflect_analyze_session", return_value={"queued": True}) as analyze:
+            status, payload = agentcat.reflect_http_get("/reflect/sessions", {"days": ["7"]})
+            self.assertEqual((status, payload), (200, {"days": 7, "sessions": []}))
+            status, payload = agentcat.reflect_http_post("/reflect/analyze/demo", {})
+            self.assertEqual((status, payload), (200, {"queued": True}))
+        sessions.assert_called_once_with(7)
+        analyze.assert_called_once_with("demo", force=False, lang=None)
+
+    def test_scheduler_needs_explicit_automatic_analysis_opt_in(self):
+        config = {**agentcat.reflect_config(), "enabled": True, "autoAnalyze": False}
+        result = agentcat.reflect_scheduler_tick(now=dt.datetime(2026, 9, 7, 3, 0), config=config, runner=StubRunner())
+        self.assertEqual(result, {"ran": [], "skipped": "automatic_analysis_disabled"})
+
     def test_default_config_written_once_and_disabled(self):
         self.assertTrue(agentcat.reflect_write_default_config())
         self.assertFalse(agentcat.reflect_write_default_config())
         raw = json.loads(agentcat.REFLECT_CONFIG_FILE.read_text())
         self.assertFalse(raw["enabled"])
+        self.assertFalse(raw["autoAnalyze"])
         self.assertEqual(raw["runner"], "claude-native")
         self.assertEqual(raw["dailyCap"], 20)
         self.assertEqual(raw["lang"], "en")
@@ -1755,7 +1821,7 @@ class SchedulerTests(ReflectTestCase):
 
     def test_nightly_waits_for_idle_then_runs_once(self):
         self.write_claude_session()
-        config = {**agentcat.reflect_config(), "enabled": True, "lang": "ja"}
+        config = {**agentcat.reflect_config(), "enabled": True, "autoAnalyze": True, "lang": "ja"}
         now = dt.datetime(2026, 9, 7, 3, 0)
         busy = agentcat.reflect_scheduler_tick(now=now, config=config, runner=StubRunner(), idle=False)
         self.assertEqual(busy["ran"], [])
@@ -1845,7 +1911,7 @@ class SchedulerTests(ReflectTestCase):
     def test_weekly_synthesis_stored_on_sunday(self):
         self.write_claude_session()
         agentcat.reflect_analyze_session("claude:" + CLAUDE_UUID, runner=StubRunner())
-        config = {**agentcat.reflect_config(), "enabled": True}
+        config = {**agentcat.reflect_config(), "enabled": True, "autoAnalyze": True}
         sunday = dt.datetime(2026, 9, 6, 18, 0)
         result = agentcat.reflect_scheduler_tick(now=sunday, config=config, runner=StubRunner(responses=[]))
         self.assertEqual(result["ran"], ["weekly"])
