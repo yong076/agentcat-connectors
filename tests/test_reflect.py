@@ -723,7 +723,7 @@ class AnalyzerTests(ReflectTestCase):
         nudged = agentcat.reflect_build_prompt({"turn_list": []}, nudge="Return only JSON.")
         self.assertEqual(nudged.splitlines()[1], "Return only JSON.")
 
-    def test_prompt_names_reader_language_and_preserves_quotes(self):
+    def test_prompt_names_reader_language_and_rewrite_source_language(self):
         names = {
             "ko": "Korean",
             "en": "English",
@@ -733,10 +733,23 @@ class AnalyzerTests(ReflectTestCase):
         for lang, name in names.items():
             prompt = agentcat.reflect_build_prompt({"turn_list": []}, lang=lang)
             self.assertIn(
-                "Write `note`, `after`, `working_style`, and `candidate_rules` in {}; "
-                "keep quoted `evidence` and `before` verbatim in their original language.".format(name),
+                "Write `note`, `working_style`, and `candidate_rules` in {}; "
+                "keep quoted `evidence` and `before` verbatim in their original language. "
+                "For every prompt-quality rewrite, write `after` in the primary natural language of its paired `before`, even when that differs from the reader language. "
+                "When `before` mixes natural language with code, commands, logs, identifiers, paths, or exact literals, use the main human-language prose to choose `after`'s language and preserve those non-prose literals exactly.".format(name),
                 prompt,
             )
+
+    def test_rewrite_schema_requires_source_language_and_literal_preservation(self):
+        after = agentcat.reflect_analysis_schema()["properties"]["prompt_quality"]["properties"]["clarity"]["properties"]["after"]
+        self.assertIn("primary natural language of before", after["description"])
+        self.assertIn("preserve code, commands, logs, identifiers, paths, and exact literals", after["description"])
+
+    def test_cli_schema_keeps_contract_without_unsupported_draft_uri(self):
+        schema = agentcat.reflect_cli_json_schema()
+        self.assertNotIn("$schema", schema)
+        self.assertEqual(schema["required"], agentcat.reflect_analysis_schema()["required"])
+        self.assertFalse(schema["additionalProperties"])
 
     def test_reader_language_maps_apple_locale_with_patched_runner(self):
         cases = {
@@ -888,6 +901,10 @@ class AnalyzerTests(ReflectTestCase):
         self.assertEqual(agentcat.reflect_parse_claude_cli_output(json.dumps(events))["text"], "{\"ok\": true}")
         # progress line before the JSON
         self.assertEqual(agentcat.reflect_parse_claude_cli_output("warming up\n" + json.dumps(obj))["session_id"], "s1")
+        structured = {"type": "result", "is_error": False, "result": "ignored", "structured_output": valid_analysis(), "session_id": "structured"}
+        self.assertEqual(json.loads(agentcat.reflect_parse_claude_cli_output(json.dumps(structured))["text"]), valid_analysis())
+        with self.assertRaises(agentcat.ReflectRunnerError):
+            agentcat.reflect_parse_claude_cli_output(json.dumps({"type": "result", "is_error": False, "structured_output": "not-an-object"}))
         with self.assertRaises(agentcat.ReflectRunnerError):
             agentcat.reflect_parse_claude_cli_output(json.dumps({**obj, "is_error": True}))
         with self.assertRaises(agentcat.ReflectRunnerError):
@@ -910,7 +927,15 @@ class AnalyzerTests(ReflectTestCase):
                 self.assertTrue(runner.available())
                 result = runner.run("PROMPT")
         self.subprocess.start()
-        self.assertEqual(captured["cmd"], ["/fake/claude", "-p", "--model", "sonnet", "--output-format", "json"])
+        self.assertEqual(captured["cmd"][:6], [
+            "/fake/claude", "-p", "--model", "sonnet", "--output-format", "json",
+        ])
+        self.assertEqual(json.loads(captured["cmd"][7]), agentcat.reflect_cli_json_schema())
+        self.assertEqual(captured["cmd"][6], "--json-schema")
+        self.assertEqual(captured["cmd"][8:], [
+            "--safe-mode", "--strict-mcp-config",
+            "--disable-slash-commands", "--no-session-persistence",
+        ])
         self.assertEqual(captured["kwargs"]["input"], "PROMPT")
         self.assertEqual(captured["kwargs"]["timeout"], agentcat.REFLECT_ANALYZER_TIMEOUT_SECONDS)
         self.assertEqual(captured["kwargs"]["cwd"], str(agentcat.REFLECT_SCRATCH_DIR))
@@ -1689,11 +1714,138 @@ class ReflectContractTests(ReflectTestCase):
 
 
 class SchedulerTests(ReflectTestCase):
+    def test_enable_preserves_existing_config_and_refuses_malformed_file(self):
+        original = {"enabled": False, "runner": "codex-exec", "unknown": {"keep": True}}
+        agentcat.REFLECT_CONFIG_FILE.write_text(json.dumps(original), encoding="utf-8")
+
+        status, payload = agentcat.reflect_http_post("/reflect/enable", {})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"enabled": True, "autoAnalyze": False})
+        saved = json.loads(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertTrue(saved["enabled"])
+        self.assertEqual(saved["runner"], "codex-exec")
+        self.assertEqual(saved["unknown"], {"keep": True})
+
+        agentcat.REFLECT_CONFIG_FILE.write_text("{not json", encoding="utf-8")
+        status, payload = agentcat.reflect_http_post("/reflect/enable", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"], "reflect_bad_request")
+        self.assertEqual(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"), "{not json")
+
+    def test_master_and_automatic_analysis_controls_preserve_config(self):
+        original = {"enabled": False, "runner": "codex-exec", "unknown": {"keep": True}}
+        agentcat.REFLECT_CONFIG_FILE.write_text(json.dumps(original), encoding="utf-8")
+
+        status, enabled = agentcat.reflect_http_post("/reflect/enable", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(enabled["enabled"])
+        self.assertFalse(enabled["autoAnalyze"])
+
+        status, automatic = agentcat.reflect_http_post("/reflect/automation", {"autoAnalyze": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(automatic, {"enabled": True, "autoAnalyze": True})
+
+        status, disabled = agentcat.reflect_http_post("/reflect/disable", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(disabled, {"enabled": False, "autoAnalyze": True})
+        saved = json.loads(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(saved["runner"], "codex-exec")
+        self.assertEqual(saved["unknown"], {"keep": True})
+
+        status, rejected = agentcat.reflect_http_post("/reflect/automation", {"autoAnalyze": True})
+        self.assertEqual(status, 403)
+        self.assertEqual(rejected["error"], "reflect_disabled")
+
+    def test_settings_are_readable_while_disabled_and_automation_does_not_enable_master(self):
+        agentcat.REFLECT_CONFIG_FILE.write_text(
+            json.dumps({"enabled": False, "autoAnalyze": False, "runner": "codex-exec"}), encoding="utf-8"
+        )
+        status, settings = agentcat.reflect_http_get("/reflect/settings", {})
+        self.assertEqual(
+            (status, settings),
+            (200, {
+                "enabled": False,
+                "autoAnalyze": False,
+                "runner": {
+                    "id": "codex-exec",
+                    "available": False,
+                    "prerequisite": "unsupported_runner",
+                },
+            }),
+        )
+
+        status, rejected = agentcat.reflect_http_post("/reflect/automation", {"autoAnalyze": True})
+        self.assertEqual(status, 403)
+        self.assertEqual(rejected["error"], "reflect_disabled")
+        saved = json.loads(agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertFalse(saved["enabled"])
+        self.assertFalse(saved["autoAnalyze"])
+
+        agentcat.REFLECT_CONFIG_FILE.write_text('{"enabled": true, "autoAnalyze": "false", "runner": "codex-exec"}', encoding="utf-8")
+        status, invalid = agentcat.reflect_http_get("/reflect/settings", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["error"], "reflect_bad_request")
+        status, invalid = agentcat.reflect_http_post("/reflect/disable", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["error"], "reflect_bad_request")
+        self.assertIn('"autoAnalyze": "false"', agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+
+        agentcat.REFLECT_CONFIG_FILE.write_text('{"enabled": "false", "autoAnalyze": false, "runner": "codex-exec"}', encoding="utf-8")
+        status, disabled = agentcat.reflect_http_get("/reflect/sessions", {"days": ["7"]})
+        self.assertEqual(status, 403)
+        self.assertEqual(disabled["error"], "reflect_disabled")
+        status, invalid = agentcat.reflect_http_post("/reflect/enable", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["error"], "reflect_bad_request")
+        self.assertIn('"enabled": "false"', agentcat.REFLECT_CONFIG_FILE.read_text(encoding="utf-8"))
+        result = agentcat.reflect_scheduler_tick(
+            now=dt.datetime(2026, 9, 7, 3, 0), config=agentcat.reflect_config(), runner=StubRunner()
+        )
+        self.assertEqual(result, {"ran": [], "skipped": "disabled"})
+
+    def test_settings_reports_local_runner_readiness_without_running_it(self):
+        agentcat.REFLECT_CONFIG_FILE.write_text(
+            json.dumps({"enabled": True, "autoAnalyze": False, "runner": "claude-native"}), encoding="utf-8"
+        )
+        with patch.object(agentcat, "reflect_find_claude_binary", return_value=None) as find_binary:
+            status, settings = agentcat.reflect_http_get("/reflect/settings", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            settings["runner"],
+            {"id": "claude-native", "available": False, "prerequisite": "claude_code_cli"},
+        )
+        find_binary.assert_called_once_with()
+
+    def test_runner_error_codes_distinguish_missing_timeout_and_failed_cli(self):
+        self.assertEqual(agentcat._reflect_error_payload(agentcat.ReflectRunnerError("reflect runner unavailable: claude-native"))[1]["error"], "runner_unavailable")
+        self.assertEqual(agentcat._reflect_error_payload(agentcat.ReflectRunnerError("claude timed out after 600s"))[1]["error"], "runner_timeout")
+        self.assertEqual(agentcat._reflect_error_payload(agentcat.ReflectRunnerError("claude exited 1: not signed in"))[1]["error"], "runner_failed")
+
+    def test_manual_operations_remain_available_when_automatic_analysis_is_off(self):
+        agentcat.REFLECT_CONFIG_FILE.write_text(
+            json.dumps({"enabled": True, "autoAnalyze": False}), encoding="utf-8"
+        )
+        with patch.object(agentcat, "reflect_list_sessions", return_value=[]) as sessions, \
+             patch.object(agentcat, "reflect_analyze_session", return_value={"queued": True}) as analyze:
+            status, payload = agentcat.reflect_http_get("/reflect/sessions", {"days": ["7"]})
+            self.assertEqual((status, payload), (200, {"days": 7, "sessions": []}))
+            status, payload = agentcat.reflect_http_post("/reflect/analyze/demo", {})
+            self.assertEqual((status, payload), (200, {"queued": True}))
+        sessions.assert_called_once_with(7)
+        analyze.assert_called_once_with("demo", force=False, lang=None)
+
+    def test_scheduler_needs_explicit_automatic_analysis_opt_in(self):
+        config = {**agentcat.reflect_config(), "enabled": True, "autoAnalyze": False}
+        result = agentcat.reflect_scheduler_tick(now=dt.datetime(2026, 9, 7, 3, 0), config=config, runner=StubRunner())
+        self.assertEqual(result, {"ran": [], "skipped": "automatic_analysis_disabled"})
+
     def test_default_config_written_once_and_disabled(self):
         self.assertTrue(agentcat.reflect_write_default_config())
         self.assertFalse(agentcat.reflect_write_default_config())
         raw = json.loads(agentcat.REFLECT_CONFIG_FILE.read_text())
         self.assertFalse(raw["enabled"])
+        self.assertFalse(raw["autoAnalyze"])
         self.assertEqual(raw["runner"], "claude-native")
         self.assertEqual(raw["dailyCap"], 20)
         self.assertEqual(raw["lang"], "en")
@@ -1729,7 +1881,7 @@ class SchedulerTests(ReflectTestCase):
 
     def test_nightly_waits_for_idle_then_runs_once(self):
         self.write_claude_session()
-        config = {**agentcat.reflect_config(), "enabled": True, "lang": "ja"}
+        config = {**agentcat.reflect_config(), "enabled": True, "autoAnalyze": True, "lang": "ja"}
         now = dt.datetime(2026, 9, 7, 3, 0)
         busy = agentcat.reflect_scheduler_tick(now=now, config=config, runner=StubRunner(), idle=False)
         self.assertEqual(busy["ran"], [])
@@ -1819,7 +1971,7 @@ class SchedulerTests(ReflectTestCase):
     def test_weekly_synthesis_stored_on_sunday(self):
         self.write_claude_session()
         agentcat.reflect_analyze_session("claude:" + CLAUDE_UUID, runner=StubRunner())
-        config = {**agentcat.reflect_config(), "enabled": True}
+        config = {**agentcat.reflect_config(), "enabled": True, "autoAnalyze": True}
         sunday = dt.datetime(2026, 9, 6, 18, 0)
         result = agentcat.reflect_scheduler_tick(now=sunday, config=config, runner=StubRunner(responses=[]))
         self.assertEqual(result["ran"], ["weekly"])
