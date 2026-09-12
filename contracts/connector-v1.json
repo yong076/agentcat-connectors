@@ -27,6 +27,11 @@
       "fields": ["connections"],
       "fallback": "omit explicit API connections while preserving observed provider integrations"
     },
+    "connections.codex.appServer.v1": {
+      "owner": "shared",
+      "fields": ["connections"],
+      "fallback": "omit managed Codex connections while preserving observed provider integrations"
+    },
     "usage.antigravity.sqlite": {
       "owner": "shared",
       "fields": ["providers.antigravity.tokens", "providers.antigravity.sourceAttribution"],

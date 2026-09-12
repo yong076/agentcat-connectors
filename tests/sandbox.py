@@ -25,6 +25,8 @@ def _redirect(home: Path, agentcat_home: Path) -> dict:
         "LIMITS_FILE": agentcat_home / "limits.json",
         "AGENTCAT_KEYS_FILE": agentcat_home / "keys.json",
         "OPENROUTER_CONNECTIONS_FILE": agentcat_home / "openrouter-connections.json",
+        "CODEX_CONNECTIONS_FILE": agentcat_home / "codex-connections.json",
+        "CODEX_CONNECTIONS_PROFILES_DIR": agentcat_home / "codex-connection-profiles",
         "LOOPBACK_CONTROL_TOKEN_FILE": agentcat_home / "loopback-control-token",
         "LIVE_LIMITS_CACHE": agentcat_home / "live-limits-cache.json",
         "PROVIDER_INSTANCE_SECRET": agentcat_home / "provider-instance.key",

@@ -32,6 +32,13 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# Keep protocol-specific process handling outside the monolithic collector.  The
+# installed archive retains ``bin/../lib`` beside this entrypoint.
+_agentcat_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_agentcat_lib) not in sys.path:
+    sys.path.insert(0, str(_agentcat_lib))
+from agentcat_codex_app_server import CodexAppServer, CodexAppServerError, CodexAppServerUnsupported
+
 
 def resolve_user_home_env() -> str:
     """The user's real home directory, as a string.
@@ -56,6 +63,8 @@ LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 AGENTCAT_KEYS_FILE = AGENTCAT_HOME / "keys.json"
 OPENROUTER_CONNECTIONS_FILE = AGENTCAT_HOME / "openrouter-connections.json"
+CODEX_CONNECTIONS_FILE = AGENTCAT_HOME / "codex-connections.json"
+CODEX_CONNECTIONS_PROFILES_DIR = AGENTCAT_HOME / "codex-connection-profiles"
 LOOPBACK_CONTROL_TOKEN_FILE = AGENTCAT_HOME / "loopback-control-token"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 GEMINI_USAGE_CACHE = AGENTCAT_HOME / "gemini-usage-cache.json"
@@ -210,6 +219,7 @@ CONNECTOR_CAPABILITIES = (
     "activity.runtimeModes",
     "connector.config",
     "connections.openrouter.v1",
+    "connections.codex.appServer.v1",
     "desktopApps.localMetadata",
     "events.sqlite",
     "usage.dailyTokens",
@@ -16534,7 +16544,19 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 status, reason = guard_error
                 self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
                 return
-            self.send_json(200, {"connections": openrouter_connections_snapshot()})
+            self.send_json(200, {"connections": openrouter_connections_snapshot() + codex_connections_snapshot()})
+            return
+        codex_oauth_status_match = re.fullmatch(r"/v1/connections/codex/oauth/([0-9a-f-]{20,})", path)
+        if codex_oauth_status_match:
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            try:
+                self.send_json(200, codex_oauth_status(codex_oauth_status_match.group(1)))
+            except KeyError:
+                self.send_json(404, {"error": "oauth_operation_not_found"})
             return
         oauth_status_match = re.fullmatch(r"/v1/connections/openrouter/oauth/([A-Za-z0-9_-]{20,})", path)
         if oauth_status_match:
@@ -16613,6 +16635,24 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json(200, result)
                 return
+            if path == "/v1/connections/codex/oauth/start":
+                try:
+                    result = codex_start_oauth(
+                        str(payload.get("label") or "Codex / ChatGPT"),
+                        str(payload.get("mode") or "browser"),
+                    )
+                except ValueError as exc:
+                    self.send_json(400, {"error": "invalid_connection", "message": str(exc)})
+                    return
+                except Exception:
+                    self.send_json(502, {"error": "codex_oauth_start_failed"})
+                    return
+                self.send_json(200, result)
+                return
+            codex_cancel_match = re.fullmatch(r"/v1/connections/codex/oauth/([0-9a-f-]{20,})/cancel", path)
+            if codex_cancel_match:
+                self.send_json(200, {"status": codex_cancel_oauth(codex_cancel_match.group(1))})
+                return
             oauth_match = re.fullmatch(r"/v1/connections/openrouter/oauth/([A-Za-z0-9_-]{20,})/(key|complete)", path)
             if oauth_match:
                 nonce, action = oauth_match.groups()
@@ -16635,7 +16675,11 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 return
             connection_id = match.group(1)
             try:
-                self.send_json(200, {"connection": openrouter_connection_mutation(connection_id, "refresh")})
+                try:
+                    connection = codex_connection_mutation(connection_id, "refresh")
+                except KeyError:
+                    connection = openrouter_connection_mutation(connection_id, "refresh")
+                self.send_json(200, {"connection": connection})
             except KeyError:
                 self.send_json(404, {"error": "connection_not_found"})
             except Exception:
@@ -16770,7 +16814,10 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self.read_json_body(max_bytes=16 * 1024)
-            connection = openrouter_connection_mutation(match.group(1), "rename", str(payload.get("label") or ""))
+            try:
+                connection = codex_connection_mutation(match.group(1), "rename", str(payload.get("label") or ""))
+            except KeyError:
+                connection = openrouter_connection_mutation(match.group(1), "rename", str(payload.get("label") or ""))
         except KeyError:
             self.send_json(404, {"error": "connection_not_found"})
             return
@@ -16796,7 +16843,10 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             self.send_json(status, {"error": "connection_write_forbidden", "message": reason})
             return
         try:
-            connection = openrouter_connection_mutation(match.group(1), "remove")
+            try:
+                connection = codex_connection_mutation(match.group(1), "remove")
+            except KeyError:
+                connection = openrouter_connection_mutation(match.group(1), "remove")
         except KeyError:
             self.send_json(404, {"error": "connection_not_found"})
             return
@@ -16876,6 +16926,7 @@ def run_daemon(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        shutdown_codex_app_servers()
         server.server_close()
     return 0
 
@@ -17894,6 +17945,269 @@ def openrouter_connection_mutation(connection_id: str, action: str, label: Optio
             raise ValueError("unsupported_connection_action")
         _write_openrouter_connections(rows)
         return _openrouter_public_connection(row)
+
+
+# ---------------------------------------------------------------------------
+# Explicit managed Codex / ChatGPT connections
+#
+# OAuth is performed only by the installed Codex app-server.  This registry has
+# metadata and a profile id, never OAuth codes, tokens, app-server output, or a
+# copied credential.  ``CODEX_HOME`` is set only in the child process to the
+# profile derived from that id; the owner's existing Codex home is untouched.
+_CODEX_CONNECTIONS_LOCK = threading.RLock()
+_CODEX_APP_SERVERS: Dict[str, CodexAppServer] = {}
+_CODEX_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _codex_profile_dir(connection_id: str) -> Path:
+    if not _CODEX_ID_RE.fullmatch(connection_id):
+        raise ValueError("invalid_connection_id")
+    return CODEX_CONNECTIONS_PROFILES_DIR / connection_id
+
+
+def _codex_connections() -> List[Dict[str, Any]]:
+    raw = read_json(CODEX_CONNECTIONS_FILE)
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return []
+    rows = raw.get("connections")
+    return [dict(row) for row in rows] if isinstance(rows, list) and all(isinstance(row, dict) for row in rows) else []
+
+
+def _codex_public_connection(row: Dict[str, Any]) -> Dict[str, Any]:
+    # Do not expose profile paths, login IDs, process details, or arbitrary raw
+    # protocol payloads.  These keys are the complete public contract.
+    keys = (
+        "id", "provider", "label", "kind", "scope", "status", "createdAt",
+        "lastSyncAt", "lastSuccessfulSyncAt", "error", "identity", "usage",
+        "operationID",
+    )
+    return {key: copy.deepcopy(row[key]) for key in keys if key in row}
+
+
+def _write_codex_connections(rows: List[Dict[str, Any]]) -> None:
+    ensure_dirs()
+    write_json_atomic(CODEX_CONNECTIONS_FILE, {"version": 1, "connections": [_codex_public_connection(row) for row in rows]})
+    _chmod_quiet(CODEX_CONNECTIONS_FILE, 0o600)
+
+
+def _codex_server(row: Dict[str, Any]) -> CodexAppServer:
+    connection_id = str(row.get("id") or "")
+    server = _CODEX_APP_SERVERS.get(connection_id)
+    if server is None:
+        server = CodexAppServer(_codex_profile_dir(connection_id))
+        _CODEX_APP_SERVERS[connection_id] = server
+    return server
+
+
+def _codex_unavailable_usage() -> Dict[str, Any]:
+    return {
+        "source": "codex-app-server",
+        "freshness": "unavailable",
+        "windows": [],
+        "credits": None,
+        "spendControl": None,
+        "rateLimitReachedType": None,
+        "tokenUsage": None,
+        "tokenUsageAvailable": False,
+    }
+
+
+def _codex_refresh_row(row: Dict[str, Any]) -> bool:
+    """Refresh one explicitly managed profile; no local Codex auto-discovery."""
+    row["lastSyncAt"] = now_iso()
+    try:
+        identity = _codex_server(row).account()
+        if identity is None:
+            row["status"] = "needs_reconnect"
+            row["error"] = "This managed Codex profile is no longer signed in. Reconnect it."
+            row["usage"] = _codex_unavailable_usage()
+            return True
+        prior = row.get("identity")
+        if isinstance(prior, dict) and isinstance(prior.get("email"), str) and isinstance(identity.get("email"), str) and prior["email"].lower() != identity["email"].lower():
+            row["status"] = "needs_reconnect"
+            row["error"] = "The signed-in Codex account does not match this connection. Reconnect it."
+            row["usage"] = _codex_unavailable_usage()
+            return True
+        row["identity"] = identity
+        try:
+            row["usage"] = _codex_server(row).usage()
+            row.pop("error", None)
+        except CodexAppServerError:
+            # Identity is still authoritative.  Do not erase a useful prior
+            # usage snapshot or manufacture zeros when optional usage is down.
+            row.setdefault("usage", _codex_unavailable_usage())
+            row["error"] = "Codex is connected, but detailed usage is temporarily unavailable."
+        row["status"] = "connected"
+        row.pop("operationID", None)
+        row["lastSuccessfulSyncAt"] = row["lastSyncAt"]
+        return True
+    except CodexAppServerError:
+        row["status"] = "error"
+        row.setdefault("usage", _codex_unavailable_usage())
+        row["error"] = "Could not reach the managed Codex app-server. Retry this connection."
+        return True
+
+
+def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        changed = False
+        for row in rows:
+            if row.get("status") in {"removed", "canceled"}:
+                continue
+            if row.get("status") in {"pending_browser", "pending_device"}:
+                # A daemon restart cannot safely resume a login listener owned
+                # by the prior child.  Preserve the isolated profile and make
+                # recovery explicit rather than silently attaching another one.
+                if str(row.get("id") or "") not in _CODEX_APP_SERVERS:
+                    row["status"] = "failed"
+                    row["error"] = "The Codex sign-in session was interrupted. Start sign-in again."
+                    changed = True
+                else:
+                    try:
+                        if _codex_server(row).account() is not None:
+                            changed = _codex_refresh_row(row) or changed
+                    except CodexAppServerError:
+                        pass
+            elif refresh or row.get("status") == "connected":
+                changed = _codex_refresh_row(row) or changed
+        if changed:
+            _write_codex_connections(rows)
+        return [_codex_public_connection(row) for row in rows if row.get("status") != "removed"]
+
+
+def codex_start_oauth(label: str, mode: str = "browser") -> Dict[str, Any]:
+    if mode not in {"browser", "device"}:
+        raise ValueError("invalid_oauth_mode")
+    connection_id = uuid.uuid4().hex
+    row: Dict[str, Any] = {
+        "id": connection_id,
+        "provider": "codex",
+        "label": (label or "Codex / ChatGPT").strip()[:80] or "Codex / ChatGPT",
+        "kind": "chatgpt_oauth",
+        "scope": "managed_app_server_profile",
+        "status": "pending_device" if mode == "device" else "pending_browser",
+        "createdAt": now_iso(),
+        "usage": _codex_unavailable_usage(),
+    }
+    try:
+        login = _codex_server(row).login(mode)
+    except Exception:
+        _CODEX_APP_SERVERS.pop(connection_id, None)
+        raise RuntimeError("codex_oauth_start_failed")
+    login_id = login.get("loginId")
+    if not isinstance(login_id, str) or not login_id:
+        _CODEX_APP_SERVERS.pop(connection_id, None)
+        raise RuntimeError("codex_oauth_start_failed")
+    row["operationID"] = login_id
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        rows.append(row)
+        _write_codex_connections(rows)
+    result = {"operationID": login_id, "status": row["status"]}
+    if isinstance(login.get("authUrl"), str):
+        result["authorizationURL"] = login["authUrl"]
+    if isinstance(login.get("verificationUrl"), str):
+        result["verificationURL"] = login["verificationUrl"]
+    if isinstance(login.get("userCode"), str):
+        result["userCode"] = login["userCode"]
+    return result
+
+
+def _codex_pending_row(operation_id: str) -> Dict[str, Any]:
+    for row in _codex_connections():
+        if row.get("operationID") == operation_id and row.get("status") in {"pending_browser", "pending_device"}:
+            return row
+    raise KeyError("oauth_operation_not_found")
+
+
+def codex_oauth_status(operation_id: str) -> Dict[str, Any]:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        row = next((item for item in rows if item.get("operationID") == operation_id), None)
+        if row is None:
+            raise KeyError("oauth_operation_not_found")
+        if row.get("status") in {"pending_browser", "pending_device"}:
+            try:
+                if _codex_server(row).account() is not None:
+                    _codex_refresh_row(row)
+                    _write_codex_connections(rows)
+            except CodexAppServerError:
+                pass
+        result = {"status": row.get("status")}
+        if row.get("status") == "connected":
+            result["connection"] = _codex_public_connection(row)
+        if isinstance(row.get("error"), str):
+            result["error"] = row["error"]
+        return result
+
+
+def codex_cancel_oauth(operation_id: str) -> str:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        row = next((item for item in rows if item.get("operationID") == operation_id), None)
+        if row is None:
+            return "notFound"
+        try:
+            result = _codex_server(row).cancel_login(operation_id)
+            status = result.get("status") if isinstance(result, dict) else "canceled"
+        except CodexAppServerError:
+            status = "notFound"
+        if status == "canceled":
+            row["status"] = "canceled"
+            row.pop("operationID", None)
+            row.pop("error", None)
+            server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
+            if server is not None:
+                server.close()
+            _write_codex_connections(rows)
+        return status if status in {"canceled", "notFound"} else "notFound"
+
+
+def codex_connection_mutation(connection_id: str, action: str, label: Optional[str] = None) -> Dict[str, Any]:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        row = next((item for item in rows if item.get("id") == connection_id and item.get("status") != "removed"), None)
+        if row is None:
+            raise KeyError("connection_not_found")
+        if action == "refresh":
+            _codex_refresh_row(row)
+        elif action == "rename":
+            clean_label = (label or "").strip()
+            if not clean_label or len(clean_label) > 80:
+                raise ValueError("invalid_connection_label")
+            row["label"] = clean_label
+        elif action == "remove":
+            # The logout request and the deletion target are both the exact
+            # child-owned profile selected by this connection id.  It cannot
+            # address the user's ~/.codex or another managed profile.
+            server = _CODEX_APP_SERVERS.pop(connection_id, None)
+            if server is None:
+                server = CodexAppServer(_codex_profile_dir(connection_id))
+            try:
+                server.request("account/logout", {})
+            except CodexAppServerError:
+                pass
+            finally:
+                server.close()
+            profile = _codex_profile_dir(connection_id)
+            if profile.parent == CODEX_CONNECTIONS_PROFILES_DIR and profile.exists():
+                shutil.rmtree(profile)
+            row["status"] = "removed"
+            row.pop("error", None)
+        else:
+            raise ValueError("unsupported_connection_action")
+        _write_codex_connections(rows)
+        return _codex_public_connection(row)
+
+
+def shutdown_codex_app_servers() -> None:
+    """Terminate only app-server children started by this daemon."""
+    with _CODEX_CONNECTIONS_LOCK:
+        servers = list(_CODEX_APP_SERVERS.values())
+        _CODEX_APP_SERVERS.clear()
+    for server in servers:
+        server.close()
 
 
 def command_set_key(args: argparse.Namespace) -> int:

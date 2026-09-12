@@ -23,11 +23,13 @@ class BuildPublicReleaseTests(unittest.TestCase):
             source = Path(temp) / "source"
             (source / "bin").mkdir(parents=True)
             (source / "contracts").mkdir()
+            (source / "lib").mkdir()
             (source / "bin" / "agentcat").write_text(
                 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.34.6")\n',
                 encoding="utf-8",
             )
             (source / "contracts" / "connector-v1.json").write_text("{}\n", encoding="utf-8")
+            (source / "lib" / "agentcat_codex_app_server.py").write_text("# packaged helper\n", encoding="utf-8")
             subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
             subprocess.run(
@@ -56,6 +58,7 @@ class BuildPublicReleaseTests(unittest.TestCase):
                 names = package.namelist()
             self.assertTrue(any(name.endswith("/bin/agentcat") for name in names))
             self.assertTrue(any(name.endswith("/contracts/connector-v1.json") for name in names))
+            self.assertTrue(any(name.endswith("/lib/agentcat_codex_app_server.py") for name in names))
 
 
 if __name__ == "__main__":
