@@ -55,6 +55,8 @@ EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 AGENTCAT_KEYS_FILE = AGENTCAT_HOME / "keys.json"
+OPENROUTER_CONNECTIONS_FILE = AGENTCAT_HOME / "openrouter-connections.json"
+LOOPBACK_CONTROL_TOKEN_FILE = AGENTCAT_HOME / "loopback-control-token"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 GEMINI_USAGE_CACHE = AGENTCAT_HOME / "gemini-usage-cache.json"
 ANTIGRAVITY_CLI_DIR = HOME / ".gemini" / "antigravity-cli"
@@ -207,6 +209,7 @@ CONNECTOR_CAPABILITIES = (
     "activity.memory",
     "activity.runtimeModes",
     "connector.config",
+    "connections.openrouter.v1",
     "desktopApps.localMetadata",
     "events.sqlite",
     "usage.dailyTokens",
@@ -1288,6 +1291,27 @@ def agentcat_settings() -> Dict[str, Any]:
 
 def write_agentcat_settings(settings: Dict[str, Any]) -> None:
     write_json_atomic(AGENTCAT_HOME / "settings.json", settings)
+
+
+def loopback_control_token() -> str:
+    """Return the per-user bearer secret for credential-management routes."""
+    ensure_dirs()
+    try:
+        token = LOOPBACK_CONTROL_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    if token:
+        return token
+    token = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+    # Exclusive creation prevents two daemon starts from silently rotating it.
+    try:
+        fd = os.open(str(LOOPBACK_CONTROL_TOKEN_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
+    except FileExistsError:
+        return loopback_control_token()
+    _chmod_quiet(LOOPBACK_CONTROL_TOKEN_FILE, 0o600)
+    return token
 
 
 def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
@@ -12891,6 +12915,9 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         "events": {
             "latestByProvider": latest_by_provider,
         },
+        # Explicit API connections are independent from observed CLI/provider
+        # subscriptions. Their USD amounts are only for the connected key.
+        "connections": openrouter_connections_snapshot(),
     }
     for data in providers.values():
         try:
@@ -16382,6 +16409,20 @@ def key_mutation_request_error(headers: Any) -> Optional[Tuple[int, str]]:
     return None
 
 
+def connection_control_request_error(headers: Any, *, mutation: bool) -> Optional[Tuple[int, str]]:
+    """Authenticate local credential routes in addition to browser-write guards."""
+    if mutation:
+        guard_error = key_mutation_request_error(headers)
+        if guard_error is not None:
+            return guard_error
+    authorization = str(headers.get("Authorization") or "")
+    prefix = "Bearer "
+    supplied = authorization[len(prefix):] if authorization.startswith(prefix) else ""
+    if not supplied or not hmac.compare_digest(supplied, loopback_control_token()):
+        return 401, "connection_control_token_required"
+    return None
+
+
 class AgentCatHandler(BaseHTTPRequestHandler):
     server_version = "AgentCat/1"
 
@@ -16487,6 +16528,38 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if path == "/v1/keys":
             self.send_json(200, {"openai": {"configured": bool(read_provider_key("openai"))}})
             return
+        if path == "/v1/connections":
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            self.send_json(200, {"connections": openrouter_connections_snapshot()})
+            return
+        oauth_status_match = re.fullmatch(r"/v1/connections/openrouter/oauth/([A-Za-z0-9_-]{20,})", path)
+        if oauth_status_match:
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            self.send_json(200, {"status": openrouter_oauth_status(oauth_status_match.group(1))})
+            return
+        callback_prefix = "/v1/connections/openrouter/callback/"
+        if path.startswith(callback_prefix):
+            nonce = path[len(callback_prefix):]
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
+            code = (query.get("code") or [""])[0]
+            try:
+                openrouter_finish_oauth(nonce, code)
+            except ValueError:
+                self.send_html(400, "<h1>OpenRouter connection could not be completed</h1><p>Please return to Agent Cat and start again.</p>")
+                return
+            except Exception:
+                self.send_html(502, "<h1>OpenRouter connection could not be completed</h1><p>Please return to Agent Cat and retry.</p>")
+                return
+            self.send_html(200, "<h1>OpenRouter connected</h1><p>You can return to Agent Cat. Your key remains only in this Mac’s Keychain.</p>")
+            return
         if path == "/reflect/report.html":
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
             week = (query.get("week") or [""])[0].strip() or None
@@ -16509,6 +16582,65 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if not self.host_header_ok():
             return
         path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/v1/connections/"):
+            guard_error = connection_control_request_error(self.headers, mutation=True)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_write_forbidden", "message": reason})
+                return
+            try:
+                payload = self.read_json_body(max_bytes=16 * 1024)
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_connection_request", "message": str(exc)})
+                return
+            if path == "/v1/connections/openrouter/import":
+                try:
+                    connection = openrouter_import_connection(str(payload.get("id") or ""), str(payload.get("label") or "OpenRouter"))
+                except ValueError as exc:
+                    self.send_json(400, {"error": "invalid_connection", "message": str(exc)})
+                    return
+                except Exception:
+                    self.send_json(500, {"error": "connection_store_failed"})
+                    return
+                self.send_json(201, {"connection": connection})
+                return
+            if path == "/v1/connections/openrouter/oauth/start":
+                try:
+                    port = int(self.server.server_address[1])
+                    result = openrouter_start_oauth(str(payload.get("label") or "OpenRouter"), port)
+                except Exception:
+                    self.send_json(500, {"error": "oauth_start_failed"})
+                    return
+                self.send_json(200, result)
+                return
+            oauth_match = re.fullmatch(r"/v1/connections/openrouter/oauth/([A-Za-z0-9_-]{20,})/(key|complete)", path)
+            if oauth_match:
+                nonce, action = oauth_match.groups()
+                try:
+                    if action == "key":
+                        # The app claims this only to write it through native
+                        # Security.framework; it is not persisted by the daemon.
+                        self.send_json(200, {"key": openrouter_claim_oauth_key(nonce)})
+                    else:
+                        connection = openrouter_complete_oauth(nonce, str(payload.get("id") or ""), str(payload.get("label") or "OpenRouter"))
+                        self.send_json(201, {"connection": connection})
+                except ValueError as exc:
+                    self.send_json(409, {"error": "oauth_not_ready", "message": str(exc)})
+                except Exception:
+                    self.send_json(500, {"error": "oauth_completion_failed"})
+                return
+            match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})/refresh", path)
+            if not match:
+                self.send_json(404, {"error": "not_found"})
+                return
+            connection_id = match.group(1)
+            try:
+                self.send_json(200, {"connection": openrouter_connection_mutation(connection_id, "refresh")})
+            except KeyError:
+                self.send_json(404, {"error": "connection_not_found"})
+            except Exception:
+                self.send_json(502, {"error": "connection_refresh_failed"})
+            return
         if path.startswith("/reflect/"):
             try:
                 body = self.read_json_body()
@@ -16622,6 +16754,56 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         event_type = payload.get("eventType")
         event = store_event(provider, source, event_type, payload.get("payload", payload))
         self.send_json(201, event)
+
+    def do_PATCH(self) -> None:
+        if not self.host_header_ok():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})", path)
+        if not match:
+            self.send_json(404, {"error": "not_found"})
+            return
+        guard_error = connection_control_request_error(self.headers, mutation=True)
+        if guard_error is not None:
+            status, reason = guard_error
+            self.send_json(status, {"error": "connection_write_forbidden", "message": reason})
+            return
+        try:
+            payload = self.read_json_body(max_bytes=16 * 1024)
+            connection = openrouter_connection_mutation(match.group(1), "rename", str(payload.get("label") or ""))
+        except KeyError:
+            self.send_json(404, {"error": "connection_not_found"})
+            return
+        except ValueError as exc:
+            self.send_json(400, {"error": "invalid_connection", "message": str(exc)})
+            return
+        except Exception:
+            self.send_json(500, {"error": "connection_update_failed"})
+            return
+        self.send_json(200, {"connection": connection})
+
+    def do_DELETE(self) -> None:
+        if not self.host_header_ok():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})", path)
+        if not match:
+            self.send_json(404, {"error": "not_found"})
+            return
+        guard_error = connection_control_request_error(self.headers, mutation=True)
+        if guard_error is not None:
+            status, reason = guard_error
+            self.send_json(status, {"error": "connection_write_forbidden", "message": reason})
+            return
+        try:
+            connection = openrouter_connection_mutation(match.group(1), "remove")
+        except KeyError:
+            self.send_json(404, {"error": "connection_not_found"})
+            return
+        except Exception:
+            self.send_json(500, {"error": "connection_remove_failed"})
+            return
+        self.send_json(200, {"connection": connection})
 
 
 LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -17434,6 +17616,256 @@ def write_provider_key(provider: str, key: Optional[str]) -> None:
         keys.pop(provider, None)
     write_json_atomic(AGENTCAT_KEYS_FILE, keys)
     _chmod_quiet(AGENTCAT_KEYS_FILE, 0o600)
+
+
+# ---------------------------------------------------------------------------
+# Explicit OpenRouter API-key connections
+#
+# The registry is deliberately metadata-only. API keys are kept in the local
+# macOS Keychain, never in settings, snapshots, logs, or the usage cache.
+OPENROUTER_AUTH_URL = "https://openrouter.ai/auth"
+OPENROUTER_KEY_EXCHANGE_URL = "https://openrouter.ai/api/v1/auth/keys"
+OPENROUTER_CURRENT_KEY_URL = "https://openrouter.ai/api/v1/key"
+OPENROUTER_KEYCHAIN_SERVICE = "com.trappist.agentcat.openrouter"
+OPENROUTER_OAUTH_TTL_SECONDS = 10 * 60
+_OPENROUTER_OAUTH_PENDING: Dict[str, Dict[str, Any]] = {}
+_OPENROUTER_CONNECTIONS_LOCK = threading.RLock()
+
+
+def _openrouter_keychain_account(connection_id: str) -> str:
+    return f"connection.{connection_id}"
+
+
+def _openrouter_keychain_read(connection_id: str) -> Optional[str]:
+    if IS_WINDOWS:
+        return None
+    command = [
+        "/usr/bin/security", "find-generic-password", "-w",
+        "-a", _openrouter_keychain_account(connection_id),
+        "-s", OPENROUTER_KEYCHAIN_SERVICE,
+    ]
+    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=10)
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.decode("utf-8", errors="replace").rstrip("\r\n")
+    return value or None
+
+
+def _openrouter_keychain_delete(connection_id: str) -> None:
+    if IS_WINDOWS:
+        return
+    subprocess.run(
+        ["/usr/bin/security", "delete-generic-password", "-a", _openrouter_keychain_account(connection_id), "-s", OPENROUTER_KEYCHAIN_SERVICE],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=10,
+    )
+
+
+def _openrouter_connections() -> List[Dict[str, Any]]:
+    raw = read_json(OPENROUTER_CONNECTIONS_FILE)
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return []
+    rows = raw.get("connections")
+    return [dict(row) for row in rows] if isinstance(rows, list) and all(isinstance(row, dict) for row in rows) else []
+
+
+def _write_openrouter_connections(rows: List[Dict[str, Any]]) -> None:
+    ensure_dirs()
+    # Enforce the no-secret registry contract even if a future caller adds an
+    # accidental credential field to an in-memory row.
+    write_json_atomic(OPENROUTER_CONNECTIONS_FILE, {"version": 1, "connections": [_openrouter_public_connection(row) for row in rows]})
+    _chmod_quiet(OPENROUTER_CONNECTIONS_FILE, 0o600)
+
+
+def _openrouter_public_connection(row: Dict[str, Any]) -> Dict[str, Any]:
+    # Never return the stored key, key hash, or any raw upstream response.
+    keys = ("id", "provider", "label", "kind", "scope", "status", "createdAt", "lastSyncAt", "lastSuccessfulSyncAt", "error", "usage")
+    return {key: copy.deepcopy(row[key]) for key in keys if key in row}
+
+
+def openrouter_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        rows = _openrouter_connections()
+        if refresh:
+            changed = False
+            for row in rows:
+                if row.get("status") == "removed":
+                    continue
+                changed = openrouter_refresh_connection(row) or changed
+            if changed:
+                _write_openrouter_connections(rows)
+        return [_openrouter_public_connection(row) for row in rows if row.get("status") != "removed"]
+
+
+def _openrouter_usage_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    # Null/absent values remain null. They are never converted to USD 0.
+    def number(name: str) -> Optional[float]:
+        value = data.get(name)
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    return {
+        "currency": "USD",
+        "daily": number("usage_daily"),
+        "weekly": number("usage_weekly"),
+        "monthly": number("usage_monthly"),
+        "total": number("usage"),
+        "limit": number("limit"),
+        "limitRemaining": number("limit_remaining"),
+        "limitReset": data.get("limit_reset") if isinstance(data.get("limit_reset"), str) else None,
+        # BYOK is an estimated market-rate value, not an amount to sum into
+        # OpenRouter spend. The boolean only says whether it counts toward a
+        # configured key limit.
+        "includeByokInLimit": data.get("include_byok_in_limit") if isinstance(data.get("include_byok_in_limit"), bool) else None,
+        "byokDaily": number("byok_usage_daily"),
+        "byokWeekly": number("byok_usage_weekly"),
+        "byokMonthly": number("byok_usage_monthly"),
+        "byokTotal": number("byok_usage"),
+    }
+
+
+def openrouter_refresh_connection(row: Dict[str, Any]) -> bool:
+    """Refresh a single key scope, retaining the previous successful amounts on failure."""
+    row["lastSyncAt"] = now_iso()
+    key = _openrouter_keychain_read(str(row.get("id") or ""))
+    if not key:
+        row["status"] = "needs_reconnect"
+        row["error"] = "Key unavailable locally. Reconnect this OpenRouter key."
+        return True
+    request = urllib.request.Request(
+        OPENROUTER_CURRENT_KEY_URL,
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "AgentCat/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise ValueError("invalid_current_key_response")
+        row["usage"] = _openrouter_usage_payload(data)
+        row["status"] = "connected"
+        row.pop("error", None)
+        row["lastSuccessfulSyncAt"] = row["lastSyncAt"]
+        return True
+    except Exception:
+        row["status"] = "error"
+        row["error"] = "Could not refresh OpenRouter usage. Last successful amounts are retained."
+        return True
+
+
+def _openrouter_new_connection(connection_id: str, label: str, kind: str) -> Dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{32}", connection_id):
+        raise ValueError("invalid_connection_id")
+    row: Dict[str, Any] = {
+        "id": connection_id,
+        "provider": "openrouter",
+        "label": (label or "OpenRouter").strip()[:80] or "OpenRouter",
+        "kind": kind,
+        "scope": "api_key_scoped",
+        "status": "connected",
+        "createdAt": now_iso(),
+        "usage": {"currency": "USD", "daily": None, "weekly": None, "monthly": None, "total": None, "limit": None, "limitRemaining": None, "limitReset": None, "includeByokInLimit": None, "byokDaily": None, "byokWeekly": None, "byokMonthly": None, "byokTotal": None},
+    }
+    openrouter_refresh_connection(row)
+    return row
+
+
+def openrouter_import_connection(connection_id: str, label: str) -> Dict[str, Any]:
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        rows = _openrouter_connections()
+        if any(item.get("id") == connection_id for item in rows):
+            raise ValueError("duplicate_connection_id")
+        row = _openrouter_new_connection(connection_id, label, "imported_key")
+        rows.append(row)
+        _write_openrouter_connections(rows)
+        return _openrouter_public_connection(row)
+
+
+def openrouter_start_oauth(label: str, port: int) -> Dict[str, str]:
+    nonce = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+    verifier = base64.urlsafe_b64encode(os.urandom(48)).decode("ascii").rstrip("=")
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+    callback_path = f"/v1/connections/openrouter/callback/{nonce}"
+    callback_url = f"http://127.0.0.1:{port}{callback_path}"
+    _OPENROUTER_OAUTH_PENDING[nonce] = {"verifier": verifier, "label": label[:80], "created": time.monotonic()}
+    query = urllib.parse.urlencode({"callback_url": callback_url, "code_challenge": challenge, "code_challenge_method": "S256"})
+    return {"authorizationURL": f"{OPENROUTER_AUTH_URL}?{query}", "callbackPath": callback_path, "operationID": nonce}
+
+
+def openrouter_finish_oauth(nonce: str, code: str) -> None:
+    pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
+    if not pending or time.monotonic() - float(pending["created"]) > OPENROUTER_OAUTH_TTL_SECONDS:
+        _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
+        raise ValueError("oauth_state_expired")
+    if pending.get("callbackConsumed"):
+        raise ValueError("oauth_state_consumed")
+    if not code or len(code) > 4096:
+        raise ValueError("oauth_code_required")
+    request = urllib.request.Request(
+        OPENROUTER_KEY_EXCHANGE_URL,
+        data=json.dumps({"code": code, "code_verifier": pending["verifier"], "code_challenge_method": "S256"}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "AgentCat/1.0"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("oauth_exchange_failed") from exc
+    key = payload.get("key") if isinstance(payload, dict) else None
+    if not isinstance(key, str) or not key:
+        raise RuntimeError("oauth_exchange_failed")
+    pending["callbackConsumed"] = True
+    pending["key"] = key
+
+
+def openrouter_oauth_status(nonce: str) -> str:
+    pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
+    if not pending or time.monotonic() - float(pending["created"]) > OPENROUTER_OAUTH_TTL_SECONDS:
+        _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
+        return "expired"
+    return "ready" if isinstance(pending.get("key"), str) else "awaiting_browser"
+
+
+def openrouter_claim_oauth_key(nonce: str) -> str:
+    pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
+    if openrouter_oauth_status(nonce) != "ready" or not pending:
+        raise ValueError("oauth_key_not_ready")
+    return str(pending["key"])
+
+
+def openrouter_complete_oauth(nonce: str, connection_id: str, label: str) -> Dict[str, Any]:
+    if openrouter_oauth_status(nonce) != "ready":
+        raise ValueError("oauth_key_not_ready")
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        rows = _openrouter_connections()
+        if any(item.get("id") == connection_id for item in rows):
+            raise ValueError("duplicate_connection_id")
+        row = _openrouter_new_connection(connection_id, label, "oauth_pkce")
+        rows.append(row)
+        _write_openrouter_connections(rows)
+    _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
+    return _openrouter_public_connection(row)
+
+
+def openrouter_connection_mutation(connection_id: str, action: str, label: Optional[str] = None) -> Dict[str, Any]:
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        rows = _openrouter_connections()
+        row = next((item for item in rows if item.get("id") == connection_id and item.get("status") != "removed"), None)
+        if row is None:
+            raise KeyError("connection_not_found")
+        if action == "refresh":
+            openrouter_refresh_connection(row)
+        elif action == "rename":
+            clean_label = (label or "").strip()
+            if not clean_label or len(clean_label) > 80:
+                raise ValueError("invalid_connection_label")
+            row["label"] = clean_label
+        elif action == "remove":
+            _openrouter_keychain_delete(connection_id)
+            row["status"] = "removed"
+            row.pop("error", None)
+        else:
+            raise ValueError("unsupported_connection_action")
+        _write_openrouter_connections(rows)
+        return _openrouter_public_connection(row)
 
 
 def command_set_key(args: argparse.Namespace) -> int:

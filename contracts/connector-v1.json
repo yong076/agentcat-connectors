@@ -22,6 +22,11 @@
       "fields": ["providerInstances"],
       "fallback": "render the aggregate providers map as one connection per provider"
     },
+    "connections.openrouter.v1": {
+      "owner": "shared",
+      "fields": ["connections"],
+      "fallback": "omit explicit API connections while preserving observed provider integrations"
+    },
     "usage.antigravity.sqlite": {
       "owner": "shared",
       "fields": ["providers.antigravity.tokens", "providers.antigravity.sourceAttribution"],
