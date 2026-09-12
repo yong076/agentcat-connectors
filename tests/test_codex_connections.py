@@ -36,6 +36,11 @@ class FakeCodexAppServer:
         self.profile_dir = Path(profile_dir)
         self.connection_id = self.profile_dir.name
         self.closed = False
+        self.generation = 1
+        self.alive = True
+
+    def is_alive(self):
+        return self.alive
 
     def login(self, mode):
         # The installed protocol uses a UUID-shaped login id, accepted by the
@@ -64,6 +69,7 @@ class FakeCodexAppServer:
 
     def close(self):
         self.closed = True
+        self.alive = False
 
 
 class CodexConnectionsTests(unittest.TestCase):
@@ -145,7 +151,7 @@ class CodexConnectionsTests(unittest.TestCase):
 
     def test_normalization_keeps_null_distinct_from_zero_and_preserves_both_windows(self):
         usage = app_server.normalize_usage(
-            {"primary": {"usedPercent": 0, "windowDurationMins": None, "resetsAt": None}, "secondary": {"usedPercent": 100, "windowDurationMins": 60, "resetsAt": 123}},
+            {"rateLimits": {"primary": {"usedPercent": 0, "windowDurationMins": None, "resetsAt": None}, "secondary": {"usedPercent": 100, "windowDurationMins": 60, "resetsAt": 123}}, "rateLimitsByLimitId": {"codex": {"limitName": "Codex", "primary": {"usedPercent": 0, "windowDurationMins": None, "resetsAt": None}, "secondary": {"usedPercent": 100, "windowDurationMins": 60, "resetsAt": 123}}, "gpt-5": {"limitName": "GPT-5", "primary": {"usedPercent": 20, "windowDurationMins": 30, "resetsAt": 456}}}, "rateLimitResetCredits": {"availableCount": 2, "credits": [{"id": "opaque", "title": "Reset", "status": "available"}]}},
             {"summary": {"lifetimeTokens": 0}, "dailyUsageBuckets": [{"startDate": "2026-09-12", "tokens": 0}]},
             token_usage_available=True,
         )
@@ -153,6 +159,10 @@ class CodexConnectionsTests(unittest.TestCase):
         self.assertEqual(usage["windows"][0]["remainingPercent"], 100.0)
         self.assertIsNone(usage["windows"][0]["windowDurationMins"])
         self.assertEqual(usage["windows"][1]["usedPercent"], 100.0)
+        self.assertEqual(len(usage["windows"]), 3)
+        self.assertEqual(usage["windows"][2]["limitID"], "gpt-5")
+        self.assertEqual(usage["resetCredits"]["availableCount"], 2)
+        self.assertNotIn("id", usage["resetCredits"]["details"][0])
         self.assertEqual(usage["tokenUsage"]["summary"]["lifetimeTokens"], 0)
         self.assertEqual(usage["tokenUsage"]["dailyBuckets"][0]["tokens"], 0)
 
@@ -162,7 +172,7 @@ class CodexConnectionsTests(unittest.TestCase):
         def request(method, params):
             calls.append(method)
             if method == "account/rateLimits/read":
-                return {"primary": {"usedPercent": 5}}
+                return {"rateLimits": {"primary": {"usedPercent": 5}}}
             if method == "account/usage/read":
                 raise app_server.CodexAppServerUnsupported("unknown variant")
             return {"summary": {"lifetimeTokens": 77}, "dailyUsageBuckets": []}
@@ -171,6 +181,16 @@ class CodexConnectionsTests(unittest.TestCase):
         self.assertEqual(calls, ["account/rateLimits/read", "account/usage/read", "account/tokenUsage/read"])
         self.assertTrue(usage["tokenUsageAvailable"])
         self.assertEqual(usage["tokenUsage"]["summary"]["lifetimeTokens"], 77)
+
+    def test_exited_pending_child_becomes_terminal_failed_without_restart(self):
+        started = self._start()
+        row = agentcat._codex_connections()[0]
+        child = agentcat._CODEX_APP_SERVERS[row["id"]]
+        child.alive = False
+        result = agentcat.codex_oauth_status(started["operationID"])
+        self.assertEqual(result["status"], "failed")
+        self.assertNotIn(row["id"], agentcat._CODEX_APP_SERVERS)
+        self.assertIn("interrupted", result["error"])
 
     def test_installed_app_server_unauthenticated_smoke_uses_isolated_profile(self):
         if not Path("/opt/homebrew/bin/codex").exists():

@@ -17957,6 +17957,7 @@ def openrouter_connection_mutation(connection_id: str, action: str, label: Optio
 _CODEX_CONNECTIONS_LOCK = threading.RLock()
 _CODEX_APP_SERVERS: Dict[str, CodexAppServer] = {}
 _CODEX_ID_RE = re.compile(r"[0-9a-f]{32}")
+CODEX_OAUTH_PENDING_TTL_SECONDS = 10 * 60
 
 
 def _codex_profile_dir(connection_id: str) -> Path:
@@ -17986,7 +17987,15 @@ def _codex_public_connection(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _write_codex_connections(rows: List[Dict[str, Any]]) -> None:
     ensure_dirs()
-    write_json_atomic(CODEX_CONNECTIONS_FILE, {"version": 1, "connections": [_codex_public_connection(row) for row in rows]})
+    # Generation is lifecycle metadata needed to reject a dead in-flight
+    # login after a registry reload.  It is never part of the HTTP payload.
+    registry_rows = []
+    for row in rows:
+        stored = _codex_public_connection(row)
+        if isinstance(row.get("appServerGeneration"), int):
+            stored["appServerGeneration"] = row["appServerGeneration"]
+        registry_rows.append(stored)
+    write_json_atomic(CODEX_CONNECTIONS_FILE, {"version": 1, "connections": registry_rows})
     _chmod_quiet(CODEX_CONNECTIONS_FILE, 0o600)
 
 
@@ -18010,6 +18019,35 @@ def _codex_unavailable_usage() -> Dict[str, Any]:
         "tokenUsage": None,
         "tokenUsageAvailable": False,
     }
+
+
+def _codex_fail_pending(row: Dict[str, Any], message: str) -> None:
+    row["status"] = "failed"
+    row["error"] = message
+    row.pop("operationID", None)
+    row.pop("appServerGeneration", None)
+    server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
+    if server is not None:
+        server.close()
+
+
+def _codex_pending_server(row: Dict[str, Any]) -> Optional[CodexAppServer]:
+    """Return the original live login child; never restart a lost login."""
+    connection_id = str(row.get("id") or "")
+    created = str(row.get("createdAt") or "")
+    try:
+        age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(created.replace("Z", "+00:00"))).total_seconds()
+    except ValueError:
+        age = CODEX_OAUTH_PENDING_TTL_SECONDS + 1
+    if age > CODEX_OAUTH_PENDING_TTL_SECONDS:
+        _codex_fail_pending(row, "The Codex sign-in session expired. Start sign-in again.")
+        return None
+    server = _CODEX_APP_SERVERS.get(connection_id)
+    expected = row.get("appServerGeneration")
+    if server is None or not server.is_alive() or expected != server.generation:
+        _codex_fail_pending(row, "The Codex sign-in session was interrupted. Start sign-in again.")
+        return None
+    return server
 
 
 def _codex_refresh_row(row: Dict[str, Any]) -> bool:
@@ -18059,13 +18097,12 @@ def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
                 # A daemon restart cannot safely resume a login listener owned
                 # by the prior child.  Preserve the isolated profile and make
                 # recovery explicit rather than silently attaching another one.
-                if str(row.get("id") or "") not in _CODEX_APP_SERVERS:
-                    row["status"] = "failed"
-                    row["error"] = "The Codex sign-in session was interrupted. Start sign-in again."
+                server = _codex_pending_server(row)
+                if server is None:
                     changed = True
                 else:
                     try:
-                        if _codex_server(row).account() is not None:
+                        if server.account() is not None:
                             changed = _codex_refresh_row(row) or changed
                     except CodexAppServerError:
                         pass
@@ -18100,6 +18137,7 @@ def codex_start_oauth(label: str, mode: str = "browser") -> Dict[str, Any]:
         _CODEX_APP_SERVERS.pop(connection_id, None)
         raise RuntimeError("codex_oauth_start_failed")
     row["operationID"] = login_id
+    row["appServerGeneration"] = _codex_server(row).generation
     with _CODEX_CONNECTIONS_LOCK:
         rows = _codex_connections()
         rows.append(row)
@@ -18128,8 +18166,12 @@ def codex_oauth_status(operation_id: str) -> Dict[str, Any]:
         if row is None:
             raise KeyError("oauth_operation_not_found")
         if row.get("status") in {"pending_browser", "pending_device"}:
+            server = _codex_pending_server(row)
+            if server is None:
+                _write_codex_connections(rows)
+                return {"status": row["status"], "error": row["error"]}
             try:
-                if _codex_server(row).account() is not None:
+                if server.account() is not None:
                     _codex_refresh_row(row)
                     _write_codex_connections(rows)
             except CodexAppServerError:

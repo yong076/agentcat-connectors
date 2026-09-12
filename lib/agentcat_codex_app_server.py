@@ -52,25 +52,32 @@ def normalize_identity(result: Any) -> Optional[Dict[str, Optional[str]]]:
 
 def normalize_usage(rate_limits: Any, token_usage: Any, *, token_usage_available: bool) -> Dict[str, Any]:
     """Preserve native account quota semantics; absent values stay unavailable."""
-    snapshot = rate_limits if isinstance(rate_limits, dict) else {}
+    response = rate_limits if isinstance(rate_limits, dict) else {}
+    legacy = response.get("rateLimits") if isinstance(response.get("rateLimits"), dict) else response
+    by_limit_id = response.get("rateLimitsByLimitId") if isinstance(response.get("rateLimitsByLimitId"), dict) else {}
+    snapshots = list(by_limit_id.items()) if by_limit_id else [("default", legacy)]
     windows = []
-    for key, is_primary in (("primary", True), ("secondary", False)):
-        raw = snapshot.get(key)
-        if not isinstance(raw, dict):
+    for limit_id, snapshot in snapshots:
+        if not isinstance(snapshot, dict):
             continue
-        used = raw.get("usedPercent")
-        used_value = float(used) if isinstance(used, (int, float)) and not isinstance(used, bool) else None
-        windows.append({
-            "id": key,
-            "name": snapshot.get("limitName") if isinstance(snapshot.get("limitName"), str) else None,
-            "model": snapshot.get("normalModelSlug") if isinstance(snapshot.get("normalModelSlug"), str) else None,
-            "primary": is_primary,
-            "usedPercent": used_value,
-            "remainingPercent": (max(0.0, 100.0 - used_value) if used_value is not None else None),
-            "windowDurationMins": raw.get("windowDurationMins") if isinstance(raw.get("windowDurationMins"), int) else None,
-            "resetsAt": raw.get("resetsAt") if isinstance(raw.get("resetsAt"), int) else None,
-        })
-    credits = snapshot.get("credits")
+        for key, is_primary in (("primary", True), ("secondary", False)):
+            raw = snapshot.get(key)
+            if not isinstance(raw, dict):
+                continue
+            used = raw.get("usedPercent")
+            used_value = float(used) if isinstance(used, (int, float)) and not isinstance(used, bool) else None
+            windows.append({
+                "id": f"{limit_id}:{key}",
+                "limitID": limit_id,
+                "name": snapshot.get("limitName") if isinstance(snapshot.get("limitName"), str) else None,
+                "model": snapshot.get("normalModelSlug") if isinstance(snapshot.get("normalModelSlug"), str) else None,
+                "primary": is_primary,
+                "usedPercent": used_value,
+                "remainingPercent": (max(0.0, 100.0 - used_value) if used_value is not None else None),
+                "windowDurationMins": raw.get("windowDurationMins") if isinstance(raw.get("windowDurationMins"), int) else None,
+                "resetsAt": raw.get("resetsAt") if isinstance(raw.get("resetsAt"), int) else None,
+            })
+    credits = legacy.get("credits")
     normalized_credits = None
     if isinstance(credits, dict):
         normalized_credits = {
@@ -78,7 +85,7 @@ def normalize_usage(rate_limits: Any, token_usage: Any, *, token_usage_available
             "unlimited": bool(credits.get("unlimited")),
             "balance": credits.get("balance") if isinstance(credits.get("balance"), str) else None,
         }
-    spend = snapshot.get("individualLimit")
+    spend = legacy.get("individualLimit")
     normalized_spend = None
     if isinstance(spend, dict):
         normalized_spend = {key: spend.get(key) for key in ("limit", "used", "remainingPercent", "resetsAt") if spend.get(key) is not None}
@@ -97,6 +104,18 @@ def normalize_usage(rate_limits: Any, token_usage: Any, *, token_usage_available
                 if isinstance(summary, dict) and isinstance(summary.get(key), int)
             } if isinstance(summary, dict) else None,
         }
+    reset_credits = response.get("rateLimitResetCredits")
+    normalized_reset_credits = None
+    if isinstance(reset_credits, dict):
+        details = reset_credits.get("credits")
+        normalized_reset_credits = {
+            "availableCount": reset_credits.get("availableCount") if isinstance(reset_credits.get("availableCount"), int) else None,
+            # Opaque ids can authorize a consume request. Keep display-only data.
+            "details": [
+                {key: item.get(key) for key in ("title", "description", "status", "resetType", "grantedAt", "expiresAt") if item.get(key) is not None}
+                for item in details if isinstance(item, dict)
+            ] if isinstance(details, list) else None,
+        }
     return {
         "source": "codex-app-server",
         "freshness": "live",
@@ -104,7 +123,9 @@ def normalize_usage(rate_limits: Any, token_usage: Any, *, token_usage_available
         "windows": windows,
         "credits": normalized_credits,
         "spendControl": normalized_spend,
-        "rateLimitReachedType": snapshot.get("rateLimitReachedType") if isinstance(snapshot.get("rateLimitReachedType"), str) else None,
+        "rateLimitReachedType": legacy.get("rateLimitReachedType") if isinstance(legacy.get("rateLimitReachedType"), str) else None,
+        "ordinaryUsageAllowed": response.get("ordinaryUsageAllowed") if isinstance(response.get("ordinaryUsageAllowed"), bool) else None,
+        "resetCredits": normalized_reset_credits,
         "tokenUsage": normalized_tokens,
         "tokenUsageAvailable": token_usage_available,
     }
@@ -120,9 +141,13 @@ class CodexAppServer:
         self.messages: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.write_lock = threading.Lock()
         self.request_id = 0
+        self.generation = 0
+
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
 
     def start(self) -> None:
-        if self.process is not None and self.process.poll() is None:
+        if self.is_alive():
             return
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -134,6 +159,7 @@ class CodexAppServer:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, bufsize=1, env=child_environment(self.profile_dir),
         )
+        self.generation += 1
         assert self.process.stdout is not None
         threading.Thread(target=self._read_stdout, daemon=True).start()
         self.request("initialize", {"clientInfo": {"name": "Agent Cat", "version": "1"}, "capabilities": {}}, timeout=12)
