@@ -17821,18 +17821,21 @@ def openrouter_oauth_status(nonce: str) -> str:
     if not pending or time.monotonic() - float(pending["created"]) > OPENROUTER_OAUTH_TTL_SECONDS:
         _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
         return "expired"
-    return "ready" if isinstance(pending.get("key"), str) else "awaiting_browser"
+    if not isinstance(pending.get("key"), str):
+        return "awaiting_browser"
+    return "claimed" if pending.get("keyClaimed") else "ready"
 
 
 def openrouter_claim_oauth_key(nonce: str) -> str:
     pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
     if openrouter_oauth_status(nonce) != "ready" or not pending:
         raise ValueError("oauth_key_not_ready")
+    pending["keyClaimed"] = True
     return str(pending["key"])
 
 
 def openrouter_complete_oauth(nonce: str, connection_id: str, label: str) -> Dict[str, Any]:
-    if openrouter_oauth_status(nonce) != "ready":
+    if openrouter_oauth_status(nonce) != "claimed":
         raise ValueError("oauth_key_not_ready")
     with _OPENROUTER_CONNECTIONS_LOCK:
         rows = _openrouter_connections()

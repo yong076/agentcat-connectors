@@ -2,10 +2,14 @@ import importlib.util
 import json
 import tempfile
 import time
+import threading
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
+from http.server import ThreadingHTTPServer
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from sandbox import assert_sandboxed, redirect_module_paths, restore_module_paths
 
@@ -86,6 +90,44 @@ class OpenRouterConnectionsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             agentcat.openrouter_finish_oauth(nonce, "authorization-code")
         self.assertNotIn(nonce, agentcat._OPENROUTER_OAUTH_PENDING)
+
+    def test_oauth_claim_is_one_time_and_completion_requires_claim(self):
+        nonce = "n" * 43
+        agentcat._OPENROUTER_OAUTH_PENDING[nonce] = {
+            "created": time.monotonic(), "key": "temporary-secret", "label": "OAuth",
+        }
+        self.assertEqual(agentcat.openrouter_oauth_status(nonce), "ready")
+        self.assertEqual(agentcat.openrouter_claim_oauth_key(nonce), "temporary-secret")
+        self.assertEqual(agentcat.openrouter_oauth_status(nonce), "claimed")
+        with self.assertRaises(ValueError):
+            agentcat.openrouter_claim_oauth_key(nonce)
+
+    def test_handler_requires_bearer_and_rejects_foreign_origin_writes(self):
+        token = agentcat.loopback_control_token()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with self.assertRaises(HTTPError) as missing:
+                urlopen(base + "/v1/connections", timeout=3)
+            self.assertEqual(missing.exception.code, 401)
+            request = Request(base + "/v1/connections", headers={"Authorization": f"Bearer {token}"})
+            with urlopen(request, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read().decode("utf-8")), {"connections": []})
+            foreign = Request(
+                base + "/v1/connections/openrouter/oauth/start",
+                data=b"{}", method="POST",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Origin": "https://evil.example"},
+            )
+            with self.assertRaises(HTTPError) as rejected:
+                urlopen(foreign, timeout=3)
+            self.assertEqual(rejected.exception.code, 403)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
 
     def test_control_token_is_stable_and_not_written_to_registry(self):
         token = agentcat.loopback_control_token()
