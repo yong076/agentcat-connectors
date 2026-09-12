@@ -17630,6 +17630,7 @@ OPENROUTER_KEYCHAIN_SERVICE = "com.trappist.agentcat.openrouter"
 OPENROUTER_OAUTH_TTL_SECONDS = 10 * 60
 _OPENROUTER_OAUTH_PENDING: Dict[str, Dict[str, Any]] = {}
 _OPENROUTER_CONNECTIONS_LOCK = threading.RLock()
+_OPENROUTER_OAUTH_LOCK = threading.RLock()
 
 
 def _openrouter_keychain_account(connection_id: str) -> str:
@@ -17784,23 +17785,29 @@ def openrouter_start_oauth(label: str, port: int) -> Dict[str, str]:
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
     callback_path = f"/v1/connections/openrouter/callback/{nonce}"
     callback_url = f"http://127.0.0.1:{port}{callback_path}"
-    _OPENROUTER_OAUTH_PENDING[nonce] = {"verifier": verifier, "label": label[:80], "created": time.monotonic()}
+    with _OPENROUTER_OAUTH_LOCK:
+        _OPENROUTER_OAUTH_PENDING[nonce] = {"verifier": verifier, "label": label[:80], "created": time.monotonic()}
     query = urllib.parse.urlencode({"callback_url": callback_url, "code_challenge": challenge, "code_challenge_method": "S256"})
     return {"authorizationURL": f"{OPENROUTER_AUTH_URL}?{query}", "callbackPath": callback_path, "operationID": nonce}
 
 
 def openrouter_finish_oauth(nonce: str, code: str) -> None:
-    pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
-    if not pending or time.monotonic() - float(pending["created"]) > OPENROUTER_OAUTH_TTL_SECONDS:
-        _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
-        raise ValueError("oauth_state_expired")
-    if pending.get("callbackConsumed"):
-        raise ValueError("oauth_state_consumed")
+    with _OPENROUTER_OAUTH_LOCK:
+        pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
+        if not pending or time.monotonic() - float(pending["created"]) > OPENROUTER_OAUTH_TTL_SECONDS:
+            _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
+            raise ValueError("oauth_state_expired")
+        if pending.get("callbackConsumed"):
+            raise ValueError("oauth_state_consumed")
+        # Mark before the outbound exchange so a concurrent callback cannot
+        # replay the authorization code while the request is in flight.
+        pending["callbackConsumed"] = True
+        verifier = str(pending["verifier"])
     if not code or len(code) > 4096:
         raise ValueError("oauth_code_required")
     request = urllib.request.Request(
         OPENROUTER_KEY_EXCHANGE_URL,
-        data=json.dumps({"code": code, "code_verifier": pending["verifier"], "code_challenge_method": "S256"}).encode("utf-8"),
+        data=json.dumps({"code": code, "code_verifier": verifier, "code_challenge_method": "S256"}).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "AgentCat/1.0"},
         method="POST",
     )
@@ -17808,35 +17815,52 @@ def openrouter_finish_oauth(nonce: str, code: str) -> None:
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
+        with _OPENROUTER_OAUTH_LOCK:
+            current = _OPENROUTER_OAUTH_PENDING.get(nonce)
+            if current is not None:
+                current["failed"] = True
         raise RuntimeError("oauth_exchange_failed") from exc
     key = payload.get("key") if isinstance(payload, dict) else None
     if not isinstance(key, str) or not key:
         raise RuntimeError("oauth_exchange_failed")
-    pending["callbackConsumed"] = True
-    pending["key"] = key
+    with _OPENROUTER_OAUTH_LOCK:
+        current = _OPENROUTER_OAUTH_PENDING.get(nonce)
+        if current is None:
+            raise ValueError("oauth_state_expired")
+        current["key"] = key
 
 
 def openrouter_oauth_status(nonce: str) -> str:
-    pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
-    if not pending or time.monotonic() - float(pending["created"]) > OPENROUTER_OAUTH_TTL_SECONDS:
-        _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
-        return "expired"
-    if not isinstance(pending.get("key"), str):
-        return "awaiting_browser"
-    return "claimed" if pending.get("keyClaimed") else "ready"
+    with _OPENROUTER_OAUTH_LOCK:
+        pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
+        if not pending or time.monotonic() - float(pending["created"]) > OPENROUTER_OAUTH_TTL_SECONDS:
+            _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
+            return "expired"
+        if pending.get("failed"):
+            return "failed"
+        if pending.get("keyClaimed"):
+            return "claimed"
+        if not isinstance(pending.get("key"), str):
+            return "awaiting_browser"
+        return "ready"
 
 
 def openrouter_claim_oauth_key(nonce: str) -> str:
-    pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
-    if openrouter_oauth_status(nonce) != "ready" or not pending:
-        raise ValueError("oauth_key_not_ready")
-    pending["keyClaimed"] = True
-    return str(pending["key"])
+    with _OPENROUTER_OAUTH_LOCK:
+        pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
+        if not pending or pending.get("keyClaimed") or not isinstance(pending.get("key"), str):
+            raise ValueError("oauth_key_not_ready")
+        pending["keyClaimed"] = True
+        # The only copy now travels in the authenticated response to the app,
+        # which immediately writes it through Security.framework.
+        return str(pending.pop("key"))
 
 
 def openrouter_complete_oauth(nonce: str, connection_id: str, label: str) -> Dict[str, Any]:
-    if openrouter_oauth_status(nonce) != "claimed":
-        raise ValueError("oauth_key_not_ready")
+    with _OPENROUTER_OAUTH_LOCK:
+        pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
+        if not pending or not pending.get("keyClaimed"):
+            raise ValueError("oauth_key_not_ready")
     with _OPENROUTER_CONNECTIONS_LOCK:
         rows = _openrouter_connections()
         if any(item.get("id") == connection_id for item in rows):
@@ -17844,7 +17868,8 @@ def openrouter_complete_oauth(nonce: str, connection_id: str, label: str) -> Dic
         row = _openrouter_new_connection(connection_id, label, "oauth_pkce")
         rows.append(row)
         _write_openrouter_connections(rows)
-    _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
+    with _OPENROUTER_OAUTH_LOCK:
+        _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
     return _openrouter_public_connection(row)
 
 

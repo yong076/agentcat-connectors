@@ -4,6 +4,7 @@ import tempfile
 import time
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
@@ -101,6 +102,22 @@ class OpenRouterConnectionsTests(unittest.TestCase):
         self.assertEqual(agentcat.openrouter_oauth_status(nonce), "claimed")
         with self.assertRaises(ValueError):
             agentcat.openrouter_claim_oauth_key(nonce)
+
+    def test_concurrent_oauth_claim_delivers_key_once(self):
+        nonce = "c" * 43
+        agentcat._OPENROUTER_OAUTH_PENDING[nonce] = {
+            "created": time.monotonic(), "key": "temporary-secret", "label": "OAuth",
+        }
+        def claim():
+            try:
+                return agentcat.openrouter_claim_oauth_key(nonce)
+            except ValueError:
+                return None
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: claim(), range(2)))
+        self.assertEqual(results.count("temporary-secret"), 1)
+        self.assertEqual(results.count(None), 1)
+        self.assertNotIn("key", agentcat._OPENROUTER_OAUTH_PENDING[nonce])
 
     def test_handler_requires_bearer_and_rejects_foreign_origin_writes(self):
         token = agentcat.loopback_control_token()
