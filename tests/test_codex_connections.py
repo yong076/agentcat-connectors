@@ -119,7 +119,8 @@ class CodexConnectionsTests(unittest.TestCase):
         status = agentcat.codex_oauth_status(started["operationID"])
         connection = status["connection"]
         self.assertEqual(status["status"], "connected")
-        self.assertEqual(connection["identity"], {"email": "me@example.com", "planType": "pro"})
+        self.assertEqual(connection["identity"]["email"], "me@example.com")
+        self.assertTrue(connection["identity"]["verification"])
         self.assertEqual(connection["usage"]["windows"][0]["windowDurationMins"], 300)
         self.assertEqual(connection["usage"]["windows"][1]["windowDurationMins"], 10080)
         self.assertEqual(connection["usage"]["tokenUsage"]["dailyBuckets"][0]["tokens"], 123)

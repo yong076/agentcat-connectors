@@ -21,7 +21,7 @@ class FakeAdapter:
 
     def poll(self, profile, operation):
         if self.connected:
-            return {"status": "connected", "authenticated": True, "identity": {"email": "local@example.test"}, "usage": {"source": "fake", "freshness": "live", "windows": [], "tokenUsage": None, "tokenUsageAvailable": False}}
+            return {"status": "connected", "authenticated": True, "identity": {"email": "local@example.test", "verification": True, "source": "fixture"}, "usage": {"source": "fake", "freshness": "live", "windows": [], "tokenUsage": None, "tokenUsageAvailable": False}}
         return {"status": "pending_device"}
 
     def cancel(self, profile, operation):
@@ -57,6 +57,8 @@ class ManagedAccountsTests(unittest.TestCase):
         state = self.accounts.status("fake", started["operationID"])
         self.assertEqual(state["status"], "connected")
         self.assertEqual(state["connection"]["usage"]["source"], "fake")
+        self.assertEqual(state["connection"]["label"], "local@example.test")
+        self.assertTrue(state["connection"]["identity"]["verification"])
         self.assertNotIn("operationID", state["connection"])
 
     def test_unverified_provider_exit_never_becomes_connected(self):
@@ -71,10 +73,10 @@ class ManagedAccountsTests(unittest.TestCase):
 
     def test_refresh_rejects_a_different_native_account_for_same_connection(self):
         started = self.accounts.start("fake", "My account", "device")
-        self.adapter.poll = lambda profile, operation: {"status": "connected", "authenticated": True, "identity": {"accountID": "first"}, "usage": {"source": "fake"}}
+        self.adapter.poll = lambda profile, operation: {"status": "connected", "authenticated": True, "identity": {"accountID": "first", "email": "first@example.test", "verification": True, "source": "fixture"}, "usage": {"source": "fake"}}
         connected = self.accounts.status("fake", started["operationID"])
         row = connected["connection"]
-        self.adapter.refresh = lambda profile: {"status": "connected", "authenticated": True, "identity": {"accountID": "other"}, "usage": {"source": "other"}}
+        self.adapter.refresh = lambda profile: {"status": "connected", "authenticated": True, "identity": {"accountID": "other", "email": "other@example.test", "verification": True, "source": "fixture"}, "usage": {"source": "other"}}
         refreshed = self.accounts.refresh("fake", row["id"])
         self.assertEqual(refreshed["status"], "needs_reconnect")
         self.assertEqual(refreshed["identity"]["accountID"], "first")
@@ -87,7 +89,7 @@ class ManagedAccountsTests(unittest.TestCase):
         second = accounts.start("fake", "Second", "device")
         third = accounts.start("other", "Third", "device")
         before = accounts.snapshot()
-        self.assertEqual([(row["provider"], row["label"]) for row in before], [("fake", "First"), ("fake", "Second"), ("other", "Third")])
+        self.assertEqual([(row["provider"], row["label"]) for row in before], [("fake", ""), ("fake", ""), ("other", "")])
         restarted = ManagedAccounts(Path(self.temp.name), {"fake": self.adapter, "other": other})
         # Pending browser/device details are intentionally gone after restart,
         # while unrelated registered metadata remains listable.

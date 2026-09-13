@@ -17927,7 +17927,7 @@ def _write_openrouter_connections(rows: List[Dict[str, Any]]) -> None:
 
 def _openrouter_public_connection(row: Dict[str, Any]) -> Dict[str, Any]:
     # Never return the stored key, key hash, or any raw upstream response.
-    keys = ("id", "provider", "label", "kind", "scope", "status", "createdAt", "lastSyncAt", "lastSuccessfulSyncAt", "error", "usage")
+    keys = ("id", "provider", "label", "kind", "scope", "status", "createdAt", "lastSyncAt", "lastSuccessfulSyncAt", "error", "identity", "identityStatus", "usage")
     return {key: copy.deepcopy(row[key]) for key in keys if key in row}
 
 
@@ -17973,6 +17973,11 @@ def _openrouter_usage_payload(data: Dict[str, Any]) -> Dict[str, Any]:
 def openrouter_refresh_connection(row: Dict[str, Any]) -> bool:
     """Refresh a single key scope, retaining the previous successful amounts on failure."""
     row["lastSyncAt"] = now_iso()
+    # The documented current-key response has no account email.  Never retain
+    # an older display label as if it were an authenticated identity.
+    row["label"] = ""
+    row.pop("identity", None)
+    row["identityStatus"] = {"status": "unavailable", "reason": "provider_email_not_exposed"}
     key = _openrouter_keychain_read(str(row.get("id") or ""))
     if not key:
         row["status"] = "needs_reconnect"
@@ -18005,10 +18010,11 @@ def _openrouter_new_connection(connection_id: str, label: str, kind: str) -> Dic
     row: Dict[str, Any] = {
         "id": connection_id,
         "provider": "openrouter",
-        "label": (label or "OpenRouter").strip()[:80] or "OpenRouter",
+        "label": "",
         "kind": kind,
         "scope": "api_key_scoped",
         "status": "connected",
+        "identityStatus": {"status": "unavailable", "reason": "provider_email_not_exposed"},
         "createdAt": now_iso(),
         "usage": {"currency": "USD", "daily": None, "weekly": None, "monthly": None, "total": None, "limit": None, "limitRemaining": None, "limitReset": None, "includeByokInLimit": None, "byokDaily": None, "byokWeekly": None, "byokMonthly": None, "byokTotal": None},
     }
@@ -18140,10 +18146,7 @@ def openrouter_connection_mutation(connection_id: str, action: str, label: Optio
         if action == "refresh":
             openrouter_refresh_connection(row)
         elif action == "rename":
-            clean_label = (label or "").strip()
-            if not clean_label or len(clean_label) > 80:
-                raise ValueError("invalid_connection_label")
-            row["label"] = clean_label
+            raise ValueError("account_label_is_verified_email")
         elif action == "remove":
             _openrouter_keychain_delete(connection_id)
             row["status"] = "removed"
@@ -18190,7 +18193,7 @@ def _codex_public_connection(row: Dict[str, Any]) -> Dict[str, Any]:
     # protocol payloads.  These keys are the complete public contract.
     keys = (
         "id", "provider", "label", "kind", "scope", "status", "createdAt",
-        "lastSyncAt", "lastSuccessfulSyncAt", "error", "identity", "usage",
+        "lastSyncAt", "lastSuccessfulSyncAt", "error", "identity", "identityStatus", "usage",
         "operationID",
     )
     return {key: copy.deepcopy(row[key]) for key in keys if key in row}
@@ -18301,13 +18304,24 @@ def _codex_refresh_row(row: Dict[str, Any]) -> bool:
             row["error"] = "This managed Codex profile is no longer signed in. Reconnect it."
             row["usage"] = _codex_unavailable_usage()
             return True
+        if isinstance(identity, dict) and isinstance(identity.get("email"), str) and identity["email"].strip():
+            # The only caller is the official account/read response from this
+            # connection's isolated app-server child.
+            identity = {**identity, "email": identity["email"].strip().lower(), "verification": True, "source": identity.get("source") or "codex_app_server_account_read"}
         prior = row.get("identity")
         if isinstance(prior, dict) and isinstance(prior.get("email"), str) and isinstance(identity.get("email"), str) and prior["email"].lower() != identity["email"].lower():
             row["status"] = "needs_reconnect"
             row["error"] = "The signed-in Codex account does not match this connection. Reconnect it."
             row["usage"] = _codex_unavailable_usage()
             return True
-        row["identity"] = identity
+        email = identity.get("email") if isinstance(identity, dict) else None
+        if isinstance(email, str) and email.strip() and identity.get("verification") is True:
+            row["identity"] = identity
+            row["label"] = email.strip().lower()
+            row.pop("identityStatus", None)
+        else:
+            row.pop("identity", None)
+            row["identityStatus"] = {"status": "unavailable", "reason": "verified_email_not_exposed"}
         try:
             row["usage"] = _codex_server(row).usage()
             row.pop("error", None)
@@ -18412,7 +18426,7 @@ def codex_start_oauth(label: str, mode: str = "browser") -> Dict[str, Any]:
         row: Dict[str, Any] = {
             "id": uuid.uuid4().hex,
             "provider": "codex",
-            "label": (label or "Codex / ChatGPT").strip()[:80] or "Codex / ChatGPT",
+            "label": "",
             "kind": "chatgpt_oauth",
             "scope": "managed_app_server_profile",
             "createdAt": now_iso(),
@@ -18537,10 +18551,7 @@ def codex_connection_mutation(connection_id: str, action: str, label: Optional[s
         if action == "refresh":
             _codex_refresh_row(row)
         elif action == "rename":
-            clean_label = (label or "").strip()
-            if not clean_label or len(clean_label) > 80:
-                raise ValueError("invalid_connection_label")
-            row["label"] = clean_label
+            raise ValueError("account_label_is_verified_email")
         elif action == "remove":
             # The logout request and the deletion target are both the exact
             # child-owned profile selected by this connection id.  It cannot

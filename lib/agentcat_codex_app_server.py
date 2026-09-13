@@ -94,6 +94,10 @@ def normalize_identity(result: Any) -> Optional[Dict[str, Optional[str]]]:
     plan = account.get("planType")
     return {
         "email": email if isinstance(email, str) else None,
+        # account/read is the official authenticated app-server identity
+        # response for this isolated ChatGPT session.
+        "verification": isinstance(email, str) and bool(email.strip()),
+        "source": "codex_app_server_account_read",
         "planType": plan if isinstance(plan, str) else None,
     }
 

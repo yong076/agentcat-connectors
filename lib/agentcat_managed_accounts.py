@@ -21,7 +21,7 @@ PENDING = frozenset({"pending_browser", "pending_device"})
 TERMINAL = frozenset({"failed", "canceled", "error", "needs_reconnect"})
 PUBLIC_FIELDS = (
     "id", "provider", "label", "kind", "scope", "status", "createdAt",
-    "lastSyncAt", "lastSuccessfulSyncAt", "error", "identity", "usage",
+    "lastSyncAt", "lastSuccessfulSyncAt", "error", "identity", "identityStatus", "usage",
     "operationID",
 )
 
@@ -156,7 +156,9 @@ class ManagedAccounts:
             row: Dict[str, Any] = {
                 "id": uuid.uuid4().hex,
                 "provider": provider,
-                "label": label.strip()[:80] or provider.title(),
+                # A pending operation has no account identity yet.  Never use
+                # a caller label as the eventual account title.
+                "label": "",
                 "kind": "managed_native_auth",
                 "scope": "managed_provider_profile",
                 "status": "starting",
@@ -205,8 +207,19 @@ class ManagedAccounts:
             status = "needs_reconnect"
             payload = {"status": status, "error": "managed_account_identity_mismatch"}
         row["status"] = status
-        if isinstance(payload.get("identity"), dict):
-            row["identity"] = copy.deepcopy(payload["identity"])
+        identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else None
+        email = identity.get("email") if identity else None
+        verified = identity.get("verification") is True if identity else False
+        if isinstance(email, str) and "@" in email and verified:
+            normalized_identity = copy.deepcopy(identity)
+            normalized_identity["email"] = email.strip().lower()
+            row["identity"] = normalized_identity
+            row["label"] = normalized_identity["email"]
+            row.pop("identityStatus", None)
+        elif isinstance(payload.get("identityStatus"), dict):
+            row["identityStatus"] = copy.deepcopy(payload["identityStatus"])
+        elif status == "connected" and not (isinstance(row.get("identity"), dict) and row["identity"].get("verification") is True and isinstance(row["identity"].get("email"), str)):
+            row["identityStatus"] = {"status": "unavailable", "reason": "verified_email_not_exposed"}
         if isinstance(payload.get("usage"), dict):
             row["usage"] = copy.deepcopy(payload["usage"])
         if isinstance(payload.get("error"), str):
