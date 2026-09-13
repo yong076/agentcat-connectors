@@ -5,6 +5,7 @@ import argparse
 import base64
 import copy
 import csv
+import importlib
 from contextlib import closing
 import logging
 import datetime as dt
@@ -43,6 +44,7 @@ from agentcat_codex_app_server import (
     CodexAppServerUnsupported,
     app_server_prerequisite,
 )
+from agentcat_managed_accounts import ManagedAccounts
 
 
 def resolve_user_home_env() -> str:
@@ -71,6 +73,56 @@ OPENROUTER_CONNECTIONS_FILE = AGENTCAT_HOME / "openrouter-connections.json"
 CODEX_CONNECTIONS_FILE = AGENTCAT_HOME / "codex-connections.json"
 CODEX_CONNECTIONS_PROFILES_DIR = AGENTCAT_HOME / "codex-connection-profiles"
 LOOPBACK_CONTROL_TOKEN_FILE = AGENTCAT_HOME / "loopback-control-token"
+
+
+class _UnavailableManagedAdapter:
+    """Advertise an installed-but-unusable provider without a fake Add flow."""
+
+    def __init__(self, provider: str, reason: str) -> None:
+        self.provider = provider
+        self.reason = reason
+
+    def adapter_capability(self) -> Dict[str, Any]:
+        return {"provider": self.provider, "supported": True, "available": False, "reason": self.reason, "modes": []}
+
+
+_MANAGED_ACCOUNTS: Optional[ManagedAccounts] = None
+_MANAGED_ACCOUNTS_HOME: Optional[Path] = None
+
+
+def _native_managed_adapters() -> Dict[str, Any]:
+    """Import provider modules lazily; a missing optional module is explicit."""
+    adapters: Dict[str, Any] = {"antigravity": _UnavailableManagedAdapter("antigravity", "managed_auth_not_supported")}
+    for provider, module_name in (
+        ("kimi", "agentcat_kimi_managed"),
+        ("grok", "agentcat_grok_managed"),
+        ("gemini", "agentcat_google_managed_auth"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+            adapter = module.build_adapter() if callable(getattr(module, "build_adapter", None)) else module
+            adapters[provider] = adapter
+        except Exception:
+            adapters[provider] = _UnavailableManagedAdapter(provider, "provider_adapter_unavailable")
+    return adapters
+
+
+def managed_accounts() -> ManagedAccounts:
+    global _MANAGED_ACCOUNTS, _MANAGED_ACCOUNTS_HOME
+    if _MANAGED_ACCOUNTS is None or _MANAGED_ACCOUNTS_HOME != AGENTCAT_HOME:
+        _MANAGED_ACCOUNTS = ManagedAccounts(AGENTCAT_HOME, _native_managed_adapters())
+        _MANAGED_ACCOUNTS_HOME = AGENTCAT_HOME
+    return _MANAGED_ACCOUNTS
+
+
+def managed_connection_capabilities() -> Dict[str, Any]:
+    providers = managed_accounts().capabilities()["providers"]
+    codex = codex_connection_capabilities()
+    providers.append({key: codex[key] for key in ("provider", "supported", "available", "reason", "modes")})
+    # Legacy OpenRouter OAuth remains available through its established
+    # callback/key-claim routes while its managed adapter is being wired.
+    providers.append({"provider": "openrouter", "supported": True, "available": True, "reason": None, "modes": ["browser"]})
+    return {"providers": sorted(providers, key=lambda item: str(item["provider"]))}
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 GEMINI_USAGE_CACHE = AGENTCAT_HOME / "gemini-usage-cache.json"
 ANTIGRAVITY_CLI_DIR = HOME / ".gemini" / "antigravity-cli"
@@ -225,6 +277,7 @@ CONNECTOR_CAPABILITIES = (
     "connector.config",
     "connections.openrouter.v1",
     "connections.codex.appServer.v1",
+    "connections.managedAccounts.v1",
     "desktopApps.localMetadata",
     "events.sqlite",
     "usage.dailyTokens",
@@ -16554,7 +16607,15 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 status, reason = guard_error
                 self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
                 return
-            self.send_json(200, {"connections": openrouter_connections_snapshot() + codex_connections_snapshot()})
+            self.send_json(200, {"connections": openrouter_connections_snapshot() + codex_connections_snapshot() + managed_accounts().snapshot()})
+            return
+        if path == "/v1/connections/capabilities":
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            self.send_json(200, managed_connection_capabilities())
             return
         if path == "/v1/connections/codex/capabilities":
             guard_error = connection_control_request_error(self.headers, mutation=False)
@@ -16584,6 +16645,21 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
                 return
             self.send_json(200, {"status": openrouter_oauth_status(oauth_status_match.group(1))})
+            return
+        managed_status_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/oauth/([A-Za-z0-9_-]{8,})", path)
+        if managed_status_match:
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            provider, operation = managed_status_match.groups()
+            try:
+                self.send_json(200, managed_accounts().status(provider, operation))
+            except KeyError:
+                self.send_json(404, {"error": "oauth_operation_not_found"})
+            except Exception:
+                self.send_json(502, {"error": "managed_oauth_status_failed"})
             return
         callback_prefix = "/v1/connections/openrouter/callback/"
         if path.startswith(callback_prefix):
@@ -16667,6 +16743,29 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json(200, result)
                 return
+            managed_start_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/oauth/start", path)
+            if managed_start_match:
+                provider = managed_start_match.group(1)
+                try:
+                    result = managed_accounts().start(
+                        provider,
+                        str(payload.get("label") or provider.title()),
+                        str(payload.get("mode") or "browser"),
+                    )
+                except KeyError:
+                    self.send_json(404, {"error": "provider_not_supported"})
+                    return
+                except RuntimeError as exc:
+                    self.send_json(409, {"error": str(exc) if str(exc).endswith(("_unavailable", "_not_supported")) else "managed_oauth_start_failed"})
+                    return
+                except ValueError:
+                    self.send_json(400, {"error": "invalid_connection"})
+                    return
+                except Exception:
+                    self.send_json(502, {"error": "managed_oauth_start_failed"})
+                    return
+                self.send_json(200, result)
+                return
             codex_retry_match = re.fullmatch(r"/v1/connections/codex/([0-9a-f]{32})/oauth/retry", path)
             if codex_retry_match:
                 try:
@@ -16692,6 +16791,37 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             codex_cancel_match = re.fullmatch(r"/v1/connections/codex/oauth/([0-9a-f-]{20,})/cancel", path)
             if codex_cancel_match:
                 self.send_json(200, {"status": codex_cancel_oauth(codex_cancel_match.group(1))})
+                return
+            managed_retry_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/([0-9a-f]{32})/oauth/retry", path)
+            if managed_retry_match:
+                provider, connection_id = managed_retry_match.groups()
+                try:
+                    result = managed_accounts().retry(provider, connection_id, str(payload.get("mode") or "browser"))
+                except KeyError:
+                    self.send_json(404, {"error": "connection_not_found"})
+                    return
+                except RuntimeError as exc:
+                    self.send_json(409, {"error": str(exc) if str(exc) == "managed_oauth_retry_not_allowed" else "managed_oauth_retry_failed"})
+                    return
+                except Exception:
+                    self.send_json(502, {"error": "managed_oauth_retry_failed"})
+                    return
+                self.send_json(200, result)
+                return
+            managed_cancel_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/oauth/([A-Za-z0-9_-]{8,})/cancel", path)
+            if managed_cancel_match:
+                provider, operation = managed_cancel_match.groups()
+                self.send_json(200, {"status": managed_accounts().cancel(provider, operation)})
+                return
+            managed_refresh_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/([0-9a-f]{32})/refresh", path)
+            if managed_refresh_match:
+                provider, connection_id = managed_refresh_match.groups()
+                try:
+                    self.send_json(200, {"connection": managed_accounts().refresh(provider, connection_id)})
+                except KeyError:
+                    self.send_json(404, {"error": "connection_not_found"})
+                except Exception:
+                    self.send_json(502, {"error": "managed_connection_refresh_failed"})
                 return
             oauth_match = re.fullmatch(r"/v1/connections/openrouter/oauth/([A-Za-z0-9_-]{20,})/(key|complete)", path)
             if oauth_match:
@@ -16873,6 +17003,21 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if not self.host_header_ok():
             return
         path = urllib.parse.urlparse(self.path).path
+        managed_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/([0-9a-f]{32})", path)
+        if managed_match:
+            guard_error = connection_control_request_error(self.headers, mutation=True)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_write_forbidden", "message": reason})
+                return
+            provider, connection_id = managed_match.groups()
+            try:
+                self.send_json(200, {"connection": managed_accounts().remove(provider, connection_id)})
+            except KeyError:
+                self.send_json(404, {"error": "connection_not_found"})
+            except Exception:
+                self.send_json(500, {"error": "managed_connection_remove_failed"})
+            return
         match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})", path)
         if not match:
             self.send_json(404, {"error": "not_found"})
