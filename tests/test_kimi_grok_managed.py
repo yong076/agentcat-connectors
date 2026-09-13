@@ -339,6 +339,23 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         self.assertTrue(capability["available"])
         self.assertIsNone(capability["reason"])
 
+    def test_capability_probe_augments_system_only_path_for_env_interpreter(self):
+        """LaunchAgents can have a nonempty PATH that lacks the CLI runtime."""
+        directory = Path(self.tmp.name) / "trusted-bin"
+        directory.mkdir()
+        interpreter = directory / "agentcat-test-runtime"
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        interpreter.chmod(0o700)
+        for module, variable, name in ((kimi, "AGENTCAT_KIMI_CLI", "kimi"), (grok, "AGENTCAT_GROK_CLI", "grok")):
+            wrapper = directory / name
+            wrapper.write_text("#!/usr/bin/env agentcat-test-runtime\n", encoding="utf-8")
+            wrapper.chmod(0o700)
+            module._PROBE = None
+            with self.subTest(provider=name), patch.object(module, "_FALLBACK_PATH", str(directory)), patch.dict(os.environ, {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", variable: str(wrapper)}, clear=True):
+                capability = module.adapter_capability()
+            self.assertTrue(capability["available"])
+            self.assertIsNone(capability["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

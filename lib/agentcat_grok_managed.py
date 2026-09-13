@@ -55,10 +55,16 @@ def _executable() -> Optional[str]:
 
 def _environment(profile_dir: Path) -> Dict[str, str]:
     env = dict(os.environ)
-    # Native CLI wrappers may use ``/usr/bin/env``.  Daemon launches without a
-    # PATH must still be able to start the interpreter of an already trusted CLI.
-    if not isinstance(env.get("PATH"), str) or not env["PATH"].strip():
+    # Native CLI wrappers may use ``/usr/bin/env``.  Daemon launches with an
+    # empty or system-only PATH must still start an already trusted CLI.
+    path = env.get("PATH")
+    if not isinstance(path, str) or not path.strip():
         env["PATH"] = _FALLBACK_PATH
+    else:
+        existing = [entry for entry in path.split(":") if entry]
+        missing = [entry for entry in _FALLBACK_PATH.split(":") if entry not in existing]
+        if missing:
+            env["PATH"] = ":".join([*existing, *missing])
     for name in ("GROK_HOME", "XAI_HOME"):
         env.pop(name, None)
     env["GROK_HOME"] = str(profile_dir)

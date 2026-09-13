@@ -66,11 +66,17 @@ def _executable() -> Optional[str]:
 
 def _environment(profile_dir: Path) -> Dict[str, str]:
     env = dict(os.environ)
-    # The daemon can be launched with no PATH.  The trusted CLI is a
-    # ``#!/usr/bin/env node`` wrapper, so resolving its absolute path alone is
-    # not enough for its interpreter to start.
-    if not isinstance(env.get("PATH"), str) or not env["PATH"].strip():
+    # The CLI is an ``/usr/bin/env node`` wrapper.  A daemon can have an empty
+    # or system-only PATH, even after this adapter resolved the wrapper by its
+    # trusted absolute location.
+    path = env.get("PATH")
+    if not isinstance(path, str) or not path.strip():
         env["PATH"] = _FALLBACK_PATH
+    else:
+        existing = [entry for entry in path.split(":") if entry]
+        missing = [entry for entry in _FALLBACK_PATH.split(":") if entry not in existing]
+        if missing:
+            env["PATH"] = ":".join([*existing, *missing])
     for name in ("KIMI_CODE_HOME", "KIMI_HOME", "KIMI_CODE_DIR", "KIMI_DATA_DIR"):
         env.pop(name, None)
     env["KIMI_CODE_HOME"] = str(profile_dir)
