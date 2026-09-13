@@ -29,6 +29,30 @@ class FakeAdapter:
         return "canceled"
 
 
+class DedupAdapter(FakeAdapter):
+    def __init__(self, *, tenant_for_operation=None, include_identity=True):
+        super().__init__()
+        self.tenant_for_operation = tenant_for_operation or (lambda operation: "tenant-a")
+        self.include_identity = include_identity
+        self.promotions = []
+
+    def poll(self, profile, operation):
+        if not self.connected:
+            return {"status": "pending_device"}
+        payload = {
+            "status": "connected", "authenticated": True,
+            "identity": {"email": "verified@example.test", "verification": True, "source": "fixture", "accountID": "provider-user-42"},
+            "usage": {"source": "fake", "freshness": "live", "windows": [], "tokenUsage": None, "tokenUsageAvailable": False},
+        }
+        if self.include_identity:
+            payload["providerIdentity"] = {"accountID": "provider-user-42", "tenantID": self.tenant_for_operation(operation)}
+        return payload
+
+    def promote_verified_profile(self, source, destination, identity):
+        self.promotions.append((source, destination, dict(identity)))
+        return True
+
+
 class ManagedAccountsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -84,13 +108,13 @@ class ManagedAccountsTests(unittest.TestCase):
 
     def test_refresh_rejects_a_different_native_account_for_same_connection(self):
         started = self.accounts.start("fake", "My account", "device")
-        self.adapter.poll = lambda profile, operation: {"status": "connected", "authenticated": True, "identity": {"accountID": "first", "email": "first@example.test", "verification": True, "source": "fixture"}, "usage": {"source": "fake"}}
+        self.adapter.poll = lambda profile, operation: {"status": "connected", "authenticated": True, "identity": {"accountID": "first", "email": "first@example.test", "verification": True, "source": "fixture"}, "providerIdentity": {"accountID": "first"}, "usage": {"source": "fake"}}
         connected = self.accounts.status("fake", started["operationID"])
         row = connected["connection"]
-        self.adapter.refresh = lambda profile: {"status": "connected", "authenticated": True, "identity": {"accountID": "other", "email": "other@example.test", "verification": True, "source": "fixture"}, "usage": {"source": "other"}}
+        self.adapter.refresh = lambda profile: {"status": "connected", "authenticated": True, "identity": {"accountID": "other", "email": "other@example.test", "verification": True, "source": "fixture"}, "providerIdentity": {"accountID": "other"}, "usage": {"source": "other"}}
         refreshed = self.accounts.refresh("fake", row["id"])
         self.assertEqual(refreshed["status"], "needs_reconnect")
-        self.assertEqual(refreshed["identity"]["accountID"], "first")
+        self.assertNotIn("accountID", refreshed["identity"])
         self.assertEqual(refreshed["usage"]["source"], "fake")
 
     def test_refresh_migrates_legacy_display_label_to_verified_email(self):
@@ -131,6 +155,70 @@ class ManagedAccountsTests(unittest.TestCase):
         self.assertEqual(removed["status"], "removed")
         remaining = restarted.snapshot()
         self.assertEqual({row["id"] for row in remaining}, {rows[0]["id"], second_row["id"]})
+
+    def test_verified_provider_identity_merges_to_canonical_and_alias_survives_restart(self):
+        adapter = DedupAdapter()
+        accounts = ManagedAccounts(Path(self.temp.name), {"fake": adapter}, dedup_secret=b"d" * 32)
+        first = accounts.start("fake", "", "device")
+        adapter.connected = True
+        canonical = accounts.status("fake", first["operationID"])["connection"]
+        second = accounts.start("fake", "", "device")
+        merged = accounts.status("fake", second["operationID"])
+        self.assertEqual(merged["status"], "connected")
+        self.assertEqual(merged["connection"]["id"], canonical["id"])
+        self.assertEqual(merged["supersededConnectionID"], next(item["id"] for item in accounts._rows() if item.get("operationID") == second["operationID"]))
+        self.assertEqual([row["id"] for row in accounts.snapshot()], [canonical["id"]])
+        self.assertEqual(len(adapter.promotions), 1)
+        registry = accounts.registry.read_text(encoding="utf-8")
+        self.assertNotIn("provider-user-42", registry)
+        self.assertNotIn("tenant-a", registry)
+        restarted = ManagedAccounts(Path(self.temp.name), {"fake": adapter}, dedup_secret=b"d" * 32)
+        durable = restarted.status("fake", second["operationID"])
+        self.assertEqual(durable["connection"]["id"], canonical["id"])
+        self.assertEqual(durable["supersededConnectionID"], merged["supersededConnectionID"])
+        self.assertEqual(restarted.cancel("fake", second["operationID"]), "alreadyCompleted")
+        self.assertEqual(restarted.status("fake", second["operationID"])["connection"]["id"], canonical["id"])
+
+    def test_new_login_backfills_a_legacy_connected_row_before_merging(self):
+        adapter = DedupAdapter()
+        accounts = ManagedAccounts(Path(self.temp.name), {"fake": adapter}, dedup_secret=b"g" * 32)
+        first = accounts.start("fake", "", "device")
+        adapter.connected = True
+        original = accounts.status("fake", first["operationID"])["connection"]
+        rows = accounts._rows()
+        rows[0].pop("dedupKey", None)  # pre-dedup registry from a prior release
+        accounts._write(rows)
+        adapter.refresh = lambda profile: {
+            "status": "connected", "authenticated": True,
+            "identity": {"email": "verified@example.test", "verification": True, "source": "fixture", "accountID": "provider-user-42"},
+            "providerIdentity": {"accountID": "provider-user-42", "tenantID": "tenant-a"},
+            "usage": {"source": "fake", "freshness": "live", "windows": [], "tokenUsage": None, "tokenUsageAvailable": False},
+        }
+        second = accounts.start("fake", "", "device")
+        merged = accounts.status("fake", second["operationID"])
+        self.assertEqual(merged["connection"]["id"], original["id"])
+        self.assertIn("supersededConnectionID", merged)
+        self.assertEqual(len(accounts.snapshot()), 1)
+        self.assertEqual(len(adapter.promotions), 1)
+
+    def test_verified_identity_never_merges_across_tenant_or_when_missing(self):
+        adapter = DedupAdapter(tenant_for_operation=lambda operation: "tenant-a" if operation.endswith("1") else "tenant-b")
+        accounts = ManagedAccounts(Path(self.temp.name), {"fake": adapter}, dedup_secret=b"e" * 32)
+        first = accounts.start("fake", "", "device"); adapter.connected = True
+        accounts.status("fake", first["operationID"])
+        second = accounts.start("fake", "", "device")
+        accounts.status("fake", second["operationID"])
+        self.assertEqual(len(accounts.snapshot()), 2)
+        self.assertEqual(adapter.promotions, [])
+        unknown = DedupAdapter(include_identity=False)
+        other_home = Path(self.temp.name) / "unknown"
+        unknown_accounts = ManagedAccounts(other_home, {"fake": unknown}, dedup_secret=b"f" * 32)
+        one = unknown_accounts.start("fake", "", "device"); unknown.connected = True
+        unknown_accounts.status("fake", one["operationID"])
+        two = unknown_accounts.start("fake", "", "device")
+        unknown_accounts.status("fake", two["operationID"])
+        self.assertEqual(len(unknown_accounts.snapshot()), 2)
+        self.assertEqual(unknown.promotions, [])
 
 
 if __name__ == "__main__":

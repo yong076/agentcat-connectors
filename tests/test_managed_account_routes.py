@@ -48,6 +48,9 @@ class FakeAdapter:
     def remove(self, profile):
         return None
 
+    def promote_verified_profile(self, source, destination, identity):
+        return True
+
 
 GEMINI_UNAVAILABLE_USAGE = {
     "source": "gemini_code_assist",
@@ -176,6 +179,34 @@ class ManagedAccountRouteTests(unittest.TestCase):
         self.assertEqual(refreshed["connection"]["status"], "connected")
         _, removed = self.request(f"/v1/connections/kimi/{row['id']}", body={}, method="DELETE")
         self.assertEqual(removed["connection"]["status"], "removed")
+
+    def test_http_terminal_duplicate_returns_canonical_and_durable_supersession_alias(self):
+        def poll(profile, operation):
+            if operation not in self.adapter.connected:
+                return {"status": "pending_device"}
+            return {
+                "status": "connected", "authenticated": True,
+                "identity": {"email": "verified@example.invalid", "verification": True, "source": "fixture", "accountID": "provider-user-42"},
+                "providerIdentity": {"accountID": "provider-user-42"},
+                "usage": {"source": "fixture", "freshness": "live", "windows": [], "tokenUsage": None, "tokenUsageAvailable": False},
+            }
+        self.adapter.poll = poll
+        _, first = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
+        self.adapter.connected.add(first["operationID"])
+        _, initial = self.request(f"/v1/connections/kimi/oauth/{first['operationID']}")
+        _, second = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
+        self.adapter.connected.add(second["operationID"])
+        _, merged = self.request(f"/v1/connections/kimi/oauth/{second['operationID']}")
+        self.assertEqual(merged["status"], "connected")
+        self.assertEqual(merged["connection"]["id"], initial["connection"]["id"])
+        self.assertIn("supersededConnectionID", merged)
+        self.assertNotEqual(merged["supersededConnectionID"], merged["connection"]["id"])
+        _, repeated = self.request(f"/v1/connections/kimi/oauth/{second['operationID']}")
+        self.assertEqual(repeated["connection"]["id"], initial["connection"]["id"])
+        self.assertEqual(repeated["supersededConnectionID"], merged["supersededConnectionID"])
+        _, listed = self.request("/v1/connections")
+        self.assertEqual(len([row for row in listed["connections"] if row["provider"] == "kimi"]), 1)
+        self.assertNotIn("provider-user-42", json.dumps(listed))
 
 
 if __name__ == "__main__":

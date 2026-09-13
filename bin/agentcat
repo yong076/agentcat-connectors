@@ -114,7 +114,10 @@ def _native_managed_adapters() -> Dict[str, Any]:
 def managed_accounts() -> ManagedAccounts:
     global _MANAGED_ACCOUNTS, _MANAGED_ACCOUNTS_HOME
     if _MANAGED_ACCOUNTS is None or _MANAGED_ACCOUNTS_HOME != str(AGENTCAT_HOME):
-        _MANAGED_ACCOUNTS = ManagedAccounts(AGENTCAT_HOME, _native_managed_adapters())
+        _MANAGED_ACCOUNTS = ManagedAccounts(
+            AGENTCAT_HOME, _native_managed_adapters(),
+            dedup_secret=_provider_instance_secret(),
+        )
         _MANAGED_ACCOUNTS_HOME = str(AGENTCAT_HOME)
     return _MANAGED_ACCOUNTS
 

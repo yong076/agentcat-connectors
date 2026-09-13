@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 import threading
@@ -62,18 +64,84 @@ class ManagedAccounts:
         adapters: Mapping[str, Any],
         *,
         pending_ttl_seconds: int = 600,
+        dedup_secret: Optional[bytes] = None,
     ) -> None:
         self.home = Path(home)
         self.registry = self.home / "managed-connections.json"
         self.profile_root = self.home / "managed-connection-profiles"
         self.adapters = dict(adapters)
         self.pending_ttl_seconds = pending_ttl_seconds
+        # This device-local secret is separate from the loopback bearer token.
+        # It pseudonymizes provider-issued stable IDs for durable deduplication.
+        self.dedup_secret = self._load_dedup_secret(dedup_secret)
         self.lock = threading.RLock()
         self.surfaces: Dict[str, Dict[str, str]] = {}
         # A terminal OAuth status may be requested twice by a UI task that was
         # resumed while its prior poll was completing.  Keep only the public
         # row locator for the pending lease; never retain a login surface.
-        self.completed_operations: Dict[tuple[str, str], tuple[str, dt.datetime]] = {}
+        self.completed_operations: Dict[tuple[str, str], tuple[str, Optional[str], dt.datetime]] = {}
+
+    def _load_dedup_secret(self, supplied: Optional[bytes]) -> bytes:
+        if isinstance(supplied, bytes) and len(supplied) >= 32:
+            return supplied
+        secret_path = self.home / "managed-account-dedup-secret"
+        try:
+            value = secret_path.read_bytes()
+            if len(value) >= 32:
+                return value
+        except OSError:
+            pass
+        self.home.mkdir(parents=True, exist_ok=True)
+        value = os.urandom(32)
+        try:
+            fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, value)
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            try:
+                existing = secret_path.read_bytes()
+                if len(existing) >= 32:
+                    return existing
+            except OSError:
+                pass
+        except OSError:
+            # A read-only test/install still gets process-local dedup safety;
+            # production supplies its durable provider-instance secret.
+            pass
+        return value
+
+    def _provider_identity_key(self, row: Mapping[str, Any], payload: Mapping[str, Any]) -> Optional[str]:
+        if payload.get("status") != "connected" or payload.get("authenticated") is not True:
+            return None
+        identity = payload.get("providerIdentity")
+        if not isinstance(identity, Mapping):
+            return None
+        account_id = identity.get("accountID")
+        tenant_id = identity.get("tenantID")
+        if not isinstance(account_id, str) or not account_id.strip() or len(account_id) > 256:
+            return None
+        if any(ord(char) < 32 for char in account_id):
+            return None
+        if tenant_id is not None and (not isinstance(tenant_id, str) or len(tenant_id) > 256 or any(ord(char) < 32 for char in tenant_id)):
+            return None
+        provider = row.get("provider")
+        scope = row.get("scope")
+        if not isinstance(provider, str) or not isinstance(scope, str):
+            return None
+        material = "\0".join(("agentcat.managed-dedup.v1", provider, scope, account_id.strip(), (tenant_id or "").strip()))
+        return hmac.new(self.dedup_secret, material.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _public_identity(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        identity = payload.get("identity")
+        if not isinstance(identity, Mapping):
+            return None
+        # Stable IDs are a private one-shot handoff to the HMAC registry.  The
+        # app needs only verified display identity, never the native account ID.
+        return {str(key): copy.deepcopy(value) for key, value in identity.items()
+                if key not in {"accountID", "tenantID"}}
 
     def _rows(self) -> list[Dict[str, Any]]:
         try:
@@ -91,11 +159,11 @@ class ManagedAccounts:
             pass
         stored = []
         for row in rows:
-            public = {key: copy.deepcopy(row[key]) for key in PUBLIC_FIELDS if key in row}
-            for key in ("pendingStartedAt",):
+            stored_row = {key: copy.deepcopy(row[key]) for key in PUBLIC_FIELDS if key in row}
+            for key in ("pendingStartedAt", "dedupKey", "supersededBy"):
                 if isinstance(row.get(key), str):
-                    public[key] = row[key]
-            stored.append(public)
+                    stored_row[key] = row[key]
+            stored.append(stored_row)
         tmp = self.registry.with_name(self.registry.name + ".tmp-" + uuid.uuid4().hex)
         tmp.write_text(json.dumps({"version": 1, "connections": stored}, ensure_ascii=False) + "\n", encoding="utf-8")
         try:
@@ -196,20 +264,21 @@ class ManagedAccounts:
             return True
         return (dt.datetime.now(dt.timezone.utc) - started).total_seconds() > self.pending_ttl_seconds
 
-    def _remember_completed_operation(self, provider: str, operation: str, row: Dict[str, Any]) -> None:
+    def _remember_completed_operation(self, provider: str, operation: str, row: Dict[str, Any], *, superseded_connection_id: Optional[str] = None) -> None:
         connection_id = row.get("id")
         if not isinstance(connection_id, str) or len(connection_id) != 32:
             return
         self.completed_operations[(provider, operation)] = (
             connection_id,
+            superseded_connection_id if isinstance(superseded_connection_id, str) else None,
             dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=self.pending_ttl_seconds),
         )
 
-    def _completed_operation_row(self, provider: str, operation: str, rows: list[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _completed_operation_result(self, provider: str, operation: str, rows: list[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         remembered = self.completed_operations.get((provider, operation))
         if remembered is None:
             return None
-        connection_id, expires_at = remembered
+        connection_id, superseded_connection_id, expires_at = remembered
         if dt.datetime.now(dt.timezone.utc) > expires_at:
             self.completed_operations.pop((provider, operation), None)
             return None
@@ -217,7 +286,110 @@ class ManagedAccounts:
         if row is None or row.get("status") != "connected":
             self.completed_operations.pop((provider, operation), None)
             return None
-        return row
+        result: Dict[str, Any] = {"status": "connected", "connection": self.public(row)}
+        if superseded_connection_id:
+            result["supersededConnectionID"] = superseded_connection_id
+        return result
+
+    def _backfill_verified_identity(self, rows: list[Dict[str, Any]], source: Dict[str, Any]) -> None:
+        """Give legacy connected rows a private key only from live provider proof.
+
+        Older registries contain no HMAC key.  A new verified login may make a
+        bounded refresh of same-provider, same-scope connected candidates so it
+        can reuse an existing canonical row.  Display email/label is never an
+        input, and a failed candidate refresh leaves that row untouched.
+        """
+        provider = source.get("provider")
+        scope = source.get("scope")
+        adapter = self._adapter(str(provider))
+        candidates = [
+            row for row in rows
+            if row is not source and row.get("provider") == provider and row.get("scope") == scope
+            and row.get("status") == "connected" and not isinstance(row.get("dedupKey"), str)
+        ][:8]
+        for candidate in candidates:
+            try:
+                payload = adapter.refresh(self._profile(candidate))
+                if not isinstance(payload, dict):
+                    continue
+                key = self._provider_identity_key(candidate, payload)
+                if key is None:
+                    continue
+                self._apply(candidate, payload)
+                if candidate.get("status") == "connected":
+                    candidate["dedupKey"] = key
+            except Exception:
+                continue
+
+    def _collapse_verified_duplicates(self, rows: list[Dict[str, Any]], canonical: Dict[str, Any], dedup_key: str, *, keep: Optional[Dict[str, Any]] = None) -> None:
+        """Hide only already HMAC-matched rows; profiles remain recoverable."""
+        for candidate in rows:
+            if candidate is canonical or candidate is keep:
+                continue
+            if candidate.get("status") != "connected" or candidate.get("provider") != canonical.get("provider") or candidate.get("scope") != canonical.get("scope"):
+                continue
+            if not hmac.compare_digest(str(candidate.get("dedupKey") or ""), dedup_key):
+                continue
+            candidate["status"] = "superseded"
+            candidate["supersededBy"] = canonical["id"]
+            candidate.pop("error", None)
+            candidate.pop("pendingStartedAt", None)
+
+    def _canonical_duplicate(self, rows: list[Dict[str, Any]], source: Dict[str, Any], dedup_key: str) -> Optional[Dict[str, Any]]:
+        candidates = [
+            row for row in rows
+            if row is not source and row.get("provider") == source.get("provider")
+            and row.get("scope") == source.get("scope") and row.get("status") == "connected"
+            and hmac.compare_digest(str(row.get("dedupKey") or ""), dedup_key)
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda row: (str(row.get("createdAt") or ""), str(row.get("id") or "")))
+
+    def _promote_duplicate(self, rows: list[Dict[str, Any]], source: Dict[str, Any], payload: Dict[str, Any], operation: Optional[str]) -> Optional[Dict[str, Any]]:
+        dedup_key = self._provider_identity_key(source, payload)
+        if dedup_key is None or source.get("status") != "connected":
+            return None
+        source["dedupKey"] = dedup_key
+        self._backfill_verified_identity(rows, source)
+        canonical = self._canonical_duplicate(rows, source, dedup_key)
+        if canonical is None:
+            return None
+        promote = getattr(self._adapter(str(source["provider"])), "promote_verified_profile", None)
+        if not callable(promote):
+            return None
+        provider_identity = payload.get("providerIdentity")
+        if not isinstance(provider_identity, Mapping):
+            return None
+        try:
+            promoted = promote(self._profile(source), self._profile(canonical), provider_identity)
+        except Exception:
+            return None
+        if promoted is not True:
+            return None
+        # The newly authenticated source data is authoritative, but keeps the
+        # older canonical row ID that the app already displays.
+        self._apply(canonical, payload)
+        canonical["dedupKey"] = dedup_key
+        source["status"] = "superseded"
+        source["supersededBy"] = canonical["id"]
+        self._collapse_verified_duplicates(rows, canonical, dedup_key, keep=source)
+        source.pop("error", None)
+        source.pop("pendingStartedAt", None)
+        if isinstance(operation, str):
+            source["operationID"] = operation
+            self.surfaces.pop(operation, None)
+            self._remember_completed_operation(str(source["provider"]), operation, canonical, superseded_connection_id=str(source["id"]))
+        return canonical
+
+    def _superseded_result(self, row: Dict[str, Any], rows: list[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        canonical_id = row.get("supersededBy")
+        if not isinstance(canonical_id, str):
+            return None
+        canonical = next((item for item in rows if item.get("id") == canonical_id), None)
+        if canonical is None or canonical.get("status") != "connected":
+            return None
+        return {"status": "connected", "connection": self.public(canonical), "supersededConnectionID": row.get("id")}
 
     def _fail_pending(self, row: Dict[str, Any], message: str) -> None:
         operation = row.pop("operationID", None)
@@ -237,17 +409,15 @@ class ManagedAccounts:
             # require adapters to verify their native auth state first.
             status = "failed"
             payload = {"status": status, "error": "managed_auth_verification_required"}
-        prior_identity = row.get("identity") if isinstance(row.get("identity"), dict) else None
-        candidate_identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else None
-        prior_account = prior_identity.get("accountID") if prior_identity else None
-        candidate_account = candidate_identity.get("accountID") if candidate_identity else None
-        if status == "connected" and isinstance(prior_account, str) and prior_account and isinstance(candidate_account, str) and candidate_account and prior_account != candidate_account:
-            # A profile that now resolves to another native account must not
-            # silently take over this registered connection.
+        candidate_key = self._provider_identity_key(row, payload)
+        prior_key = row.get("dedupKey") if isinstance(row.get("dedupKey"), str) else None
+        if status == "connected" and prior_key and candidate_key and not hmac.compare_digest(prior_key, candidate_key):
+            # A profile resolving to a different provider-verified account must
+            # never take over this registered connection.
             status = "needs_reconnect"
             payload = {"status": status, "error": "managed_account_identity_mismatch"}
         row["status"] = status
-        identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else None
+        identity = self._public_identity(payload)
         email = identity.get("email") if identity else None
         verified = identity.get("verification") is True if identity else False
         if isinstance(email, str) and "@" in email and verified:
@@ -267,6 +437,8 @@ class ManagedAccounts:
         elif status == "connected":
             row.pop("error", None)
         if status == "connected":
+            if candidate_key is not None:
+                row["dedupKey"] = candidate_key
             operation = row.pop("operationID", None)
             if isinstance(operation, str):
                 self.surfaces.pop(operation, None)
@@ -279,10 +451,16 @@ class ManagedAccounts:
             rows = self._rows()
             row = next((item for item in rows if item.get("provider") == provider and item.get("operationID") == operation), None)
             if row is None:
-                completed = self._completed_operation_row(provider, operation, rows)
+                completed = self._completed_operation_result(provider, operation, rows)
                 if completed is None:
                     raise KeyError("oauth_operation_not_found")
-                return {"status": "connected", "connection": self.public(completed)}
+                return completed
+            if row.get("status") == "superseded":
+                result = self._superseded_result(row, rows)
+                if result is None:
+                    raise KeyError("oauth_operation_not_found")
+                return result
+            superseded_connection_id: Optional[str] = None
             if row.get("status") in PENDING:
                 if operation not in self.surfaces:
                     self._fail_pending(row, "The sign-in session was interrupted by a connector restart. Start sign-in again.")
@@ -299,6 +477,12 @@ class ManagedAccounts:
                                 prior.update(updated_surface)
                                 self.surfaces[operation] = prior
                         self._apply(row, payload)
+                        if row.get("status") == "connected":
+                            source_id = row.get("id")
+                            canonical = self._promote_duplicate(rows, row, payload, operation)
+                            if canonical is not None:
+                                row = canonical
+                                superseded_connection_id = source_id if isinstance(source_id, str) else None
                     except Exception:
                         # Do not leave a dead child looking pending forever.
                         self._fail_pending(row, "The managed sign-in process stopped. Start sign-in again.")
@@ -312,6 +496,8 @@ class ManagedAccounts:
                     result["resume"] = copy.deepcopy(surface)
             if row.get("status") == "connected":
                 result["connection"] = self.public(row)
+                if superseded_connection_id is not None:
+                    result["supersededConnectionID"] = superseded_connection_id
             if isinstance(row.get("error"), str):
                 result["error"] = row["error"]
             return result
@@ -322,6 +508,10 @@ class ManagedAccounts:
             row = next((item for item in rows if item.get("provider") == provider and item.get("operationID") == operation), None)
             if row is None:
                 return "notFound"
+            if row.get("status") == "superseded":
+                # A durable alias resolves a completed operation; a late UI
+                # cancel must not clobber its canonical connected account.
+                return "alreadyCompleted"
             try:
                 self._adapter(provider).cancel(self._profile(row), operation)
             except Exception:
@@ -352,7 +542,12 @@ class ManagedAccounts:
                 raise KeyError("connection_not_found")
             row["lastSyncAt"] = now_iso()
             try:
-                self._apply(row, self._adapter(provider).refresh(self._profile(row)))
+                payload = self._adapter(provider).refresh(self._profile(row))
+                self._apply(row, payload)
+                if row.get("status") == "connected":
+                    canonical = self._promote_duplicate(rows, row, payload, None)
+                    if canonical is not None:
+                        row = canonical
             except Exception:
                 row["status"] = "error"
                 row["error"] = "Could not refresh this managed account. Last successful usage is retained."
@@ -386,4 +581,4 @@ class ManagedAccounts:
     def snapshot(self) -> list[Dict[str, Any]]:
         with self.lock:
             rows = self._rows()
-            return [self.public(row) for row in rows if row.get("status") != "removed"]
+            return [self.public(row) for row in rows if row.get("status") not in {"removed", "superseded"}]
