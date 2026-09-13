@@ -416,10 +416,12 @@ def _usage_from_profile(profile_dir: Path) -> Dict[str, Any]:
         # changes the Google account's Code Assist setup, so a read-only usage
         # refresh must not perform it.  Avoid a misleading quota request that
         # the service rejects with 403 for the absent project/setup.
-        has_default_tier = any(isinstance(item, dict) and item.get("isDefault") is True for item in allowed_tiers)
+        default_tier = next((item for item in allowed_tiers if isinstance(item, dict) and item.get("isDefault") is True), None)
+        has_default_tier = default_tier is not None
+        default_requires_project = isinstance(default_tier, dict) and default_tier.get("userDefinedCloudaicompanionProject") is True
         return {
             "status": "unavailable",
-            "reason": "code_assist_onboarding_required" if has_default_tier else "google_cloud_project_required",
+            "reason": "code_assist_onboarding_required" if has_default_tier and not default_requires_project else "google_cloud_project_required",
             "source": "gemini_code_assist",
             "scope": "gemini_code_assist_request_quota",
             "quotas": [],

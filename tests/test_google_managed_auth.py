@@ -266,6 +266,15 @@ class GoogleManagedAuthTests(unittest.TestCase):
         self.assertEqual(usage, {"status": "unavailable", "reason": "code_assist_onboarding_required", "source": "gemini_code_assist", "scope": "gemini_code_assist_request_quota", "quotas": []})
         self.assertEqual([method for method, _, _ in calls], ["loadCodeAssist"])
 
+    def test_usage_requires_a_project_when_native_default_requires_one(self):
+        credential_dir = self.profile / ".gemini"
+        credential_dir.mkdir(parents=True)
+        (credential_dir / "oauth_creds.json").write_text(json.dumps({"access_token": "managed-token", "expiry_date": time.time() * 1000 + 3_600_000}), encoding="utf-8")
+        with patch.object(managed, "_code_assist_post", return_value={"allowedTiers": [{"id": "standard-tier", "isDefault": True, "userDefinedCloudaicompanionProject": True}]}) as post:
+            usage = managed._usage_from_profile(self.profile)
+        self.assertEqual(usage, {"status": "unavailable", "reason": "google_cloud_project_required", "source": "gemini_code_assist", "scope": "gemini_code_assist_request_quota", "quotas": []})
+        self.assertEqual(post.call_args.args[0], "loadCodeAssist")
+
     def test_remove_touches_only_known_managed_credential_files(self):
         gemini_dir = self.profile / ".gemini"
         gemini_dir.mkdir(parents=True)
