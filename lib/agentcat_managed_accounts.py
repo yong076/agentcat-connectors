@@ -60,6 +60,10 @@ class ManagedAccounts:
         self.pending_ttl_seconds = pending_ttl_seconds
         self.lock = threading.RLock()
         self.surfaces: Dict[str, Dict[str, str]] = {}
+        # A terminal OAuth status may be requested twice by a UI task that was
+        # resumed while its prior poll was completing.  Keep only the public
+        # row locator for the pending lease; never retain a login surface.
+        self.completed_operations: Dict[tuple[str, str], tuple[str, dt.datetime]] = {}
 
     def _rows(self) -> list[Dict[str, Any]]:
         try:
@@ -179,6 +183,29 @@ class ManagedAccounts:
             return True
         return (dt.datetime.now(dt.timezone.utc) - started).total_seconds() > self.pending_ttl_seconds
 
+    def _remember_completed_operation(self, provider: str, operation: str, row: Dict[str, Any]) -> None:
+        connection_id = row.get("id")
+        if not isinstance(connection_id, str) or len(connection_id) != 32:
+            return
+        self.completed_operations[(provider, operation)] = (
+            connection_id,
+            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=self.pending_ttl_seconds),
+        )
+
+    def _completed_operation_row(self, provider: str, operation: str, rows: list[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        remembered = self.completed_operations.get((provider, operation))
+        if remembered is None:
+            return None
+        connection_id, expires_at = remembered
+        if dt.datetime.now(dt.timezone.utc) > expires_at:
+            self.completed_operations.pop((provider, operation), None)
+            return None
+        row = next((item for item in rows if item.get("id") == connection_id), None)
+        if row is None or row.get("status") != "connected":
+            self.completed_operations.pop((provider, operation), None)
+            return None
+        return row
+
     def _fail_pending(self, row: Dict[str, Any], message: str) -> None:
         operation = row.pop("operationID", None)
         if isinstance(operation, str):
@@ -230,6 +257,7 @@ class ManagedAccounts:
             operation = row.pop("operationID", None)
             if isinstance(operation, str):
                 self.surfaces.pop(operation, None)
+                self._remember_completed_operation(str(row.get("provider") or ""), operation, row)
             row.pop("pendingStartedAt", None)
             row["lastSuccessfulSyncAt"] = now_iso()
 
@@ -238,7 +266,10 @@ class ManagedAccounts:
             rows = self._rows()
             row = next((item for item in rows if item.get("provider") == provider and item.get("operationID") == operation), None)
             if row is None:
-                raise KeyError("oauth_operation_not_found")
+                completed = self._completed_operation_row(provider, operation, rows)
+                if completed is None:
+                    raise KeyError("oauth_operation_not_found")
+                return {"status": "connected", "connection": self.public(completed)}
             if row.get("status") in PENDING:
                 if operation not in self.surfaces:
                     self._fail_pending(row, "The sign-in session was interrupted by a connector restart. Start sign-in again.")
@@ -324,6 +355,9 @@ class ManagedAccounts:
             operation = row.pop("operationID", None)
             if isinstance(operation, str):
                 self.surfaces.pop(operation, None)
+            for key, remembered in list(self.completed_operations.items()):
+                if key[0] == provider and remembered[0] == connection_id:
+                    self.completed_operations.pop(key, None)
             try:
                 self._adapter(provider).remove(self._profile(row))
             except Exception:

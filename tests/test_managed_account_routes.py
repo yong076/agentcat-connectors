@@ -146,7 +146,12 @@ class ManagedAccountRouteTests(unittest.TestCase):
         _, started = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
         self.adapter.connected.add(started["operationID"])
         _, connected = self.request(f"/v1/connections/kimi/oauth/{started['operationID']}")
+        # A second HTTP poll can race the UI task that consumed terminal state.
+        # It must return the bounded in-memory connected result, not a 404.
+        _, repeated = self.request(f"/v1/connections/kimi/oauth/{started['operationID']}")
         row = connected["connection"]
+        self.assertEqual(repeated["status"], "connected")
+        self.assertEqual(repeated["connection"]["id"], row["id"])
         self.assertEqual(row["usage"]["source"], "fixture")
         _, refreshed = self.request(f"/v1/connections/kimi/{row['id']}/refresh", body={}, method="POST")
         self.assertEqual(refreshed["connection"]["status"], "connected")

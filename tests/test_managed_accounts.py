@@ -61,6 +61,17 @@ class ManagedAccountsTests(unittest.TestCase):
         self.assertTrue(state["connection"]["identity"]["verification"])
         self.assertNotIn("operationID", state["connection"])
 
+    def test_completed_operation_is_idempotently_readable_for_the_live_lease(self):
+        started = self.accounts.start("fake", "My account", "device")
+        self.adapter.connected = True
+        first = self.accounts.status("fake", started["operationID"])
+        second = self.accounts.status("fake", started["operationID"])
+        self.assertEqual(first["status"], "connected")
+        self.assertEqual(second["status"], "connected")
+        self.assertEqual(second["connection"]["id"], first["connection"]["id"])
+        self.assertNotIn("operationID", second["connection"])
+        self.assertIn(("fake", started["operationID"]), self.accounts.completed_operations)
+
     def test_unverified_provider_exit_never_becomes_connected(self):
         started = self.accounts.start("fake", "My account", "device")
         self.adapter.connected = True
