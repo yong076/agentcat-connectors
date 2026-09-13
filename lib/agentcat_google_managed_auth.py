@@ -25,6 +25,7 @@ import urllib.error
 import time
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -48,12 +49,29 @@ _AUTH_ENV = (
     "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID",
     "GEMINI_OAUTH_CLIENT_ID", "GEMINI_OAUTH_CLIENT_SECRET",
 )
+_REFRESH_DIAGNOSTIC: ContextVar[Optional[list[Dict[str, Any]]]] = ContextVar(
+    "gemini_refresh_diagnostic", default=None
+)
 
 
 class GeminiManagedAuthError(RuntimeError):
     def __init__(self, message: str, reason: str = "sign_in_required"):
         super().__init__(message)
         self.reason = reason
+
+
+def _record_refresh_diagnostic(stage: str, **details: Any) -> None:
+    """Record only allowlisted local diagnostics during an explicit probe."""
+    events = _REFRESH_DIAGNOSTIC.get()
+    if events is None:
+        return
+    event: Dict[str, Any] = {"stage": stage}
+    for key, value in details.items():
+        if key == "httpStatus" and isinstance(value, int):
+            event[key] = value
+        elif key in {"outcome", "reason"} and isinstance(value, str):
+            event[key] = value
+    events.append(event)
 
 
 class _AcpSession:
@@ -317,6 +335,7 @@ def _oauth_client_credentials(creds: Dict[str, Any]) -> Tuple[str, str]:
     client_id = creds.get("client_id")
     client_secret = creds.get("client_secret")
     if isinstance(client_id, str) and client_id and isinstance(client_secret, str) and client_secret:
+        _record_refresh_diagnostic("oauth_metadata", outcome="credential_file")
         return client_id, client_secret
     executable = _gemini_executable()
     if executable:
@@ -344,7 +363,9 @@ def _oauth_client_credentials(creds: Dict[str, Any]) -> Tuple[str, str]:
                 found_id = _OAUTH_ID_RE.search(contents)
                 found_secret = _OAUTH_SECRET_RE.search(contents)
                 if found_id and found_secret:
+                    _record_refresh_diagnostic("oauth_metadata", outcome="installed_cli")
                     return found_id.group(1), found_secret.group(1)
+    _record_refresh_diagnostic("oauth_metadata", outcome="unavailable", reason="oauth_metadata_unavailable")
     raise GeminiManagedAuthError("Gemini CLI OAuth metadata is unavailable", "oauth_metadata_unavailable")
 
 
@@ -383,9 +404,11 @@ def _access_token(creds: Dict[str, Any], profile_dir: Optional[Path] = None) -> 
     expired = not isinstance(expiry, (int, float)) or time.time() * 1000 >= float(expiry) - 60_000
     token = creds.get("access_token")
     if not expired and isinstance(token, str) and token:
+        _record_refresh_diagnostic("access_token", outcome="cached")
         return token
     refresh_token = creds.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
+        _record_refresh_diagnostic("access_token", outcome="unavailable", reason="sign_in_required")
         raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", "sign_in_required")
     client_id, client_secret = _oauth_client_credentials(creds)
     body = urllib.parse.urlencode({
@@ -398,14 +421,19 @@ def _access_token(creds: Dict[str, Any], profile_dir: Optional[Path] = None) -> 
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         reason = _oauth_refresh_error_reason(error)
+        _record_refresh_diagnostic("token_exchange", outcome="failed", httpStatus=error.code, reason=reason)
         raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", reason) from error
     except OSError as error:
+        _record_refresh_diagnostic("token_exchange", outcome="failed", reason="token_refresh_unavailable")
         raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", "token_refresh_unavailable") from error
     if not isinstance(payload, dict):
+        _record_refresh_diagnostic("token_exchange", outcome="invalid_response", reason="token_refresh_invalid_response")
         raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", "token_refresh_invalid_response")
     updated = payload.get("access_token")
     if not isinstance(updated, str) or not updated:
+        _record_refresh_diagnostic("token_exchange", outcome="invalid_response", reason="token_refresh_invalid_response")
         raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", "token_refresh_invalid_response")
+    _record_refresh_diagnostic("token_exchange", outcome="refreshed")
     if profile_dir is not None:
         refreshed = dict(creds)
         refreshed.update(payload)
@@ -435,7 +463,9 @@ def _identity_from_managed_profile(profile_dir: Path) -> Dict[str, Any]:
     """
     creds = _managed_credentials(profile_dir)
     if not creds:
+        _record_refresh_diagnostic("managed_credentials", outcome="missing", reason="sign_in_required")
         return _identity_unavailable("sign_in_required")
+    _record_refresh_diagnostic("managed_credentials", outcome="present")
     try:
         token = _access_token(creds, profile_dir)
         request = urllib.request.Request(
@@ -445,9 +475,17 @@ def _identity_from_managed_profile(profile_dir: Path) -> Dict[str, Any]:
         with urllib.request.urlopen(request, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except GeminiManagedAuthError as error:
+        _record_refresh_diagnostic("userinfo", outcome="unavailable", reason=error.reason)
         return _identity_unavailable(error.reason)
+    except urllib.error.HTTPError as error:
+        _record_refresh_diagnostic("userinfo", outcome="failed", httpStatus=error.code)
+        return _identity_unavailable(
+            "sign_in_required" if error.code == 401 else "userinfo_unavailable"
+        )
     except Exception:
+        _record_refresh_diagnostic("userinfo", outcome="failed")
         return _identity_unavailable("userinfo_unavailable")
+    _record_refresh_diagnostic("userinfo", outcome="received")
     email = payload.get("email") if isinstance(payload, dict) else None
     verified = payload.get("verified_email") if isinstance(payload, dict) else None
     if not isinstance(email, str) or not _EMAIL_RE.fullmatch(email):
@@ -562,8 +600,16 @@ def _code_assist_post(method: str, payload: Dict[str, Any], access_token: str) -
         f"{GEMINI_CODE_ASSIST_URL}:{method}", data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json", "Content-Type": "application/json", "User-Agent": "AgentCat/1.0"},
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        value = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            value = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        _record_refresh_diagnostic("code_assist_" + method, outcome="failed", httpStatus=error.code)
+        raise
+    except OSError:
+        _record_refresh_diagnostic("code_assist_" + method, outcome="failed")
+        raise
+    _record_refresh_diagnostic("code_assist_" + method, outcome="received")
     return value if isinstance(value, dict) else {}
 
 
@@ -656,16 +702,68 @@ def refresh(profile_dir: Path) -> Dict[str, Any]:
             "usage": _unavailable_usage("sign_in_required"),
         }
     identity = _identity_from_managed_profile(profile_dir)
+    if "identity" not in identity:
+        # A managed credential file alone is not authentication proof.  A
+        # verified Google userinfo response is required before the registry can
+        # keep this account connected or associate usage with it.
+        status = identity.get("identityStatus")
+        reason = status.get("reason") if isinstance(status, dict) else "sign_in_required"
+        return {"status": "needs_reconnect", **identity, "usage": _unavailable_usage(reason)}
     try:
         usage = _usage_from_profile(profile_dir)
-    except GeminiManagedAuthError:
-        return {"status": "needs_reconnect", **identity, "usage": _unavailable_usage("sign_in_required")}
+    except GeminiManagedAuthError as error:
+        # Preserve the specific, allowlisted refresh failure instead of
+        # replacing it with a generic sign-in message.
+        if "identity" not in identity:
+            identity = _identity_unavailable(error.reason)
+        return {"status": "needs_reconnect", **identity, "usage": _unavailable_usage(error.reason)}
     except Exception:
         # Usage access and account authentication are separate provider
         # capabilities.  Do not discard a verified managed login merely
         # because the Code Assist quota endpoint is temporarily unavailable.
         return {"status": "connected", "authenticated": True, **identity, "usage": _unavailable_usage("usage_unavailable")}
     return {"status": "connected", "authenticated": True, **identity, "usage": usage}
+
+
+def diagnose_refresh(profile_dir: Path) -> Dict[str, Any]:
+    """Run the normal refresh path with a deliberately redacted stage trace.
+
+    This is for a one-shot operator diagnosis only.  It calls :func:`refresh`,
+    so any valid Google refresh-token successor follows the ordinary atomic
+    native-credential persistence path.  Its return value intentionally omits
+    profile paths, identity, tokens, response bodies, and request URLs.
+    """
+    events: list[Dict[str, Any]] = []
+    reset = _REFRESH_DIAGNOSTIC.set(events)
+    try:
+        result = refresh(Path(profile_dir))
+    except Exception:
+        _record_refresh_diagnostic("refresh", outcome="failed")
+        result = {"status": "error"}
+    finally:
+        _REFRESH_DIAGNOSTIC.reset(reset)
+
+    status = result.get("status")
+    diagnostic: Dict[str, Any] = {
+        "status": status if status in {"connected", "needs_reconnect", "error"} else "error",
+        "authenticated": result.get("authenticated") is True,
+        "events": events,
+    }
+    identity_status = result.get("identityStatus")
+    if isinstance(identity_status, dict):
+        identity_reason = identity_status.get("reason")
+        diagnostic["identityStatus"] = {
+            "status": "unavailable",
+            **({"reason": identity_reason} if isinstance(identity_reason, str) else {}),
+        }
+    usage = result.get("usage")
+    if isinstance(usage, dict):
+        diagnostic["usage"] = {
+            key: usage[key]
+            for key in ("freshness", "reason")
+            if isinstance(usage.get(key), str)
+        }
+    return diagnostic
 
 
 def remove(profile_dir: Path) -> None:
