@@ -113,7 +113,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
         original_home = os.environ.get("HOME")
         with patch.object(managed.shutil, "which", return_value="/fake/gemini"), \
              patch.object(managed.subprocess, "Popen", _FakePopen), \
-             patch.object(managed, "refresh", return_value={"status": "connected", "identity": {"status": "available", "email": "managed.user@example.com", "verification": True, "source": "google_userinfo"}, "usage": {"status": "available", "quotas": []}}):
+             patch.object(managed, "refresh", return_value={"status": "connected", "identity": {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"}, "usage": {"status": "available", "quotas": []}}):
             started = managed.start(self.profile, "browser")
             self.assertEqual(started["status"], "pending_browser")
             self.assertEqual(started["browserLaunchMode"], "provider")
@@ -169,7 +169,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
             result = managed.refresh(self.profile)
         self.assertEqual(result["status"], "connected")
         self.assertTrue(result["authenticated"])
-        self.assertEqual(result["identity"], {"status": "available", "email": "managed.user@example.com", "verification": True, "source": "google_userinfo"})
+        self.assertEqual(result["identity"], {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"})
         self.assertEqual(result["usage"]["scope"], "gemini_code_assist_request_quota")
         self.assertEqual(result["usage"]["quotas"][0]["remainingPercent"], 75.0)
         self.assertEqual(calls[0].get_header("Authorization"), "Bearer managed-token")
@@ -178,7 +178,8 @@ class GoogleManagedAuthTests(unittest.TestCase):
     def test_missing_managed_auth_is_unknown_not_zero(self):
         result = managed.refresh(self.profile)
         self.assertEqual(result["status"], "needs_reconnect")
-        self.assertEqual(result["identity"], {"status": "unavailable", "email": None, "verification": False, "source": None, "reason": "sign_in_required"})
+        self.assertNotIn("identity", result)
+        self.assertEqual(result["identityStatus"], {"status": "unavailable", "reason": "sign_in_required"})
         self.assertEqual(result["usage"], {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []})
 
     def test_missing_userinfo_email_is_explicitly_unavailable(self):
@@ -189,7 +190,8 @@ class GoogleManagedAuthTests(unittest.TestCase):
              patch.object(managed, "_usage_from_profile", return_value={"status": "available", "quotas": []}):
             result = managed.refresh(self.profile)
         self.assertEqual(result["status"], "connected")
-        self.assertEqual(result["identity"], {"status": "unavailable", "email": None, "verification": False, "source": None, "reason": "email_not_available"})
+        self.assertNotIn("identity", result)
+        self.assertEqual(result["identityStatus"], {"status": "unavailable", "reason": "email_not_available"})
 
     def test_remove_touches_only_known_managed_credential_files(self):
         gemini_dir = self.profile / ".gemini"

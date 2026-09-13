@@ -248,11 +248,13 @@ def poll(profile_dir: Path, operation_id: str) -> Dict[str, Any]:
     refreshed = refresh(managed_profile)
     usage = refreshed.get("usage") if isinstance(refreshed, dict) else None
     identity = refreshed.get("identity") if isinstance(refreshed, dict) else None
+    identity_status = refreshed.get("identityStatus") if isinstance(refreshed, dict) else None
     return {
         "status": "connected",
         "authenticated": True,
         **({"usage": usage} if isinstance(usage, dict) else {}),
         **({"identity": identity} if isinstance(identity, dict) else {}),
+        **({"identityStatus": identity_status} if isinstance(identity_status, dict) else {}),
     }
 
 
@@ -338,11 +340,7 @@ def _access_token(creds: Dict[str, Any]) -> str:
 
 def _identity_unavailable(reason: str) -> Dict[str, Any]:
     return {
-        "status": "unavailable",
-        "email": None,
-        "verification": False,
-        "source": None,
-        "reason": reason,
+        "identityStatus": {"status": "unavailable", "reason": reason},
     }
 
 
@@ -373,10 +371,11 @@ def _identity_from_managed_profile(profile_dir: Path) -> Dict[str, Any]:
     if verified is not True:
         return _identity_unavailable("email_not_verified")
     return {
-        "status": "available",
-        "email": email,
-        "verification": True,
-        "source": "google_userinfo",
+        "identity": {
+            "email": email,
+            "verification": True,
+            "source": "google_userinfo",
+        },
     }
 
 
@@ -435,7 +434,7 @@ def refresh(profile_dir: Path) -> Dict[str, Any]:
     if not _has_managed_authentication(profile_dir):
         return {
             "status": "needs_reconnect",
-            "identity": _identity_unavailable("sign_in_required"),
+            **_identity_unavailable("sign_in_required"),
             "usage": {
                 "status": "unavailable",
                 "reason": "sign_in_required",
@@ -447,10 +446,10 @@ def refresh(profile_dir: Path) -> Dict[str, Any]:
     try:
         usage = _usage_from_profile(profile_dir)
     except GeminiManagedAuthError:
-        return {"status": "needs_reconnect", "identity": identity, "usage": {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []}}
+        return {"status": "needs_reconnect", **identity, "usage": {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []}}
     except Exception:
-        return {"status": "error", "identity": identity, "usage": {"status": "unavailable", "reason": "usage_unavailable", "scope": "gemini_code_assist_request_quota", "quotas": []}}
-    return {"status": "connected", "authenticated": True, "identity": identity, "usage": usage}
+        return {"status": "error", **identity, "usage": {"status": "unavailable", "reason": "usage_unavailable", "scope": "gemini_code_assist_request_quota", "quotas": []}}
+    return {"status": "connected", "authenticated": True, **identity, "usage": usage}
 
 
 def remove(profile_dir: Path) -> None:
