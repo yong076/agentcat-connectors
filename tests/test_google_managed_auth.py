@@ -167,6 +167,46 @@ class GoogleManagedAuthTests(unittest.TestCase):
         with patch.dict(os.environ, {"AGENTCAT_GEMINI_CLI": "", "HOME": self.tmp.name, "PATH": ""}):
             self.assertEqual(managed._gemini_executable(), str(executable))
 
+    def test_oauth_metadata_resolves_from_homebrew_realpath_bundle(self):
+        bundle = Path(self.tmp.name) / "cellar" / "gemini-cli" / "bundle"
+        bundle.mkdir(parents=True)
+        target = bundle / "gemini.js"
+        target.write_text('var OAUTH_CLIENT_ID = "fixture-client"; var OAUTH_CLIENT_SECRET = "fixture-secret";', encoding="utf-8")
+        wrapper = Path(self.tmp.name) / "bin" / "gemini"
+        wrapper.parent.mkdir()
+        wrapper.symlink_to(target)
+        with patch.object(managed, "_gemini_executable", return_value=str(wrapper)):
+            self.assertEqual(managed._oauth_client_credentials({}), ("fixture-client", "fixture-secret"))
+
+    def test_expired_refresh_persists_native_format_and_reuses_it(self):
+        bundle = Path(self.tmp.name) / "cellar" / "gemini-cli" / "bundle"
+        bundle.mkdir(parents=True)
+        target = bundle / "gemini.js"
+        target.write_text('var OAUTH_CLIENT_ID = "fixture-client"; var OAUTH_CLIENT_SECRET = "fixture-secret";', encoding="utf-8")
+        wrapper = Path(self.tmp.name) / "bin" / "gemini"
+        wrapper.parent.mkdir()
+        wrapper.symlink_to(target)
+        credentials_path = self.profile / ".gemini" / "oauth_creds.json"
+        credentials_path.parent.mkdir(parents=True)
+        credentials_path.write_text(json.dumps({"access_token": "expired", "refresh_token": "durable-refresh", "expiry_date": 0}), encoding="utf-8")
+        responses = iter((
+            _Response({"access_token": "refreshed-one", "expires_in": 3600}),
+            _Response({"access_token": "refreshed-two", "expires_in": 3600}),
+        ))
+        with patch.object(managed, "_gemini_executable", return_value=str(wrapper)), \
+             patch.object(managed.urllib.request, "urlopen", side_effect=lambda request, timeout: next(responses)):
+            first = managed._access_token(managed._managed_credentials(self.profile), self.profile)
+            persisted = managed._managed_credentials(self.profile)
+            persisted["expiry_date"] = 0
+            credentials_path.write_text(json.dumps(persisted), encoding="utf-8")
+            second = managed._access_token(managed._managed_credentials(self.profile), self.profile)
+        saved = managed._managed_credentials(self.profile)
+        self.assertEqual((first, second), ("refreshed-one", "refreshed-two"))
+        self.assertEqual(saved["access_token"], "refreshed-two")
+        self.assertEqual(saved["refresh_token"], "durable-refresh")
+        self.assertIsInstance(saved["expiry_date"], int)
+        self.assertEqual(credentials_path.stat().st_mode & 0o777, 0o600)
+
     def test_acp_setup_error_keeps_a_profile_connected_only_after_verified_refresh(self):
         with patch.object(managed.shutil, "which", return_value="/fake/gemini"), \
              patch.object(managed.subprocess, "Popen", _FakePopen), \

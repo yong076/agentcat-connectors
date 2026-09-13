@@ -278,12 +278,16 @@ def cancel(profile_dir: Path, operation_id: str) -> str:
 
 
 def _managed_credentials(profile_dir: Path) -> Optional[Dict[str, Any]]:
-    path = profile_dir / ".gemini" / "oauth_creds.json"
+    path = _managed_credentials_path(profile_dir)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _managed_credentials_path(profile_dir: Path) -> Path:
+    return Path(profile_dir) / ".gemini" / "oauth_creds.json"
 
 
 def _has_managed_authentication(profile_dir: Path) -> bool:
@@ -305,11 +309,19 @@ def _oauth_client_credentials(creds: Dict[str, Any]) -> Tuple[str, str]:
     executable = _gemini_executable()
     if executable:
         resolved = Path(executable).resolve()
-        candidates = (
+        candidates = []
+        # Homebrew's gemini executable resolves directly to
+        # ``.../@google/gemini-cli/bundle/gemini.js``.  Prefer that exact
+        # installed bundle before considering wrapper-oriented layouts.
+        if resolved.parent.name == "bundle":
+            candidates.append(resolved.parent)
+        candidates.extend((
+            resolved.parent / "bundle",
+            resolved.parent.parent / "bundle",
             resolved.parent.parent / "libexec" / "lib" / "node_modules" / "@google" / "gemini-cli" / "bundle",
             resolved.parent.parent / "lib" / "node_modules" / "@google" / "gemini-cli" / "bundle",
-        )
-        for bundle_dir in candidates:
+        ))
+        for bundle_dir in dict.fromkeys(candidates):
             if not bundle_dir.is_dir():
                 continue
             for source in sorted(bundle_dir.glob("*.js")):
@@ -324,7 +336,25 @@ def _oauth_client_credentials(creds: Dict[str, Any]) -> Tuple[str, str]:
     raise GeminiManagedAuthError("Gemini CLI OAuth metadata is unavailable")
 
 
-def _access_token(creds: Dict[str, Any]) -> str:
+def _persist_refreshed_credentials(profile_dir: Path, credentials: Dict[str, Any]) -> None:
+    """Mirror Gemini CLI's managed oauth_creds.json update after refresh."""
+    path = _managed_credentials_path(profile_dir)
+    temporary = path.with_name(path.name + ".tmp-" + secrets.token_hex(8))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(credentials, indent=2) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(path)
+        path.chmod(0o600)
+    except OSError as error:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise GeminiManagedAuthError("Gemini managed credentials could not be updated") from error
+
+
+def _access_token(creds: Dict[str, Any], profile_dir: Optional[Path] = None) -> str:
     expiry = creds.get("expiry_date")
     expired = not isinstance(expiry, (int, float)) or time.time() * 1000 >= float(expiry) - 60_000
     token = creds.get("access_token")
@@ -341,9 +371,22 @@ def _access_token(creds: Dict[str, Any]) -> str:
     request = urllib.request.Request(GEMINI_OAUTH_TOKEN_URL, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(request, timeout=10) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    updated = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        raise GeminiManagedAuthError("Gemini sign-in needs to be renewed")
+    updated = payload.get("access_token")
     if not isinstance(updated, str) or not updated:
         raise GeminiManagedAuthError("Gemini sign-in needs to be renewed")
+    if profile_dir is not None:
+        refreshed = dict(creds)
+        refreshed.update(payload)
+        # Google refresh responses commonly omit the durable refresh token;
+        # the Gemini CLI's OAuth client retains it before writing credentials.
+        refreshed["refresh_token"] = payload.get("refresh_token") if isinstance(payload.get("refresh_token"), str) and payload.get("refresh_token") else refresh_token
+        expires_in = payload.get("expires_in") if isinstance(payload, dict) else None
+        if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+            refreshed["expiry_date"] = int(time.time() * 1000 + float(expires_in) * 1000)
+            refreshed.pop("expires_in", None)
+        _persist_refreshed_credentials(Path(profile_dir), refreshed)
     return updated
 
 
@@ -364,7 +407,7 @@ def _identity_from_managed_profile(profile_dir: Path) -> Dict[str, Any]:
     if not creds:
         return _identity_unavailable("sign_in_required")
     try:
-        token = _access_token(creds)
+        token = _access_token(creds, profile_dir)
         request = urllib.request.Request(
             GOOGLE_USERINFO_URL,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -418,7 +461,7 @@ def _usage_from_profile(profile_dir: Path) -> Dict[str, Any]:
     creds = _managed_credentials(profile_dir)
     if not creds:
         return _unavailable_usage("sign_in_required")
-    token = _access_token(creds)
+    token = _access_token(creds, profile_dir)
     metadata = {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}
     try:
         tier = _code_assist_post("loadCodeAssist", {"metadata": metadata}, token)
