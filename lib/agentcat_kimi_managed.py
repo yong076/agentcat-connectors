@@ -37,6 +37,8 @@ _USERINFO_URL = "https://api.kimi.com/coding/v1/me"
 _TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 _CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 _BINDING_NAME = ".agentcat-kimi-binding.json"
+_NATIVE_CREDENTIAL_NAME = "kimi-code.json"
+_REAUTH_BACKUP_PREFIX = ".agentcat-kimi-reauth-"
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _FALLBACK_PATH = ":".join((
     str(Path.home() / ".local/bin"),
@@ -302,6 +304,95 @@ def _private_replace(path: Path, data: bytes) -> bool:
         return False
 
 
+def _native_credential_path(profile_dir: Path) -> Path:
+    """The one token file used by Kimi Code's native OAuth token manager."""
+    return Path(profile_dir) / "credentials" / _NATIVE_CREDENTIAL_NAME
+
+
+def _reauth_backups(profile_dir: Path) -> list[Path]:
+    """Return only our hidden, per-operation backups in this private profile."""
+    directory = _native_credential_path(profile_dir).parent
+    try:
+        return sorted(
+            (path for path in directory.glob(_REAUTH_BACKUP_PREFIX + "*" + _NATIVE_CREDENTIAL_NAME + ".bak") if path.is_file()),
+            key=lambda path: path.name,
+        )
+    except OSError:
+        return []
+
+
+def _recover_interrupted_reauth(profile_dir: Path) -> bool:
+    """Recover a sole staged native credential without replacing a successor.
+
+    A crash can leave the source absent with its hidden staged copy present.  We
+    restore only the unambiguous one-backup case.  If a newer native credential
+    exists, or more than one old copy survived, we leave every file untouched.
+    """
+    source = _native_credential_path(profile_dir)
+    if source.exists():
+        return True
+    backups = _reauth_backups(profile_dir)
+    if len(backups) != 1:
+        return not backups
+    try:
+        backups[0].replace(source)
+        source.chmod(0o600)
+        return True
+    except OSError:
+        return False
+
+
+def _stage_native_reauth(profile_dir: Path, operation_id: str) -> Optional[Tuple[Path, Path]]:
+    """Hide the existing native token so `kimi login` emits device auth.
+
+    Kimi 0.39.1 silently refreshes an existing token instead of presenting a
+    device surface.  This moves only the deterministic private token file, and
+    keeps it until the replacement has been authenticated by the provider.
+    """
+    if not _recover_interrupted_reauth(profile_dir):
+        return None
+    source = _native_credential_path(profile_dir)
+    if not source.is_file():
+        return ()
+    backup = source.with_name(_REAUTH_BACKUP_PREFIX + operation_id + "-" + _NATIVE_CREDENTIAL_NAME + ".bak")
+    try:
+        source.replace(backup)
+        backup.chmod(0o600)
+        return source, backup
+    except OSError:
+        return None
+
+
+def _restore_staged_reauth(staged: Any) -> None:
+    """Restore the approved credential without overwriting a possible successor."""
+    if not (isinstance(staged, tuple) and len(staged) == 2 and all(isinstance(item, Path) for item in staged)):
+        return
+    source, backup = staged
+    if not backup.exists():
+        return
+    try:
+        if source.exists():
+            successor = source.with_name(_REAUTH_BACKUP_PREFIX + uuid.uuid4().hex + "-unverified-" + _NATIVE_CREDENTIAL_NAME + ".bak")
+            source.replace(successor)
+            successor.chmod(0o600)
+        backup.replace(source)
+        source.chmod(0o600)
+    except OSError:
+        # Leave both private files in place for a later safe recovery; never
+        # overwrite an unknown current credential.
+        return
+
+
+def _commit_staged_reauth(staged: Any) -> None:
+    """Discard our old-token backup only after the successor is authenticated."""
+    if not (isinstance(staged, tuple) and len(staged) == 2 and isinstance(staged[1], Path)):
+        return
+    try:
+        staged[1].unlink()
+    except OSError:
+        pass
+
+
 def _persist_refreshed_credential(selected: Dict[str, Any], response: Any) -> Optional[Path]:
     """Atomically preserve a native-format rotating refresh response privately."""
     if not isinstance(response, dict):
@@ -473,11 +564,15 @@ def start(profile_dir: Path, mode: str) -> Dict[str, Any]:
     operation_id = uuid.uuid4().hex
     # Snapshot before spawning: a zero exit alone never proves this login changed auth.
     before = {item["fingerprint"] for item in _credential_candidates(profile_dir)}
+    staged = _stage_native_reauth(profile_dir, operation_id)
+    if staged is None:
+        return {"status": "failed", "error": "kimi_login_start_failed"}
     try:
         process = subprocess.Popen([str(_executable()), "login"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=_environment(profile_dir))
     except OSError:
+        _restore_staged_reauth(staged)
         return {"status": "failed", "error": "kimi_login_start_failed"}
-    operation = {"process": process, "surface": {}, "surface_ready": threading.Event(), "profile": profile_dir, "before": before}
+    operation = {"process": process, "surface": {}, "surface_ready": threading.Event(), "profile": profile_dir, "before": before, "staged": staged}
     with _LOCK:
         _OPERATIONS[operation_id] = operation
     assert process.stdout is not None
@@ -511,7 +606,9 @@ def poll(profile_dir: Path, operation_id: str) -> Dict[str, Any]:
     # steps.  A nonzero CLI exit is therefore not decisive when this operation
     # wrote a changed credential that the provider subsequently authenticates.
     if verified is not None:
+        _commit_staged_reauth(operation.get("staged"))
         return {"status": "connected", "authenticated": True, **verified}
+    _restore_staged_reauth(operation.get("staged"))
     if code != 0:
         return {"status": "failed", "error": "kimi_login_failed"}
     return {"status": "failed", "error": "kimi_auth_state_not_updated"}
@@ -530,6 +627,7 @@ def cancel(profile_dir: Path, operation_id: str) -> str:
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             process.kill()
+    _restore_staged_reauth(operation.get("staged"))
     return "canceled"
 
 

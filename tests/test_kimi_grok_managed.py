@@ -166,6 +166,105 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
             result = kimi.poll(profile, started["operationID"])
         self.assertEqual(result, {"status": "failed", "error": "kimi_auth_state_not_updated"})
         request.assert_not_called()
+        self.assertTrue((credentials / "kimi-code.json").is_file())
+        self.assertEqual(kimi._reauth_backups(profile), [])
+
+    def test_kimi_reauth_stages_existing_native_token_and_commits_verified_successor(self):
+        profile = Path(self.tmp.name) / "kimi-reauth-success"
+        credentials = profile / "credentials"
+        credentials.mkdir(parents=True)
+        native = credentials / "kimi-code.json"
+        native.write_text('{"access_token":"old-secret","expires_at":4102444800}', encoding="utf-8")
+        process = FakeProcess('{"verification_uri":"https://auth.kimi.com/device","user_code":"ABCD-1234"}\n')
+        usage = '{"limits":[{"detail":{"used":1,"limit":2}}]}'
+        with patch.object(kimi, "_executable", return_value="/test/kimi"), \
+             patch.object(kimi.subprocess, "run", return_value=Mock(returncode=0)), \
+             patch.object(kimi.subprocess, "Popen", return_value=process), \
+             patch.object(kimi, "urlopen", side_effect=[FakeResponse(usage), FakeResponse('{"user_id":"account-new"}')]):
+            started = kimi.start(profile, "device")
+            self.assertEqual(started["status"], "pending_device")
+            self.assertFalse(native.exists())
+            backups = kimi._reauth_backups(profile)
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+            native.write_text('{"access_token":"new-secret","expires_at":2208988800}', encoding="utf-8")
+            process.code = 0
+            result = kimi.poll(profile, started["operationID"])
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(json.loads(native.read_text(encoding="utf-8"))["access_token"], "new-secret")
+        self.assertEqual(kimi._reauth_backups(profile), [])
+        self.assertNotIn("old-secret", str(result))
+        self.assertNotIn("new-secret", str(result))
+
+    def test_kimi_reauth_cancel_restores_existing_native_token(self):
+        profile = Path(self.tmp.name) / "kimi-reauth-cancel"
+        credentials = profile / "credentials"
+        credentials.mkdir(parents=True)
+        native = credentials / "kimi-code.json"
+        original = b'{"access_token":"old-secret","expires_at":4102444800}'
+        native.write_bytes(original)
+        process = FakeProcess('{"verification_uri":"https://auth.kimi.com/device","user_code":"ABCD-1234"}\n')
+        with patch.object(kimi, "_executable", return_value="/test/kimi"), \
+             patch.object(kimi.subprocess, "run", return_value=Mock(returncode=0)), \
+             patch.object(kimi.subprocess, "Popen", return_value=process):
+            started = kimi.start(profile, "device")
+            self.assertFalse(native.exists())
+            self.assertEqual(kimi.cancel(profile, started["operationID"]), "canceled")
+        self.assertEqual(native.read_bytes(), original)
+        self.assertEqual(native.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(kimi._reauth_backups(profile), [])
+
+    def test_kimi_reauth_spawn_failure_restores_existing_native_token(self):
+        profile = Path(self.tmp.name) / "kimi-reauth-spawn-failure"
+        credentials = profile / "credentials"
+        credentials.mkdir(parents=True)
+        native = credentials / "kimi-code.json"
+        original = b'{"access_token":"old-secret","expires_at":4102444800}'
+        native.write_bytes(original)
+        with patch.object(kimi, "_executable", return_value="/test/kimi"), \
+             patch.object(kimi.subprocess, "run", return_value=Mock(returncode=0)), \
+             patch.object(kimi.subprocess, "Popen", side_effect=OSError("unavailable")):
+            result = kimi.start(profile, "device")
+        self.assertEqual(result, {"status": "failed", "error": "kimi_login_start_failed"})
+        self.assertEqual(native.read_bytes(), original)
+        self.assertEqual(kimi._reauth_backups(profile), [])
+
+    def test_kimi_reauth_preserves_interrupted_backup_without_overwriting_current_token(self):
+        profile = Path(self.tmp.name) / "kimi-reauth-interrupted"
+        credentials = profile / "credentials"
+        credentials.mkdir(parents=True)
+        native = credentials / "kimi-code.json"
+        native.write_bytes(b'{"access_token":"current-secret","expires_at":4102444800}')
+        interrupted = credentials / (kimi._REAUTH_BACKUP_PREFIX + "interrupted-kimi-code.json.bak")
+        interrupted.write_bytes(b'{"access_token":"older-secret","expires_at":4102444800}')
+        process = FakeProcess('{"verification_uri":"https://auth.kimi.com/device","user_code":"ABCD-1234"}\n')
+        with patch.object(kimi, "_executable", return_value="/test/kimi"), \
+             patch.object(kimi.subprocess, "run", return_value=Mock(returncode=0)), \
+             patch.object(kimi.subprocess, "Popen", return_value=process):
+            started = kimi.start(profile, "device")
+            self.assertEqual(kimi.cancel(profile, started["operationID"]), "canceled")
+        self.assertIn(b"current-secret", native.read_bytes())
+        self.assertIn(b"older-secret", interrupted.read_bytes())
+
+    def test_kimi_reauth_network_proof_failure_restores_old_and_preserves_successor(self):
+        profile = Path(self.tmp.name) / "kimi-reauth-unverified-successor"
+        credentials = profile / "credentials"
+        credentials.mkdir(parents=True)
+        native = credentials / "kimi-code.json"
+        native.write_bytes(b'{"access_token":"old-secret","expires_at":4102444800}')
+        process = FakeProcess('{"verification_uri":"https://auth.kimi.com/device","user_code":"ABCD-1234"}\n')
+        with patch.object(kimi, "_executable", return_value="/test/kimi"), \
+             patch.object(kimi.subprocess, "run", return_value=Mock(returncode=0)), \
+             patch.object(kimi.subprocess, "Popen", return_value=process), \
+             patch.object(kimi, "urlopen", side_effect=OSError("offline")):
+            started = kimi.start(profile, "device")
+            native.write_bytes(b'{"access_token":"new-secret","expires_at":2208988800}')
+            process.code = 0
+            result = kimi.poll(profile, started["operationID"])
+        self.assertEqual(result, {"status": "failed", "error": "kimi_auth_state_not_updated"})
+        self.assertIn(b"old-secret", native.read_bytes())
+        preserved = [path for path in kimi._reauth_backups(profile) if b"new-secret" in path.read_bytes()]
+        self.assertEqual(len(preserved), 1)
 
     def test_kimi_nonzero_exit_connects_only_after_changed_server_authenticated_credential(self):
         profile = Path(self.tmp.name) / "kimi-post-login-provisioning"
