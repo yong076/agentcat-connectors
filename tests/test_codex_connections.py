@@ -1,4 +1,5 @@
 import importlib.util
+import base64
 import json
 import tempfile
 import threading
@@ -29,6 +30,8 @@ class FakeCodexAppServer:
     accounts = {}
     attempts = {}
     fail_logout = False
+    instances = []
+    fail_promotion_for = set()
     usage_payload = {
         "primary": {"usedPercent": 31, "windowDurationMins": 300, "resetsAt": 1_800_000_000},
         "secondary": {"usedPercent": 8, "windowDurationMins": 10080, "resetsAt": 1_800_500_000},
@@ -41,6 +44,7 @@ class FakeCodexAppServer:
         self.closed = False
         self.generation = 1
         self.alive = True
+        self.instances.append(self)
 
     def is_alive(self):
         return self.alive
@@ -58,6 +62,8 @@ class FakeCodexAppServer:
         return login
 
     def account(self):
+        if self.connection_id in self.fail_promotion_for:
+            return None
         return self.accounts.get(self.connection_id)
 
     def usage(self):
@@ -99,6 +105,8 @@ class CodexConnectionsTests(unittest.TestCase):
         FakeCodexAppServer.accounts = {}
         FakeCodexAppServer.attempts = {}
         FakeCodexAppServer.fail_logout = False
+        FakeCodexAppServer.instances = []
+        FakeCodexAppServer.fail_promotion_for = set()
         assert_sandboxed(agentcat, self.home, self.agentcat_home)
 
     def tearDown(self):
@@ -111,6 +119,24 @@ class CodexConnectionsTests(unittest.TestCase):
     def _start(self, mode="browser"):
         with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
             return agentcat.codex_start_oauth("Personal", mode)
+
+    def _write_managed_auth(self, row, account="account-a", user="user-a", membership=None):
+        def token(payload):
+            encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+            return "fixture." + encoded + ".fixture"
+        auth_claims = {"chatgpt_account_id": account, "chatgpt_user_id": user}
+        access_claims = {"chatgpt_account_id": account}
+        if membership:
+            access_claims["chatgpt_account_user_id"] = membership
+        profile = agentcat._codex_profile_dir(row["id"])
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / "auth.json").write_text(json.dumps({"tokens": {"account_id": account, "id_token": token({"https://api.openai.com/auth": auth_claims}), "access_token": token({"https://api.openai.com/auth": access_claims})}}))
+
+    def _connect_with_native_identity(self, started, account="account-a", user="user-a", membership=None):
+        row = next(item for item in agentcat._codex_connections() if item.get("operationID") == started["operationID"])
+        self._write_managed_auth(row, account, user, membership)
+        FakeCodexAppServer.accounts[row["id"]] = {"email": f"{row['id']}@example.invalid", "planType": "pro"}
+        return agentcat.codex_oauth_status(started["operationID"]), row
 
     def test_pending_then_connected_normalizes_native_windows_and_token_activity(self):
         started = self._start()
@@ -369,6 +395,74 @@ class CodexConnectionsTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertNotIn(row["id"], agentcat._CODEX_APP_SERVERS)
         self.assertIn("interrupted", result["error"])
+
+    def test_same_managed_codex_member_promotes_new_profile_and_keeps_durable_alias(self):
+        with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
+            first, canonical_row = self._connect_with_native_identity(self._start(), membership="member-a")
+            second_start = self._start()
+            second, incoming_row = self._connect_with_native_identity(second_start, membership="member-a")
+        self.assertEqual(first["status"], "connected")
+        self.assertEqual(second["status"], "connected")
+        self.assertEqual(second["connection"]["id"], canonical_row["id"])
+        self.assertEqual(second["supersededConnectionID"], incoming_row["id"])
+        rows = agentcat._codex_connections()
+        source = next(row for row in rows if row["id"] == incoming_row["id"])
+        self.assertEqual(source["status"], "superseded")
+        self.assertEqual(source["supersededBy"], canonical_row["id"])
+        self.assertEqual((agentcat._codex_profile_dir(canonical_row["id"]) / "auth.json").read_bytes(), (agentcat._codex_profile_dir(incoming_row["id"]) / "auth.json").read_bytes())
+        # A new daemon has no in-memory lease but resolves the durable source
+        # operation alias to the canonical row without guessing by email.
+        agentcat._CODEX_COMPLETED_OPERATIONS.clear()
+        repeated = agentcat.codex_oauth_status(second_start["operationID"])
+        self.assertEqual(repeated["connection"]["id"], canonical_row["id"])
+        self.assertEqual(repeated["supersededConnectionID"], incoming_row["id"])
+        self.assertEqual(len(agentcat.codex_connections_snapshot()), 1)
+        stored = agentcat.CODEX_CONNECTIONS_FILE.read_text()
+        self.assertNotIn("member-a", stored)
+        self.assertNotIn("account-a", stored)
+
+    def test_managed_codex_membership_or_person_difference_never_merges(self):
+        with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
+            self._connect_with_native_identity(self._start(), membership="member-a")
+            second, _ = self._connect_with_native_identity(self._start(), membership="member-b")
+        self.assertNotIn("supersededConnectionID", second)
+        self.assertEqual(len(agentcat.codex_connections_snapshot()), 2)
+
+    def test_managed_codex_workspace_difference_never_merges_even_for_same_member(self):
+        with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
+            self._connect_with_native_identity(self._start(), account="workspace-a", membership="member-a")
+            second, _ = self._connect_with_native_identity(self._start(), account="workspace-b", membership="member-a")
+        self.assertNotIn("supersededConnectionID", second)
+        self.assertEqual(len(agentcat.codex_connections_snapshot()), 2)
+
+    def test_legacy_codex_without_key_is_backfilled_before_new_login_merge(self):
+        with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
+            first_start = self._start()
+            _, legacy = self._connect_with_native_identity(first_start, membership="member-a")
+            rows = agentcat._codex_connections()
+            legacy_row = next(row for row in rows if row["id"] == legacy["id"])
+            legacy_row.pop("dedupKey", None)
+            legacy_row.pop("authProofFingerprint", None)
+            agentcat._write_codex_connections(rows)
+            second, source = self._connect_with_native_identity(self._start(), membership="member-a")
+        self.assertEqual(second["connection"]["id"], legacy["id"])
+        self.assertEqual(second["supersededConnectionID"], source["id"])
+
+    def test_promotion_rolls_back_and_recreates_managed_servers_when_destination_validation_fails(self):
+        with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
+            _, canonical = self._connect_with_native_identity(self._start(), membership="member-a")
+            old_auth = (agentcat._codex_profile_dir(canonical["id"]) / "auth.json").read_bytes()
+            next_start = self._start()
+            source_row = next(row for row in agentcat._codex_connections() if row.get("operationID") == next_start["operationID"])
+            self._write_managed_auth(source_row, membership="member-a")
+            FakeCodexAppServer.accounts[source_row["id"]] = {"email": "source@example.invalid", "planType": "pro"}
+            FakeCodexAppServer.fail_promotion_for.add(canonical["id"])
+            result = agentcat.codex_oauth_status(next_start["operationID"])
+        self.assertEqual(result["connection"]["id"], source_row["id"])
+        self.assertEqual((agentcat._codex_profile_dir(canonical["id"]) / "auth.json").read_bytes(), old_auth)
+        self.assertIn(canonical["id"], agentcat._CODEX_APP_SERVERS)
+        self.assertIn(source_row["id"], agentcat._CODEX_APP_SERVERS)
+        self.assertTrue(any(instance.closed for instance in FakeCodexAppServer.instances if instance.connection_id == canonical["id"]))
 
     def test_installed_app_server_unauthenticated_smoke_uses_isolated_profile(self):
         if not Path("/opt/homebrew/bin/codex").exists():

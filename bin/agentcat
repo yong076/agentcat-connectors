@@ -18227,6 +18227,76 @@ def _codex_profile_dir(connection_id: str) -> Path:
     return CODEX_CONNECTIONS_PROFILES_DIR / connection_id
 
 
+def _codex_managed_auth_material(row: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], str]]:
+    """Read only this daemon-owned profile's native auth metadata.
+
+    This never consults the user's Codex home.  The result is ephemeral: the
+    raw document and claims are used only to bind an already provider-verified
+    app-server session to a local HMAC, never returned or written to registry.
+    """
+    connection_id = row.get("id")
+    if not isinstance(connection_id, str) or not _CODEX_ID_RE.fullmatch(connection_id):
+        return None
+    profile = _codex_profile_dir(connection_id)
+    try:
+        root = CODEX_CONNECTIONS_PROFILES_DIR.resolve()
+        if profile.resolve().parent != root:
+            return None
+        auth_path = profile / "auth.json"
+        raw = auth_path.read_bytes()
+        if not raw or len(raw) > 2 * 1024 * 1024:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def _codex_native_claim(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or normalized != value or len(normalized) > 512 or any(ord(char) < 32 for char in normalized):
+        return None
+    return normalized
+
+
+def _codex_managed_provider_identity(auth: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Extract the official Codex compound identity from a controlled profile.
+
+    The native Codex AuthManager uses the selected provider account plus the
+    account-user membership when present, otherwise the ChatGPT user.  These
+    unverified local claims become eligible only after the same profile's
+    official app-server account and usage calls succeed and its file remains
+    fingerprint-stable in ``_codex_refresh_row``.
+    """
+    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else auth
+    provider_account = _codex_native_claim(tokens.get("account_id"))
+    id_claims = _jwt_claims_unverified(tokens.get("id_token")) if isinstance(tokens.get("id_token"), str) else {}
+    access_claims = _jwt_claims_unverified(tokens.get("access_token")) if isinstance(tokens.get("access_token"), str) else {}
+    id_auth = id_claims.get("https://api.openai.com/auth") if isinstance(id_claims.get("https://api.openai.com/auth"), dict) else {}
+    access_auth = access_claims.get("https://api.openai.com/auth") if isinstance(access_claims.get("https://api.openai.com/auth"), dict) else {}
+    provider_account = provider_account or _codex_native_claim(id_auth.get("chatgpt_account_id"))
+    person = _codex_native_claim(id_auth.get("chatgpt_user_id")) or _codex_native_claim(id_auth.get("user_id"))
+    membership = None
+    if provider_account and _codex_native_claim(access_auth.get("chatgpt_account_id")) == provider_account:
+        membership = _codex_native_claim(access_auth.get("chatgpt_account_user_id"))
+    if not provider_account or not person:
+        return None
+    return {"providerAccountID": provider_account, "personID": person, **({"membershipID": membership} if membership else {})}
+
+
+def _codex_dedup_key(identity: Dict[str, str]) -> str:
+    discriminator = identity.get("membershipID") or identity.get("personID")
+    return hmac.new(
+        _provider_instance_secret(),
+        f"agentcat.codex-managed-dedup.v1:{identity['providerAccountID']}:{discriminator}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _codex_connections() -> List[Dict[str, Any]]:
     raw = read_json(CODEX_CONNECTIONS_FILE)
     if not isinstance(raw, dict) or raw.get("version") != 1:
@@ -18257,6 +18327,11 @@ def _write_codex_connections(rows: List[Dict[str, Any]]) -> None:
             stored["appServerGeneration"] = row["appServerGeneration"]
         if isinstance(row.get("pendingStartedAt"), str):
             stored["pendingStartedAt"] = row["pendingStartedAt"]
+        # These are local pseudonyms/provenance for managed-profile duplicate
+        # reconciliation.  They never contain a token, claim, email, or path.
+        for key in ("dedupKey", "authProofFingerprint", "supersededBy", "completedOperationID"):
+            if isinstance(row.get(key), str):
+                stored[key] = row[key]
         registry_rows.append(stored)
     write_json_atomic(CODEX_CONNECTIONS_FILE, {"version": 1, "connections": registry_rows})
     _chmod_quiet(CODEX_CONNECTIONS_FILE, 0o600)
@@ -18371,6 +18446,8 @@ def codex_connection_capabilities() -> Dict[str, Any]:
 def _codex_refresh_row(row: Dict[str, Any]) -> bool:
     """Refresh one explicitly managed profile; no local Codex auto-discovery."""
     row["lastSyncAt"] = now_iso()
+    auth_before = _codex_managed_auth_material(row)
+    native_identity = _codex_managed_provider_identity(auth_before[0]) if auth_before else None
     try:
         identity = _codex_server(row).account()
         if identity is None:
@@ -18399,6 +18476,16 @@ def _codex_refresh_row(row: Dict[str, Any]) -> bool:
         try:
             row["usage"] = _codex_server(row).usage()
             row.pop("error", None)
+            # Native claims are eligible only when this same controlled
+            # profile passed both official account/read and usage proof, and
+            # no credential rotation happened in between those calls.
+            auth_after = _codex_managed_auth_material(row)
+            if native_identity and auth_after and auth_before and auth_after[1] == auth_before[1]:
+                row["dedupKey"] = _codex_dedup_key(native_identity)
+                row["authProofFingerprint"] = auth_after[1]
+            elif auth_after is None or (auth_before and auth_after[1] != auth_before[1]):
+                row.pop("dedupKey", None)
+                row.pop("authProofFingerprint", None)
         except CodexAppServerError:
             # Identity is still authoritative.  Do not erase a useful prior
             # usage snapshot or manufacture zeros when optional usage is down.
@@ -18440,6 +18527,117 @@ def _codex_implicit_refresh_due(row: Dict[str, Any]) -> bool:
     return (dt.datetime.now(dt.timezone.utc) - observed).total_seconds() >= CODEX_IMPLICIT_REFRESH_MIN_INTERVAL_SECONDS
 
 
+def _codex_close_managed_server(connection_id: str) -> None:
+    """Quiesce only a daemon-owned app-server before profile replacement."""
+    server = _CODEX_APP_SERVERS.pop(connection_id, None)
+    if server is not None:
+        server.close()
+
+
+def _codex_promote_verified_profile(source: Dict[str, Any], canonical: Dict[str, Any]) -> bool:
+    """Atomically install a newly verified managed auth file into canonical.
+
+    Both app-server children are stopped first so an AuthManager with old
+    credentials cannot overwrite the replacement.  The source stays intact;
+    a failed destination validation restores its prior file and recreates both
+    children.  No profile outside the two exact managed ids is touched.
+    """
+    source_material = _codex_managed_auth_material(source)
+    if source_material is None or source.get("authProofFingerprint") != source_material[1]:
+        return False
+    source_identity = _codex_managed_provider_identity(source_material[0])
+    if source_identity is None or source.get("dedupKey") != _codex_dedup_key(source_identity):
+        return False
+    source_path = _codex_profile_dir(str(source["id"])) / "auth.json"
+    destination_path = _codex_profile_dir(str(canonical["id"])) / "auth.json"
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    backup = destination_path.with_name(".agentcat-auth-backup")
+    staged = destination_path.with_name(".agentcat-auth-stage")
+    had_destination = destination_path.exists()
+    try:
+        _codex_close_managed_server(str(source["id"]))
+        _codex_close_managed_server(str(canonical["id"]))
+        if had_destination:
+            shutil.copy2(destination_path, backup)
+            _chmod_quiet(backup, 0o600)
+        staged.write_bytes(source_path.read_bytes())
+        _chmod_quiet(staged, 0o600)
+        os.replace(staged, destination_path)
+        _chmod_quiet(destination_path, 0o600)
+        # Recreate the target child after the atomic swap and require the same
+        # official account/usage proof used to admit native identity.
+        if _codex_server(canonical).account() is None:
+            raise CodexAppServerError("promotion_account_unavailable")
+        _codex_server(canonical).usage()
+        verified = _codex_managed_auth_material(canonical)
+        verified_identity = _codex_managed_provider_identity(verified[0]) if verified else None
+        if verified is None or verified_identity is None or _codex_dedup_key(verified_identity) != source.get("dedupKey"):
+            raise CodexAppServerError("promotion_identity_mismatch")
+        canonical["authProofFingerprint"] = verified[1]
+        canonical["dedupKey"] = source["dedupKey"]
+        backup.unlink(missing_ok=True)
+        return True
+    except (OSError, CodexAppServerError):
+        _codex_close_managed_server(str(canonical["id"]))
+        try:
+            if had_destination and backup.exists():
+                os.replace(backup, destination_path)
+            elif not had_destination:
+                destination_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        finally:
+            staged.unlink(missing_ok=True)
+            backup.unlink(missing_ok=True)
+            # Recreate both managed children from their retained profiles.
+            _codex_server(source)
+            _codex_server(canonical)
+        return False
+
+
+def _codex_reconcile_verified_duplicate(rows: List[Dict[str, Any]], source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fold a proven same-person managed login into its oldest canonical row."""
+    dedup_key = source.get("dedupKey")
+    if source.get("status") != "connected" or not isinstance(dedup_key, str):
+        return None
+    # Backfill a bounded number of older managed rows through their own
+    # app-server proof, never through labels or an email-only comparison.
+    candidates = [item for item in rows if item is not source and item.get("provider") == "codex" and item.get("status") == "connected"]
+    for candidate in candidates[:8]:
+        if not isinstance(candidate.get("dedupKey"), str):
+            _codex_refresh_row(candidate)
+    same = [item for item in candidates if item.get("dedupKey") == dedup_key]
+    if not same:
+        return None
+    canonical = min(same, key=lambda item: (str(item.get("createdAt") or ""), str(item.get("id") or "")))
+    if not _codex_promote_verified_profile(source, canonical):
+        return None
+    # The incoming profile contains the newly validated credentials and wins
+    # over older metadata after promotion succeeds.
+    for key in ("identity", "identityStatus", "usage", "label", "lastSyncAt", "lastSuccessfulSyncAt", "dedupKey", "authProofFingerprint"):
+        if key in source:
+            canonical[key] = copy.deepcopy(source[key])
+    canonical["status"] = "connected"
+    canonical.pop("error", None)
+    source["status"] = "superseded"
+    source["supersededBy"] = canonical["id"]
+    source.pop("error", None)
+    source.pop("appServerGeneration", None)
+    source.pop("pendingStartedAt", None)
+    return canonical
+
+
+def _codex_terminal_connection(row: Dict[str, Any], rows: List[Dict[str, Any]]) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
+    if row.get("status") == "connected":
+        return row, None
+    canonical_id = row.get("supersededBy")
+    if row.get("status") == "superseded" and isinstance(canonical_id, str):
+        canonical = next((item for item in rows if item.get("id") == canonical_id and item.get("status") == "connected"), None)
+        if canonical is not None:
+            return canonical, str(row.get("id") or "")
+    return None
+
+
 def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
     with _CODEX_CONNECTIONS_LOCK:
         rows = _codex_connections()
@@ -18464,7 +18662,16 @@ def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
                 changed = _codex_refresh_row(row) or changed
         if changed:
             _write_codex_connections(rows)
-        return [_codex_public_connection(row) for row in rows if row.get("status") != "removed"]
+        # A completed refresh can backfill a legacy key and reveal an existing
+        # duplicate even without a new login.  Only active canonical rows are
+        # listed to the app.
+        for row in list(rows):
+            if row.get("status") == "connected":
+                canonical = _codex_reconcile_verified_duplicate(rows, row)
+                changed = bool(canonical) or changed
+        if changed:
+            _write_codex_connections(rows)
+        return [_codex_public_connection(row) for row in rows if row.get("status") not in {"removed", "superseded"}]
 
 
 def _codex_start_oauth_on_row(row: Dict[str, Any], mode: str) -> Dict[str, Any]:
@@ -18577,6 +18784,15 @@ def codex_oauth_status(operation_id: str) -> Dict[str, Any]:
         rows = _codex_connections()
         row = next((item for item in rows if item.get("operationID") == operation_id), None)
         if row is None:
+            durable = next((item for item in rows if item.get("completedOperationID") == operation_id), None)
+            if durable is not None:
+                terminal = _codex_terminal_connection(durable, rows)
+                if terminal is not None:
+                    canonical, superseded = terminal
+                    result = {"status": "connected", "connection": _codex_public_connection(canonical)}
+                    if superseded:
+                        result["supersededConnectionID"] = superseded
+                    return result
             completed = _codex_completed_operation_row(operation_id, rows)
             if completed is None:
                 raise KeyError("oauth_operation_not_found")
@@ -18589,9 +18805,19 @@ def codex_oauth_status(operation_id: str) -> Dict[str, Any]:
             try:
                 if server.account() is not None:
                     _codex_refresh_row(row)
+                    canonical = _codex_reconcile_verified_duplicate(rows, row)
+                    if canonical is not None:
+                        row["completedOperationID"] = operation_id
                     _write_codex_connections(rows)
             except CodexAppServerError:
                 pass
+        terminal = _codex_terminal_connection(row, rows)
+        if terminal is not None:
+            canonical, superseded = terminal
+            result = {"status": "connected", "connection": _codex_public_connection(canonical)}
+            if superseded:
+                result["supersededConnectionID"] = superseded
+            return result
         result = {"status": row.get("status")}
         if row.get("status") in {"pending_browser", "pending_device"}:
             lease = _codex_pending_lease(row)
