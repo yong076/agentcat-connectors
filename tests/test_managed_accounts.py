@@ -80,6 +80,29 @@ class ManagedAccountsTests(unittest.TestCase):
         self.assertEqual(refreshed["identity"]["accountID"], "first")
         self.assertEqual(refreshed["usage"]["source"], "fake")
 
+    def test_multiple_provider_rows_survive_restart_and_isolate_retry_remove(self):
+        other = FakeAdapter()
+        accounts = ManagedAccounts(Path(self.temp.name), {"fake": self.adapter, "other": other})
+        first = accounts.start("fake", "First", "device")
+        second = accounts.start("fake", "Second", "device")
+        third = accounts.start("other", "Third", "device")
+        before = accounts.snapshot()
+        self.assertEqual([(row["provider"], row["label"]) for row in before], [("fake", "First"), ("fake", "Second"), ("other", "Third")])
+        restarted = ManagedAccounts(Path(self.temp.name), {"fake": self.adapter, "other": other})
+        # Pending browser/device details are intentionally gone after restart,
+        # while unrelated registered metadata remains listable.
+        self.assertEqual(restarted.status("fake", first["operationID"])["status"], "failed")
+        rows = restarted.snapshot()
+        second_row = next(row for row in rows if row.get("operationID") == second["operationID"])
+        third_row = next(row for row in rows if row.get("operationID") == third["operationID"])
+        self.assertEqual(restarted.cancel("fake", second["operationID"]), "canceled")
+        retried = restarted.retry("fake", second_row["id"], "device")
+        self.assertNotEqual(retried["operationID"], second["operationID"])
+        removed = restarted.remove("other", third_row["id"])
+        self.assertEqual(removed["status"], "removed")
+        remaining = restarted.snapshot()
+        self.assertEqual({row["id"] for row in remaining}, {rows[0]["id"], second_row["id"]})
+
 
 if __name__ == "__main__":
     unittest.main()
