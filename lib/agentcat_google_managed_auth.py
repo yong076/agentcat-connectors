@@ -30,8 +30,10 @@ from typing import Any, Dict, Optional, Tuple
 
 GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 _OAUTH_ID_RE = re.compile(r"OAUTH_CLIENT_ID\s*[:=]\s*[\"']([^\"']+)[\"']")
 _OAUTH_SECRET_RE = re.compile(r"OAUTH_CLIENT_SECRET\s*[:=]\s*[\"']([^\"']+)[\"']")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+$")
 _AUTH_ENV = (
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA",
@@ -245,10 +247,12 @@ def poll(profile_dir: Path, operation_id: str) -> Dict[str, Any]:
         return {"status": "failed", "error": "Gemini sign-in did not create managed credentials."}
     refreshed = refresh(managed_profile)
     usage = refreshed.get("usage") if isinstance(refreshed, dict) else None
+    identity = refreshed.get("identity") if isinstance(refreshed, dict) else None
     return {
         "status": "connected",
         "authenticated": True,
         **({"usage": usage} if isinstance(usage, dict) else {}),
+        **({"identity": identity} if isinstance(identity, dict) else {}),
     }
 
 
@@ -332,6 +336,50 @@ def _access_token(creds: Dict[str, Any]) -> str:
     return updated
 
 
+def _identity_unavailable(reason: str) -> Dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "email": None,
+        "verification": False,
+        "source": None,
+        "reason": reason,
+    }
+
+
+def _identity_from_managed_profile(profile_dir: Path) -> Dict[str, Any]:
+    """Resolve email from Google's authenticated userinfo endpoint only.
+
+    Gemini CLI itself requests this endpoint after OAuth and caches the result.
+    We query it with the managed profile's token so a stale local cache cannot
+    label a newly authorized account.
+    """
+    creds = _managed_credentials(profile_dir)
+    if not creds:
+        return _identity_unavailable("sign_in_required")
+    try:
+        token = _access_token(creds)
+        request = urllib.request.Request(
+            GOOGLE_USERINFO_URL,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return _identity_unavailable("userinfo_unavailable")
+    email = payload.get("email") if isinstance(payload, dict) else None
+    verified = payload.get("verified_email") if isinstance(payload, dict) else None
+    if not isinstance(email, str) or not _EMAIL_RE.fullmatch(email):
+        return _identity_unavailable("email_not_available")
+    if verified is not True:
+        return _identity_unavailable("email_not_verified")
+    return {
+        "status": "available",
+        "email": email,
+        "verification": True,
+        "source": "google_userinfo",
+    }
+
+
 def _code_assist_post(method: str, payload: Dict[str, Any], access_token: str) -> Dict[str, Any]:
     request = urllib.request.Request(
         f"{GEMINI_CODE_ASSIST_URL}:{method}", data=json.dumps(payload).encode("utf-8"),
@@ -387,6 +435,7 @@ def refresh(profile_dir: Path) -> Dict[str, Any]:
     if not _has_managed_authentication(profile_dir):
         return {
             "status": "needs_reconnect",
+            "identity": _identity_unavailable("sign_in_required"),
             "usage": {
                 "status": "unavailable",
                 "reason": "sign_in_required",
@@ -394,13 +443,14 @@ def refresh(profile_dir: Path) -> Dict[str, Any]:
                 "quotas": [],
             },
         }
+    identity = _identity_from_managed_profile(profile_dir)
     try:
         usage = _usage_from_profile(profile_dir)
     except GeminiManagedAuthError:
-        return {"status": "needs_reconnect", "usage": {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []}}
+        return {"status": "needs_reconnect", "identity": identity, "usage": {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []}}
     except Exception:
-        return {"status": "error", "usage": {"status": "unavailable", "reason": "usage_unavailable", "scope": "gemini_code_assist_request_quota", "quotas": []}}
-    return {"status": "connected", "authenticated": True, "usage": usage}
+        return {"status": "error", "identity": identity, "usage": {"status": "unavailable", "reason": "usage_unavailable", "scope": "gemini_code_assist_request_quota", "quotas": []}}
+    return {"status": "connected", "authenticated": True, "identity": identity, "usage": usage}
 
 
 def remove(profile_dir: Path) -> None:
