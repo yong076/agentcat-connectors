@@ -27,6 +27,54 @@ class CodexAppServerUnsupported(CodexAppServerError):
     pass
 
 
+_APP_SERVER_PROBE_TTL_SECONDS = 60.0
+_app_server_probe_cache: Optional[tuple[float, Optional[str]]] = None
+
+
+def _app_server_executable() -> Optional[str]:
+    resolved = shutil.which("codex")
+    if resolved:
+        return resolved
+    fallback = Path("/opt/homebrew/bin/codex")
+    return str(fallback) if fallback.is_file() and os.access(fallback, os.X_OK) else None
+
+
+def app_server_prerequisite() -> Optional[str]:
+    """Return a safe prerequisite reason, or ``None`` for a usable CLI.
+
+    A command existing on PATH does not establish that it implements the
+    official app-server command.  Probe its help surface with a short timeout,
+    cache the result, and never start an auth/profile process for this check.
+    """
+    global _app_server_probe_cache
+    now = time.monotonic()
+    if _app_server_probe_cache is not None and now - _app_server_probe_cache[0] < _APP_SERVER_PROBE_TTL_SECONDS:
+        return _app_server_probe_cache[1]
+    executable = _app_server_executable()
+    if executable is None:
+        reason = "codex_app_server_not_installed"
+    else:
+        try:
+            result = subprocess.run(
+                [executable, "app-server", "--help"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+            reason = None if result.returncode == 0 else "codex_app_server_unsupported"
+        except (OSError, subprocess.TimeoutExpired):
+            reason = "codex_app_server_unsupported"
+    _app_server_probe_cache = (now, reason)
+    return reason
+
+
+def app_server_available() -> bool:
+    """Whether an official Codex app-server executable is available locally."""
+    return app_server_prerequisite() is None
+
+
 def child_environment(profile_dir: Path) -> Dict[str, str]:
     """Return an isolated child environment without inherited auth overrides."""
     env = dict(os.environ)
@@ -136,7 +184,7 @@ class CodexAppServer:
 
     def __init__(self, profile_dir: Path, executable: Optional[str] = None):
         self.profile_dir = Path(profile_dir)
-        self.executable = executable or shutil.which("codex") or "/opt/homebrew/bin/codex"
+        self.executable = executable or _app_server_executable() or "codex"
         self.process: Optional[subprocess.Popen[str]] = None
         self.messages: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.write_lock = threading.Lock()

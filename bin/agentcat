@@ -37,7 +37,12 @@ import uuid
 _agentcat_lib = Path(__file__).resolve().parent.parent / "lib"
 if str(_agentcat_lib) not in sys.path:
     sys.path.insert(0, str(_agentcat_lib))
-from agentcat_codex_app_server import CodexAppServer, CodexAppServerError, CodexAppServerUnsupported
+from agentcat_codex_app_server import (
+    CodexAppServer,
+    CodexAppServerError,
+    CodexAppServerUnsupported,
+    app_server_prerequisite,
+)
 
 
 def resolve_user_home_env() -> str:
@@ -174,7 +179,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.36.9")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.37.1")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -16546,6 +16551,14 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, {"connections": openrouter_connections_snapshot() + codex_connections_snapshot()})
             return
+        if path == "/v1/connections/codex/capabilities":
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            self.send_json(200, codex_connection_capabilities())
+            return
         codex_oauth_status_match = re.fullmatch(r"/v1/connections/codex/oauth/([0-9a-f-]{20,})", path)
         if codex_oauth_status_match:
             guard_error = connection_control_request_error(self.headers, mutation=False)
@@ -16646,6 +16659,28 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                     return
                 except Exception:
                     self.send_json(502, {"error": "codex_oauth_start_failed"})
+                    return
+                self.send_json(200, result)
+                return
+            codex_retry_match = re.fullmatch(r"/v1/connections/codex/([0-9a-f]{32})/oauth/retry", path)
+            if codex_retry_match:
+                try:
+                    result = codex_retry_oauth(
+                        codex_retry_match.group(1),
+                        str(payload.get("mode") or "browser"),
+                    )
+                except KeyError:
+                    self.send_json(404, {"error": "connection_not_found"})
+                    return
+                except ValueError as exc:
+                    self.send_json(400, {"error": "invalid_connection", "message": str(exc)})
+                    return
+                except RuntimeError as exc:
+                    error = str(exc)
+                    self.send_json(409, {"error": error if error == "codex_oauth_retry_not_allowed" else "codex_oauth_retry_failed"})
+                    return
+                except Exception:
+                    self.send_json(502, {"error": "codex_oauth_retry_failed"})
                     return
                 self.send_json(200, result)
                 return
@@ -17956,6 +17991,10 @@ def openrouter_connection_mutation(connection_id: str, action: str, label: Optio
 # profile derived from that id; the owner's existing Codex home is untouched.
 _CODEX_CONNECTIONS_LOCK = threading.RLock()
 _CODEX_APP_SERVERS: Dict[str, CodexAppServer] = {}
+# OAuth URLs and device codes are deliberately process-memory-only.  They are
+# returned solely to the authenticated local app while the matching child is
+# alive, never written to the connection registry or daemon logs.
+_CODEX_OAUTH_SURFACES: Dict[str, Dict[str, str]] = {}
 _CODEX_ID_RE = re.compile(r"[0-9a-f]{32}")
 CODEX_OAUTH_PENDING_TTL_SECONDS = 10 * 60
 
@@ -17994,6 +18033,8 @@ def _write_codex_connections(rows: List[Dict[str, Any]]) -> None:
         stored = _codex_public_connection(row)
         if isinstance(row.get("appServerGeneration"), int):
             stored["appServerGeneration"] = row["appServerGeneration"]
+        if isinstance(row.get("pendingStartedAt"), str):
+            stored["pendingStartedAt"] = row["pendingStartedAt"]
         registry_rows.append(stored)
     write_json_atomic(CODEX_CONNECTIONS_FILE, {"version": 1, "connections": registry_rows})
     _chmod_quiet(CODEX_CONNECTIONS_FILE, 0o600)
@@ -18024,8 +18065,11 @@ def _codex_unavailable_usage() -> Dict[str, Any]:
 def _codex_fail_pending(row: Dict[str, Any], message: str) -> None:
     row["status"] = "failed"
     row["error"] = message
-    row.pop("operationID", None)
+    operation_id = row.pop("operationID", None)
+    if isinstance(operation_id, str):
+        _CODEX_OAUTH_SURFACES.pop(operation_id, None)
     row.pop("appServerGeneration", None)
+    row.pop("pendingStartedAt", None)
     server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
     if server is not None:
         server.close()
@@ -18034,7 +18078,7 @@ def _codex_fail_pending(row: Dict[str, Any], message: str) -> None:
 def _codex_pending_server(row: Dict[str, Any]) -> Optional[CodexAppServer]:
     """Return the original live login child; never restart a lost login."""
     connection_id = str(row.get("id") or "")
-    created = str(row.get("createdAt") or "")
+    created = str(row.get("pendingStartedAt") or row.get("createdAt") or "")
     try:
         age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(created.replace("Z", "+00:00"))).total_seconds()
     except ValueError:
@@ -18048,6 +18092,31 @@ def _codex_pending_server(row: Dict[str, Any]) -> Optional[CodexAppServer]:
         _codex_fail_pending(row, "The Codex sign-in session was interrupted. Start sign-in again.")
         return None
     return server
+
+
+def _codex_pending_lease(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    started = str(row.get("pendingStartedAt") or row.get("createdAt") or "")
+    try:
+        value = dt.datetime.fromisoformat(started.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return {"expiresAt": (value + dt.timedelta(seconds=CODEX_OAUTH_PENDING_TTL_SECONDS)).isoformat().replace("+00:00", "Z")}
+
+
+def codex_connection_capabilities() -> Dict[str, Any]:
+    """Runtime prerequisite signal for the authenticated local settings UI."""
+    reason = app_server_prerequisite()
+    available = reason is None
+    return {
+        "provider": "codex",
+        "supported": True,
+        "available": available,
+        "reason": reason,
+        "modes": ["browser", "device"] if available else [],
+        "pendingTTLSeconds": CODEX_OAUTH_PENDING_TTL_SECONDS,
+        "resume": True,
+        "retry": True,
+    }
 
 
 def _codex_refresh_row(row: Dict[str, Any]) -> bool:
@@ -18076,7 +18145,11 @@ def _codex_refresh_row(row: Dict[str, Any]) -> bool:
             row.setdefault("usage", _codex_unavailable_usage())
             row["error"] = "Codex is connected, but detailed usage is temporarily unavailable."
         row["status"] = "connected"
-        row.pop("operationID", None)
+        operation_id = row.pop("operationID", None)
+        if isinstance(operation_id, str):
+            _CODEX_OAUTH_SURFACES.pop(operation_id, None)
+        row.pop("appServerGeneration", None)
+        row.pop("pendingStartedAt", None)
         row["lastSuccessfulSyncAt"] = row["lastSyncAt"]
         return True
     except CodexAppServerError:
@@ -18113,43 +18186,102 @@ def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
         return [_codex_public_connection(row) for row in rows if row.get("status") != "removed"]
 
 
-def codex_start_oauth(label: str, mode: str = "browser") -> Dict[str, Any]:
+def _codex_start_oauth_on_row(row: Dict[str, Any], mode: str) -> Dict[str, Any]:
     if mode not in {"browser", "device"}:
         raise ValueError("invalid_oauth_mode")
-    connection_id = uuid.uuid4().hex
-    row: Dict[str, Any] = {
-        "id": connection_id,
-        "provider": "codex",
-        "label": (label or "Codex / ChatGPT").strip()[:80] or "Codex / ChatGPT",
-        "kind": "chatgpt_oauth",
-        "scope": "managed_app_server_profile",
-        "status": "pending_device" if mode == "device" else "pending_browser",
-        "createdAt": now_iso(),
-        "usage": _codex_unavailable_usage(),
-    }
+    prerequisite = app_server_prerequisite()
+    if prerequisite is not None:
+        raise RuntimeError(prerequisite)
+    prior_operation = row.pop("operationID", None)
+    if isinstance(prior_operation, str):
+        _CODEX_OAUTH_SURFACES.pop(prior_operation, None)
+    row["status"] = "pending_device" if mode == "device" else "pending_browser"
+    row["pendingStartedAt"] = now_iso()
+    row["usage"] = _codex_unavailable_usage()
+    row.pop("error", None)
     try:
         login = _codex_server(row).login(mode)
     except Exception:
-        _CODEX_APP_SERVERS.pop(connection_id, None)
+        server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
+        if server is not None:
+            server.close()
+        row["status"] = "error"
+        row["error"] = "Could not start the managed Codex sign-in. Retry this connection."
+        row.pop("pendingStartedAt", None)
         raise RuntimeError("codex_oauth_start_failed")
     login_id = login.get("loginId")
     if not isinstance(login_id, str) or not login_id:
-        _CODEX_APP_SERVERS.pop(connection_id, None)
+        server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
+        if server is not None:
+            server.close()
+        row["status"] = "error"
+        row["error"] = "Could not start the managed Codex sign-in. Retry this connection."
+        row.pop("pendingStartedAt", None)
         raise RuntimeError("codex_oauth_start_failed")
     row["operationID"] = login_id
     row["appServerGeneration"] = _codex_server(row).generation
+    result = {"operationID": login_id, "status": row["status"]}
+    surface: Dict[str, str] = {"mode": mode}
+    if isinstance(login.get("authUrl"), str):
+        result["authorizationURL"] = login["authUrl"]
+        surface["authorizationURL"] = login["authUrl"]
+    if isinstance(login.get("verificationUrl"), str):
+        result["verificationURL"] = login["verificationUrl"]
+        surface["verificationURL"] = login["verificationUrl"]
+    if isinstance(login.get("userCode"), str):
+        result["userCode"] = login["userCode"]
+        surface["userCode"] = login["userCode"]
+    _CODEX_OAUTH_SURFACES[login_id] = surface
+    return result
+
+
+def codex_start_oauth(label: str, mode: str = "browser") -> Dict[str, Any]:
     with _CODEX_CONNECTIONS_LOCK:
+        row: Dict[str, Any] = {
+            "id": uuid.uuid4().hex,
+            "provider": "codex",
+            "label": (label or "Codex / ChatGPT").strip()[:80] or "Codex / ChatGPT",
+            "kind": "chatgpt_oauth",
+            "scope": "managed_app_server_profile",
+            "createdAt": now_iso(),
+            "usage": _codex_unavailable_usage(),
+        }
+        result = _codex_start_oauth_on_row(row, mode)
         rows = _codex_connections()
         rows.append(row)
         _write_codex_connections(rows)
-    result = {"operationID": login_id, "status": row["status"]}
-    if isinstance(login.get("authUrl"), str):
-        result["authorizationURL"] = login["authUrl"]
-    if isinstance(login.get("verificationUrl"), str):
-        result["verificationURL"] = login["verificationUrl"]
-    if isinstance(login.get("userCode"), str):
-        result["userCode"] = login["userCode"]
-    return result
+        return result
+
+
+def codex_retry_oauth(connection_id: str, mode: str = "browser") -> Dict[str, Any]:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        row = next((item for item in rows if item.get("id") == connection_id and item.get("status") != "removed"), None)
+        if row is None:
+            raise KeyError("connection_not_found")
+        if row.get("status") not in {"failed", "canceled", "error", "needs_reconnect"}:
+            raise RuntimeError("codex_oauth_retry_not_allowed")
+        # A retry reuses only this connection's isolated profile.  Clear any
+        # prior local account from that profile before the official login flow;
+        # connected profiles cannot reach this route.
+        server = _CODEX_APP_SERVERS.pop(connection_id, None)
+        if server is None:
+            server = CodexAppServer(_codex_profile_dir(connection_id))
+        try:
+            server.request("account/logout", {})
+        except CodexAppServerError:
+            # Do not launch a new login over an account that could not be
+            # cleared.  Keep this profile and its last known metadata intact
+            # so the user can explicitly reconnect or remove it.
+            row["status"] = "needs_reconnect"
+            row["error"] = "Could not prepare this managed Codex profile for sign-in. Reconnect it."
+            _write_codex_connections(rows)
+            raise RuntimeError("codex_oauth_retry_logout_failed")
+        finally:
+            server.close()
+        result = _codex_start_oauth_on_row(row, mode)
+        _write_codex_connections(rows)
+        return result
 
 
 def _codex_pending_row(operation_id: str) -> Dict[str, Any]:
@@ -18177,6 +18309,16 @@ def codex_oauth_status(operation_id: str) -> Dict[str, Any]:
             except CodexAppServerError:
                 pass
         result = {"status": row.get("status")}
+        if row.get("status") in {"pending_browser", "pending_device"}:
+            lease = _codex_pending_lease(row)
+            if lease is not None:
+                result["lease"] = lease
+            operation = row.get("operationID")
+            surface = _CODEX_OAUTH_SURFACES.get(operation) if isinstance(operation, str) else None
+            if isinstance(surface, dict):
+                # The surface only exists in this daemon process, for the live
+                # child that owns this exact login lease.
+                result["resume"] = copy.deepcopy(surface)
         if row.get("status") == "connected":
             result["connection"] = _codex_public_connection(row)
         if isinstance(row.get("error"), str):
@@ -18190,20 +18332,28 @@ def codex_cancel_oauth(operation_id: str) -> str:
         row = next((item for item in rows if item.get("operationID") == operation_id), None)
         if row is None:
             return "notFound"
+        if _codex_pending_server(row) is None:
+            _write_codex_connections(rows)
+            return "failed"
         try:
             result = _codex_server(row).cancel_login(operation_id)
             status = result.get("status") if isinstance(result, dict) else "canceled"
         except CodexAppServerError:
-            status = "notFound"
-        if status == "canceled":
+            # The child is owned by this exact lease.  It is safer to end that
+            # lease locally than leave an unusable browser login alive.
+            status = "canceled"
+        if status in {"canceled", "notFound"}:
             row["status"] = "canceled"
             row.pop("operationID", None)
+            _CODEX_OAUTH_SURFACES.pop(operation_id, None)
+            row.pop("appServerGeneration", None)
+            row.pop("pendingStartedAt", None)
             row.pop("error", None)
             server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
             if server is not None:
                 server.close()
             _write_codex_connections(rows)
-        return status if status in {"canceled", "notFound"} else "notFound"
+        return "canceled" if status in {"canceled", "notFound"} else "notFound"
 
 
 def codex_connection_mutation(connection_id: str, action: str, label: Optional[str] = None) -> Dict[str, Any]:

@@ -3,10 +3,11 @@ import json
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -26,6 +27,8 @@ SPEC.loader.exec_module(agentcat)
 
 class FakeCodexAppServer:
     accounts = {}
+    attempts = {}
+    fail_logout = False
     usage_payload = {
         "primary": {"usedPercent": 31, "windowDurationMins": 300, "resetsAt": 1_800_000_000},
         "secondary": {"usedPercent": 8, "windowDurationMins": 10080, "resetsAt": 1_800_500_000},
@@ -45,7 +48,14 @@ class FakeCodexAppServer:
     def login(self, mode):
         # The installed protocol uses a UUID-shaped login id, accepted by the
         # loopback route's conservative identifier validation.
-        return {"loginId": self.connection_id, "authUrl": "https://auth.example/" + self.connection_id}
+        attempt = self.attempts.get(self.connection_id, 0) + 1
+        self.attempts[self.connection_id] = attempt
+        login = {"loginId": self.connection_id + format(attempt, "x")}
+        if mode == "device":
+            login.update({"verificationUrl": "https://auth.example/device", "userCode": "TEST-CODE"})
+        else:
+            login["authUrl"] = "https://auth.example/" + self.connection_id
+        return login
 
     def account(self):
         return self.accounts.get(self.connection_id)
@@ -65,6 +75,8 @@ class FakeCodexAppServer:
         return {"status": "canceled"}
 
     def request(self, method, params):
+        if method == "account/logout" and self.fail_logout:
+            raise app_server.CodexAppServerError("logout failed")
         return {}
 
     def close(self):
@@ -80,11 +92,16 @@ class CodexConnectionsTests(unittest.TestCase):
         self.home.mkdir()
         self.agentcat_home.mkdir()
         self.old_paths = redirect_module_paths(agentcat, self.home, self.agentcat_home)
+        self.prerequisite = patch.object(agentcat, "app_server_prerequisite", return_value=None)
+        self.prerequisite.start()
         agentcat._CODEX_APP_SERVERS.clear()
         FakeCodexAppServer.accounts = {}
+        FakeCodexAppServer.attempts = {}
+        FakeCodexAppServer.fail_logout = False
         assert_sandboxed(agentcat, self.home, self.agentcat_home)
 
     def tearDown(self):
+        self.prerequisite.stop()
         agentcat._CODEX_APP_SERVERS.clear()
         restore_module_paths(agentcat, self.old_paths)
         self.tmp.cleanup()
@@ -117,6 +134,107 @@ class CodexConnectionsTests(unittest.TestCase):
         self.assertNotIn("authUrl", encoded)
         self.assertEqual(stored["connections"][0]["status"], "canceled")
 
+    def test_pending_status_can_resume_only_from_live_memory_and_never_registry(self):
+        started = self._start()
+        status = agentcat.codex_oauth_status(started["operationID"])
+        self.assertEqual(status["status"], "pending_browser")
+        self.assertEqual(status["resume"], {"mode": "browser", "authorizationURL": started["authorizationURL"]})
+        self.assertIn("expiresAt", status["lease"])
+        stored = agentcat.CODEX_CONNECTIONS_FILE.read_text()
+        self.assertNotIn("authorizationURL", stored)
+        self.assertNotIn("auth.example", stored)
+
+    def test_retry_reuses_one_terminal_connection_and_its_profile(self):
+        with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
+            started = agentcat.codex_start_oauth("Personal")
+            row = agentcat._codex_connections()[0]
+            self.assertEqual(agentcat.codex_cancel_oauth(started["operationID"]), "canceled")
+            retried = agentcat.codex_retry_oauth(row["id"], "browser")
+        rows = agentcat._codex_connections()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], row["id"])
+        self.assertEqual(rows[0]["status"], "pending_browser")
+        self.assertNotEqual(retried["operationID"], started["operationID"])
+
+    def test_retry_rejects_connected_or_pending_connection(self):
+        started = self._start()
+        row = agentcat._codex_connections()[0]
+        with self.assertRaisesRegex(RuntimeError, "codex_oauth_retry_not_allowed"):
+            agentcat.codex_retry_oauth(row["id"])
+
+    def test_parallel_retry_creates_one_new_pending_lease(self):
+        with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
+            started = agentcat.codex_start_oauth("Personal")
+            row = agentcat._codex_connections()[0]
+            agentcat.codex_cancel_oauth(started["operationID"])
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(agentcat.codex_retry_oauth, row["id"], "browser") for _ in range(2)]
+                outcomes = []
+                for future in futures:
+                    try:
+                        outcomes.append(future.result())
+                    except RuntimeError as exc:
+                        outcomes.append(str(exc))
+        self.assertEqual(sum(isinstance(item, dict) for item in outcomes), 1)
+        self.assertIn("codex_oauth_retry_not_allowed", outcomes)
+        rows = agentcat._codex_connections()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "pending_browser")
+        self.assertEqual(len(agentcat._CODEX_APP_SERVERS), 1)
+
+    def test_late_cancel_cannot_clobber_completed_connection(self):
+        started = self._start()
+        row = agentcat._codex_connections()[0]
+        FakeCodexAppServer.accounts[row["id"]] = {"email": "me@example.com", "planType": "pro"}
+        self.assertEqual(agentcat.codex_oauth_status(started["operationID"])["status"], "connected")
+        self.assertEqual(agentcat.codex_cancel_oauth(started["operationID"]), "notFound")
+        persisted = agentcat._codex_connections()[0]
+        self.assertEqual(persisted["status"], "connected")
+        self.assertEqual(persisted["identity"]["email"], "me@example.com")
+
+    def test_capability_probe_reports_missing_official_app_server(self):
+        with patch.object(agentcat, "app_server_prerequisite", return_value="codex_app_server_not_installed"):
+            payload = agentcat.codex_connection_capabilities()
+        self.assertTrue(payload["supported"])
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["reason"], "codex_app_server_not_installed")
+        self.assertEqual(payload["modes"], [])
+
+    def test_capability_probe_hides_unsupported_installed_cli(self):
+        with patch.object(agentcat, "app_server_prerequisite", return_value="codex_app_server_unsupported"):
+            payload = agentcat.codex_connection_capabilities()
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["reason"], "codex_app_server_unsupported")
+
+    def test_app_server_probe_is_bounded_and_cached(self):
+        old_cache = app_server._app_server_probe_cache
+        app_server._app_server_probe_cache = None
+        try:
+            with patch.object(app_server, "_app_server_executable", return_value="/tmp/codex"), \
+                 patch.object(app_server.subprocess, "run", return_value=Mock(returncode=2)) as run:
+                self.assertEqual(app_server.app_server_prerequisite(), "codex_app_server_unsupported")
+                self.assertEqual(app_server.app_server_prerequisite(), "codex_app_server_unsupported")
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.kwargs["timeout"], 3)
+        finally:
+            app_server._app_server_probe_cache = old_cache
+
+    def test_retry_does_not_start_over_a_profile_that_failed_logout(self):
+        with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
+            started = agentcat.codex_start_oauth("Personal")
+            row = agentcat._codex_connections()[0]
+            FakeCodexAppServer.accounts[row["id"]] = {"email": "first@example.com", "planType": "pro"}
+            agentcat.codex_oauth_status(started["operationID"])
+            FakeCodexAppServer.accounts[row["id"]] = {"email": "other@example.com", "planType": "plus"}
+            agentcat.codex_connection_mutation(row["id"], "refresh")
+            FakeCodexAppServer.fail_logout = True
+            with self.assertRaisesRegex(RuntimeError, "codex_oauth_retry_logout_failed"):
+                agentcat.codex_retry_oauth(row["id"])
+        stored = agentcat._codex_connections()[0]
+        self.assertEqual(stored["status"], "needs_reconnect")
+        self.assertEqual(stored["identity"]["email"], "first@example.com")
+        self.assertIn("Could not prepare", stored["error"])
+
     def test_account_mismatch_requires_reconnect_without_reassigning_identity(self):
         started = self._start()
         row = agentcat._codex_connections()[0]
@@ -141,9 +259,19 @@ class CodexConnectionsTests(unittest.TestCase):
                 request = Request(base + "/v1/connections/codex/oauth/start", data=b'{"mode":"browser"}', method="POST", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
                 with urlopen(request, timeout=3) as response:
                     started = json.loads(response.read().decode())
+                status_request = Request(base + "/v1/connections/codex/oauth/" + started["operationID"], headers={"Authorization": f"Bearer {token}"})
+                with urlopen(status_request, timeout=3) as response:
+                    pending = json.loads(response.read().decode())
+                self.assertEqual(pending["resume"]["mode"], "browser")
+                self.assertIn("expiresAt", pending["lease"])
                 cancel = Request(base + "/v1/connections/codex/oauth/" + started["operationID"] + "/cancel", data=b"{}", method="POST", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
                 with urlopen(cancel, timeout=3) as response:
                     self.assertEqual(json.loads(response.read().decode())["status"], "canceled")
+                connection_id = agentcat._codex_connections()[0]["id"]
+                retry = Request(base + "/v1/connections/codex/" + connection_id + "/oauth/retry", data=b'{"mode":"device"}', method="POST", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+                with urlopen(retry, timeout=3) as response:
+                    retried = json.loads(response.read().decode())
+                self.assertEqual(retried["status"], "pending_device")
             finally:
                 server.shutdown()
                 server.server_close()
