@@ -253,6 +253,29 @@ class ManagedAccountsTests(unittest.TestCase):
         self.assertEqual(legacy["status"], "needs_reconnect")
         self.assertEqual(adapter.promotions, [])
 
+    def test_refresh_of_existing_successor_reconciles_reconnecting_legacy_row(self):
+        adapter = DedupAdapter()
+        accounts = ManagedAccounts(Path(self.temp.name), {"fake": adapter}, dedup_secret=b"s" * 32)
+        first = accounts.start("fake", "", "device")
+        adapter.connected = True
+        legacy = accounts.status("fake", first["operationID"])["connection"]
+        rows = accounts._rows()
+        rows[0]["status"] = "needs_reconnect"
+        rows[0].pop("dedupKey", None)
+        accounts._write(rows)
+        second = accounts.start("fake", "", "device")
+        successor = accounts.status("fake", second["operationID"])["connection"]
+        adapter.refresh = lambda profile: {
+            "status": "connected", "authenticated": True,
+            "identity": {"email": "verified@example.test", "verification": True, "source": "fixture", "accountID": "provider-user-42"},
+            "providerIdentity": {"accountID": "provider-user-42", "tenantID": "tenant-a"},
+            "usage": {"source": "fake", "freshness": "live", "windows": [], "tokenUsage": None, "tokenUsageAvailable": False},
+        }
+        refreshed = accounts.refresh("fake", successor["id"])
+        self.assertEqual(refreshed["id"], legacy["id"])
+        self.assertEqual(len(accounts.snapshot()), 1)
+        self.assertEqual(len(adapter.promotions), 1)
+
     def test_verified_identity_never_merges_across_tenant_or_when_missing(self):
         adapter = DedupAdapter(tenant_for_operation=lambda operation: "tenant-a" if operation.endswith("1") else "tenant-b")
         accounts = ManagedAccounts(Path(self.temp.name), {"fake": adapter}, dedup_secret=b"e" * 32)
