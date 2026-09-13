@@ -20,7 +20,7 @@ import time
 import uuid
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -245,8 +245,8 @@ def _verified_email_identity(token: str) -> Tuple[Dict[str, Any], Optional[str]]
     account_id = account_id.strip()
     email = claims.get("email") if isinstance(claims, dict) else None
     if not isinstance(email, str) or not _EMAIL_RE.fullmatch(email):
-        return {"identityStatus": {"status": "unavailable", "reason": "email_not_available"}}, account_id
-    return {"identity": {"email": email, "verification": True, "source": "kimi_managed_userinfo", "accountID": account_id}}, account_id
+        return {"identityStatus": {"status": "unavailable", "reason": "email_not_available"}, "providerIdentity": {"accountID": account_id}}, account_id
+    return {"identity": {"email": email, "verification": True, "source": "kimi_managed_userinfo", "accountID": account_id}, "providerIdentity": {"accountID": account_id}}, account_id
 
 
 def _usage_number(value: Any) -> Optional[float]:
@@ -391,6 +391,124 @@ def _commit_staged_reauth(staged: Any) -> None:
         staged[1].unlink()
     except OSError:
         pass
+
+
+def _private_directory(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
+        return True
+    except OSError:
+        return False
+
+
+def _verified_provider_account(profile_dir: Path, credential_name: Optional[str] = None) -> Optional[str]:
+    """Validate a selected credential through Kimi's authenticated `/me` endpoint."""
+    selected = _select_credential(profile_dir, credential_name=credential_name)
+    if selected is None:
+        return None
+    token = selected.get("access")
+    if not isinstance(token, str) or not token:
+        return None
+    _, account_id = _verified_email_identity(token)
+    return account_id
+
+
+def _cleanup_promotion_directory(path: Path) -> None:
+    """Remove only a fully agent-created, now-empty promotion directory."""
+    try:
+        credentials = path / "credentials"
+        credentials.rmdir()
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def promote_verified_profile(source: Path, destination: Path, identity: Mapping[str, Any]) -> bool:
+    """Promote one server-verified Kimi credential without moving either profile.
+
+    The registry calls this only after deciding that two rows have the same
+    provider identity.  We independently confirm that identity from `/me` for
+    both a private destination candidate and the installed destination before
+    committing a replacement.  The source always remains.
+    """
+    expected = identity.get("accountID") if isinstance(identity, Mapping) else None
+    if not isinstance(expected, str) or not (1 <= len(expected.strip()) <= 256):
+        return False
+    expected = expected.strip()
+    source = Path(source)
+    destination = Path(destination)
+    source_binding = _binding(source)
+    selected = _select_credential(source, credential_name=source_binding.get("credentialName"))
+    if selected is None or _verified_provider_account(source, selected["name"]) != expected:
+        return False
+    credential_source = selected.get("path")
+    if not isinstance(credential_source, Path):
+        return False
+    try:
+        credential_bytes = credential_source.read_bytes()
+    except OSError:
+        return False
+    if not _private_directory(destination) or not _private_directory(destination / "credentials"):
+        return False
+    transaction = uuid.uuid4().hex
+    candidate_root = destination / (".agentcat-kimi-promotion-" + transaction)
+    candidate_credential = candidate_root / "credentials" / selected["name"]
+    candidate_binding = candidate_root / _BINDING_NAME
+    if not _private_directory(candidate_root) or not _private_directory(candidate_credential.parent) or not _private_replace(candidate_credential, credential_bytes):
+        return False
+    _bind_credential(candidate_root, {"accountID": expected}, selected["name"])
+    if not candidate_binding.is_file() or _verified_provider_account(candidate_root, selected["name"]) != expected:
+        return False
+
+    destination_credential = destination / "credentials" / selected["name"]
+    destination_binding = _binding_path(destination)
+    backup_root = destination / (".agentcat-kimi-promotion-backup-" + transaction)
+    backup_credential = backup_root / "credentials" / selected["name"]
+    backup_binding = backup_root / _BINDING_NAME
+    had_credential = destination_credential.exists()
+    had_binding = destination_binding.exists()
+    moved_credential = False
+    moved_binding = False
+    backed_up_credential = False
+    backed_up_binding = False
+    try:
+        if not _private_directory(backup_root) or not _private_directory(backup_credential.parent):
+            return False
+        if had_credential:
+            destination_credential.replace(backup_credential)
+            backup_credential.chmod(0o600)
+            backed_up_credential = True
+        if had_binding:
+            destination_binding.replace(backup_binding)
+            backup_binding.chmod(0o600)
+            backed_up_binding = True
+        candidate_credential.replace(destination_credential)
+        destination_credential.chmod(0o600)
+        moved_credential = True
+        candidate_binding.replace(destination_binding)
+        destination_binding.chmod(0o600)
+        moved_binding = True
+        if _verified_provider_account(destination, selected["name"]) != expected:
+            raise ValueError("destination_identity_mismatch")
+    except (OSError, ValueError):
+        try:
+            if backed_up_credential and backup_credential.exists():
+                backup_credential.replace(destination_credential)
+                destination_credential.chmod(0o600)
+            elif moved_credential and not had_credential and destination_credential.exists():
+                destination_credential.unlink()
+            if backed_up_binding and backup_binding.exists():
+                backup_binding.replace(destination_binding)
+                destination_binding.chmod(0o600)
+            elif moved_binding and not had_binding and destination_binding.exists():
+                destination_binding.unlink()
+        except OSError:
+            pass
+        return False
+    _cleanup_promotion_directory(candidate_root)
+    _cleanup_promotion_directory(backup_root)
+    return True
 
 
 def _persist_refreshed_credential(selected: Dict[str, Any], response: Any) -> Optional[Path]:

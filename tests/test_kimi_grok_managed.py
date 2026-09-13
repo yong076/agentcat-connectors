@@ -450,6 +450,7 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
             "email": "kimi@example.test", "verification": True,
             "source": "kimi_managed_userinfo", "accountID": "kimi-account",
         })
+        self.assertEqual(result["providerIdentity"], {"accountID": "kimi-account"})
         self.assertNotIn("identityStatus", result)
         with patch.object(kimi, "urlopen", side_effect=[FakeResponse(usage), FakeResponse('{"user_id":"kimi-account","email":"kimi@example.test"}')]):
             kimi._verified_credential(profile, bind=True)
@@ -469,6 +470,7 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         self.assertTrue(kimi_result["authenticated"])
         self.assertNotIn("identity", kimi_result)
         self.assertEqual(kimi_result["identityStatus"], {"status": "unavailable", "reason": "email_not_available"})
+        self.assertEqual(kimi_result["providerIdentity"], {"accountID": "kimi-account"})
         self.assertNotIn("not-proof@example.test", str(kimi_result))
 
         with patch.object(kimi, "urlopen", side_effect=[FakeResponse(usage), FakeResponse('{"email":"kimi@example.test"}')]):
@@ -487,6 +489,61 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         self.assertEqual(grok_result["identityStatus"], {"status": "unavailable", "reason": "native_email_not_exposed"})
         self.assertEqual(grok_result["usage"]["subscriptionTier"], "SuperGrok Heavy")
         self.assertNotIn("not-proof@example.test", str(grok_result))
+
+    def test_kimi_promote_verified_profile_copies_validated_native_credential_and_binding(self):
+        source = Path(self.tmp.name) / "kimi-promotion-source"
+        destination = Path(self.tmp.name) / "kimi-promotion-destination"
+        for profile, token, account in ((source, "source-secret", "account-new"), (destination, "destination-secret", "account-old")):
+            (profile / "credentials").mkdir(parents=True)
+            (profile / "credentials" / "kimi-code.json").write_text(json.dumps({"access_token": token, "expires_at": 2208988800}), encoding="utf-8")
+            kimi._bind_credential(profile, {"accountID": account}, "kimi-code.json")
+        with patch.object(kimi, "urlopen", side_effect=[
+            FakeResponse('{"user_id":"account-new"}'),
+            FakeResponse('{"user_id":"account-new"}'),
+            FakeResponse('{"user_id":"account-new"}'),
+        ]):
+            self.assertTrue(kimi.promote_verified_profile(source, destination, {"accountID": "account-new"}))
+        self.assertIn("source-secret", (source / "credentials" / "kimi-code.json").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads((destination / "credentials" / "kimi-code.json").read_text(encoding="utf-8"))["access_token"], "source-secret")
+        binding = (destination / ".agentcat-kimi-binding.json").read_text(encoding="utf-8")
+        self.assertIn("account-new", binding)
+        self.assertEqual((destination / "credentials" / "kimi-code.json").stat().st_mode & 0o777, 0o600)
+        backups = list(destination.glob(".agentcat-kimi-promotion-backup-*"))
+        self.assertEqual(len(backups), 1)
+        previous = backups[0] / "credentials" / "kimi-code.json"
+        self.assertEqual(previous.stat().st_mode & 0o777, 0o600)
+        self.assertIn("destination-secret", previous.read_text(encoding="utf-8"))
+
+    def test_kimi_promote_verified_profile_rejects_missing_id_without_provider_or_file_changes(self):
+        source = Path(self.tmp.name) / "kimi-promotion-missing-source"
+        destination = Path(self.tmp.name) / "kimi-promotion-missing-destination"
+        for profile, token in ((source, "source-secret"), (destination, "destination-secret")):
+            (profile / "credentials").mkdir(parents=True)
+            (profile / "credentials" / "kimi-code.json").write_text(json.dumps({"access_token": token, "expires_at": 2208988800}), encoding="utf-8")
+        before = (destination / "credentials" / "kimi-code.json").read_bytes()
+        with patch.object(kimi, "urlopen") as request:
+            self.assertFalse(kimi.promote_verified_profile(source, destination, {}))
+        request.assert_not_called()
+        self.assertEqual((destination / "credentials" / "kimi-code.json").read_bytes(), before)
+
+    def test_kimi_promote_verified_profile_rolls_back_destination_on_final_identity_mismatch(self):
+        source = Path(self.tmp.name) / "kimi-promotion-rollback-source"
+        destination = Path(self.tmp.name) / "kimi-promotion-rollback-destination"
+        for profile, token, account in ((source, "source-secret", "account-new"), (destination, "destination-secret", "account-old")):
+            (profile / "credentials").mkdir(parents=True)
+            (profile / "credentials" / "kimi-code.json").write_text(json.dumps({"access_token": token, "expires_at": 2208988800}), encoding="utf-8")
+            kimi._bind_credential(profile, {"accountID": account}, "kimi-code.json")
+        old_credential = (destination / "credentials" / "kimi-code.json").read_bytes()
+        old_binding = (destination / ".agentcat-kimi-binding.json").read_bytes()
+        with patch.object(kimi, "urlopen", side_effect=[
+            FakeResponse('{"user_id":"account-new"}'),
+            FakeResponse('{"user_id":"account-new"}'),
+            FakeResponse('{"user_id":"other-account"}'),
+        ]):
+            self.assertFalse(kimi.promote_verified_profile(source, destination, {"accountID": "account-new"}))
+        self.assertEqual((destination / "credentials" / "kimi-code.json").read_bytes(), old_credential)
+        self.assertEqual((destination / ".agentcat-kimi-binding.json").read_bytes(), old_binding)
+        self.assertIn("source-secret", (source / "credentials" / "kimi-code.json").read_text(encoding="utf-8"))
 
     def test_explicit_cli_override_works_with_minimal_path(self):
         directory = Path(self.tmp.name) / "bin"
