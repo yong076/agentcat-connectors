@@ -164,6 +164,26 @@ class ManagedAccountRouteTests(unittest.TestCase):
         listed_row = next(item for item in listed["connections"] if item["provider"] == "gemini")
         self.assertEqual(listed_row["usage"], GEMINI_UNAVAILABLE_USAGE)
 
+    def test_http_claude_browser_route_is_provider_scoped(self):
+        class ClaudeFixtureAdapter(FakeAdapter):
+            def adapter_capability(self):
+                return {"provider": "claude", "supported": True, "available": True,
+                        "reason": None, "modes": ["browser"], "browserLaunchMode": "provider"}
+
+            def start(self, profile, mode):
+                if mode != "browser":
+                    raise AssertionError("Claude adapter received the wrong mode")
+                self.number += 1
+                return {"operationID": f"claude-{self.number:08d}", "status": "pending_browser",
+                        "browserLaunchMode": "provider"}
+
+        self.adapter = ClaudeFixtureAdapter()
+        agentcat._MANAGED_ACCOUNTS = agentcat.ManagedAccounts(self.agentcat_home, {"claude": self.adapter})
+        _, started = self.request("/v1/connections/claude/oauth/start", body={"mode": "browser"}, method="POST")
+        self.assertEqual(started["status"], "pending_browser")
+        _, pending = self.request(f"/v1/connections/claude/oauth/{started['operationID']}")
+        self.assertEqual(pending["resume"]["browserLaunchMode"], "provider")
+
     def test_connected_refresh_and_remove_are_per_account(self):
         _, started = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
         self.adapter.connected.add(started["operationID"])

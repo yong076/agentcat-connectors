@@ -30,6 +30,7 @@ SAFE_ADAPTER_START_ERRORS = frozenset({
     "grok_cli_unsupported", "grok_login_mode_unsupported",
     "grok_browser_not_supported", "grok_login_start_failed",
     "grok_login_surface_unavailable",
+    "claude_cli_unsupported", "claude_browser_only", "claude_login_start_failed",
 })
 PUBLIC_FIELDS = (
     "id", "provider", "label", "kind", "scope", "status", "createdAt",

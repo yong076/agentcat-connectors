@@ -101,6 +101,7 @@ def _native_managed_adapters() -> Dict[str, Any]:
         ("kimi", "agentcat_kimi_managed"),
         ("grok", "agentcat_grok_managed"),
         ("gemini", "agentcat_google_managed_auth"),
+        ("claude", "agentcat_claude_managed"),
     ):
         try:
             module = importlib.import_module(module_name)
@@ -16675,7 +16676,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, {"status": openrouter_oauth_status(oauth_status_match.group(1))})
             return
-        managed_status_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/oauth/([A-Za-z0-9_-]{8,})", path)
+        managed_status_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/oauth/([A-Za-z0-9_-]{8,})", path)
         if managed_status_match:
             guard_error = connection_control_request_error(self.headers, mutation=False)
             if guard_error is not None:
@@ -16772,7 +16773,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json(200, result)
                 return
-            managed_start_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/oauth/start", path)
+            managed_start_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/oauth/start", path)
             if managed_start_match:
                 provider = managed_start_match.group(1)
                 try:
@@ -16831,7 +16832,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             if openrouter_cancel_match:
                 self.send_json(200, {"status": openrouter_cancel_oauth(openrouter_cancel_match.group(1))})
                 return
-            managed_retry_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/([0-9a-f]{32})/oauth/retry", path)
+            managed_retry_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/([0-9a-f]{32})/oauth/retry", path)
             if managed_retry_match:
                 provider, connection_id = managed_retry_match.groups()
                 try:
@@ -16853,12 +16854,12 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json(200, result)
                 return
-            managed_cancel_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/oauth/([A-Za-z0-9_-]{8,})/cancel", path)
+            managed_cancel_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/oauth/([A-Za-z0-9_-]{8,})/cancel", path)
             if managed_cancel_match:
                 provider, operation = managed_cancel_match.groups()
                 self.send_json(200, {"status": managed_accounts().cancel(provider, operation)})
                 return
-            managed_refresh_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/([0-9a-f]{32})/refresh", path)
+            managed_refresh_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/([0-9a-f]{32})/refresh", path)
             if managed_refresh_match:
                 provider, connection_id = managed_refresh_match.groups()
                 try:
@@ -17048,7 +17049,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if not self.host_header_ok():
             return
         path = urllib.parse.urlparse(self.path).path
-        managed_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/([0-9a-f]{32})", path)
+        managed_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/([0-9a-f]{32})", path)
         if managed_match:
             guard_error = connection_control_request_error(self.headers, mutation=True)
             if guard_error is not None:
