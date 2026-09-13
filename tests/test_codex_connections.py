@@ -95,6 +95,7 @@ class CodexConnectionsTests(unittest.TestCase):
         self.prerequisite = patch.object(agentcat, "app_server_prerequisite", return_value=None)
         self.prerequisite.start()
         agentcat._CODEX_APP_SERVERS.clear()
+        agentcat._CODEX_COMPLETED_OPERATIONS.clear()
         FakeCodexAppServer.accounts = {}
         FakeCodexAppServer.attempts = {}
         FakeCodexAppServer.fail_logout = False
@@ -103,6 +104,7 @@ class CodexConnectionsTests(unittest.TestCase):
     def tearDown(self):
         self.prerequisite.stop()
         agentcat._CODEX_APP_SERVERS.clear()
+        agentcat._CODEX_COMPLETED_OPERATIONS.clear()
         restore_module_paths(agentcat, self.old_paths)
         self.tmp.cleanup()
 
@@ -124,6 +126,24 @@ class CodexConnectionsTests(unittest.TestCase):
         self.assertEqual(connection["usage"]["windows"][0]["windowDurationMins"], 300)
         self.assertEqual(connection["usage"]["windows"][1]["windowDurationMins"], 10080)
         self.assertEqual(connection["usage"]["tokenUsage"]["dailyBuckets"][0]["tokens"], 123)
+
+    def test_completed_operation_remains_idempotently_readable_for_the_live_lease(self):
+        started = self._start()
+        row = agentcat._codex_connections()[0]
+        FakeCodexAppServer.accounts[row["id"]] = {"email": "me@example.com", "planType": "pro"}
+
+        first = agentcat.codex_oauth_status(started["operationID"])
+        repeated = agentcat.codex_oauth_status(started["operationID"])
+
+        self.assertEqual(first["status"], "connected")
+        self.assertEqual(repeated["status"], "connected")
+        self.assertEqual(repeated["connection"]["id"], row["id"])
+        self.assertEqual(repeated["connection"]["identity"]["email"], "me@example.com")
+        self.assertEqual(repeated["connection"]["usage"]["tokenUsage"]["summary"]["lifetimeTokens"], 999)
+        self.assertNotIn("operationID", repeated["connection"])
+        remembered = agentcat._CODEX_COMPLETED_OPERATIONS[started["operationID"]]
+        self.assertEqual(remembered[0], row["id"])
+        self.assertEqual(len(remembered), 2)
 
     def test_cancel_and_registry_never_persist_raw_auth_material(self):
         started = self._start("device")

@@ -18170,6 +18170,13 @@ _CODEX_APP_SERVERS: Dict[str, CodexAppServer] = {}
 # returned solely to the authenticated local app while the matching child is
 # alive, never written to the connection registry or daemon logs.
 _CODEX_OAUTH_SURFACES: Dict[str, Dict[str, str]] = {}
+# A completed OAuth operation is kept in memory for the same bounded lease as a
+# pending operation.  The UI can otherwise observe ``connected`` once, issue a
+# final poll, and receive 404 because the durable connection correctly no
+# longer retains its login ID.  This is deliberately only an operation ->
+# connection-id association: it contains no OAuth surface, credential, or
+# profile path and disappears on daemon restart.
+_CODEX_COMPLETED_OPERATIONS: Dict[str, Tuple[str, dt.datetime]] = {}
 _CODEX_ID_RE = re.compile(r"[0-9a-f]{32}")
 CODEX_OAUTH_PENDING_TTL_SECONDS = 10 * 60
 
@@ -18278,6 +18285,33 @@ def _codex_pending_lease(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     return {"expiresAt": (value + dt.timedelta(seconds=CODEX_OAUTH_PENDING_TTL_SECONDS)).isoformat().replace("+00:00", "Z")}
 
 
+def _codex_remember_completed_operation(operation_id: str, row: Dict[str, Any]) -> None:
+    """Let a live client observe its terminal result after the durable ID is cleared."""
+    connection_id = row.get("id")
+    if not isinstance(connection_id, str) or not _CODEX_ID_RE.fullmatch(connection_id):
+        return
+    _CODEX_COMPLETED_OPERATIONS[operation_id] = (
+        connection_id,
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=CODEX_OAUTH_PENDING_TTL_SECONDS),
+    )
+
+
+def _codex_completed_operation_row(operation_id: str, rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Find a bounded, live-only terminal operation without reviving stale state."""
+    remembered = _CODEX_COMPLETED_OPERATIONS.get(operation_id)
+    if remembered is None:
+        return None
+    connection_id, expires_at = remembered
+    if dt.datetime.now(dt.timezone.utc) > expires_at:
+        _CODEX_COMPLETED_OPERATIONS.pop(operation_id, None)
+        return None
+    row = next((item for item in rows if item.get("id") == connection_id), None)
+    if row is None or row.get("status") != "connected":
+        _CODEX_COMPLETED_OPERATIONS.pop(operation_id, None)
+        return None
+    return row
+
+
 def codex_connection_capabilities() -> Dict[str, Any]:
     """Runtime prerequisite signal for the authenticated local settings UI."""
     reason = app_server_prerequisite()
@@ -18334,6 +18368,7 @@ def _codex_refresh_row(row: Dict[str, Any]) -> bool:
         operation_id = row.pop("operationID", None)
         if isinstance(operation_id, str):
             _CODEX_OAUTH_SURFACES.pop(operation_id, None)
+            _codex_remember_completed_operation(operation_id, row)
         row.pop("appServerGeneration", None)
         row.pop("pendingStartedAt", None)
         row["lastSuccessfulSyncAt"] = row["lastSyncAt"]
@@ -18482,7 +18517,10 @@ def codex_oauth_status(operation_id: str) -> Dict[str, Any]:
         rows = _codex_connections()
         row = next((item for item in rows if item.get("operationID") == operation_id), None)
         if row is None:
-            raise KeyError("oauth_operation_not_found")
+            completed = _codex_completed_operation_row(operation_id, rows)
+            if completed is None:
+                raise KeyError("oauth_operation_not_found")
+            return {"status": "connected", "connection": _codex_public_connection(completed)}
         if row.get("status") in {"pending_browser", "pending_device"}:
             server = _codex_pending_server(row)
             if server is None:
