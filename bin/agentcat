@@ -44,7 +44,7 @@ from agentcat_codex_app_server import (
     CodexAppServerUnsupported,
     app_server_prerequisite,
 )
-from agentcat_managed_accounts import ManagedAccounts
+from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS
 from agentcat_openrouter_managed import OpenRouterManagedAuth, OpenRouterManagedError, build_adapter as build_openrouter_managed_adapter
 
 
@@ -16782,7 +16782,13 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                     self.send_json(404, {"error": "provider_not_supported"})
                     return
                 except RuntimeError as exc:
-                    self.send_json(409, {"error": str(exc) if str(exc).endswith(("_unavailable", "_not_supported")) else "managed_oauth_start_failed"})
+                    reason = str(exc)
+                    if reason in SAFE_ADAPTER_START_ERRORS:
+                        self.send_json(502, {"error": reason})
+                    elif reason.endswith(("_unavailable", "_not_supported")):
+                        self.send_json(409, {"error": reason})
+                    else:
+                        self.send_json(502, {"error": "managed_oauth_start_failed"})
                     return
                 except ValueError:
                     self.send_json(400, {"error": "invalid_connection"})
@@ -16831,7 +16837,13 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                     self.send_json(404, {"error": "connection_not_found"})
                     return
                 except RuntimeError as exc:
-                    self.send_json(409, {"error": str(exc) if str(exc) == "managed_oauth_retry_not_allowed" else "managed_oauth_retry_failed"})
+                    reason = str(exc)
+                    if reason == "managed_oauth_retry_not_allowed":
+                        self.send_json(409, {"error": reason})
+                    elif reason in SAFE_ADAPTER_START_ERRORS:
+                        self.send_json(502, {"error": reason})
+                    else:
+                        self.send_json(502, {"error": "managed_oauth_retry_failed"})
                     return
                 except Exception:
                     self.send_json(502, {"error": "managed_oauth_retry_failed"})

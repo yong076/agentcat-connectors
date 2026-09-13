@@ -23,11 +23,14 @@ class FakeAdapter:
     def __init__(self):
         self.number = 0
         self.connected = set()
+        self.start_error = None
 
     def adapter_capability(self):
         return {"provider": "kimi", "supported": True, "available": True, "reason": None, "modes": ["device"]}
 
     def start(self, profile, mode):
+        if self.start_error is not None:
+            return {"status": "failed", "error": self.start_error}
         self.number += 1
         return {"operationID": f"device-{self.number:08d}", "status": "pending_device", "verificationURL": "https://login.example.test/device", "userCode": "CODE-123"}
 
@@ -114,6 +117,22 @@ class ManagedAccountRouteTests(unittest.TestCase):
         _, retried = self.request(f"/v1/connections/kimi/{row['id']}/oauth/retry", body={"mode": "device"}, method="POST")
         self.assertEqual(retried["status"], "pending_device")
         self.assertEqual(agentcat.managed_accounts().snapshot()[0]["id"], row["id"])
+
+    def test_retry_exposes_only_allowlisted_start_failures(self):
+        _, started = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
+        self.request(f"/v1/connections/kimi/oauth/{started['operationID']}/cancel", body={}, method="POST")
+        _, listed = self.request("/v1/connections")
+        row = next(item for item in listed["connections"] if item["provider"] == "kimi")
+        for adapter_error, expected in (("kimi_login_surface_unavailable", "kimi_login_surface_unavailable"), ("raw CLI output: secret-looking-detail", "managed_oauth_retry_failed")):
+            with self.subTest(adapter_error=adapter_error):
+                self.adapter.start_error = adapter_error
+                with self.assertRaises(HTTPError) as rejected:
+                    self.request(f"/v1/connections/kimi/{row['id']}/oauth/retry", body={"mode": "device"}, method="POST")
+                self.assertEqual(rejected.exception.code, 502)
+                payload = json.loads(rejected.exception.read().decode())
+                self.assertEqual(payload, {"error": expected})
+                self.assertNotIn("secret-looking-detail", str(payload))
+        self.adapter.start_error = None
 
     def test_http_managed_connection_preserves_normalized_unavailable_usage(self):
         class GeminiFixtureAdapter(FakeAdapter):

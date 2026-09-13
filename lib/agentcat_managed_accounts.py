@@ -19,6 +19,16 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 PENDING = frozenset({"pending_browser", "pending_device"})
 TERMINAL = frozenset({"failed", "canceled", "error", "needs_reconnect"})
+# Adapter startup may expose only these stable, non-sensitive reason codes to
+# the authenticated local client.  Raw CLI output and provider detail stay out
+# of both the registry and HTTP responses.
+SAFE_ADAPTER_START_ERRORS = frozenset({
+    "kimi_cli_unsupported", "kimi_browser_not_supported",
+    "kimi_login_start_failed", "kimi_login_surface_unavailable",
+    "grok_cli_unsupported", "grok_login_mode_unsupported",
+    "grok_browser_not_supported", "grok_login_start_failed",
+    "grok_login_surface_unavailable",
+})
 PUBLIC_FIELDS = (
     "id", "provider", "label", "kind", "scope", "status", "createdAt",
     "lastSyncAt", "lastSuccessfulSyncAt", "error", "identity", "identityStatus", "usage",
@@ -136,6 +146,9 @@ class ManagedAccounts:
         operation = result.get("operationID") if isinstance(result, dict) else None
         status = result.get("status") if isinstance(result, dict) else None
         if not isinstance(operation, str) or not operation or status not in PENDING:
+            error = result.get("error") if isinstance(result, dict) else None
+            if isinstance(error, str) and error in SAFE_ADAPTER_START_ERRORS:
+                raise RuntimeError(error)
             raise RuntimeError("managed_oauth_start_failed")
         row["operationID"] = operation
         row["status"] = status
