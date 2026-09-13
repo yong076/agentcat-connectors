@@ -46,6 +46,20 @@ class FakeAdapter:
         return None
 
 
+GEMINI_UNAVAILABLE_USAGE = {
+    "source": "gemini_code_assist",
+    "freshness": "unavailable",
+    "windows": [],
+    "credits": None,
+    "spendControl": None,
+    "rateLimitReachedType": None,
+    "tokenUsage": None,
+    "tokenUsageAvailable": False,
+    "scope": "gemini_code_assist_request_quota",
+    "reason": "gemini_consumer_tier_unsupported",
+}
+
+
 class ManagedAccountRouteTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -100,6 +114,33 @@ class ManagedAccountRouteTests(unittest.TestCase):
         _, retried = self.request(f"/v1/connections/kimi/{row['id']}/oauth/retry", body={"mode": "device"}, method="POST")
         self.assertEqual(retried["status"], "pending_device")
         self.assertEqual(agentcat.managed_accounts().snapshot()[0]["id"], row["id"])
+
+    def test_http_managed_connection_preserves_normalized_unavailable_usage(self):
+        class GeminiFixtureAdapter(FakeAdapter):
+            def adapter_capability(self):
+                return {"provider": "gemini", "supported": True, "available": True, "reason": None, "modes": ["browser"]}
+
+            def start(self, profile, mode):
+                self.number += 1
+                return {"operationID": f"browser-{self.number:08d}", "status": "pending_browser", "browserLaunchMode": "provider"}
+
+            def poll(self, profile, operation):
+                return {
+                    "status": "connected", "authenticated": True,
+                    "identity": {"email": "verified@example.invalid", "verification": True, "source": "google_userinfo"},
+                    "usage": GEMINI_UNAVAILABLE_USAGE,
+                }
+
+        self.adapter = GeminiFixtureAdapter()
+        agentcat._MANAGED_ACCOUNTS = agentcat.ManagedAccounts(self.agentcat_home, {"gemini": self.adapter})
+        _, started = self.request("/v1/connections/gemini/oauth/start", body={"mode": "browser"}, method="POST")
+        _, connected = self.request(f"/v1/connections/gemini/oauth/{started['operationID']}")
+        row = connected["connection"]
+        self.assertEqual(row["identity"], {"email": "verified@example.invalid", "verification": True, "source": "google_userinfo"})
+        self.assertEqual(row["usage"], GEMINI_UNAVAILABLE_USAGE)
+        _, listed = self.request("/v1/connections")
+        listed_row = next(item for item in listed["connections"] if item["provider"] == "gemini")
+        self.assertEqual(listed_row["usage"], GEMINI_UNAVAILABLE_USAGE)
 
     def test_connected_refresh_and_remove_are_per_account(self):
         _, started = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")

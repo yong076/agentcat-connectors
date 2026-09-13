@@ -127,6 +127,30 @@ class CodexConnectionsTests(unittest.TestCase):
         self.assertEqual(connection["usage"]["windows"][1]["windowDurationMins"], 10080)
         self.assertEqual(connection["usage"]["tokenUsage"]["dailyBuckets"][0]["tokens"], 123)
 
+    def test_list_refresh_throttles_connected_profile_but_explicit_refresh_is_unbounded(self):
+        started = self._start()
+        row = agentcat._codex_connections()[0]
+        FakeCodexAppServer.accounts[row["id"]] = {"email": "me@example.com", "planType": "pro"}
+        agentcat.codex_oauth_status(started["operationID"])
+
+        # Completion set lastSyncAt. A normal protected list returns the cached
+        # connected row without another app-server usage request.
+        with patch.object(agentcat, "_codex_refresh_row", side_effect=AssertionError("implicit list probe")):
+            listed = agentcat.codex_connections_snapshot()
+        self.assertEqual(listed[0]["status"], "connected")
+
+        # Once the durable attempt timestamp is older than the short cadence,
+        # list may refresh. An explicit POST refresh remains immediate.
+        row = agentcat._codex_connections()[0]
+        row["lastSyncAt"] = "2000-01-01T00:00:00Z"
+        agentcat._write_codex_connections([row])
+        with patch.object(agentcat, "_codex_refresh_row", return_value=True) as implicit:
+            agentcat.codex_connections_snapshot()
+        implicit.assert_called_once()
+        with patch.object(agentcat, "_codex_refresh_row", return_value=True) as explicit:
+            agentcat.codex_connections_snapshot(refresh=True)
+        explicit.assert_called_once()
+
     def test_completed_operation_remains_idempotently_readable_for_the_live_lease(self):
         started = self._start()
         row = agentcat._codex_connections()[0]
