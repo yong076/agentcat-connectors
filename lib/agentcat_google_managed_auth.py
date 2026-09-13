@@ -527,7 +527,7 @@ def _copy_0600(source: Path, destination: Path) -> None:
     destination.chmod(0o600)
 
 
-def promote_verified_profile(source: Path, destination: Path, identity: Mapping[str, Any]) -> None:
+def promote_verified_profile(source: Path, destination: Path, identity: Mapping[str, Any]) -> bool:
     """Promote verified Gemini credentials without losing either profile on error.
 
     The registry calls this only after it has matched the private provider
@@ -593,6 +593,10 @@ def promote_verified_profile(source: Path, destination: Path, identity: Mapping[
                 directory.rmdir()
             except OSError:
                 pass
+    # ManagedAccounts treats this explicit value as its commit signal.  All
+    # failures above raise after preserving the source and restoring the
+    # destination where required.
+    return True
 
 
 def _code_assist_post(method: str, payload: Dict[str, Any], access_token: str) -> Dict[str, Any]:

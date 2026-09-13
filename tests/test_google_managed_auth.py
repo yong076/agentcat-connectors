@@ -14,6 +14,7 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "lib"))
 import agentcat_google_managed_auth as managed
+from agentcat_managed_accounts import ManagedAccounts
 
 
 def _unavailable_usage(reason):
@@ -511,6 +512,56 @@ class GoogleManagedAuthTests(unittest.TestCase):
 
         self.assertTrue(source_credentials.exists())
         self.assertEqual(json.loads(destination_credentials.read_text(encoding="utf-8"))["access_token"], "old-managed-token")
+
+    def test_verified_same_owner_login_commits_gemini_profile_promotion_to_core_canonical_row(self):
+        class GeminiDedupAdapter:
+            def __init__(self):
+                self.next_operation = 0
+
+            def adapter_capability(self):
+                return {"provider": "gemini", "supported": True, "available": True, "reason": None, "modes": ["browser"]}
+
+            def start(self, profile, mode):
+                self.next_operation += 1
+                credentials = Path(profile) / ".gemini" / "oauth_creds.json"
+                credentials.parent.mkdir(parents=True, exist_ok=True)
+                credentials.write_text(
+                    json.dumps({"access_token": "fixture-token", "expiry_date": time.time() * 1000 + 3_600_000}),
+                    encoding="utf-8",
+                )
+                return {"operationID": f"gemini-op-{self.next_operation}", "status": "pending_browser"}
+
+            def poll(self, profile, operation):
+                return {
+                    "status": "connected",
+                    "authenticated": True,
+                    "identity": {
+                        "email": "managed.user@example.com",
+                        "verification": True,
+                        "source": "google_userinfo",
+                        "accountID": "google-account-42",
+                    },
+                    "providerIdentity": {"accountID": "google-account-42"},
+                    "usage": _unavailable_usage("gemini_consumer_tier_unsupported"),
+                }
+
+            def promote_verified_profile(self, source, destination, identity):
+                return managed.promote_verified_profile(source, destination, identity)
+
+        adapter = GeminiDedupAdapter()
+        accounts = ManagedAccounts(Path(self.tmp.name) / "registry", {"gemini": adapter}, dedup_secret=b"g" * 32)
+        first = accounts.start("gemini", "", "browser")
+        canonical = accounts.status("gemini", first["operationID"])["connection"]
+        second = accounts.start("gemini", "", "browser")
+        with patch.object(managed.urllib.request, "urlopen", return_value=_Response({"id": "google-account-42", "email": "managed.user@example.com", "verified_email": True})):
+            merged = accounts.status("gemini", second["operationID"])
+
+        self.assertEqual(merged["status"], "connected")
+        self.assertEqual(merged["connection"]["id"], canonical["id"])
+        self.assertIn("supersededConnectionID", merged)
+        self.assertEqual([row["id"] for row in accounts.snapshot()], [canonical["id"]])
+        promoted_credentials = accounts.profile_root / "gemini" / canonical["id"] / ".gemini" / "oauth_creds.json"
+        self.assertTrue(promoted_credentials.exists())
 
     def test_remove_touches_only_known_managed_credential_files(self):
         gemini_dir = self.profile / ".gemini"
