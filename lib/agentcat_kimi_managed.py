@@ -19,7 +19,7 @@ import time
 import uuid
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -32,9 +32,11 @@ _OUTPUT_LIMIT = 8192
 _AUTH_HOSTS = {"kimi.com", "www.kimi.com", "auth.kimi.com"}
 _CODE_RE = re.compile(r"\b(?:code|user[ _-]?code)\s*[:=]\s*([A-Z0-9-]{4,64})\b", re.I)
 _USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+_USERINFO_URL = "https://api.kimi.com/coding/v1/me"
 _TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 _CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 _BINDING_NAME = ".agentcat-kimi-binding.json"
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _executable() -> Optional[str]:
@@ -187,7 +189,7 @@ def _bind_credential(profile_dir: Path, identity: Dict[str, Any], credential_nam
 
 
 def _native_identity(raw: Dict[str, Any], token: Optional[str]) -> Dict[str, str]:
-    """Expose only a provider-issued subject/account claim, never a token derivative."""
+    """Return a private provider-issued account identifier for credential binding."""
     claims: Dict[str, Any] = dict(raw)
     if isinstance(token, str) and token.count(".") >= 2:
         try:
@@ -203,6 +205,25 @@ def _native_identity(raw: Dict[str, Any], token: Optional[str]) -> Dict[str, str
         if isinstance(value, str) and 1 <= len(value.strip()) <= 256:
             return {"accountID": value.strip()}
     return {"status": "unavailable"}
+
+
+def _verified_email_identity(token: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Return email and account ID only from Kimi CLI's managed-user endpoint."""
+    try:
+        request = Request(_USERINFO_URL, headers={"Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": "kimi-code/1.0"})
+        with urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read(1_000_000).decode("utf-8"))
+    except Exception:
+        return {"identityStatus": {"status": "unavailable", "reason": "userinfo_unavailable"}}, None
+    claims = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else payload
+    account_id = claims.get("user_id") if isinstance(claims, dict) else None
+    if not isinstance(account_id, str) or not (1 <= len(account_id.strip()) <= 256):
+        return {"identityStatus": {"status": "unavailable", "reason": "userinfo_malformed"}}, None
+    account_id = account_id.strip()
+    email = claims.get("email") if isinstance(claims, dict) else None
+    if not isinstance(email, str) or not _EMAIL_RE.fullmatch(email):
+        return {"identityStatus": {"status": "unavailable", "reason": "email_not_available"}}, account_id
+    return {"identity": {"email": email, "verification": True, "source": "kimi_managed_userinfo", "accountID": account_id}}, account_id
 
 
 def _live_usage(token: str) -> Dict[str, Any]:
@@ -248,10 +269,11 @@ def _verified_credential(
     if not isinstance(token, str) or not token:
         return None
     # This provider request proves the selected credential is accepted before its claim is used.
-    identity = _native_identity(selected["raw"], token)
-    result = {"identity": identity, "usage": _live_usage(token)}
+    usage = _live_usage(token)
+    identity_result, account_id = _verified_email_identity(token)
+    result = {**identity_result, "usage": usage}
     if bind:
-        _bind_credential(profile_dir, identity, selected["name"])
+        _bind_credential(profile_dir, {"accountID": account_id}, selected["name"])
     return result
 
 
@@ -406,14 +428,16 @@ def refresh(profile_dir: Path) -> Dict[str, Any]:
         binding = _binding(profile_dir)
         verified = _verified_credential(
             profile_dir,
-            account_id=binding.get("accountID"),
+            # The selected credential name is the durable binding.  A managed
+            # `/me` user_id need not be duplicated in the credential payload.
+            account_id=binding.get("accountID") if not binding.get("credentialName") else None,
             credential_name=binding.get("credentialName"),
         )
         if verified is None:
             raise ValueError("token_missing")
         return {"status": "connected", "authenticated": True, **verified}
     except Exception:
-        return {"status": "connected", "authenticated": False, "identity": {"status": "unavailable"}, "usage": {"source": "kimi-live", "freshness": "unavailable", "windows": [], "credits": None, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False}}
+        return {"status": "connected", "authenticated": False, "identityStatus": {"status": "unavailable", "reason": "sign_in_required"}, "usage": {"source": "kimi-live", "freshness": "unavailable", "windows": [], "credits": None, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False}}
 
 
 def remove(profile_dir: Path) -> None:

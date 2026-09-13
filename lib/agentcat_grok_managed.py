@@ -131,6 +131,12 @@ def _native_identity(raw: Dict[str, Any], token: str) -> Dict[str, str]:
     return {"status": "unavailable"}
 
 
+def _verified_email_identity(raw: Dict[str, Any], token: str) -> Dict[str, Any]:
+    """Fail closed: Grok exposes no verified email source in its installed CLI."""
+    del raw, token
+    return {"identityStatus": {"status": "unavailable", "reason": "native_email_not_exposed"}}
+
+
 def _live_usage(token: str) -> Dict[str, Any]:
     request = Request(_BILLING_URL, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
     with urlopen(request, timeout=12) as response:
@@ -154,7 +160,7 @@ def _verified_credential(profile_dir: Path, before: Optional[set[str]] = None) -
     token = selected.get("token")
     if not isinstance(token, str) or not token:
         return None
-    return {"identity": _native_identity(selected["raw"], token), "usage": _live_usage(token)}
+    return {**_verified_email_identity(selected["raw"], token), "usage": _live_usage(token)}
 
 
 def _safe_url(value: Any) -> Optional[str]:
@@ -314,7 +320,7 @@ def refresh(profile_dir: Path) -> Dict[str, Any]:
             raise ValueError("token_missing")
         return {"status": "connected", "authenticated": True, **verified}
     except Exception:
-        return {"status": "connected", "authenticated": False, "identity": {"status": "unavailable"}, "usage": {"source": "grok-live", "freshness": "unavailable", "windows": [], "credits": None, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False}}
+        return {"status": "connected", "authenticated": False, "identityStatus": {"status": "unavailable", "reason": "sign_in_required"}, "usage": {"source": "grok-live", "freshness": "unavailable", "windows": [], "credits": None, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False}}
 
 
 def remove(profile_dir: Path) -> None:

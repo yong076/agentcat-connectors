@@ -82,6 +82,22 @@ class ManagedAccountsTests(unittest.TestCase):
         self.assertEqual(refreshed["identity"]["accountID"], "first")
         self.assertEqual(refreshed["usage"]["source"], "fake")
 
+    def test_refresh_migrates_legacy_display_label_to_verified_email(self):
+        self.accounts._write([{
+            "id": "a" * 32, "provider": "fake", "label": "Account 1",
+            "kind": "managed_native_auth", "scope": "managed_provider_profile",
+            "status": "connected", "createdAt": "2026-01-01T00:00:00Z",
+            "usage": {"source": "old"},
+        }])
+        self.adapter.refresh = lambda profile: {
+            "status": "connected", "authenticated": True,
+            "identity": {"email": "real@example.test", "verification": True, "source": "fixture"},
+            "usage": {"source": "fixture"},
+        }
+        refreshed = self.accounts.refresh("fake", "a" * 32)
+        self.assertEqual(refreshed["label"], "real@example.test")
+        self.assertEqual(refreshed["identity"]["email"], "real@example.test")
+
     def test_multiple_provider_rows_survive_restart_and_isolate_retry_remove(self):
         other = FakeAdapter()
         accounts = ManagedAccounts(Path(self.temp.name), {"fake": self.adapter, "other": other})

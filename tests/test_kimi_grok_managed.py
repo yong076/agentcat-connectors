@@ -65,7 +65,11 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
 
     @staticmethod
     def jwt_with_sub(subject):
-        payload = base64.urlsafe_b64encode(json.dumps({"sub": subject}).encode("utf-8")).decode("ascii").rstrip("=")
+        return ManagedDeviceAdapterTests.jwt_with_claims({"sub": subject})
+
+    @staticmethod
+    def jwt_with_claims(claims):
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode("utf-8")).decode("ascii").rstrip("=")
         return "header." + payload + ".signature"
 
     def test_kimi_device_login_uses_only_kimi_code_home_and_allowlists_surface(self):
@@ -171,7 +175,8 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         with patch.object(kimi, "urlopen", return_value=FakeResponse('{"data":{"limits":[{"detail":{"used":1,"limit":2}}]}}')) as request:
             result = kimi.refresh(profile)
         self.assertTrue(result["authenticated"])
-        self.assertEqual(result["identity"], {"accountID": "kimi-new"})
+        self.assertNotIn("identity", result)
+        self.assertEqual(result["identityStatus"], {"status": "unavailable", "reason": "userinfo_malformed"})
         self.assertIn("Bearer new-secret", request.call_args.args[0].get_header("Authorization"))
 
     def test_kimi_retry_binds_changed_credential_despite_older_credential_expiry(self):
@@ -187,7 +192,10 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         with patch.object(kimi, "_executable", return_value="/test/kimi"), \
              patch.object(kimi.subprocess, "run", return_value=Mock(returncode=0)), \
              patch.object(kimi.subprocess, "Popen", return_value=process), \
-             patch.object(kimi, "urlopen", return_value=FakeResponse(usage)) as request:
+             patch.object(kimi, "urlopen", side_effect=[
+                 FakeResponse(usage), FakeResponse('{"user_id":"account-b"}'),
+                 FakeResponse(usage), FakeResponse('{"user_id":"account-b"}'),
+             ]) as request:
             started = kimi.start(profile, "device")
             (credentials / "kimi-code-b.json").write_text(
                 '{"access_token":"new-secret","expires_at":2208988800,"account_id":"account-b"}',
@@ -197,8 +205,8 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
             connected = kimi.poll(profile, started["operationID"])
             refreshed = kimi.refresh(profile)
 
-        self.assertEqual(connected["identity"], {"accountID": "account-b"})
-        self.assertEqual(refreshed["identity"], {"accountID": "account-b"})
+        self.assertEqual(connected["identityStatus"], {"status": "unavailable", "reason": "email_not_available"})
+        self.assertEqual(refreshed["identityStatus"], {"status": "unavailable", "reason": "email_not_available"})
         self.assertTrue(all("Bearer new-secret" in call.args[0].get_header("Authorization") for call in request.call_args_list))
         binding = (profile / ".agentcat-kimi-binding.json").read_text(encoding="utf-8")
         self.assertIn("account-b", binding)
@@ -218,7 +226,10 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         with patch.object(kimi, "_executable", return_value="/test/kimi"), \
              patch.object(kimi.subprocess, "run", return_value=Mock(returncode=0)), \
              patch.object(kimi.subprocess, "Popen", return_value=process), \
-             patch.object(kimi, "urlopen", return_value=FakeResponse(usage)) as request:
+             patch.object(kimi, "urlopen", side_effect=[
+                 FakeResponse(usage), FakeResponse('{"user_id":"account-b"}'),
+                 FakeResponse(usage), FakeResponse('{"user_id":"account-b"}'),
+             ]) as request:
             started = kimi.start(profile, "device")
             (credentials / "kimi-code-b.json").write_text(
                 '{"access_token":"new-secret","expires_at":2208988800}', encoding="utf-8"
@@ -227,12 +238,12 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
             connected = kimi.poll(profile, started["operationID"])
             refreshed = kimi.refresh(profile)
 
-        self.assertEqual(connected["identity"], {"status": "unavailable"})
-        self.assertEqual(refreshed["identity"], {"status": "unavailable"})
+        self.assertEqual(connected["identityStatus"], {"status": "unavailable", "reason": "email_not_available"})
+        self.assertEqual(refreshed["identityStatus"], {"status": "unavailable", "reason": "email_not_available"})
         self.assertTrue(all("Bearer new-secret" in call.args[0].get_header("Authorization") for call in request.call_args_list))
         binding = (profile / ".agentcat-kimi-binding.json").read_text(encoding="utf-8")
         self.assertIn('"credentialName": "kimi-code-b.json"', binding)
-        self.assertNotIn("accountID", binding)
+        self.assertIn("account-b", binding)
         self.assertNotIn("secret", binding)
 
     def test_changed_profiles_connect_to_their_own_native_identity(self):
@@ -248,10 +259,62 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
             for process in processes:
                 process.code = 0
             results = [kimi.poll(profile, started["operationID"]) for profile, started in zip(profiles, starts)]
-        self.assertEqual([result["identity"]["accountID"] for result in results], ["account-one", "account-two"])
+        self.assertEqual([result["identityStatus"] for result in results], [
+            {"status": "unavailable", "reason": "userinfo_malformed"},
+            {"status": "unavailable", "reason": "userinfo_malformed"},
+        ])
         self.assertTrue(all(result["authenticated"] for result in results))
         self.assertNotIn("signature", str(results))
         self.assertNotIn(str(profiles[0]), str(results))
+
+    def test_kimi_verified_email_comes_only_from_authenticated_userinfo(self):
+        usage = '{"data":{"limits":[{"detail":{"used":1,"limit":2}}]}}'
+        profile = Path(self.tmp.name) / "kimi-verified-email"
+        (profile / "credentials").mkdir(parents=True)
+        token = self.jwt_with_claims({"sub": "forged-jwt-account", "email": "ignored@example.test"})
+        (profile / "credentials" / "kimi-code.json").write_text(json.dumps({"access_token": token, "account_id": "forged-raw-account", "email": "not-proof@example.test"}), encoding="utf-8")
+        with patch.object(kimi, "urlopen", side_effect=[FakeResponse(usage), FakeResponse('{"user_id":"kimi-account","email":"kimi@example.test"}')]):
+            result = kimi.refresh(profile)
+        self.assertEqual(result["identity"], {
+            "email": "kimi@example.test", "verification": True,
+            "source": "kimi_managed_userinfo", "accountID": "kimi-account",
+        })
+        self.assertNotIn("identityStatus", result)
+        with patch.object(kimi, "urlopen", side_effect=[FakeResponse(usage), FakeResponse('{"user_id":"kimi-account","email":"kimi@example.test"}')]):
+            kimi._verified_credential(profile, bind=True)
+        binding = (profile / ".agentcat-kimi-binding.json").read_text(encoding="utf-8")
+        self.assertIn("kimi-account", binding)
+        self.assertNotIn("forged-raw-account", binding)
+        self.assertNotIn("forged-jwt-account", binding)
+
+    def test_missing_kimi_userinfo_email_and_grok_claims_omit_identity_with_safe_status(self):
+        usage = '{"data":{"limits":[{"detail":{"used":1,"limit":2}}]}}'
+        billing = '{"config":{"currentPeriod":"WEEK","creditUsagePercent":7}}'
+        kimi_profile = Path(self.tmp.name) / "kimi-missing-email"
+        (kimi_profile / "credentials").mkdir(parents=True)
+        (kimi_profile / "credentials" / "kimi-code.json").write_text('{"access_token":"kimi-secret","account_id":"kimi-account","email":"not-proof@example.test"}', encoding="utf-8")
+        with patch.object(kimi, "urlopen", side_effect=[FakeResponse(usage), FakeResponse('{"user_id":"kimi-account"}')]):
+            kimi_result = kimi.refresh(kimi_profile)
+        self.assertTrue(kimi_result["authenticated"])
+        self.assertNotIn("identity", kimi_result)
+        self.assertEqual(kimi_result["identityStatus"], {"status": "unavailable", "reason": "email_not_available"})
+        self.assertNotIn("not-proof@example.test", str(kimi_result))
+
+        with patch.object(kimi, "urlopen", side_effect=[FakeResponse(usage), FakeResponse('{"email":"kimi@example.test"}')]):
+            malformed_result = kimi.refresh(kimi_profile)
+        self.assertNotIn("identity", malformed_result)
+        self.assertEqual(malformed_result["identityStatus"], {"status": "unavailable", "reason": "userinfo_malformed"})
+
+        grok_profile = Path(self.tmp.name) / "grok-missing-email"
+        grok_profile.mkdir()
+        token = self.jwt_with_claims({"sub": "grok-account", "email": "grok@example.test", "email_verified": True})
+        (grok_profile / "auth.json").write_text(json.dumps({"oauth": {"access_token": token}, "email": "not-proof@example.test"}), encoding="utf-8")
+        with patch.object(grok, "urlopen", return_value=FakeResponse(billing)):
+            grok_result = grok.refresh(grok_profile)
+        self.assertTrue(grok_result["authenticated"])
+        self.assertNotIn("identity", grok_result)
+        self.assertEqual(grok_result["identityStatus"], {"status": "unavailable", "reason": "native_email_not_exposed"})
+        self.assertNotIn("not-proof@example.test", str(grok_result))
 
     def test_explicit_cli_override_works_with_minimal_path(self):
         directory = Path(self.tmp.name) / "bin"
