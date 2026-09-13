@@ -241,6 +241,15 @@ def poll(profile_dir: Path, operation_id: str) -> Dict[str, Any]:
         _SESSIONS.pop(key, None)
     session.close()
     if not result:
+        # Gemini ACP runs the OAuth exchange and then Code Assist setup in one
+        # `authenticate` request.  The latter may reject an account that has
+        # not completed Code Assist setup *after* the OAuth token has been
+        # persisted.  A JSON-RPC error alone therefore is not proof that the
+        # managed Google sign-in failed.  Accept it only when a fresh check of
+        # this exact profile proves the credentials are usable.
+        refreshed = refresh(Path(profile_dir))
+        if refreshed.get("status") == "connected" and refreshed.get("authenticated") is True:
+            return refreshed
         return {"status": "failed", "error": "Gemini did not accept this sign-in."}
     managed_profile = Path(profile_dir)
     if not _has_managed_authentication(managed_profile):
@@ -400,6 +409,21 @@ def _usage_from_profile(profile_dir: Path) -> Dict[str, Any]:
     except Exception:
         tier = {}
     project = tier.get("cloudaicompanionProject") if isinstance(tier.get("cloudaicompanionProject"), str) else ""
+    current_tier = tier.get("currentTier") if isinstance(tier.get("currentTier"), dict) else None
+    allowed_tiers = tier.get("allowedTiers") if isinstance(tier.get("allowedTiers"), list) else []
+    if not project and current_tier is None:
+        # Current Gemini CLI calls onboardUser for this response shape.  That
+        # changes the Google account's Code Assist setup, so a read-only usage
+        # refresh must not perform it.  Avoid a misleading quota request that
+        # the service rejects with 403 for the absent project/setup.
+        has_default_tier = any(isinstance(item, dict) and item.get("isDefault") is True for item in allowed_tiers)
+        return {
+            "status": "unavailable",
+            "reason": "code_assist_onboarding_required" if has_default_tier else "google_cloud_project_required",
+            "source": "gemini_code_assist",
+            "scope": "gemini_code_assist_request_quota",
+            "quotas": [],
+        }
     quota = _code_assist_post("retrieveUserQuota", {"project": project} if project else {}, token)
     buckets = quota.get("buckets") if isinstance(quota.get("buckets"), list) else []
     normalized = []
@@ -448,7 +472,10 @@ def refresh(profile_dir: Path) -> Dict[str, Any]:
     except GeminiManagedAuthError:
         return {"status": "needs_reconnect", **identity, "usage": {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []}}
     except Exception:
-        return {"status": "error", **identity, "usage": {"status": "unavailable", "reason": "usage_unavailable", "scope": "gemini_code_assist_request_quota", "quotas": []}}
+        # Usage access and account authentication are separate provider
+        # capabilities.  Do not discard a verified managed login merely
+        # because the Code Assist quota endpoint is temporarily unavailable.
+        return {"status": "connected", "authenticated": True, **identity, "usage": {"status": "unavailable", "reason": "usage_unavailable", "scope": "gemini_code_assist_request_quota", "quotas": []}}
     return {"status": "connected", "authenticated": True, **identity, "usage": usage}
 
 
