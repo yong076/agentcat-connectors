@@ -37,6 +37,15 @@ _TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 _CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 _BINDING_NAME = ".agentcat-kimi-binding.json"
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_FALLBACK_PATH = ":".join((
+    str(Path.home() / ".local/bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+))
 
 
 def _executable() -> Optional[str]:
@@ -57,6 +66,11 @@ def _executable() -> Optional[str]:
 
 def _environment(profile_dir: Path) -> Dict[str, str]:
     env = dict(os.environ)
+    # The daemon can be launched with no PATH.  The trusted CLI is a
+    # ``#!/usr/bin/env node`` wrapper, so resolving its absolute path alone is
+    # not enough for its interpreter to start.
+    if not isinstance(env.get("PATH"), str) or not env["PATH"].strip():
+        env["PATH"] = _FALLBACK_PATH
     for name in ("KIMI_CODE_HOME", "KIMI_HOME", "KIMI_CODE_DIR", "KIMI_DATA_DIR"):
         env.pop(name, None)
     env["KIMI_CODE_HOME"] = str(profile_dir)

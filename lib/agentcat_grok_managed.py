@@ -26,6 +26,15 @@ _OUTPUT_LIMIT = 8192
 _AUTH_SUFFIXES = ("x.ai", "grok.com")
 _CODE_RE = re.compile(r"\b(?:code|user[ _-]?code)\s*[:=]\s*([A-Z0-9-]{4,64})\b", re.I)
 _BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+_FALLBACK_PATH = ":".join((
+    str(Path.home() / ".local/bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+))
 
 
 def _executable() -> Optional[str]:
@@ -46,6 +55,10 @@ def _executable() -> Optional[str]:
 
 def _environment(profile_dir: Path) -> Dict[str, str]:
     env = dict(os.environ)
+    # Native CLI wrappers may use ``/usr/bin/env``.  Daemon launches without a
+    # PATH must still be able to start the interpreter of an already trusted CLI.
+    if not isinstance(env.get("PATH"), str) or not env["PATH"].strip():
+        env["PATH"] = _FALLBACK_PATH
     for name in ("GROK_HOME", "XAI_HOME"):
         env.pop(name, None)
     env["GROK_HOME"] = str(profile_dir)

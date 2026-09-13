@@ -326,6 +326,17 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
             with self.subTest(provider=name), patch.dict(os.environ, {"PATH": "/definitely-empty", variable: str(executable)}, clear=False):
                 self.assertEqual(module._executable(), str(executable))
 
+    def test_capability_probe_supplies_path_for_env_interpreter_when_daemon_path_is_empty(self):
+        """An absolute CLI wrapper still needs PATH for ``/usr/bin/env sh``."""
+        wrapper = Path(self.tmp.name) / "kimi-env-wrapper"
+        wrapper.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+        wrapper.chmod(0o700)
+        kimi._PROBE = None
+        with patch.dict(os.environ, {"AGENTCAT_KIMI_CLI": str(wrapper), "PATH": ""}, clear=True):
+            capability = kimi.adapter_capability()
+        self.assertTrue(capability["available"])
+        self.assertIsNone(capability["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()
