@@ -150,6 +150,17 @@ def _verified_email_identity(raw: Dict[str, Any], token: str) -> Dict[str, Any]:
     return {"identityStatus": {"status": "unavailable", "reason": "native_email_not_exposed"}}
 
 
+def _subscription_tier(config: Dict[str, Any]) -> Optional[str]:
+    """Allowlist the provider-reported billing tier for display only."""
+    value = config.get("subscriptionTier")
+    if not isinstance(value, str):
+        return None
+    tier = value.strip()
+    if not 1 <= len(tier) <= 128 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._+/-]*", tier):
+        return None
+    return tier
+
+
 def _live_usage(token: str) -> Dict[str, Any]:
     request = Request(_BILLING_URL, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
     with urlopen(request, timeout=12) as response:
@@ -163,7 +174,8 @@ def _live_usage(token: str) -> Dict[str, Any]:
     window_id = "grok:5h" if "hour" in period or "5h" in period or "short" in period else "grok:7d"
     products = config.get("productUsage")
     credits = {"products": products} if isinstance(products, (dict, list)) else None
-    return {"source": "grok-live", "freshness": "live", "windows": [{"id": window_id, "usedPercent": max(0.0, min(100.0, float(percent))), "remainingPercent": max(0.0, min(100.0, 100.0 - float(percent)))}], "credits": credits, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False}
+    tier = _subscription_tier(config)
+    return {"source": "grok-live", "freshness": "live", "windows": [{"id": window_id, "usedPercent": max(0.0, min(100.0, float(percent))), "remainingPercent": max(0.0, min(100.0, 100.0 - float(percent)))}], "credits": credits, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False, **({"subscriptionTier": tier} if tier else {})}
 
 
 def _verified_credential(profile_dir: Path, before: Optional[set[str]] = None) -> Optional[Dict[str, Any]]:

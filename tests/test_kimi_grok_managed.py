@@ -139,6 +139,7 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
             result = grok.refresh(grok_profile)
         self.assertEqual(result["usage"]["windows"], [{"id": "grok:7d", "usedPercent": 7.0, "remainingPercent": 93.0}])
         self.assertEqual(result["usage"]["credits"], {"products": {"grok": 7}})
+        self.assertNotIn("subscriptionTier", result["usage"])
         self.assertNotIn("grok-secret", str(result))
         self.assertIn("Bearer grok-secret", request.call_args.args[0].get_header("Authorization"))
 
@@ -289,7 +290,7 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
 
     def test_missing_kimi_userinfo_email_and_grok_claims_omit_identity_with_safe_status(self):
         usage = '{"data":{"limits":[{"detail":{"used":1,"limit":2}}]}}'
-        billing = '{"config":{"currentPeriod":"WEEK","creditUsagePercent":7}}'
+        billing = '{"config":{"currentPeriod":"WEEK","creditUsagePercent":7,"subscriptionTier":"SuperGrok Heavy"}}'
         kimi_profile = Path(self.tmp.name) / "kimi-missing-email"
         (kimi_profile / "credentials").mkdir(parents=True)
         (kimi_profile / "credentials" / "kimi-code.json").write_text('{"access_token":"kimi-secret","account_id":"kimi-account","email":"not-proof@example.test"}', encoding="utf-8")
@@ -314,6 +315,7 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         self.assertTrue(grok_result["authenticated"])
         self.assertNotIn("identity", grok_result)
         self.assertEqual(grok_result["identityStatus"], {"status": "unavailable", "reason": "native_email_not_exposed"})
+        self.assertEqual(grok_result["usage"]["subscriptionTier"], "SuperGrok Heavy")
         self.assertNotIn("not-proof@example.test", str(grok_result))
 
     def test_explicit_cli_override_works_with_minimal_path(self):
