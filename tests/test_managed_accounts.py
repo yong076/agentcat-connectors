@@ -169,6 +169,9 @@ class ManagedAccountsTests(unittest.TestCase):
         self.assertEqual(merged["supersededConnectionID"], next(item["id"] for item in accounts._rows() if item.get("operationID") == second["operationID"]))
         self.assertEqual([row["id"] for row in accounts.snapshot()], [canonical["id"]])
         self.assertEqual(len(adapter.promotions), 1)
+        promoted_source, promoted_destination, _ = adapter.promotions[0]
+        self.assertEqual(promoted_source.name, merged["supersededConnectionID"])
+        self.assertEqual(promoted_destination.name, canonical["id"])
         registry = accounts.registry.read_text(encoding="utf-8")
         self.assertNotIn("provider-user-42", registry)
         self.assertNotIn("tenant-a", registry)
