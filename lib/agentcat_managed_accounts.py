@@ -295,9 +295,11 @@ class ManagedAccounts:
         """Give legacy connected rows a private key only from live provider proof.
 
         Older registries contain no HMAC key.  A new verified login may make a
-        bounded refresh of same-provider, same-scope connected candidates so it
-        can reuse an existing canonical row.  Display email/label is never an
-        input, and a failed candidate refresh leaves that row untouched.
+        bounded refresh of same-provider, same-scope connected or reconnecting
+        candidates so it can reuse an existing canonical row.  A reconnecting
+        row is eligible only when its own managed profile can freshly prove a
+        stable provider identity. Display email/label is never an input, and a
+        failed candidate refresh leaves that row unmerged.
         """
         provider = source.get("provider")
         scope = source.get("scope")
@@ -305,7 +307,8 @@ class ManagedAccounts:
         candidates = [
             row for row in rows
             if row is not source and row.get("provider") == provider and row.get("scope") == scope
-            and row.get("status") == "connected" and not isinstance(row.get("dedupKey"), str)
+            and row.get("status") in {"connected", "needs_reconnect"}
+            and not isinstance(row.get("dedupKey"), str)
         ][:8]
         for candidate in candidates:
             try:
