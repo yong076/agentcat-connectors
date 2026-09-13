@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import base64
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -246,6 +247,16 @@ def _verified_email_identity(token: str) -> Tuple[Dict[str, Any], Optional[str]]
     return {"identity": {"email": email, "verification": True, "source": "kimi_managed_userinfo", "accountID": account_id}}, account_id
 
 
+def _usage_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _live_usage(token: str) -> Dict[str, Any]:
     request = Request(_USAGE_URL, headers={"Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": "kimi-code/1.0"})
     with urlopen(request, timeout=12) as response:
@@ -257,14 +268,22 @@ def _live_usage(token: str) -> Dict[str, Any]:
         detail = item.get("detail") if isinstance(item, dict) and isinstance(item.get("detail"), dict) else item
         if not isinstance(detail, dict):
             continue
-        used, limit = detail.get("used"), detail.get("limit")
-        if not isinstance(used, (int, float)) or isinstance(used, bool) or not isinstance(limit, (int, float)) or isinstance(limit, bool) or limit <= 0:
+        used = _usage_number(detail.get("used"))
+        limit = _usage_number(detail.get("limit"))
+        remaining = _usage_number(detail.get("remaining"))
+        if used is None and remaining is not None and limit is not None:
+            used = max(limit - remaining, 0.0)
+        if used is None or limit is None or limit <= 0:
             continue
-        percent = max(0.0, min(100.0, float(used) * 100.0 / float(limit)))
+        percent = max(0.0, min(100.0, used * 100.0 / limit))
         windows.append({"id": "kimi:" + str(len(windows)), "usedPercent": percent, "remainingPercent": 100.0 - percent})
     if not windows:
         raise ValueError("usage_shape_unknown")
     return {"source": "kimi-live", "freshness": "live", "windows": windows, "credits": None, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False}
+
+
+def _unavailable_usage() -> Dict[str, Any]:
+    return {"source": "kimi-live", "freshness": "unavailable", "reason": "usage_unavailable", "windows": [], "credits": None, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False}
 
 
 def _verified_credential(
@@ -288,9 +307,17 @@ def _verified_credential(
         token = refreshed.get("access_token") if isinstance(refreshed, dict) else None
     if not isinstance(token, str) or not token:
         return None
-    # This provider request proves the selected credential is accepted before its claim is used.
-    usage = _live_usage(token)
+    # A successful usage response or authenticated userinfo response proves this
+    # credential.  Quota parsing/outages must not discard a verified identity.
+    try:
+        usage = _live_usage(token)
+        usage_authenticated = True
+    except Exception:
+        usage = _unavailable_usage()
+        usage_authenticated = False
     identity_result, account_id = _verified_email_identity(token)
+    if not usage_authenticated and account_id is None:
+        return None
     result = {**identity_result, "usage": usage}
     if bind:
         _bind_credential(profile_dir, {"accountID": account_id}, selected["name"])
@@ -415,15 +442,18 @@ def poll(profile_dir: Path, operation_id: str) -> Dict[str, Any]:
         return {"status": "pending_device", **surface}
     with _LOCK:
         _OPERATIONS.pop(operation_id, None)
-    if code != 0:
-        return {"status": "failed", "error": "kimi_login_failed"}
     try:
         verified = _verified_credential(operation["profile"], operation["before"], bind=True)
     except Exception:
         verified = None
-    if verified is None:
-        return {"status": "failed", "error": "kimi_auth_state_not_updated"}
-    return {"status": "connected", "authenticated": True, **verified}
+    # Kimi persists the device credential before its later local provisioning
+    # steps.  A nonzero CLI exit is therefore not decisive when this operation
+    # wrote a changed credential that the provider subsequently authenticates.
+    if verified is not None:
+        return {"status": "connected", "authenticated": True, **verified}
+    if code != 0:
+        return {"status": "failed", "error": "kimi_login_failed"}
+    return {"status": "failed", "error": "kimi_auth_state_not_updated"}
 
 
 def cancel(profile_dir: Path, operation_id: str) -> str:

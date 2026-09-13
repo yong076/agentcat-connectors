@@ -167,6 +167,45 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         self.assertEqual(result, {"status": "failed", "error": "kimi_auth_state_not_updated"})
         request.assert_not_called()
 
+    def test_kimi_nonzero_exit_connects_only_after_changed_server_authenticated_credential(self):
+        profile = Path(self.tmp.name) / "kimi-post-login-provisioning"
+        process = FakeProcess('{"verification_uri":"https://auth.kimi.com/device","user_code":"ABCD-1234"}\n')
+        live_usage = '{"limits":[{"window":{"duration":7,"timeUnit":"day"},"detail":{"limit":"8","remaining":"6","resetTime":"future"}}]}'
+        with patch.object(kimi, "_executable", return_value="/test/kimi"), \
+             patch.object(kimi.subprocess, "run", return_value=Mock(returncode=0)), \
+             patch.object(kimi.subprocess, "Popen", return_value=process), \
+             patch.object(kimi, "urlopen", side_effect=[FakeResponse(live_usage), FakeResponse('{"user_id":"kimi-account","email":"kimi@example.test"}')]):
+            started = kimi.start(profile, "device")
+            credentials = profile / "credentials"
+            credentials.mkdir()
+            (credentials / "kimi-code.json").write_text(
+                '{"access_token":"new-secret","refresh_token":"refresh-secret","expires_at":2208988800}',
+                encoding="utf-8",
+            )
+            process.code = 1
+            result = kimi.poll(profile, started["operationID"])
+
+        self.assertEqual(result["status"], "connected")
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["usage"]["windows"][0]["usedPercent"], 25.0)
+        self.assertEqual(result["identity"]["email"], "kimi@example.test")
+        self.assertNotIn("new-secret", str(result))
+
+    def test_kimi_verified_identity_survives_unavailable_usage(self):
+        profile = Path(self.tmp.name) / "kimi-usage-unavailable"
+        (profile / "credentials").mkdir(parents=True)
+        (profile / "credentials" / "kimi-code.json").write_text(
+            '{"access_token":"kimi-secret","refresh_token":"refresh-secret","expires_at":2208988800}',
+            encoding="utf-8",
+        )
+        with patch.object(kimi, "urlopen", side_effect=[OSError("offline"), FakeResponse('{"user_id":"kimi-account","email":"kimi@example.test"}')]):
+            result = kimi.refresh(profile)
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["identity"]["email"], "kimi@example.test")
+        self.assertEqual(result["usage"]["freshness"], "unavailable")
+        self.assertEqual(result["usage"]["reason"], "usage_unavailable")
+        self.assertEqual(result["usage"]["windows"], [])
+
     def test_kimi_selects_current_credential_by_expiry_not_glob_order(self):
         profile = Path(self.tmp.name) / "kimi-multiple"
         credentials = profile / "credentials"
