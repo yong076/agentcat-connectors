@@ -21,19 +21,27 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+_OAUTH_REFRESH_ERROR_REASONS = {
+    "invalid_grant": "token_refresh_rejected",
+    "invalid_client": "oauth_client_invalid",
+    "unauthorized_client": "oauth_client_unauthorized",
+    "invalid_request": "oauth_refresh_request_invalid",
+}
 _OAUTH_ID_RE = re.compile(r"OAUTH_CLIENT_ID\s*[:=]\s*[\"']([^\"']+)[\"']")
 _OAUTH_SECRET_RE = re.compile(r"OAUTH_CLIENT_SECRET\s*[:=]\s*[\"']([^\"']+)[\"']")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+$")
+_GOOGLE_ACCOUNT_ID_RE = re.compile(r"^[^\s\x00-\x1f]{1,255}$")
 _AUTH_ENV = (
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA",
@@ -43,7 +51,9 @@ _AUTH_ENV = (
 
 
 class GeminiManagedAuthError(RuntimeError):
-    pass
+    def __init__(self, message: str, reason: str = "sign_in_required"):
+        super().__init__(message)
+        self.reason = reason
 
 
 class _AcpSession:
@@ -258,12 +268,14 @@ def poll(profile_dir: Path, operation_id: str) -> Dict[str, Any]:
     usage = refreshed.get("usage") if isinstance(refreshed, dict) else None
     identity = refreshed.get("identity") if isinstance(refreshed, dict) else None
     identity_status = refreshed.get("identityStatus") if isinstance(refreshed, dict) else None
+    provider_identity = refreshed.get("providerIdentity") if isinstance(refreshed, dict) else None
     return {
         "status": "connected",
         "authenticated": True,
         **({"usage": usage} if isinstance(usage, dict) else {}),
         **({"identity": identity} if isinstance(identity, dict) else {}),
         **({"identityStatus": identity_status} if isinstance(identity_status, dict) else {}),
+        **({"providerIdentity": provider_identity} if isinstance(provider_identity, dict) else {}),
     }
 
 
@@ -333,7 +345,7 @@ def _oauth_client_credentials(creds: Dict[str, Any]) -> Tuple[str, str]:
                 found_secret = _OAUTH_SECRET_RE.search(contents)
                 if found_id and found_secret:
                     return found_id.group(1), found_secret.group(1)
-    raise GeminiManagedAuthError("Gemini CLI OAuth metadata is unavailable")
+    raise GeminiManagedAuthError("Gemini CLI OAuth metadata is unavailable", "oauth_metadata_unavailable")
 
 
 def _persist_refreshed_credentials(profile_dir: Path, credentials: Dict[str, Any]) -> None:
@@ -354,6 +366,18 @@ def _persist_refreshed_credentials(profile_dir: Path, credentials: Dict[str, Any
         raise GeminiManagedAuthError("Gemini managed credentials could not be updated") from error
 
 
+def _oauth_refresh_error_reason(error: urllib.error.HTTPError) -> str:
+    """Classify OAuth's standard error enum without retaining its response body."""
+    if error.code != 400:
+        return "token_refresh_unavailable"
+    try:
+        payload = json.loads(error.read().decode("utf-8"))
+    except Exception:
+        return "token_refresh_rejected"
+    code = payload.get("error") if isinstance(payload, dict) else None
+    return _OAUTH_REFRESH_ERROR_REASONS.get(code, "token_refresh_rejected")
+
+
 def _access_token(creds: Dict[str, Any], profile_dir: Optional[Path] = None) -> str:
     expiry = creds.get("expiry_date")
     expired = not isinstance(expiry, (int, float)) or time.time() * 1000 >= float(expiry) - 60_000
@@ -362,20 +386,26 @@ def _access_token(creds: Dict[str, Any], profile_dir: Optional[Path] = None) -> 
         return token
     refresh_token = creds.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
-        raise GeminiManagedAuthError("Gemini sign-in needs to be renewed")
+        raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", "sign_in_required")
     client_id, client_secret = _oauth_client_credentials(creds)
     body = urllib.parse.urlencode({
         "grant_type": "refresh_token", "refresh_token": refresh_token,
         "client_id": client_id, "client_secret": client_secret,
     }).encode("utf-8")
     request = urllib.request.Request(GEMINI_OAUTH_TOKEN_URL, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(request, timeout=10) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        reason = _oauth_refresh_error_reason(error)
+        raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", reason) from error
+    except OSError as error:
+        raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", "token_refresh_unavailable") from error
     if not isinstance(payload, dict):
-        raise GeminiManagedAuthError("Gemini sign-in needs to be renewed")
+        raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", "token_refresh_invalid_response")
     updated = payload.get("access_token")
     if not isinstance(updated, str) or not updated:
-        raise GeminiManagedAuthError("Gemini sign-in needs to be renewed")
+        raise GeminiManagedAuthError("Gemini sign-in needs to be renewed", "token_refresh_invalid_response")
     if profile_dir is not None:
         refreshed = dict(creds)
         refreshed.update(payload)
@@ -414,6 +444,8 @@ def _identity_from_managed_profile(profile_dir: Path) -> Dict[str, Any]:
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
+    except GeminiManagedAuthError as error:
+        return _identity_unavailable(error.reason)
     except Exception:
         return _identity_unavailable("userinfo_unavailable")
     email = payload.get("email") if isinstance(payload, dict) else None
@@ -422,13 +454,107 @@ def _identity_from_managed_profile(profile_dir: Path) -> Dict[str, Any]:
         return _identity_unavailable("email_not_available")
     if verified is not True:
         return _identity_unavailable("email_not_verified")
-    return {
-        "identity": {
-            "email": email,
-            "verification": True,
-            "source": "google_userinfo",
-        },
+    account_id = payload.get("id") if isinstance(payload, dict) else None
+    identity = {
+        "email": email,
+        "verification": True,
+        "source": "google_userinfo",
     }
+    # OAuth v2 userinfo's `id` is Google's provider-issued account identifier.
+    # It is deliberately separate from the display email: Google documents that
+    # an email address may change and must not be used as a primary key.
+    if isinstance(account_id, str) and _GOOGLE_ACCOUNT_ID_RE.fullmatch(account_id):
+        identity["accountID"] = account_id
+        return {
+            "identity": identity,
+            # The managed-account registry consumes this private handoff and
+            # HMACs it before persistence; never expose it through the app API.
+            "providerIdentity": {"accountID": account_id},
+        }
+    return {
+        "identity": identity,
+    }
+
+
+def _checked_provider_account_id(identity: Mapping[str, Any]) -> str:
+    account_id = identity.get("accountID")
+    if not isinstance(account_id, str) or not _GOOGLE_ACCOUNT_ID_RE.fullmatch(account_id):
+        raise GeminiManagedAuthError("Gemini verified account identity is unavailable")
+    return account_id
+
+
+def _copy_0600(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    destination.chmod(0o600)
+
+
+def promote_verified_profile(source: Path, destination: Path, identity: Mapping[str, Any]) -> None:
+    """Promote verified Gemini credentials without losing either profile on error.
+
+    The registry calls this only after it has matched the private provider
+    identity.  This function copies just Gemini's native OAuth credential file,
+    validates the staged copy against Google userinfo, atomically replaces the
+    destination credential, and retains the source for supersession recovery.
+    """
+    expected_account_id = _checked_provider_account_id(identity)
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+    if source == destination:
+        raise GeminiManagedAuthError("Gemini source and destination profiles must differ")
+    source_credentials = _managed_credentials_path(source)
+    if not source_credentials.is_file():
+        raise GeminiManagedAuthError("Gemini source credentials are unavailable")
+
+    staging_root = destination.parent / ("." + destination.name + ".gemini-promote-" + secrets.token_hex(8))
+    staged_credentials = _managed_credentials_path(staging_root)
+    destination_credentials = _managed_credentials_path(destination)
+    backup_credentials = destination_credentials.with_name(destination_credentials.name + ".backup-" + secrets.token_hex(8))
+    replaced = False
+    retain_backup = False
+    had_destination = destination_credentials.is_file()
+    try:
+        _copy_0600(source_credentials, staged_credentials)
+        validated = _identity_from_managed_profile(staging_root)
+        candidate_identity = validated.get("identity") if isinstance(validated.get("identity"), dict) else {}
+        if _checked_provider_account_id(candidate_identity) != expected_account_id:
+            raise GeminiManagedAuthError("Gemini staged credentials belong to another account")
+
+        if had_destination:
+            _copy_0600(destination_credentials, backup_credentials)
+        destination_credentials.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staged_credentials, destination_credentials)
+        replaced = True
+        destination_credentials.chmod(0o600)
+    except Exception as error:
+        if replaced:
+            try:
+                if had_destination:
+                    os.replace(backup_credentials, destination_credentials)
+                    destination_credentials.chmod(0o600)
+                else:
+                    destination_credentials.unlink(missing_ok=True)
+            except OSError:
+                # Keep the same-filesystem backup if restoring it also fails.
+                # The source credential is retained in every failure case.
+                retain_backup = had_destination
+        if isinstance(error, GeminiManagedAuthError):
+            raise
+        raise GeminiManagedAuthError("Gemini credentials could not be promoted") from error
+    finally:
+        paths_to_remove = [staged_credentials]
+        if not retain_backup:
+            paths_to_remove.append(backup_credentials)
+        for path in paths_to_remove:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        for directory in (staging_root / ".gemini", staging_root):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
 
 
 def _code_assist_post(method: str, payload: Dict[str, Any], access_token: str) -> Dict[str, Any]:

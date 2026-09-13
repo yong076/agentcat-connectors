@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import queue
@@ -132,7 +133,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
         original_home = os.environ.get("HOME")
         with patch.object(managed.shutil, "which", return_value="/fake/gemini"), \
              patch.object(managed.subprocess, "Popen", _FakePopen), \
-             patch.object(managed, "refresh", return_value={"status": "connected", "identity": {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"}, "usage": {"source": "gemini_code_assist", "freshness": "live", "windows": []}}):
+             patch.object(managed, "refresh", return_value={"status": "connected", "identity": {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo", "accountID": "google-account-42"}, "providerIdentity": {"accountID": "google-account-42"}, "usage": {"source": "gemini_code_assist", "freshness": "live", "windows": []}}):
             started = managed.start(self.profile, "browser")
             self.assertEqual(started["status"], "pending_browser")
             self.assertEqual(started["browserLaunchMode"], "provider")
@@ -157,6 +158,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
             self.assertEqual(state["status"], "connected")
             self.assertTrue(state["authenticated"])
             self.assertEqual(state["identity"]["email"], "managed.user@example.com")
+            self.assertEqual(state["providerIdentity"], {"accountID": "google-account-42"})
             self.assertEqual(state["usage"]["freshness"], "live")
 
     def test_resolver_uses_trusted_home_fallback_when_launchagent_path_is_minimal(self):
@@ -260,7 +262,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
         def urlopen(request, timeout):
             calls.append(request)
             if request.full_url == managed.GOOGLE_USERINFO_URL:
-                return _Response({"email": "managed.user@example.com", "verified_email": True})
+                return _Response({"id": "google-account-42", "email": "managed.user@example.com", "verified_email": True})
             if request.full_url.endswith(":loadCodeAssist"):
                 return _Response({"currentTier": {"id": "managed-tier"}, "paidTier": {"name": "Managed tier"}})
             return _Response({"buckets": [{"modelId": "gemini-pro", "remainingFraction": 0.75, "resetTime": "2026-10-01T00:00:00Z", "tokenType": "REQUESTS"}]})
@@ -269,7 +271,8 @@ class GoogleManagedAuthTests(unittest.TestCase):
             result = managed.refresh(self.profile)
         self.assertEqual(result["status"], "connected")
         self.assertTrue(result["authenticated"])
-        self.assertEqual(result["identity"], {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"})
+        self.assertEqual(result["identity"], {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo", "accountID": "google-account-42"})
+        self.assertEqual(result["providerIdentity"], {"accountID": "google-account-42"})
         self.assertEqual(result["usage"]["scope"], "gemini_code_assist_request_quota")
         self.assertEqual(result["usage"]["freshness"], "live")
         self.assertEqual(result["usage"]["windows"][0]["remainingPercent"], 75.0)
@@ -282,6 +285,60 @@ class GoogleManagedAuthTests(unittest.TestCase):
         self.assertNotIn("identity", result)
         self.assertEqual(result["identityStatus"], {"status": "unavailable", "reason": "sign_in_required"})
         self.assertEqual(result["usage"], _unavailable_usage("sign_in_required"))
+
+    def test_expired_auth_reports_missing_native_oauth_metadata_without_exposing_credentials(self):
+        credential_dir = self.profile / ".gemini"
+        credential_dir.mkdir(parents=True)
+        (credential_dir / "oauth_creds.json").write_text(json.dumps({"refresh_token": "fixture-refresh", "expiry_date": 0}), encoding="utf-8")
+        with patch.object(managed, "_oauth_client_credentials", side_effect=managed.GeminiManagedAuthError("metadata unavailable", "oauth_metadata_unavailable")):
+            result = managed.refresh(self.profile)
+        self.assertEqual(result["status"], "needs_reconnect")
+        self.assertEqual(result["identityStatus"], {"status": "unavailable", "reason": "oauth_metadata_unavailable"})
+        self.assertEqual(result["usage"], _unavailable_usage("sign_in_required"))
+
+    def test_expired_auth_reports_token_refresh_rejection_without_raw_provider_error(self):
+        credential_dir = self.profile / ".gemini"
+        credential_dir.mkdir(parents=True)
+        (credential_dir / "oauth_creds.json").write_text(json.dumps({"refresh_token": "fixture-refresh", "expiry_date": 0}), encoding="utf-8")
+        rejected = urllib.error.HTTPError("https://oauth2.googleapis.com/token", 400, "invalid_grant", None, io.BytesIO(b'{"error":"invalid_grant"}'))
+        with patch.object(managed, "_oauth_client_credentials", return_value=("fixture-client", "fixture-secret")), \
+             patch.object(managed.urllib.request, "urlopen", side_effect=rejected):
+            result = managed.refresh(self.profile)
+        self.assertEqual(result["status"], "needs_reconnect")
+        self.assertEqual(result["identityStatus"], {"status": "unavailable", "reason": "token_refresh_rejected"})
+        self.assertEqual(result["usage"], _unavailable_usage("sign_in_required"))
+
+    def test_expired_auth_distinguishes_invalid_oauth_client_metadata(self):
+        credential_dir = self.profile / ".gemini"
+        credential_dir.mkdir(parents=True)
+        (credential_dir / "oauth_creds.json").write_text(json.dumps({"refresh_token": "fixture-refresh", "expiry_date": 0}), encoding="utf-8")
+
+        def rejected(*unused, **unused_kwargs):
+            raise urllib.error.HTTPError(
+                "https://oauth2.googleapis.com/token", 400, "invalid_client", None, io.BytesIO(b'{"error":"invalid_client"}')
+            )
+
+        with patch.object(managed, "_oauth_client_credentials", return_value=("fixture-client", "fixture-secret")), \
+             patch.object(managed.urllib.request, "urlopen", side_effect=rejected):
+            result = managed.refresh(self.profile)
+        self.assertEqual(result["status"], "needs_reconnect")
+        self.assertEqual(result["identityStatus"], {"status": "unavailable", "reason": "oauth_client_invalid"})
+        self.assertEqual(result["usage"], _unavailable_usage("sign_in_required"))
+
+    def test_oauth_refresh_reason_allowlists_standard_error_enums(self):
+        expected = {
+            "invalid_grant": "token_refresh_rejected",
+            "invalid_client": "oauth_client_invalid",
+            "unauthorized_client": "oauth_client_unauthorized",
+            "invalid_request": "oauth_refresh_request_invalid",
+        }
+        for code, reason in expected.items():
+            with self.subTest(code=code):
+                error = urllib.error.HTTPError(
+                    "https://oauth2.googleapis.com/token", 400, code, None,
+                    io.BytesIO(json.dumps({"error": code, "error_description": "discarded"}).encode("utf-8")),
+                )
+                self.assertEqual(managed._oauth_refresh_error_reason(error), reason)
 
     def test_missing_userinfo_email_is_explicitly_unavailable(self):
         credential_dir = self.profile / ".gemini"
@@ -299,12 +356,13 @@ class GoogleManagedAuthTests(unittest.TestCase):
         credential_dir.mkdir(parents=True)
         (credential_dir / "oauth_creds.json").write_text(json.dumps({"access_token": "managed-token", "expiry_date": time.time() * 1000 + 3_600_000}), encoding="utf-8")
         forbidden = urllib.error.HTTPError("https://example.invalid", 403, "forbidden", None, None)
-        with patch.object(managed.urllib.request, "urlopen", return_value=_Response({"email": "managed.user@example.com", "verified_email": True})), \
+        with patch.object(managed.urllib.request, "urlopen", return_value=_Response({"id": "google-account-42", "email": "managed.user@example.com", "verified_email": True})), \
              patch.object(managed, "_usage_from_profile", side_effect=forbidden):
             result = managed.refresh(self.profile)
         self.assertEqual(result["status"], "connected")
         self.assertTrue(result["authenticated"])
-        self.assertEqual(result["identity"], {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"})
+        self.assertEqual(result["identity"], {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo", "accountID": "google-account-42"})
+        self.assertEqual(result["providerIdentity"], {"accountID": "google-account-42"})
         self.assertEqual(result["usage"], _unavailable_usage("usage_unavailable"))
 
     def test_usage_reports_official_onboarding_requirement_without_posting_onboard(self):
@@ -343,6 +401,42 @@ class GoogleManagedAuthTests(unittest.TestCase):
             usage = managed._usage_from_profile(self.profile)
         self.assertEqual(usage, _unavailable_usage("gemini_consumer_tier_unsupported"))
         self.assertEqual(post.call_count, 1)
+
+    def test_promote_verified_profile_replaces_only_validated_credentials_and_retains_source(self):
+        source = Path(self.tmp.name) / "new-profile"
+        destination = Path(self.tmp.name) / "canonical-profile"
+        source_credentials = source / ".gemini" / "oauth_creds.json"
+        destination_credentials = destination / ".gemini" / "oauth_creds.json"
+        source_credentials.parent.mkdir(parents=True)
+        destination_credentials.parent.mkdir(parents=True)
+        source_credentials.write_text(json.dumps({"access_token": "new-managed-token", "expiry_date": time.time() * 1000 + 3_600_000}), encoding="utf-8")
+        destination_credentials.write_text(json.dumps({"access_token": "old-managed-token", "expiry_date": time.time() * 1000 + 3_600_000}), encoding="utf-8")
+
+        with patch.object(managed.urllib.request, "urlopen", return_value=_Response({"id": "google-account-42", "email": "managed.user@example.com", "verified_email": True})):
+            managed.promote_verified_profile(source, destination, {"accountID": "google-account-42"})
+
+        self.assertTrue(source_credentials.exists())
+        self.assertEqual(json.loads(destination_credentials.read_text(encoding="utf-8"))["access_token"], "new-managed-token")
+        self.assertEqual(destination_credentials.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(list(destination.parent.glob(".canonical-profile.gemini-promote-*")))
+        self.assertFalse(list(destination_credentials.parent.glob("oauth_creds.json.backup-*")))
+
+    def test_promote_verified_profile_rejects_mismatched_provider_account_without_touching_profiles(self):
+        source = Path(self.tmp.name) / "new-profile"
+        destination = Path(self.tmp.name) / "canonical-profile"
+        source_credentials = source / ".gemini" / "oauth_creds.json"
+        destination_credentials = destination / ".gemini" / "oauth_creds.json"
+        source_credentials.parent.mkdir(parents=True)
+        destination_credentials.parent.mkdir(parents=True)
+        source_credentials.write_text(json.dumps({"access_token": "new-managed-token", "expiry_date": time.time() * 1000 + 3_600_000}), encoding="utf-8")
+        destination_credentials.write_text(json.dumps({"access_token": "old-managed-token", "expiry_date": time.time() * 1000 + 3_600_000}), encoding="utf-8")
+
+        with patch.object(managed.urllib.request, "urlopen", return_value=_Response({"id": "another-google-account", "email": "managed.user@example.com", "verified_email": True})):
+            with self.assertRaises(managed.GeminiManagedAuthError):
+                managed.promote_verified_profile(source, destination, {"accountID": "google-account-42"})
+
+        self.assertTrue(source_credentials.exists())
+        self.assertEqual(json.loads(destination_credentials.read_text(encoding="utf-8"))["access_token"], "old-managed-token")
 
     def test_remove_touches_only_known_managed_credential_files(self):
         gemini_dir = self.profile / ".gemini"
