@@ -1329,6 +1329,11 @@ def loopback_control_token() -> str:
     return token
 
 
+def initialize_loopback_control() -> None:
+    """Create the local control token before an app first needs to read it."""
+    loopback_control_token()
+
+
 def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
     for path in paths:
         current: Any = settings
@@ -16910,6 +16915,10 @@ def resolve_bind_host(host: Optional[str]) -> str:
 
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
+    # Connection clients read this file before their first authenticated request.
+    # Creating it only inside the request guard makes a fresh install unable to
+    # issue that request at all.
+    initialize_loopback_control()
     # Give the long-running daemon a real, leveled log so failures (keychain
     # denials, provider parse errors) leave a diagnosable trail in the launchd
     # stderr file instead of vanishing. Reason codes + ~-relative paths only —

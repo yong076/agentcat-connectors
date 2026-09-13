@@ -246,7 +246,12 @@ class CodexConnectionsTests(unittest.TestCase):
         self.assertEqual(refreshed["identity"]["email"], "first@example.com")
 
     def test_http_routes_require_loopback_bearer_and_cancel(self):
-        token = agentcat.loopback_control_token()
+        # This mirrors the native app: it reads the token before sending its
+        # first connection request, so daemon startup must bootstrap it.
+        self.assertFalse(agentcat.LOOPBACK_CONTROL_TOKEN_FILE.exists())
+        agentcat.initialize_loopback_control()
+        token = agentcat.LOOPBACK_CONTROL_TOKEN_FILE.read_text().strip()
+        self.assertTrue(token)
         with patch.object(agentcat, "CodexAppServer", FakeCodexAppServer):
             server = ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
