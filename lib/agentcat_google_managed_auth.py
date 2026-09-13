@@ -149,8 +149,24 @@ def _profile_key(profile_dir: Path, operation_id: str) -> Tuple[str, str]:
 
 
 def _gemini_executable() -> Optional[str]:
+    explicit = os.environ.get("AGENTCAT_GEMINI_CLI")
+    if explicit and _is_executable_file(Path(explicit)):
+        return explicit
     executable = shutil.which("gemini")
-    return executable if executable else None
+    if executable:
+        return executable
+    for candidate in (
+        Path.home() / ".local" / "bin" / "gemini",
+        Path("/opt/homebrew/bin/gemini"),
+        Path("/usr/local/bin/gemini"),
+    ):
+        if _is_executable_file(candidate):
+            return str(candidate)
+    return None
+
+
+def _is_executable_file(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
 
 
 def child_environment(profile_dir: Path) -> Dict[str, str]:
@@ -224,9 +240,16 @@ def poll(profile_dir: Path, operation_id: str) -> Dict[str, Any]:
     session.close()
     if not result:
         return {"status": "failed", "error": "Gemini did not accept this sign-in."}
-    refreshed = refresh(Path(profile_dir))
+    managed_profile = Path(profile_dir)
+    if not _has_managed_authentication(managed_profile):
+        return {"status": "failed", "error": "Gemini sign-in did not create managed credentials."}
+    refreshed = refresh(managed_profile)
     usage = refreshed.get("usage") if isinstance(refreshed, dict) else None
-    return {"status": "connected", **({"usage": usage} if isinstance(usage, dict) else {})}
+    return {
+        "status": "connected",
+        "authenticated": True,
+        **({"usage": usage} if isinstance(usage, dict) else {}),
+    }
 
 
 def cancel(profile_dir: Path, operation_id: str) -> str:
@@ -246,6 +269,17 @@ def _managed_credentials(profile_dir: Path) -> Optional[Dict[str, Any]]:
     except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _has_managed_authentication(profile_dir: Path) -> bool:
+    """Confirm that ACP persisted usable auth in this profile only."""
+    creds = _managed_credentials(profile_dir)
+    if not creds:
+        return False
+    return any(
+        isinstance(creds.get(field), str) and bool(creds[field])
+        for field in ("access_token", "refresh_token")
+    )
 
 
 def _oauth_client_credentials(creds: Dict[str, Any]) -> Tuple[str, str]:
@@ -349,13 +383,24 @@ def _usage_from_profile(profile_dir: Path) -> Dict[str, Any]:
 
 
 def refresh(profile_dir: Path) -> Dict[str, Any]:
+    profile_dir = Path(profile_dir)
+    if not _has_managed_authentication(profile_dir):
+        return {
+            "status": "needs_reconnect",
+            "usage": {
+                "status": "unavailable",
+                "reason": "sign_in_required",
+                "scope": "gemini_code_assist_request_quota",
+                "quotas": [],
+            },
+        }
     try:
-        usage = _usage_from_profile(Path(profile_dir))
+        usage = _usage_from_profile(profile_dir)
     except GeminiManagedAuthError:
         return {"status": "needs_reconnect", "usage": {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []}}
     except Exception:
         return {"status": "error", "usage": {"status": "unavailable", "reason": "usage_unavailable", "scope": "gemini_code_assist_request_quota", "quotas": []}}
-    return {"status": "connected", "usage": usage}
+    return {"status": "connected", "authenticated": True, "usage": usage}
 
 
 def remove(profile_dir: Path) -> None:

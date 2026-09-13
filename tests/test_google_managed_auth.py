@@ -125,6 +125,9 @@ class GoogleManagedAuthTests(unittest.TestCase):
             self.assertEqual(process.requests[1]["method"], "authenticate")
             self.assertEqual(process.requests[1]["params"], {"methodId": "oauth-personal"})
             self.assertEqual(managed.poll(self.profile, started["operationID"])["status"], "pending_browser")
+            credentials_path = self.profile / ".gemini" / "oauth_creds.json"
+            credentials_path.parent.mkdir(parents=True)
+            credentials_path.write_text(json.dumps({"refresh_token": "managed-refresh"}), encoding="utf-8")
             process.complete_authentication()
             deadline = time.monotonic() + 1
             while time.monotonic() < deadline:
@@ -133,7 +136,16 @@ class GoogleManagedAuthTests(unittest.TestCase):
                     break
                 time.sleep(0.01)
             self.assertEqual(state["status"], "connected")
+            self.assertTrue(state["authenticated"])
             self.assertEqual(state["usage"]["status"], "available")
+
+    def test_resolver_uses_trusted_home_fallback_when_launchagent_path_is_minimal(self):
+        executable = Path(self.tmp.name) / ".local" / "bin" / "gemini"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o700)
+        with patch.dict(os.environ, {"AGENTCAT_GEMINI_CLI": "", "HOME": self.tmp.name, "PATH": ""}):
+            self.assertEqual(managed._gemini_executable(), str(executable))
 
     def test_refresh_reads_only_the_managed_profile_and_keeps_quota_scope_explicit(self):
         owner = Path(self.tmp.name) / "owner"
@@ -153,6 +165,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
         with patch.object(managed.urllib.request, "urlopen", side_effect=urlopen):
             result = managed.refresh(self.profile)
         self.assertEqual(result["status"], "connected")
+        self.assertTrue(result["authenticated"])
         self.assertEqual(result["usage"]["scope"], "gemini_code_assist_request_quota")
         self.assertEqual(result["usage"]["quotas"][0]["remainingPercent"], 75.0)
         self.assertEqual(calls[0].get_header("Authorization"), "Bearer managed-token")
@@ -160,7 +173,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
 
     def test_missing_managed_auth_is_unknown_not_zero(self):
         result = managed.refresh(self.profile)
-        self.assertEqual(result["status"], "connected")
+        self.assertEqual(result["status"], "needs_reconnect")
         self.assertEqual(result["usage"], {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []})
 
     def test_remove_touches_only_known_managed_credential_files(self):
