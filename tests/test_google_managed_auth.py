@@ -15,6 +15,21 @@ sys.path.insert(0, str(REPO_ROOT / "lib"))
 import agentcat_google_managed_auth as managed
 
 
+def _unavailable_usage(reason):
+    return {
+        "source": "gemini_code_assist",
+        "freshness": "unavailable",
+        "windows": [],
+        "credits": None,
+        "spendControl": None,
+        "rateLimitReachedType": None,
+        "tokenUsage": None,
+        "tokenUsageAvailable": False,
+        "scope": "gemini_code_assist_request_quota",
+        "reason": reason,
+    }
+
+
 class _Output:
     def __init__(self):
         self.lines = queue.Queue()
@@ -117,7 +132,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
         original_home = os.environ.get("HOME")
         with patch.object(managed.shutil, "which", return_value="/fake/gemini"), \
              patch.object(managed.subprocess, "Popen", _FakePopen), \
-             patch.object(managed, "refresh", return_value={"status": "connected", "identity": {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"}, "usage": {"status": "available", "quotas": []}}):
+             patch.object(managed, "refresh", return_value={"status": "connected", "identity": {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"}, "usage": {"source": "gemini_code_assist", "freshness": "live", "windows": []}}):
             started = managed.start(self.profile, "browser")
             self.assertEqual(started["status"], "pending_browser")
             self.assertEqual(started["browserLaunchMode"], "provider")
@@ -142,7 +157,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
             self.assertEqual(state["status"], "connected")
             self.assertTrue(state["authenticated"])
             self.assertEqual(state["identity"]["email"], "managed.user@example.com")
-            self.assertEqual(state["usage"]["status"], "available")
+            self.assertEqual(state["usage"]["freshness"], "live")
 
     def test_resolver_uses_trusted_home_fallback_when_launchagent_path_is_minimal(self):
         executable = Path(self.tmp.name) / ".local" / "bin" / "gemini"
@@ -159,7 +174,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
                  "status": "connected",
                  "authenticated": True,
                  "identity": {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"},
-                 "usage": {"status": "unavailable", "reason": "code_assist_onboarding_required", "scope": "gemini_code_assist_request_quota", "quotas": []},
+                 "usage": _unavailable_usage("code_assist_onboarding_required"),
              }) as refresh:
             started = managed.start(self.profile, "browser")
             process = _FakePopen.instances[0]
@@ -173,7 +188,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
         self.assertEqual(state["status"], "connected")
         self.assertTrue(state["authenticated"])
         self.assertEqual(state["identity"]["email"], "managed.user@example.com")
-        self.assertEqual(state["usage"]["reason"], "code_assist_onboarding_required")
+        self.assertEqual(state["usage"], _unavailable_usage("code_assist_onboarding_required"))
         refresh.assert_called_once_with(self.profile)
 
     def test_acp_setup_error_cannot_connect_from_credentials_without_authentication_proof(self):
@@ -216,7 +231,8 @@ class GoogleManagedAuthTests(unittest.TestCase):
         self.assertTrue(result["authenticated"])
         self.assertEqual(result["identity"], {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"})
         self.assertEqual(result["usage"]["scope"], "gemini_code_assist_request_quota")
-        self.assertEqual(result["usage"]["quotas"][0]["remainingPercent"], 75.0)
+        self.assertEqual(result["usage"]["freshness"], "live")
+        self.assertEqual(result["usage"]["windows"][0]["remainingPercent"], 75.0)
         self.assertEqual(calls[0].get_header("Authorization"), "Bearer managed-token")
         self.assertNotIn("owner-token", str(calls))
 
@@ -225,14 +241,14 @@ class GoogleManagedAuthTests(unittest.TestCase):
         self.assertEqual(result["status"], "needs_reconnect")
         self.assertNotIn("identity", result)
         self.assertEqual(result["identityStatus"], {"status": "unavailable", "reason": "sign_in_required"})
-        self.assertEqual(result["usage"], {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []})
+        self.assertEqual(result["usage"], _unavailable_usage("sign_in_required"))
 
     def test_missing_userinfo_email_is_explicitly_unavailable(self):
         credential_dir = self.profile / ".gemini"
         credential_dir.mkdir(parents=True)
         (credential_dir / "oauth_creds.json").write_text(json.dumps({"access_token": "managed-token", "expiry_date": time.time() * 1000 + 3_600_000}), encoding="utf-8")
         with patch.object(managed.urllib.request, "urlopen", return_value=_Response({"id": "opaque-google-id", "verified_email": True})), \
-             patch.object(managed, "_usage_from_profile", return_value={"status": "available", "quotas": []}):
+             patch.object(managed, "_usage_from_profile", return_value={"source": "gemini_code_assist", "freshness": "live", "windows": [], "credits": None, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False, "scope": "gemini_code_assist_request_quota"}):
             result = managed.refresh(self.profile)
         self.assertEqual(result["status"], "connected")
         self.assertNotIn("identity", result)
@@ -249,7 +265,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
         self.assertEqual(result["status"], "connected")
         self.assertTrue(result["authenticated"])
         self.assertEqual(result["identity"], {"email": "managed.user@example.com", "verification": True, "source": "google_userinfo"})
-        self.assertEqual(result["usage"], {"status": "unavailable", "reason": "usage_unavailable", "scope": "gemini_code_assist_request_quota", "quotas": []})
+        self.assertEqual(result["usage"], _unavailable_usage("usage_unavailable"))
 
     def test_usage_reports_official_onboarding_requirement_without_posting_onboard(self):
         credential_dir = self.profile / ".gemini"
@@ -263,7 +279,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
 
         with patch.object(managed, "_code_assist_post", side_effect=post):
             usage = managed._usage_from_profile(self.profile)
-        self.assertEqual(usage, {"status": "unavailable", "reason": "code_assist_onboarding_required", "source": "gemini_code_assist", "scope": "gemini_code_assist_request_quota", "quotas": []})
+        self.assertEqual(usage, _unavailable_usage("code_assist_onboarding_required"))
         self.assertEqual([method for method, _, _ in calls], ["loadCodeAssist"])
 
     def test_usage_requires_a_project_when_native_default_requires_one(self):
@@ -272,8 +288,21 @@ class GoogleManagedAuthTests(unittest.TestCase):
         (credential_dir / "oauth_creds.json").write_text(json.dumps({"access_token": "managed-token", "expiry_date": time.time() * 1000 + 3_600_000}), encoding="utf-8")
         with patch.object(managed, "_code_assist_post", return_value={"allowedTiers": [{"id": "standard-tier", "isDefault": True, "userDefinedCloudaicompanionProject": True}]}) as post:
             usage = managed._usage_from_profile(self.profile)
-        self.assertEqual(usage, {"status": "unavailable", "reason": "google_cloud_project_required", "source": "gemini_code_assist", "scope": "gemini_code_assist_request_quota", "quotas": []})
+        self.assertEqual(usage, _unavailable_usage("google_cloud_project_required"))
         self.assertEqual(post.call_args.args[0], "loadCodeAssist")
+
+    def test_usage_reports_consumer_tier_unsupported_before_project_inference(self):
+        credential_dir = self.profile / ".gemini"
+        credential_dir.mkdir(parents=True)
+        (credential_dir / "oauth_creds.json").write_text(json.dumps({"access_token": "managed-token", "expiry_date": time.time() * 1000 + 3_600_000}), encoding="utf-8")
+        response = {
+            "allowedTiers": [{"id": "standard-tier", "isDefault": True, "userDefinedCloudaicompanionProject": True}],
+            "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_CLIENT"}],
+        }
+        with patch.object(managed, "_code_assist_post", return_value=response) as post:
+            usage = managed._usage_from_profile(self.profile)
+        self.assertEqual(usage, _unavailable_usage("gemini_consumer_tier_unsupported"))
+        self.assertEqual(post.call_count, 1)
 
     def test_remove_touches_only_known_managed_credential_files(self):
         gemini_dir = self.profile / ".gemini"

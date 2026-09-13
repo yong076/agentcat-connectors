@@ -398,10 +398,26 @@ def _code_assist_post(method: str, payload: Dict[str, Any], access_token: str) -
     return value if isinstance(value, dict) else {}
 
 
+def _unavailable_usage(reason: str) -> Dict[str, Any]:
+    """Return the managed-account usage schema without implying a quota value."""
+    return {
+        "source": "gemini_code_assist",
+        "freshness": "unavailable",
+        "windows": [],
+        "credits": None,
+        "spendControl": None,
+        "rateLimitReachedType": None,
+        "tokenUsage": None,
+        "tokenUsageAvailable": False,
+        "scope": "gemini_code_assist_request_quota",
+        "reason": reason,
+    }
+
+
 def _usage_from_profile(profile_dir: Path) -> Dict[str, Any]:
     creds = _managed_credentials(profile_dir)
     if not creds:
-        return {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []}
+        return _unavailable_usage("sign_in_required")
     token = _access_token(creds)
     metadata = {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}
     try:
@@ -411,6 +427,13 @@ def _usage_from_profile(profile_dir: Path) -> Dict[str, Any]:
     project = tier.get("cloudaicompanionProject") if isinstance(tier.get("cloudaicompanionProject"), str) else ""
     current_tier = tier.get("currentTier") if isinstance(tier.get("currentTier"), dict) else None
     allowed_tiers = tier.get("allowedTiers") if isinstance(tier.get("allowedTiers"), list) else []
+    ineligible_tiers = tier.get("ineligibleTiers") if isinstance(tier.get("ineligibleTiers"), list) else []
+    if any(isinstance(item, dict) and item.get("reasonCode") == "UNSUPPORTED_CLIENT" for item in ineligible_tiers):
+        # Gemini reports this consumer tier as unsupported for this Code Assist
+        # client.  A projectless quota request for the same managed token is
+        # rejected with SUBSCRIPTION_REQUIRED, so do not turn it into a false
+        # project-configuration requirement.
+        return _unavailable_usage("gemini_consumer_tier_unsupported")
     if not project and current_tier is None:
         # Current Gemini CLI calls onboardUser for this response shape.  That
         # changes the Google account's Code Assist setup, so a read-only usage
@@ -419,13 +442,7 @@ def _usage_from_profile(profile_dir: Path) -> Dict[str, Any]:
         default_tier = next((item for item in allowed_tiers if isinstance(item, dict) and item.get("isDefault") is True), None)
         has_default_tier = default_tier is not None
         default_requires_project = isinstance(default_tier, dict) and default_tier.get("userDefinedCloudaicompanionProject") is True
-        return {
-            "status": "unavailable",
-            "reason": "code_assist_onboarding_required" if has_default_tier and not default_requires_project else "google_cloud_project_required",
-            "source": "gemini_code_assist",
-            "scope": "gemini_code_assist_request_quota",
-            "quotas": [],
-        }
+        return _unavailable_usage("code_assist_onboarding_required" if has_default_tier and not default_requires_project else "google_cloud_project_required")
     quota = _code_assist_post("retrieveUserQuota", {"project": project} if project else {}, token)
     buckets = quota.get("buckets") if isinstance(quota.get("buckets"), list) else []
     normalized = []
@@ -445,13 +462,19 @@ def _usage_from_profile(profile_dir: Path) -> Dict[str, Any]:
     paid = tier.get("paidTier") if isinstance(tier.get("paidTier"), dict) else {}
     current = tier.get("currentTier") if isinstance(tier.get("currentTier"), dict) else {}
     plan = paid.get("name") or current.get("name") or paid.get("id") or current.get("id")
+    if not normalized:
+        return _unavailable_usage("quota_not_exposed")
     return {
-        "status": "available" if normalized else "unavailable",
-        "reason": None if normalized else "quota_not_exposed",
         "source": "gemini_code_assist",
+        "freshness": "live",
+        "windows": normalized,
+        "credits": None,
+        "spendControl": None,
+        "rateLimitReachedType": None,
+        "tokenUsage": None,
+        "tokenUsageAvailable": False,
         "scope": "gemini_code_assist_request_quota",
-        "planType": str(plan) if plan else None,
-        "quotas": normalized,
+        **({"planType": str(plan)} if plan else {}),
     }
 
 
@@ -461,23 +484,18 @@ def refresh(profile_dir: Path) -> Dict[str, Any]:
         return {
             "status": "needs_reconnect",
             **_identity_unavailable("sign_in_required"),
-            "usage": {
-                "status": "unavailable",
-                "reason": "sign_in_required",
-                "scope": "gemini_code_assist_request_quota",
-                "quotas": [],
-            },
+            "usage": _unavailable_usage("sign_in_required"),
         }
     identity = _identity_from_managed_profile(profile_dir)
     try:
         usage = _usage_from_profile(profile_dir)
     except GeminiManagedAuthError:
-        return {"status": "needs_reconnect", **identity, "usage": {"status": "unavailable", "reason": "sign_in_required", "scope": "gemini_code_assist_request_quota", "quotas": []}}
+        return {"status": "needs_reconnect", **identity, "usage": _unavailable_usage("sign_in_required")}
     except Exception:
         # Usage access and account authentication are separate provider
         # capabilities.  Do not discard a verified managed login merely
         # because the Code Assist quota endpoint is temporarily unavailable.
-        return {"status": "connected", "authenticated": True, **identity, "usage": {"status": "unavailable", "reason": "usage_unavailable", "scope": "gemini_code_assist_request_quota", "quotas": []}}
+        return {"status": "connected", "authenticated": True, **identity, "usage": _unavailable_usage("usage_unavailable")}
     return {"status": "connected", "authenticated": True, **identity, "usage": usage}
 
 
