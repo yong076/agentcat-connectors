@@ -297,7 +297,9 @@ def _verified_credential(
     if selected is None:
         return None
     token = selected.get("access")
-    if not isinstance(token, str) or not token:
+    expires = selected.get("expires")
+    expired = isinstance(expires, int) and expires <= int(time.time())
+    if not isinstance(token, str) or not token or expired:
         refresh = selected.get("refresh")
         if not isinstance(refresh, str) or not refresh:
             return None

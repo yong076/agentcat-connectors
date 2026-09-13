@@ -206,6 +206,28 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         self.assertEqual(result["usage"]["reason"], "usage_unavailable")
         self.assertEqual(result["usage"]["windows"], [])
 
+    def test_kimi_refreshes_expired_access_token_before_server_validation(self):
+        profile = Path(self.tmp.name) / "kimi-expired-access"
+        (profile / "credentials").mkdir(parents=True)
+        (profile / "credentials" / "kimi-code.json").write_text(
+            '{"access_token":"expired-secret","refresh_token":"refresh-secret","expires_at":1}',
+            encoding="utf-8",
+        )
+        live_usage = '{"limits":[{"detail":{"limit":"8","remaining":"6"}}]}'
+        with patch.object(kimi, "urlopen", side_effect=[
+            FakeResponse('{"access_token":"fresh-secret"}'),
+            FakeResponse(live_usage),
+            FakeResponse('{"user_id":"kimi-account","email":"kimi@example.test"}'),
+        ]) as request:
+            result = kimi.refresh(profile)
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["identity"]["email"], "kimi@example.test")
+        self.assertEqual(result["usage"]["windows"][0]["usedPercent"], 25.0)
+        self.assertIsNone(request.call_args_list[0].args[0].get_header("Authorization"))
+        self.assertTrue(all(call.args[0].get_header("Authorization") == "Bearer fresh-secret" for call in request.call_args_list[1:]))
+        self.assertNotIn("expired-secret", str(result))
+        self.assertNotIn("fresh-secret", str(result))
+
     def test_kimi_selects_current_credential_by_expiry_not_glob_order(self):
         profile = Path(self.tmp.name) / "kimi-multiple"
         credentials = profile / "credentials"
