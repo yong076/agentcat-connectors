@@ -128,7 +128,7 @@ def _credential_candidates(profile_dir: Path) -> list[Dict[str, Any]]:
         fingerprint = _credential_fingerprint(path)
         if not fingerprint or not (access or refresh):
             continue
-        result.append({"raw": raw, "access": access, "refresh": refresh, "expires": _epoch(raw.get("expires_at") or raw.get("expiresAt")), "modified": modified, "name": path.name, "fingerprint": fingerprint})
+        result.append({"path": path, "raw": raw, "access": access, "refresh": refresh, "expires": _epoch(raw.get("expires_at") or raw.get("expiresAt")), "modified": modified, "name": path.name, "fingerprint": fingerprint})
     return result
 
 
@@ -286,6 +286,56 @@ def _unavailable_usage() -> Dict[str, Any]:
     return {"source": "kimi-live", "freshness": "unavailable", "reason": "usage_unavailable", "windows": [], "credits": None, "spendControl": None, "rateLimitReachedType": None, "tokenUsage": None, "tokenUsageAvailable": False}
 
 
+def _private_replace(path: Path, data: bytes) -> bool:
+    temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
+    try:
+        temporary.write_bytes(data)
+        temporary.chmod(0o600)
+        temporary.replace(path)
+        path.chmod(0o600)
+        return True
+    except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _persist_refreshed_credential(selected: Dict[str, Any], response: Any) -> Optional[Path]:
+    """Atomically preserve a native-format rotating refresh response privately."""
+    if not isinstance(response, dict):
+        return None
+    access = response.get("access_token")
+    refresh = response.get("refresh_token")
+    expires_in = _usage_number(response.get("expires_in"))
+    path = selected.get("path")
+    if not isinstance(path, Path) or not isinstance(access, str) or not access or len(access) > 8192 or not isinstance(refresh, str) or not refresh or len(refresh) > 8192 or expires_in is None or expires_in <= 0:
+        return None
+    try:
+        original = path.read_bytes()
+    except OSError:
+        return None
+    backup = path.with_name(".agentcat-kimi-refresh-backup-" + path.name)
+    if not _private_replace(backup, original):
+        return None
+    updated = dict(selected["raw"])
+    updated.update({
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_at": int(time.time() + expires_in),
+        "expires_in": expires_in,
+    })
+    for key in ("scope", "token_type"):
+        value = response.get(key)
+        if isinstance(value, str) and len(value) <= 4096:
+            updated[key] = value
+    encoded = (json.dumps(updated, indent=2) + "\n").encode("utf-8")
+    if not _private_replace(path, encoded):
+        return None
+    return backup
+
+
 def _verified_credential(
     profile_dir: Path,
     before: Optional[set[str]] = None,
@@ -299,6 +349,7 @@ def _verified_credential(
     token = selected.get("access")
     expires = selected.get("expires")
     expired = isinstance(expires, int) and expires <= int(time.time())
+    refresh_backup: Optional[Path] = None
     if not isinstance(token, str) or not token or expired:
         refresh = selected.get("refresh")
         if not isinstance(refresh, str) or not refresh:
@@ -306,6 +357,9 @@ def _verified_credential(
         body = urllib.parse.urlencode({"client_id": _CLIENT_ID, "grant_type": "refresh_token", "refresh_token": refresh}).encode("utf-8")
         with urlopen(Request(_TOKEN_URL, data=body, headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}), timeout=12) as response:
             refreshed = json.loads(response.read(1_000_000).decode("utf-8"))
+        refresh_backup = _persist_refreshed_credential(selected, refreshed)
+        if refresh_backup is None:
+            return None
         token = refreshed.get("access_token") if isinstance(refreshed, dict) else None
     if not isinstance(token, str) or not token:
         return None
@@ -321,6 +375,11 @@ def _verified_credential(
     if not usage_authenticated and account_id is None:
         return None
     result = {**identity_result, "usage": usage}
+    if refresh_backup is not None:
+        try:
+            refresh_backup.unlink()
+        except OSError:
+            pass
     if bind:
         _bind_credential(profile_dir, {"accountID": account_id}, selected["name"])
     return result

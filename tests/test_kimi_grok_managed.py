@@ -215,18 +215,28 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         )
         live_usage = '{"limits":[{"detail":{"limit":"8","remaining":"6"}}]}'
         with patch.object(kimi, "urlopen", side_effect=[
-            FakeResponse('{"access_token":"fresh-secret"}'),
+            FakeResponse('{"access_token":"fresh-one","refresh_token":"refresh-one","expires_in":3600,"scope":"scope","token_type":"Bearer"}'),
+            FakeResponse(live_usage),
+            FakeResponse('{"user_id":"kimi-account","email":"kimi@example.test"}'),
+            FakeResponse('{"access_token":"fresh-two","refresh_token":"refresh-two","expires_in":3600,"scope":"scope","token_type":"Bearer"}'),
             FakeResponse(live_usage),
             FakeResponse('{"user_id":"kimi-account","email":"kimi@example.test"}'),
         ]) as request:
-            result = kimi.refresh(profile)
-        self.assertTrue(result["authenticated"])
-        self.assertEqual(result["identity"]["email"], "kimi@example.test")
-        self.assertEqual(result["usage"]["windows"][0]["usedPercent"], 25.0)
+            first = kimi.refresh(profile)
+            persisted = json.loads((profile / "credentials" / "kimi-code.json").read_text(encoding="utf-8"))
+            persisted["expires_at"] = 1
+            (profile / "credentials" / "kimi-code.json").write_text(json.dumps(persisted), encoding="utf-8")
+            second = kimi.refresh(profile)
+        self.assertTrue(first["authenticated"])
+        self.assertTrue(second["authenticated"])
+        self.assertEqual(second["identity"]["email"], "kimi@example.test")
+        self.assertEqual(second["usage"]["windows"][0]["usedPercent"], 25.0)
+        self.assertEqual(json.loads((profile / "credentials" / "kimi-code.json").read_text(encoding="utf-8"))["refresh_token"], "refresh-two")
+        self.assertFalse((profile / "credentials" / ".agentcat-kimi-refresh-backup-kimi-code.json").exists())
         self.assertIsNone(request.call_args_list[0].args[0].get_header("Authorization"))
-        self.assertTrue(all(call.args[0].get_header("Authorization") == "Bearer fresh-secret" for call in request.call_args_list[1:]))
-        self.assertNotIn("expired-secret", str(result))
-        self.assertNotIn("fresh-secret", str(result))
+        self.assertIn(b"refresh_token=refresh-one", request.call_args_list[3].args[0].data)
+        self.assertNotIn("expired-secret", str(second))
+        self.assertNotIn("fresh-two", str(second))
 
     def test_kimi_selects_current_credential_by_expiry_not_glob_order(self):
         profile = Path(self.tmp.name) / "kimi-multiple"
