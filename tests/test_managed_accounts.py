@@ -227,6 +227,32 @@ class ManagedAccountsTests(unittest.TestCase):
         self.assertEqual(len(accounts.snapshot()), 1)
         self.assertEqual(len(adapter.promotions), 1)
 
+    def test_reconnecting_legacy_row_with_unreadable_provider_identity_never_merges_by_email(self):
+        adapter = DedupAdapter()
+        accounts = ManagedAccounts(Path(self.temp.name), {"fake": adapter}, dedup_secret=b"u" * 32)
+        first = accounts.start("fake", "", "device")
+        adapter.connected = True
+        original = accounts.status("fake", first["operationID"])["connection"]
+        rows = accounts._rows()
+        rows[0]["status"] = "needs_reconnect"
+        rows[0].pop("dedupKey", None)
+        accounts._write(rows)
+        adapter.refresh = lambda profile: {
+            "status": "needs_reconnect",
+            # A familiar verified display email is explicitly insufficient
+            # without the provider's stable private account identity.
+            "identity": {"email": "verified@example.test", "verification": True, "source": "fixture"},
+            "identityStatus": {"status": "unavailable", "reason": "sign_in_required"},
+            "usage": {"source": "fake", "freshness": "unavailable", "windows": []},
+        }
+        second = accounts.start("fake", "", "device")
+        result = accounts.status("fake", second["operationID"])
+        self.assertNotIn("supersededConnectionID", result)
+        self.assertEqual(len(accounts.snapshot()), 2)
+        legacy = next(row for row in accounts._rows() if row["id"] == original["id"])
+        self.assertEqual(legacy["status"], "needs_reconnect")
+        self.assertEqual(adapter.promotions, [])
+
     def test_verified_identity_never_merges_across_tenant_or_when_missing(self):
         adapter = DedupAdapter(tenant_for_operation=lambda operation: "tenant-a" if operation.endswith("1") else "tenant-b")
         accounts = ManagedAccounts(Path(self.temp.name), {"fake": adapter}, dedup_secret=b"e" * 32)
