@@ -295,6 +295,37 @@ class ManagedAccountsTests(unittest.TestCase):
         self.assertEqual(len(unknown_accounts.snapshot()), 2)
         self.assertEqual(unknown.promotions, [])
 
+    def test_resolve_connection_id_follows_only_same_provider_durable_aliases(self):
+        canonical = "a" * 32
+        source = "b" * 32
+        foreign = "c" * 32
+        missing = "d" * 32
+        cycle_one = "e" * 32
+        cycle_two = "f" * 32
+        self.accounts._write([
+            {"id": canonical, "provider": "fake", "status": "connected", "scope": "managed_provider_profile"},
+            {"id": source, "provider": "fake", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": canonical},
+            {"id": foreign, "provider": "other", "status": "connected", "scope": "managed_provider_profile"},
+            {"id": missing, "provider": "fake", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": foreign},
+            {"id": cycle_one, "provider": "fake", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": cycle_two},
+            {"id": cycle_two, "provider": "fake", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": cycle_one},
+        ])
+        self.assertEqual(self.accounts.resolve_connection_id(canonical), {
+            "requestConnectionID": canonical, "canonicalConnectionID": canonical,
+            "provider": "fake", "status": "connected", "alias": False,
+        })
+        self.assertEqual(self.accounts.resolve_connection_id(source), {
+            "requestConnectionID": source, "canonicalConnectionID": canonical,
+            "provider": "fake", "status": "connected", "alias": True,
+        })
+        self.assertEqual(self.accounts.resolve_connection_id(missing), {
+            "requestConnectionID": missing, "canonicalConnectionID": None,
+            "provider": "fake", "status": "missing", "alias": True,
+        })
+        self.assertIsNone(self.accounts.resolve_connection_id("0" * 32))
+        with self.assertRaisesRegex(RuntimeError, "connection_alias_cycle"):
+            self.accounts.resolve_connection_id(cycle_one)
+
 
 if __name__ == "__main__":
     unittest.main()

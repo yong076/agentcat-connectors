@@ -16639,6 +16639,23 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, {"connections": openrouter_connections_snapshot() + codex_connections_snapshot() + managed_accounts().snapshot()})
             return
+        connection_resolve_match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})/resolve", path)
+        if connection_resolve_match:
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            try:
+                result = connection_resolution(connection_resolve_match.group(1))
+            except RuntimeError as error:
+                self.send_json(409, {"error": str(error) if str(error) in {"connection_alias_cycle", "connection_alias_ambiguous"} else "connection_alias_invalid"})
+                return
+            if result is None:
+                self.send_json(404, {"error": "connection_not_found"})
+            else:
+                self.send_json(200, result)
+            return
         if path == "/v1/connections/capabilities":
             guard_error = connection_control_request_error(self.headers, mutation=False)
             if guard_error is not None:
@@ -17983,6 +18000,43 @@ def openrouter_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any
         return [_openrouter_public_connection(row) for row in rows if row.get("status") != "removed"]
 
 
+def _resolve_connection_alias(rows: List[Dict[str, Any]], connection_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve an exact durable same-provider supersession chain only."""
+    current = next((row for row in rows if row.get("id") == connection_id), None)
+    if current is None:
+        return None
+    provider = current.get("provider")
+    if not isinstance(provider, str):
+        return None
+    alias = False
+    seen: set[str] = set()
+    for _ in range(8):
+        current_id = current.get("id")
+        if not isinstance(current_id, str) or current_id in seen:
+            raise RuntimeError("connection_alias_cycle")
+        seen.add(current_id)
+        if current.get("status") != "superseded":
+            canonical = None if current.get("status") == "removed" else current_id
+            return {"requestConnectionID": connection_id, "canonicalConnectionID": canonical,
+                    "provider": provider, "status": current.get("status"), "alias": alias}
+        alias = True
+        target_id = current.get("supersededBy")
+        if not isinstance(target_id, str):
+            return {"requestConnectionID": connection_id, "canonicalConnectionID": None,
+                    "provider": provider, "status": "missing", "alias": True}
+        target = next((row for row in rows if row.get("id") == target_id and row.get("provider") == provider), None)
+        if target is None:
+            return {"requestConnectionID": connection_id, "canonicalConnectionID": None,
+                    "provider": provider, "status": "missing", "alias": True}
+        current = target
+    raise RuntimeError("connection_alias_cycle")
+
+
+def openrouter_connection_resolution(connection_id: str) -> Optional[Dict[str, Any]]:
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        return _resolve_connection_alias(_openrouter_connections(), connection_id)
+
+
 def _openrouter_usage_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     # Null/absent values remain null. They are never converted to USD 0.
     def number(name: str) -> Optional[float]:
@@ -18673,6 +18727,25 @@ def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
         if changed:
             _write_codex_connections(rows)
         return [_codex_public_connection(row) for row in rows if row.get("status") not in {"removed", "superseded"}]
+
+
+def codex_connection_resolution(connection_id: str) -> Optional[Dict[str, Any]]:
+    with _CODEX_CONNECTIONS_LOCK:
+        return _resolve_connection_alias(_codex_connections(), connection_id)
+
+
+def connection_resolution(connection_id: str) -> Optional[Dict[str, Any]]:
+    """Find an exact ID in one registry; no cross-provider aliasing is allowed."""
+    matches = []
+    for resolver in (openrouter_connection_resolution, codex_connection_resolution, managed_accounts().resolve_connection_id):
+        result = resolver(connection_id)
+        if result is not None:
+            matches.append(result)
+    if len(matches) > 1:
+        # IDs are random and should not collide across registries.  Do not
+        # choose a provider if a malformed registry ever creates one.
+        raise RuntimeError("connection_alias_ambiguous")
+    return matches[0] if matches else None
 
 
 def _codex_start_oauth_on_row(row: Dict[str, Any], mode: str) -> Dict[str, Any]:

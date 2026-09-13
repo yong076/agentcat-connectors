@@ -586,3 +586,41 @@ class ManagedAccounts:
         with self.lock:
             rows = self._rows()
             return [self.public(row) for row in rows if row.get("status") not in {"removed", "superseded"}]
+
+    def resolve_connection_id(self, connection_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve only a durable supersession chain for a saved UI selection.
+
+        This intentionally does not search by email, provider, or identity.  A
+        caller can remap an ID only when the registry itself recorded its exact
+        same-provider successor during verified duplicate promotion.
+        """
+        with self.lock:
+            rows = self._rows()
+            current = next((row for row in rows if row.get("id") == connection_id), None)
+            if current is None:
+                return None
+            provider = current.get("provider")
+            if not isinstance(provider, str):
+                return None
+            alias = False
+            seen: set[str] = set()
+            for _ in range(8):
+                current_id = current.get("id")
+                if not isinstance(current_id, str) or current_id in seen:
+                    raise RuntimeError("connection_alias_cycle")
+                seen.add(current_id)
+                if current.get("status") != "superseded":
+                    canonical = None if current.get("status") == "removed" else current_id
+                    return {"requestConnectionID": connection_id, "canonicalConnectionID": canonical,
+                            "provider": provider, "status": current.get("status"), "alias": alias}
+                alias = True
+                target_id = current.get("supersededBy")
+                if not isinstance(target_id, str):
+                    return {"requestConnectionID": connection_id, "canonicalConnectionID": None,
+                            "provider": provider, "status": "missing", "alias": True}
+                target = next((row for row in rows if row.get("id") == target_id and row.get("provider") == provider), None)
+                if target is None:
+                    return {"requestConnectionID": connection_id, "canonicalConnectionID": None,
+                            "provider": provider, "status": "missing", "alias": True}
+                current = target
+            raise RuntimeError("connection_alias_cycle")

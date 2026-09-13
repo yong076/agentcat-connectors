@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -183,6 +184,43 @@ class ManagedAccountRouteTests(unittest.TestCase):
         self.assertEqual(started["status"], "pending_browser")
         _, pending = self.request(f"/v1/connections/claude/oauth/{started['operationID']}")
         self.assertEqual(pending["resume"]["browserLaunchMode"], "provider")
+
+    def test_protected_connection_resolver_handles_alias_missing_and_cycle(self):
+        canonical, source, missing, cycle_one, cycle_two = ("a" * 32, "b" * 32, "c" * 32, "d" * 32, "e" * 32)
+        accounts = agentcat.ManagedAccounts(self.agentcat_home, {"kimi": self.adapter})
+        accounts._write([
+            {"id": canonical, "provider": "kimi", "status": "connected", "scope": "managed_provider_profile"},
+            {"id": source, "provider": "kimi", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": canonical},
+            {"id": missing, "provider": "kimi", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": "f" * 32},
+            {"id": cycle_one, "provider": "kimi", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": cycle_two},
+            {"id": cycle_two, "provider": "kimi", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": cycle_one},
+        ])
+        agentcat._MANAGED_ACCOUNTS = accounts
+        with self.assertRaises(HTTPError) as denied:
+            urlopen(self.base + f"/v1/connections/{source}/resolve", timeout=3)
+        self.assertEqual(denied.exception.code, 401)
+        _, resolved = self.request(f"/v1/connections/{source}/resolve")
+        self.assertEqual(resolved["canonicalConnectionID"], canonical)
+        self.assertTrue(resolved["alias"])
+        _, unresolved = self.request(f"/v1/connections/{missing}/resolve")
+        self.assertIsNone(unresolved["canonicalConnectionID"])
+        self.assertEqual(unresolved["status"], "missing")
+        with self.assertRaises(HTTPError) as cycle:
+            self.request(f"/v1/connections/{cycle_one}/resolve")
+        self.assertEqual(cycle.exception.code, 409)
+        self.assertEqual(json.loads(cycle.exception.read().decode()), {"error": "connection_alias_cycle"})
+
+    def test_codex_resolution_uses_its_own_same_provider_alias_chain(self):
+        canonical, source, foreign = "a" * 32, "b" * 32, "c" * 32
+        rows = [
+            {"id": canonical, "provider": "codex", "status": "connected"},
+            {"id": source, "provider": "codex", "status": "superseded", "supersededBy": canonical},
+            {"id": foreign, "provider": "kimi", "status": "connected"},
+        ]
+        with patch.object(agentcat, "_codex_connections", return_value=rows):
+            result = agentcat.codex_connection_resolution(source)
+        self.assertEqual(result["canonicalConnectionID"], canonical)
+        self.assertEqual(result["provider"], "codex")
 
     def test_connected_refresh_and_remove_are_per_account(self):
         _, started = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
