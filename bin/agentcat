@@ -45,6 +45,7 @@ from agentcat_codex_app_server import (
     app_server_prerequisite,
 )
 from agentcat_managed_accounts import ManagedAccounts
+from agentcat_openrouter_managed import OpenRouterManagedAuth, OpenRouterManagedError, build_adapter as build_openrouter_managed_adapter
 
 
 def resolve_user_home_env() -> str:
@@ -87,7 +88,10 @@ class _UnavailableManagedAdapter:
 
 
 _MANAGED_ACCOUNTS: Optional[ManagedAccounts] = None
-_MANAGED_ACCOUNTS_HOME: Optional[Path] = None
+_MANAGED_ACCOUNTS_HOME: Optional[str] = None
+_OPENROUTER_MANAGED_AUTH: Optional[OpenRouterManagedAuth] = None
+_OPENROUTER_MANAGED_HOME: Optional[str] = None
+_OPENROUTER_OAUTH_CALLBACK_PORT: Optional[int] = None
 
 
 def _native_managed_adapters() -> Dict[str, Any]:
@@ -109,9 +113,9 @@ def _native_managed_adapters() -> Dict[str, Any]:
 
 def managed_accounts() -> ManagedAccounts:
     global _MANAGED_ACCOUNTS, _MANAGED_ACCOUNTS_HOME
-    if _MANAGED_ACCOUNTS is None or _MANAGED_ACCOUNTS_HOME != AGENTCAT_HOME:
+    if _MANAGED_ACCOUNTS is None or _MANAGED_ACCOUNTS_HOME != str(AGENTCAT_HOME):
         _MANAGED_ACCOUNTS = ManagedAccounts(AGENTCAT_HOME, _native_managed_adapters())
-        _MANAGED_ACCOUNTS_HOME = AGENTCAT_HOME
+        _MANAGED_ACCOUNTS_HOME = str(AGENTCAT_HOME)
     return _MANAGED_ACCOUNTS
 
 
@@ -16792,6 +16796,10 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             if codex_cancel_match:
                 self.send_json(200, {"status": codex_cancel_oauth(codex_cancel_match.group(1))})
                 return
+            openrouter_cancel_match = re.fullmatch(r"/v1/connections/openrouter/oauth/([A-Za-z0-9_-]{20,})/cancel", path)
+            if openrouter_cancel_match:
+                self.send_json(200, {"status": openrouter_cancel_oauth(openrouter_cancel_match.group(1))})
+                return
             managed_retry_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity)/([0-9a-f]{32})/oauth/retry", path)
             if managed_retry_match:
                 provider, connection_id = managed_retry_match.groups()
@@ -18019,98 +18027,108 @@ def openrouter_import_connection(connection_id: str, label: str) -> Dict[str, An
         return _openrouter_public_connection(row)
 
 
-def openrouter_start_oauth(label: str, port: int) -> Dict[str, str]:
-    nonce = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
-    verifier = base64.urlsafe_b64encode(os.urandom(48)).decode("ascii").rstrip("=")
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
-    callback_path = f"/v1/connections/openrouter/callback/{nonce}"
-    callback_url = f"http://127.0.0.1:{port}{callback_path}"
-    with _OPENROUTER_OAUTH_LOCK:
-        _OPENROUTER_OAUTH_PENDING[nonce] = {"verifier": verifier, "label": label[:80], "created": time.monotonic()}
-    query = urllib.parse.urlencode({"callback_url": callback_url, "code_challenge": challenge, "code_challenge_method": "S256"})
-    return {"authorizationURL": f"{OPENROUTER_AUTH_URL}?{query}", "callbackPath": callback_path, "operationID": nonce}
+def _openrouter_oauth_operation_rows() -> Dict[str, Dict[str, Any]]:
+    operations_file = AGENTCAT_HOME / "openrouter-oauth-operations.json"
+    try:
+        payload = json.loads(operations_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    rows = payload.get("operations") if isinstance(payload, dict) else None
+    return {str(key): dict(value) for key, value in rows.items() if isinstance(key, str) and isinstance(value, dict)} if isinstance(rows, dict) else {}
 
 
-def openrouter_finish_oauth(nonce: str, code: str) -> None:
-    with _OPENROUTER_OAUTH_LOCK:
-        pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
-        if not pending or time.monotonic() - float(pending["created"]) > OPENROUTER_OAUTH_TTL_SECONDS:
-            _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
-            raise ValueError("oauth_state_expired")
-        if pending.get("callbackConsumed"):
-            raise ValueError("oauth_state_consumed")
-        # Mark before the outbound exchange so a concurrent callback cannot
-        # replay the authorization code while the request is in flight.
-        pending["callbackConsumed"] = True
-        verifier = str(pending["verifier"])
-    if not code or len(code) > 4096:
-        raise ValueError("oauth_code_required")
+def _write_openrouter_oauth_operation(operation_id: str, metadata: Optional[Dict[str, Any]]) -> None:
+    """Persist only adapter-provided public operation metadata at 0600."""
+    rows = _openrouter_oauth_operation_rows()
+    if metadata is None:
+        rows.pop(operation_id, None)
+    else:
+        rows[operation_id] = dict(metadata)
+    AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
+    operations_file = AGENTCAT_HOME / "openrouter-oauth-operations.json"
+    tmp = operations_file.with_name(operations_file.name + ".tmp-" + uuid.uuid4().hex)
+    tmp.write_text(json.dumps({"version": 1, "operations": rows}, ensure_ascii=False) + "\n", encoding="utf-8")
+    _chmod_quiet(tmp, 0o600)
+    tmp.replace(operations_file)
+    _chmod_quiet(operations_file, 0o600)
+
+
+def _openrouter_exchange_managed_code(code: str, verifier: str) -> str:
     request = urllib.request.Request(
         OPENROUTER_KEY_EXCHANGE_URL,
         data=json.dumps({"code": code, "code_verifier": verifier, "code_challenge_method": "S256"}).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "AgentCat/1.0"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except Exception as exc:
-        with _OPENROUTER_OAUTH_LOCK:
-            current = _OPENROUTER_OAUTH_PENDING.get(nonce)
-            if current is not None:
-                current["failed"] = True
-        raise RuntimeError("oauth_exchange_failed") from exc
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
     key = payload.get("key") if isinstance(payload, dict) else None
     if not isinstance(key, str) or not key:
         raise RuntimeError("oauth_exchange_failed")
-    with _OPENROUTER_OAUTH_LOCK:
-        current = _OPENROUTER_OAUTH_PENDING.get(nonce)
-        if current is None:
-            raise ValueError("oauth_state_expired")
-        current["key"] = key
+    return key
 
 
-def openrouter_oauth_status(nonce: str) -> str:
-    with _OPENROUTER_OAUTH_LOCK:
-        pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
-        if not pending or time.monotonic() - float(pending["created"]) > OPENROUTER_OAUTH_TTL_SECONDS:
-            _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
-            return "expired"
-        if pending.get("failed"):
-            return "failed"
-        if pending.get("keyClaimed"):
-            return "claimed"
-        if not isinstance(pending.get("key"), str):
-            return "awaiting_browser"
-        return "ready"
-
-
-def openrouter_claim_oauth_key(nonce: str) -> str:
-    with _OPENROUTER_OAUTH_LOCK:
-        pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
-        if not pending or pending.get("keyClaimed") or not isinstance(pending.get("key"), str):
-            raise ValueError("oauth_key_not_ready")
-        pending["keyClaimed"] = True
-        # The only copy now travels in the authenticated response to the app,
-        # which immediately writes it through Security.framework.
-        return str(pending.pop("key"))
-
-
-def openrouter_complete_oauth(nonce: str, connection_id: str, label: str) -> Dict[str, Any]:
-    with _OPENROUTER_OAUTH_LOCK:
-        pending = _OPENROUTER_OAUTH_PENDING.get(nonce)
-        if not pending or not pending.get("keyClaimed"):
-            raise ValueError("oauth_key_not_ready")
+def _openrouter_register_managed_connection(connection_id: str, label: str, kind: str) -> Dict[str, Any]:
     with _OPENROUTER_CONNECTIONS_LOCK:
         rows = _openrouter_connections()
         if any(item.get("id") == connection_id for item in rows):
             raise ValueError("duplicate_connection_id")
-        row = _openrouter_new_connection(connection_id, label, "oauth_pkce")
+        row = _openrouter_new_connection(connection_id, label, kind)
         rows.append(row)
         _write_openrouter_connections(rows)
-    with _OPENROUTER_OAUTH_LOCK:
-        _OPENROUTER_OAUTH_PENDING.pop(nonce, None)
     return _openrouter_public_connection(row)
+
+
+def openrouter_managed_auth(port: Optional[int] = None) -> OpenRouterManagedAuth:
+    """One PKCE state machine per Agent Cat home; callback/key material stays memory-only."""
+    global _OPENROUTER_MANAGED_AUTH, _OPENROUTER_MANAGED_HOME, _OPENROUTER_OAUTH_CALLBACK_PORT
+    if port is not None:
+        _OPENROUTER_OAUTH_CALLBACK_PORT = port
+    if _OPENROUTER_MANAGED_AUTH is None or _OPENROUTER_MANAGED_HOME != str(AGENTCAT_HOME):
+        def callback_port() -> int:
+            if not isinstance(_OPENROUTER_OAUTH_CALLBACK_PORT, int) or _OPENROUTER_OAUTH_CALLBACK_PORT <= 0:
+                raise OpenRouterManagedError("oauth_callback_port_unavailable")
+            return _OPENROUTER_OAUTH_CALLBACK_PORT
+        _OPENROUTER_MANAGED_AUTH = build_openrouter_managed_adapter(
+            callback_port=callback_port,
+            read_metadata=lambda operation: _openrouter_oauth_operation_rows().get(operation),
+            write_metadata=lambda operation, metadata: _write_openrouter_oauth_operation(operation, dict(metadata)),
+            exchange_code=_openrouter_exchange_managed_code,
+            complete=_openrouter_register_managed_connection,
+        )
+        _OPENROUTER_MANAGED_HOME = str(AGENTCAT_HOME)
+    return _OPENROUTER_MANAGED_AUTH
+
+
+def openrouter_start_oauth(label: str, port: int) -> Dict[str, str]:
+    return openrouter_managed_auth(port).start(None, "browser", label=label)
+
+
+def openrouter_finish_oauth(nonce: str, code: str) -> None:
+    openrouter_managed_auth().callback(nonce, code)
+
+
+def openrouter_oauth_status(nonce: str) -> str:
+    state = openrouter_managed_auth().poll(None, nonce).get("status")
+    return {
+        "pending_browser": "awaiting_browser",
+        "ready": "ready",
+        "claimed": "claimed",
+        "canceled": "canceled",
+        "failed": "failed",
+    }.get(str(state), "failed")
+
+
+def openrouter_claim_oauth_key(nonce: str) -> str:
+    return openrouter_managed_auth().claim(nonce)
+
+
+def openrouter_complete_oauth(nonce: str, connection_id: str, label: str) -> Dict[str, Any]:
+    return openrouter_managed_auth().complete(nonce, connection_id, label)
+
+
+def openrouter_cancel_oauth(nonce: str) -> str:
+    return str(openrouter_managed_auth().cancel(None, nonce).get("status") or "canceled")
 
 
 def openrouter_connection_mutation(connection_id: str, action: str, label: Optional[str] = None) -> Dict[str, Any]:

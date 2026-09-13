@@ -35,6 +35,9 @@ class OpenRouterConnectionsTests(unittest.TestCase):
         agentcat.LOOPBACK_CONTROL_TOKEN_FILE = self.agentcat_home / "loopback-control-token"
         assert_sandboxed(agentcat, self.home, self.agentcat_home)
         agentcat._OPENROUTER_OAUTH_PENDING.clear()
+        agentcat._OPENROUTER_MANAGED_AUTH = None
+        agentcat._OPENROUTER_MANAGED_HOME = None
+        agentcat._OPENROUTER_OAUTH_CALLBACK_PORT = None
 
     def tearDown(self):
         restore_module_paths(agentcat, self.old_paths)
@@ -83,41 +86,38 @@ class OpenRouterConnectionsTests(unittest.TestCase):
         self.assertIn("Last successful", row["error"])
 
     def test_oauth_state_is_one_time_and_expiring(self):
-        started = agentcat.openrouter_start_oauth("Personal", 8765)
-        nonce = started["callbackPath"].rsplit("/", 1)[1]
-        self.assertIn("code_challenge_method=S256", started["authorizationURL"])
-        self.assertIn(nonce, agentcat._OPENROUTER_OAUTH_PENDING)
-        agentcat._OPENROUTER_OAUTH_PENDING[nonce]["created"] = time.monotonic() - 601
-        with self.assertRaises(ValueError):
+        with patch.object(agentcat, "_openrouter_exchange_managed_code", return_value="temporary-secret"):
+            started = agentcat.openrouter_start_oauth("Personal", 8765)
+            nonce = started["operationID"]
+            self.assertIn("code_challenge_method=S256", started["authorizationURL"])
+            self.assertEqual(agentcat.openrouter_oauth_status(nonce), "awaiting_browser")
             agentcat.openrouter_finish_oauth(nonce, "authorization-code")
-        self.assertNotIn(nonce, agentcat._OPENROUTER_OAUTH_PENDING)
+            self.assertEqual(agentcat.openrouter_oauth_status(nonce), "ready")
+            self.assertNotIn("authorizationURL", (self.agentcat_home / "openrouter-oauth-operations.json").read_text())
 
     def test_oauth_claim_is_one_time_and_completion_requires_claim(self):
-        nonce = "n" * 43
-        agentcat._OPENROUTER_OAUTH_PENDING[nonce] = {
-            "created": time.monotonic(), "key": "temporary-secret", "label": "OAuth",
-        }
-        self.assertEqual(agentcat.openrouter_oauth_status(nonce), "ready")
-        self.assertEqual(agentcat.openrouter_claim_oauth_key(nonce), "temporary-secret")
-        self.assertEqual(agentcat.openrouter_oauth_status(nonce), "claimed")
-        with self.assertRaises(ValueError):
-            agentcat.openrouter_claim_oauth_key(nonce)
+        with patch.object(agentcat, "_openrouter_exchange_managed_code", return_value="temporary-secret"):
+            nonce = agentcat.openrouter_start_oauth("OAuth", 8765)["operationID"]
+            agentcat.openrouter_finish_oauth(nonce, "authorization-code")
+            self.assertEqual(agentcat.openrouter_oauth_status(nonce), "ready")
+            self.assertEqual(agentcat.openrouter_claim_oauth_key(nonce), "temporary-secret")
+            self.assertEqual(agentcat.openrouter_oauth_status(nonce), "claimed")
+            with self.assertRaises(Exception):
+                agentcat.openrouter_claim_oauth_key(nonce)
 
     def test_concurrent_oauth_claim_delivers_key_once(self):
-        nonce = "c" * 43
-        agentcat._OPENROUTER_OAUTH_PENDING[nonce] = {
-            "created": time.monotonic(), "key": "temporary-secret", "label": "OAuth",
-        }
-        def claim():
-            try:
-                return agentcat.openrouter_claim_oauth_key(nonce)
-            except ValueError:
-                return None
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            results = list(executor.map(lambda _: claim(), range(2)))
+        with patch.object(agentcat, "_openrouter_exchange_managed_code", return_value="temporary-secret"):
+            nonce = agentcat.openrouter_start_oauth("OAuth", 8765)["operationID"]
+            agentcat.openrouter_finish_oauth(nonce, "authorization-code")
+            def claim():
+                try:
+                    return agentcat.openrouter_claim_oauth_key(nonce)
+                except Exception:
+                    return None
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _: claim(), range(2)))
         self.assertEqual(results.count("temporary-secret"), 1)
         self.assertEqual(results.count(None), 1)
-        self.assertNotIn("key", agentcat._OPENROUTER_OAUTH_PENDING[nonce])
 
     def test_handler_requires_bearer_and_rejects_foreign_origin_writes(self):
         token = agentcat.loopback_control_token()

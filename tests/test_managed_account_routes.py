@@ -56,7 +56,7 @@ class ManagedAccountRouteTests(unittest.TestCase):
         agentcat.LOOPBACK_CONTROL_TOKEN_FILE = self.agentcat_home / "loopback-control-token"
         self.adapter = FakeAdapter()
         agentcat._MANAGED_ACCOUNTS = agentcat.ManagedAccounts(self.agentcat_home, {"kimi": self.adapter})
-        agentcat._MANAGED_ACCOUNTS_HOME = self.agentcat_home
+        agentcat._MANAGED_ACCOUNTS_HOME = str(self.agentcat_home)
         self.token = agentcat.loopback_control_token()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
