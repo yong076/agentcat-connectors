@@ -146,6 +146,28 @@ class HomeDiscoveryTestCase(unittest.TestCase):
         )
         return path
 
+    def _native_auth(self, provider: str, account_id) -> None:
+        """Use only identity fields observed in the providers' local files."""
+        if provider == "codex":
+            self._codex_auth(agentcat.HOME / ".codex", account_id)
+        elif provider == "claude":
+            metadata = {"emailAddress": "private@example.test", "organizationUuid": "private-org"}
+            if account_id is not None:
+                metadata["accountUuid"] = account_id
+            (agentcat.HOME / ".claude.json").write_text(json.dumps({"oauthAccount": metadata}))
+        elif provider in ("gemini", "antigravity"):
+            path = (agentcat.HOME / ".gemini" / "oauth_creds.json"
+                    if provider == "gemini" else agentcat.ANTIGRAVITY_OAUTH_TOKEN)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            claims = {"iss": "https://accounts.google.com", "email": "private@example.test"}
+            if account_id is not None:
+                claims["sub"] = account_id
+            encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+            credentials = {
+                "access_token": "fixture-access-token", "id_token": f"header.{encoded}.signature",
+            }
+            path.write_text(json.dumps(credentials if provider == "gemini" else {"token": credentials}))
+
     def _adopt(self, provider: str, home: Path) -> None:
         agentcat.write_agentcat_settings(
             {"homes": {provider: {"adopted": [str(home)]}}}
@@ -612,6 +634,8 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
         self.assertEqual(native["syncIdentity"], agentcat.provider_sync_identity("codex", account_a))
         self.assertRegex(native["syncIdentity"], r"^[0-9a-f]{64}$")
         self.assertNotIn(account_a, native["syncIdentity"])
+        self.assertEqual({row["identityConfidence"] for row in instances}, {"native_account_id"})
+        self.assertEqual(len({row["syncIdentity"] for row in instances}), 2)
 
     def test_profile_only_candidates_never_false_merge(self) -> None:
         self._codex_auth(agentcat.HOME / ".codex", None, "pro")
@@ -676,6 +700,130 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
 
     def test_provider_instances_capability_is_advertised(self) -> None:
         self.assertIn("providerInstances.v1", agentcat.CONNECTOR_CAPABILITIES)
+
+
+class NativeSyncIdentityTests(HomeDiscoveryTestCase):
+    PROVIDERS = ("codex", "claude", "gemini", "antigravity")
+
+    def rows(self):
+        return agentcat.provider_instances_snapshot({
+            provider: {"status": "auto", "quotas": []} for provider in self.PROVIDERS
+        })
+
+    def test_native_identity_survives_machine_change_and_separates_accounts(self):
+        observations = []
+        for machine, account_id in (("macbook", "native-account-a"), ("studio", "native-account-a"),
+                                    ("other", "native-account-b")):
+            with self.subTest(machine=machine):
+                home = self.root / machine
+                state = home / ".agentcat"
+                state.mkdir(parents=True)
+                originals = redirect_module_paths(agentcat, home, state)
+                try:
+                    # Real, different device keys: mocking only the home would miss
+                    # a sync identity accidentally derived from a cached local key.
+                    agentcat.PROVIDER_INSTANCE_SECRET.write_bytes(machine.encode().ljust(32, b"!"))
+                    for provider in self.PROVIDERS:
+                        self._native_auth(provider, account_id)
+                    with patch("socket.gethostname", return_value=machine):
+                        rows = self.rows()
+                    by_provider = {row["providerID"]: row for row in rows}
+                    self.assertEqual(set(by_provider), set(self.PROVIDERS))
+                    for provider, row in by_provider.items():
+                        self.assertEqual(row["identityConfidence"], "native_account_id")
+                        self.assertRegex(row["syncIdentity"], r"^[0-9a-f]{64}$")
+                        self.assertEqual(row["syncIdentity"], agentcat.provider_sync_identity(provider, account_id))
+                    self.assertEqual(len({row["syncIdentity"] for row in rows}), len(self.PROVIDERS))
+                    serialized = json.dumps(rows)
+                    for secret in (account_id, "@example.test", str(home), "fixture-access-token"):
+                        self.assertNotIn(secret, serialized)
+                    observations.append(by_provider)
+                finally:
+                    restore_module_paths(agentcat, originals)
+        for provider in self.PROVIDERS:
+            self.assertEqual(observations[0][provider]["syncIdentity"], observations[1][provider]["syncIdentity"])
+            self.assertNotEqual(observations[0][provider]["id"], observations[1][provider]["id"])
+            self.assertNotEqual(observations[0][provider]["syncIdentity"], observations[2][provider]["syncIdentity"])
+
+    def test_missing_or_invalid_native_id_never_uses_email_or_profile(self):
+        for account_id in (None, "", "  ", 123, [], {}):
+            with self.subTest(account_id=account_id):
+                for provider in self.PROVIDERS:
+                    self._native_auth(provider, account_id)
+                rows = self.rows()
+                self.assertEqual({row["providerID"] for row in rows}, set(self.PROVIDERS))
+                for row in rows:
+                    self.assertEqual(row["identityConfidence"], "profile_only")
+                    self.assertNotIn("syncIdentity", row)
+
+    def test_google_malformed_token_or_non_google_subject_stays_profile_only(self):
+        foreign = base64.urlsafe_b64encode(json.dumps({"iss": "https://other.test", "sub": "foreign-id"}).encode()).decode()
+        for provider in ("gemini", "antigravity"):
+            self._native_auth(provider, "native-google-account")
+            path = (agentcat.HOME / ".gemini" / "oauth_creds.json"
+                    if provider == "gemini" else agentcat.ANTIGRAVITY_OAUTH_TOKEN)
+            for token in (None, "invalid", "header.bad.signature", f"header.{foreign}.signature"):
+                with self.subTest(provider=provider, token=token):
+                    path.write_text(json.dumps({"access_token": "fixture-access-token", "id_token": token}))
+                    row = next(row for row in self.rows() if row["providerID"] == provider)
+                    self.assertEqual(row["identityConfidence"], "profile_only")
+                    self.assertNotIn("syncIdentity", row)
+
+    def test_google_bare_issuer_and_flat_antigravity_credentials(self):
+        self._native_auth("antigravity", "native-google-account")
+        claims = {"iss": "accounts.google.com", "sub": "native-google-account"}
+        encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        agentcat.ANTIGRAVITY_OAUTH_TOKEN.write_text(json.dumps({"id_token": f"header.{encoded}.signature"}))
+        row = self.rows()[0]
+        self.assertEqual(row["identityConfidence"], "native_account_id")
+        self.assertEqual(row["syncIdentity"], agentcat.provider_sync_identity("antigravity", claims["sub"]))
+
+    def test_absent_credentials_do_not_invent_instances(self):
+        self.assertEqual(self.rows(), [])
+
+    def test_instance_limits_are_detached_from_provider_limits(self):
+        self._native_auth("claude", "native-claude-account")
+        limits = {"claude": {"status": "auto", "quotas": [{"id": "weekly", "usedPercent": 20}]}}
+        rows, complete = agentcat.provider_instances_snapshot_with_completeness(limits)
+        rows[0]["limits"]["quotas"][0]["usedPercent"] = 90
+        self.assertEqual(limits["claude"]["quotas"][0]["usedPercent"], 20)
+        self.assertEqual(complete, {"codex"})
+
+    def test_claude_override_never_inherits_default_account(self):
+        self._native_auth("claude", "default-native-account")
+        custom = agentcat.HOME / "custom-claude"
+        custom.mkdir()
+        (custom / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "fixture-token"}}))
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(custom)}):
+            rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["identityConfidence"], "profile_only")
+        self.assertNotIn("syncIdentity", rows[0])
+
+    def test_full_snapshot_never_serializes_native_ids_email_or_home(self):
+        for provider in self.PROVIDERS:
+            self._native_auth(provider, f"private-native-{provider}")
+        limits = {provider: {"status": "auto", "quotas": []} for provider in self.PROVIDERS}
+        with patch.object(agentcat, "runtime_limits", return_value=limits):
+            snapshot = agentcat.build_snapshot()
+        self.assertEqual({row["providerID"] for row in snapshot["providerInstances"]}, set(self.PROVIDERS))
+        live_apps = {"claude": {"dataRoots": [{"path": str(agentcat.HOME / "Library" / "Claude")}]}}
+        with patch.object(agentcat, "_live_activity_and_desktop", return_value=({}, live_apps)):
+            served = agentcat.snapshot_for_http()
+        for result in (snapshot, agentcat.read_json(agentcat.LATEST_SNAPSHOT), served):
+            serialized = json.dumps(result)
+            for secret in ("private-native-", "@example.test", str(agentcat.HOME), "fixture-access-token"):
+                self.assertNotIn(secret, serialized)
+
+    def test_snapshot_home_redaction_preserves_collector_paths_and_siblings(self):
+        home = str(agentcat.HOME)
+        raw = {"path": home + "/.claude", "sibling": home + "-other/file",
+               "error": f"Cannot read '{home}/.gemini/oauth_creds.json'"}
+        result = agentcat.snapshot_home_paths(raw)
+        self.assertEqual(result["path"], "~/.claude")
+        self.assertEqual(result["sibling"], raw["sibling"])
+        self.assertNotIn(home, result["error"])
+        self.assertEqual(raw["path"], home + "/.claude")
 
 
 class SnapshotBackCompatTests(HomeDiscoveryTestCase):
