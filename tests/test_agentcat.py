@@ -18,7 +18,7 @@ from typing import List
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sandbox import assert_sandboxed, redirect_module_paths, restore_module_paths
+from sandbox import assert_sandboxed, block_network, redirect_module_paths, restore_module_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -4434,20 +4434,13 @@ class InsightsIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.old_home = agentcat.HOME
-        self.old_agentcat_home = agentcat.AGENTCAT_HOME
-        self.old_events_db = agentcat.EVENTS_DB
-        self.old_latest = agentcat.LATEST_SNAPSHOT
-        agentcat.HOME = self.root
-        agentcat.AGENTCAT_HOME = self.root / ".agentcat"
-        agentcat.EVENTS_DB = agentcat.AGENTCAT_HOME / "events.sqlite"
-        agentcat.LATEST_SNAPSHOT = agentcat.AGENTCAT_HOME / "latest-snapshot.json"
+        self.old_paths = redirect_module_paths(agentcat, self.root, self.root / ".agentcat")
+        self.network_patch = block_network(agentcat)
+        self.network_patch.start()
 
     def tearDown(self) -> None:
-        agentcat.HOME = self.old_home
-        agentcat.AGENTCAT_HOME = self.old_agentcat_home
-        agentcat.EVENTS_DB = self.old_events_db
-        agentcat.LATEST_SNAPSHOT = self.old_latest
+        self.network_patch.stop()
+        restore_module_paths(agentcat, self.old_paths)
         self.tmp.cleanup()
 
     def _stub_providers(self, providers_dict):

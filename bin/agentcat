@@ -3500,8 +3500,7 @@ def _jwt_claims_unverified(token: Any) -> Dict[str, Any]:
     """Decode local JWT display claims without treating them as authorization.
 
     The credential file itself is the identity source. These unverified claims
-    only supply a plan badge; access decisions and account grouping never depend
-    on them.
+    supply display and native account metadata; they never authorize access.
     """
     if not isinstance(token, str):
         return {}
@@ -3594,7 +3593,9 @@ def provider_sync_identity(provider: str, native_account_id: str) -> str:
     can scope it to its signed-in account before an upload, allowing the server
     to recognize the same verified account on another machine.  It is a
     deterministic fingerprint, not anonymous data and not a credential; the
-    raw native id never enters a snapshot or leaves this process.
+    raw native id never enters a snapshot or leaves this process. Keep this
+    v1 SHA-256 encoding stable: no device key, hostname, or home path belongs
+    in this seed (only the separate instance ID uses a device-local HMAC).
     """
     return hashlib.sha256(
         f"agentcat.provider-sync.v1:{provider}:{native_account_id}".encode("utf-8")
@@ -4622,6 +4623,72 @@ def orca_claude_provider_instances() -> List[Dict[str, Any]]:
         return copy.deepcopy(rows)
 
 
+def google_native_account_id(credentials: Dict[str, Any]) -> Optional[str]:
+    """Read the Google subject from a local OAuth ID token, never an email.
+
+    Like Codex's local ID-token reader, this inspects claims without validating
+    the signature. It is identity metadata, not proof for authentication.
+    """
+    claims = _jwt_claims_unverified(credentials.get("id_token"))
+    if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        return None
+    subject = claims.get("sub")
+    return subject if isinstance(subject, str) and subject.strip() else None
+
+
+def local_oauth_provider_instances(
+    limits_by_provider: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Describe the current local Claude/Google profiles using native metadata.
+
+    This is not a complete multi-profile inventory. In particular, Orca profile
+    IDs and emails are never promoted to native account IDs.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    def append(provider: str, label: str, home: Path, native_id: Any) -> None:
+        if not isinstance(native_id, str) or not native_id.strip():
+            native_id = None
+        seed = f"native:{native_id}" if native_id else f"profile:{_resolved_path_key(home)}"
+        instance_id = provider_instance_id(provider, seed)
+        limits = limits_by_provider.get(provider)
+        rows.append({
+            "id": instance_id,
+            "providerID": provider,
+            "label": f"{label} · {instance_id[-4:].upper()}",
+            "identityConfidence": "native_account_id" if native_id else "profile_only",
+            **({"syncIdentity": provider_sync_identity(provider, native_id)} if native_id else {}),
+            "profileCount": 1,
+            "tracked": True,
+            "active": True,
+            "status": "connected",
+            "limits": copy.deepcopy(limits) if isinstance(limits, dict) else empty_limits(status="not_configured"),
+        })
+
+    claude_home = claude_config_dir()
+    # Only the default profile is known to own ~/.claude.json. An overridden
+    # config directory must not inherit that file's account or organization.
+    metadata = None
+    if _resolved_path_key(claude_home) == _resolved_path_key(HOME / ".claude"):
+        config = read_json(HOME / ".claude.json")
+        if isinstance(config, dict):
+            metadata = config.get("oauthAccount")
+    has_claude_credentials = any(
+        (claude_home / name).is_file() for name in (".credentials.json", "credentials.json")
+    )
+    if isinstance(metadata, dict) or has_claude_credentials:
+        append("claude", "Claude", claude_home,
+               metadata.get("accountUuid") if isinstance(metadata, dict) else None)
+
+    for provider, label, home, credentials in (
+        ("gemini", "Gemini", HOME / ".gemini", read_gemini_oauth_credentials()),
+        ("antigravity", "Antigravity", ANTIGRAVITY_CLI_DIR, read_antigravity_oauth_credentials()),
+    ):
+        if credentials:
+            append(provider, label, home, google_native_account_id(credentials))
+    return rows
+
+
 def provider_instances_snapshot(
     limits_by_provider: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
@@ -4635,13 +4702,15 @@ def provider_instances_snapshot_with_completeness(
     """Return local rows plus providers safe for authoritative replacement.
 
     Orca's optional CLI bridge deliberately isolates failures, so it cannot
-    attest that its Claude inventory is complete. Codex is the sole provider
-    with a verified native identity inventory in this protocol version.
+    attest that its Claude inventory is complete. The local OAuth rows also
+    describe only the current profile. Only Codex enumerates a complete native
+    identity inventory in this protocol version.
     """
     resolved_limits = limits_by_provider if isinstance(limits_by_provider, dict) else {}
     codex_rows, codex_complete = codex_provider_instances_with_completeness(resolved_limits.get("codex"))
     complete_providers = {"codex"} if codex_complete else set()
-    return codex_rows + orca_claude_provider_instances(), complete_providers
+    return (codex_rows + local_oauth_provider_instances(resolved_limits)
+            + orca_claude_provider_instances()), complete_providers
 
 
 def codex_usage_breakdown_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
@@ -12993,8 +13062,32 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             insights_by_period[period] = {"status": "error", "error": str(exc)}
     snapshot["insightsByPeriod"] = insights_by_period
     snapshot["insights"] = insights_by_period["week"]
+    snapshot = snapshot_home_paths(snapshot)
     write_json_atomic(LATEST_SNAPSHOT, snapshot)
     return snapshot
+
+
+def snapshot_home_paths(value: Any) -> Any:
+    """Return a snapshot copy with home paths elided, including diagnostic text.
+
+    Apply at serialization boundaries so internal collectors and their caches
+    retain usable absolute paths. Match a directory boundary, not sibling names.
+    """
+    home = str(HOME)
+    if not home or home == os.path.abspath(os.sep):
+        return value
+    pattern = re.compile(re.escape(home) + r"(?=$|[/\\]|[\s\"'])")
+
+    def redact(item: Any) -> Any:
+        if isinstance(item, str):
+            return pattern.sub("~", item)
+        if isinstance(item, dict):
+            return {redact(key): redact(entry) for key, entry in item.items()}
+        if isinstance(item, list):
+            return [redact(entry) for entry in item]
+        return item
+
+    return redact(value)
 
 
 _HTTP_LIVE_CACHE_LOCK = threading.Lock()
@@ -13073,7 +13166,7 @@ def snapshot_for_http() -> Dict[str, Any]:
         providers = snapshot.get("providers")
         if isinstance(providers, dict):
             attach_desktop_app_sources(providers, desktop_apps)
-        return snapshot
+        return snapshot_home_paths(snapshot)
     return build_snapshot()
 
 

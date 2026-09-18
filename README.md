@@ -152,6 +152,28 @@ number the product reports, so it stays an explicit choice. Adopted homes are
 deduplicated by inode and session identity, so a mirror that hardlinks or copies
 its sessions is counted once, never twice.
 
+### Native account sync identities
+
+`providerInstances` emits `identityConfidence: native_account_id` and a
+64-character hexadecimal `syncIdentity` when local account metadata is available:
+Codex's `auth.json` account ID, Claude's `~/.claude.json` `oauthAccount.accountUuid`,
+or the Google issuer and `sub` in Gemini's `~/.gemini/oauth_creds.json` ID token.
+Antigravity uses the same Google subject rule when its own OAuth credentials
+contain an ID token. These local token claims are metadata, not authentication.
+
+The existing v1 SHA-256 fingerprint includes only the provider and native ID,
+so it is stable across machines. The separate instance `id` remains a device-local
+HMAC. Clients must scope `syncIdentity` to their signed-in Agent Cat account before
+uploading it. Missing or invalid native IDs remain `profile_only` with no
+`syncIdentity`; emails, organization IDs, paths, and Orca profile IDs are never
+substitutes. A Claude config override cannot inherit the default profile's account.
+Raw native IDs and emails are not copied into the snapshot, and absolute home
+paths in snapshot diagnostics are replaced with `~`.
+
+Only Codex currently enumerates an authoritative account inventory. The added
+Claude, Gemini, and Antigravity rows describe the current local profile; they do
+not make those providers' inventories complete.
+
 ### Orca Claude account quotas
 
 When the local Orca IDE CLI is available, the connector reads `orca account list
