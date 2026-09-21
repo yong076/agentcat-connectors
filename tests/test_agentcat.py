@@ -1335,7 +1335,7 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertEqual(snapshot["status"], "ok")
         source = str(snapshot["source"]).replace("\\", "/")
-        self.assertTrue(source.endswith("/sessions/**/*.jsonl"))
+        self.assertTrue(source.endswith("sessions/**/*.jsonl"))
         # uncached input: (100-30) + 50 = 120
         self.assertEqual(snapshot["tokens"]["inputTokens"], 120)
         # output: 40 + 20 = 60. reasoning_output_tokens is a *breakdown* of
@@ -1358,7 +1358,11 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertNotIn("unknown", snapshot["models"])
         # project attributed via cwd
         self.assertEqual(snapshot["projects"]["status"], "ok")
-        self.assertEqual(snapshot["projects"]["items"][0]["path"], "/Users/me/projects/alpha")
+        project = snapshot["projects"]["items"][0]
+        self.assertEqual(project["path"], "alpha")
+        self.assertEqual(project["name"], "alpha")
+        self.assertEqual(project["id"], agentcat.short_stable_hash("/Users/me/projects/alpha"))
+        self.assertNotIn("/Users/", json.dumps(snapshot))
         # breakdown chat == token_count turns
         self.assertEqual(snapshot["breakdown"]["chat"], 2)
         # hourly buckets sum to all-time total
@@ -1515,8 +1519,8 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertEqual(snapshot["status"], "ok")
         source = str(snapshot["source"]).replace("\\", "/")
-        self.assertIn("/sessions/**/*.jsonl", source)
-        self.assertIn("/archived_sessions/**/*.jsonl", source)
+        self.assertIn("sessions/**/*.jsonl", source)
+        self.assertIn("archived_sessions/**/*.jsonl", source)
         self.assertEqual(snapshot["tokens"]["all"], 115)
         self.assertEqual(snapshot["tokens"]["inputTokens"], 85)
         self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 25)
@@ -1610,7 +1614,7 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         self.assertEqual(snapshot["status"], "ok")
         source = str(snapshot["source"]).replace("\\", "/")
-        self.assertIn("/sessions/**/*.jsonl", source)
+        self.assertIn("sessions/**/*.jsonl", source)
         self.assertIn("state_5.sqlite", source)
         self.assertEqual(snapshot["tokens"]["all"], 9999)
         self.assertEqual(snapshot["tokens"]["totalTokens"], 9999)
@@ -1920,7 +1924,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         snapshot = agentcat.codex_sqlite_snapshot()
 
         self.assertEqual(snapshot["status"], "ok")
-        self.assertEqual(Path(snapshot["source"]), db_path)
+        self.assertEqual(snapshot["source"], db_path.name)
         self.assertEqual(snapshot["tokens"]["all"], 777)
         self.assertEqual(snapshot["projects"]["status"], "ok")
 

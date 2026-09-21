@@ -1901,7 +1901,8 @@ def desktop_app_data_roots(provider: str) -> List[Path]:
 
 def scan_desktop_app_data_root(root: Path) -> Dict[str, Any]:
     result: Dict[str, Any] = {
-        "path": str(root),
+        # Home-layout data roots, not the user-chosen app bundle.
+        "path": snapshot_source_label(root),
         "exists": False,
         "readableFiles": 0,
         "latestModifiedAt": None,
@@ -1957,6 +1958,7 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
         "provider": provider,
         "displayName": spec.get("displayName") or provider,
         "hostApp": None,
+        # User-chosen (or default-detected) app bundle; Settings reads this back.
         "path": selected_path,
         "configured": configured,
         "detectedDefault": (not configured and default_path is not None),
@@ -7129,7 +7131,7 @@ def empty_periods() -> Dict[str, int]:
 def empty_provider_usage(status: str = "not_found", source: Optional[str] = None) -> Dict[str, Any]:
     return {
         "status": status,
-        "source": source,
+        "source": snapshot_source_label(source) if source else source,
         "tokens": empty_periods(),
         "models": {},
         "dailyTokens": {},
@@ -7157,13 +7159,78 @@ def display_project_name(path: str) -> str:
 
     Strips trailing slashes and returns the last meaningful directory
     component. Falls back to the input when the path doesn't have a
-    folder name (e.g. just `/`).
+    folder name (e.g. just `/`). Splits on both `/` and `\\` so a Windows
+    cwd recorded on a POSIX host still yields only the folder name.
     """
     text = (path or "").rstrip("/\\")
     if not text:
         return ""
-    leaf = Path(text).name
+    leaf = re.split(r"[\\/]+", text)[-1]
     return leaf or text
+
+
+def project_snapshot_identity(path: str) -> Dict[str, str]:
+    """Opaque id + last-component label for snapshot project items.
+
+    Snapshot payloads leave the machine (Pro sync). Never emit a filesystem
+    path: `id` is a short SHA-256 of the original path (same helper as quota
+    identities), and `path`/`name` are the leaf folder only.
+    """
+    text = str(path or "")
+    label = display_project_name(text)
+    return {
+        "id": short_stable_hash(text),
+        "path": label,
+        "name": label,
+    }
+
+
+def _is_absolute_snapshot_path(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value or value.startswith(("http://", "https://", "~")):
+        return False
+    if value.startswith("/") or value.startswith("\\\\"):
+        return True
+    if len(value) >= 3 and value[0].isalpha() and value[1] == ":" and value[2] in "\\/":
+        return True
+    home = str(HOME)
+    if home and home not in {"/", "\\"}:
+        home_slash = home.rstrip("/\\")
+        if value == home or value == home_slash:
+            return True
+        if value.startswith(home_slash + "/") or value.startswith(home_slash + "\\"):
+            return True
+    return False
+
+
+def snapshot_source_label(value: Any) -> Any:
+    """Keep source-field names, replace absolute paths with the leaf name.
+
+    Joined descriptors and suffixes like `/**/*.jsonl` or `+jsonl` are
+    preserved; URLs and already-relative labels pass through.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    if not text:
+        return text
+    if text.startswith(("http://", "https://")):
+        return text
+    for joiner in (" + ", ", ", ","):
+        if joiner in text:
+            return joiner.join(
+                str(snapshot_source_label(part) or "") for part in text.split(joiner)
+            )
+    suffix = ""
+    for marker in ("/**/*.jsonl", "+jsonl"):
+        if text.endswith(marker):
+            suffix = marker
+            text = text[: -len(marker)]
+            break
+    stripped = text.strip()
+    if _is_absolute_snapshot_path(stripped):
+        return display_project_name(stripped) + suffix
+    return stripped + suffix
 
 
 SHELL_TOOL_NAMES = {
@@ -7465,7 +7532,7 @@ def hermes_snapshot() -> Dict[str, Any]:
         return result
 
     result["status"] = "ok"
-    result["source"] = ",".join(str(path) for path in existing_paths)
+    result["source"] = snapshot_source_label(",".join(str(path) for path in existing_paths))
     events = 0
     errors: List[str] = []
     total_cost = actual_cost = estimated_cost = 0.0
@@ -7746,7 +7813,9 @@ def kimi_snapshot() -> Dict[str, Any]:
         events += parse_kimi_wire_log(path, result, kimi_config_model(root))
 
     result["status"] = "ok" if events > 0 else "no_token_events_yet"
-    result["source"] = ",".join(str(path) for path in (code_files + wire_files)) or ",".join(str(root) for root in existing_roots)
+    result["source"] = snapshot_source_label(
+        ",".join(str(path) for path in (code_files + wire_files)) or ",".join(str(root) for root in existing_roots)
+    )
     result["events"] = events
     result["sessions"] = len(
         {str(path.parent.parent) for path in code_files}
@@ -7973,8 +8042,10 @@ def grok_snapshot() -> Dict[str, Any]:
         update_breakdown(result["breakdown"], tools=parsed.get("tool_names") or [])
 
     result["status"] = "ok" if events > 0 else "no_token_events_yet"
-    result["source"] = ",".join(str(path) for path in (hook_files + update_files[:8])) or ",".join(
-        str(root) for root in existing_roots
+    result["source"] = snapshot_source_label(
+        ",".join(str(path) for path in (hook_files + update_files[:8])) or ",".join(
+            str(root) for root in existing_roots
+        )
     )
     result["events"] = events
     result["sessions"] = len(update_files)
@@ -7989,9 +8060,7 @@ def grok_snapshot() -> Dict[str, Any]:
         for project_path, tokens in project_tokens.items():
             last_active = project_last.get(project_path)
             items.append({
-                "id": project_path,
-                "path": project_path,
-                "name": display_project_name(project_path),
+                **project_snapshot_identity(project_path),
                 "tokens": tokens,
                 "lastActive": last_active.isoformat().replace("+00:00", "Z") if last_active else None,
             })
@@ -8013,7 +8082,7 @@ def opencode_snapshot() -> Dict[str, Any]:
         return result
 
     result["status"] = "ok"
-    result["source"] = ",".join(str(path) for path in db_paths)
+    result["source"] = snapshot_source_label(",".join(str(path) for path in db_paths))
     events = 0
     errors: List[str] = []
     project_tokens: Dict[str, int] = {}
@@ -8095,9 +8164,7 @@ def opencode_snapshot() -> Dict[str, Any]:
         for project_path, tokens in project_tokens.items():
             last_active = project_last.get(project_path)
             items.append({
-                "id": project_path,
-                "path": project_path,
-                "name": display_project_name(project_path),
+                **project_snapshot_identity(project_path),
                 "tokens": tokens,
                 "lastActive": last_active.isoformat().replace("+00:00", "Z") if last_active else None,
             })
@@ -8360,9 +8427,7 @@ def copilot_snapshot() -> Dict[str, Any]:
                 "status": "ok",
                 "items": [
                     {
-                        "id": folder,
-                        "path": folder,
-                        "name": display_project_name(folder),
+                        **project_snapshot_identity(folder),
                         "tokens": 0,
                         "lastActive": None,
                     }
@@ -8407,9 +8472,7 @@ def copilot_snapshot() -> Dict[str, Any]:
     if project_totals:
         items = [
             {
-                "id": project,
-                "path": project,
-                "name": display_project_name(project),
+                **project_snapshot_identity(project),
                 "tokens": tokens,
                 "lastActive": None,
             }
@@ -8839,7 +8902,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
         return result
 
     roots = [root for root in codex_session_roots() if root.is_dir()]
-    result["source"] = " + ".join(f"{root}/**/*.jsonl" for root in roots)
+    result["source"] = snapshot_source_label(" + ".join(f"{root}/**/*.jsonl" for root in roots))
 
     cursor = _empty_codex_cursor() if force_rebuild else load_codex_sessions_cursor()
     file_cursors: Dict[str, Any] = cursor["files"]
@@ -9037,9 +9100,7 @@ def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any
         if tok <= 0:
             continue
         item = {
-            "id": cwd,
-            "path": cwd,
-            "name": display_project_name(cwd),
+            **project_snapshot_identity(cwd),
             "tokens": tok,
             "lastActive": payload.get("last_active"),
         }
@@ -9107,7 +9168,7 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
         return result
 
     db_path = paths[-1]
-    result["source"] = str(db_path)
+    result["source"] = snapshot_source_label(db_path)
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         columns = [row[1] for row in conn.execute("pragma table_info(threads)").fetchall()]
@@ -9179,9 +9240,7 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
         for project_path, tokens in project_tokens.items():
             last_active = project_last.get(project_path)
             item = {
-                "id": project_path,
-                "path": project_path,
-                "name": display_project_name(project_path),
+                **project_snapshot_identity(project_path),
                 "tokens": tokens,
                 "lastActive": last_active.isoformat().replace("+00:00", "Z") if last_active else None,
             }
@@ -10464,9 +10523,7 @@ def _journal_projects_snapshot(projects: Dict[str, Dict[str, Any]]) -> Dict[str,
         if tokens <= 0:
             continue
         item = {
-            "id": path,
-            "path": path,
-            "name": display_project_name(path),
+            **project_snapshot_identity(path),
             "tokens": tokens,
             "lastActive": payload.get("last_active"),
         }
@@ -10648,7 +10705,7 @@ def claude_snapshot() -> Dict[str, Any]:
     raw = read_json(path)
     result: Dict[str, Any] = {
         "status": "not_found",
-        "source": f"{path}+jsonl",
+        "source": snapshot_source_label(f"{path}+jsonl"),
         "tokens": {},
         "models": {},
         "dailyTokens": {},
@@ -10830,9 +10887,9 @@ def gemini_source_status(source: Dict[str, Any], usage: Optional[Dict[str, Any]]
         "installed": bool(source.get("installed")),
         "status": "ok" if tokens > 0 else "no_token_events_yet" if telemetry_path.exists() else "no_telemetry_yet",
         "telemetryConfigured": telemetry_configured,
-        "source": str(telemetry_path),
-        "settings": str(settings_path),
-        "cache": str(source["cache"]),
+        "source": snapshot_source_label(telemetry_path),
+        "settings": snapshot_source_label(settings_path),
+        "cache": snapshot_source_label(source["cache"]),
         "tokens": tokens,
         "events": int((usage or {}).get("events") or 0) if usage else 0,
     }
@@ -10892,7 +10949,7 @@ def gemini_snapshot() -> Dict[str, Any]:
     sources = gemini_source_descriptors()
     result: Dict[str, Any] = {
         "status": "no_telemetry_yet",
-        "source": ", ".join(str(source["telemetry"]) for source in sources),
+        "source": snapshot_source_label(", ".join(str(source["telemetry"]) for source in sources)),
         "canonicalProvider": "google",
         "providerLabel": "Gemini",
         "displayName": "Gemini",
@@ -11846,7 +11903,7 @@ def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
         return None
     result["status"] = "ok"
     result["events"] = events
-    result["source"] = str(conversations)
+    result["source"] = snapshot_source_label(conversations)
     return result
 
 
@@ -11882,7 +11939,7 @@ def antigravity_provider_snapshot(
     )
     out = {
         "status": "ok" if google_usage_total(usage) > 0 else status_if_empty,
-        "source": source_status.get("source") or str(ANTIGRAVITY_TELEMETRY),
+        "source": source_status.get("source") or snapshot_source_label(ANTIGRAVITY_TELEMETRY),
         "canonicalProvider": "google",
         "providerLabel": "Antigravity",
         "displayName": "Antigravity",
@@ -11935,7 +11992,7 @@ def split_google_cli_snapshots(
         gemini_provider = apply_google_usage(gemini_snapshot_data, common_usage, status_if_empty="no_token_events_yet")
         sqlite_source_status = dict(antigravity_source_status)
         sqlite_source_status["collectionMethod"] = "local_sqlite_trajectory"
-        sqlite_source_status["source"] = str(antigravity_conversations_dir())
+        sqlite_source_status["source"] = snapshot_source_label(antigravity_conversations_dir())
         antigravity_provider = antigravity_provider_snapshot(
             gemini_snapshot_data,
             sqlite_usage,
@@ -12558,6 +12615,12 @@ def update_channel_status_snapshot() -> Dict[str, Any]:
     }
 
 
+def _safe_auto_update_path(value: Any) -> Any:
+    if value in (None, ""):
+        return value
+    return display_project_name(str(value))
+
+
 def auto_update_status_snapshot() -> Dict[str, Any]:
     enabled, reason = auto_update_enabled_status()
     state = read_auto_update_state()
@@ -12574,6 +12637,8 @@ def auto_update_status_snapshot() -> Dict[str, Any]:
     status.setdefault("reason", reason)
     status.setdefault("currentVersion", CONNECTOR_VERSION)
     status["channel"] = update_channel_status_snapshot()
+    status["installDir"] = _safe_auto_update_path(status.get("installDir"))
+    status["repoDir"] = _safe_auto_update_path(status.get("repoDir"))
     return status
 
 
@@ -12658,8 +12723,8 @@ def check_auto_update_once(apply_update: bool = True) -> Dict[str, Any]:
         "checkedAt": checked_at,
         "currentVersion": CONNECTOR_VERSION,
         "enabled": enabled,
-        "installDir": str(agentcat_connectors_dir()),
-        "repoDir": str(repo_dir) if repo_dir else None,
+        "installDir": _safe_auto_update_path(agentcat_connectors_dir()),
+        "repoDir": _safe_auto_update_path(repo_dir) if repo_dir else None,
         "reason": reason,
     }
     if not enabled:
@@ -12910,7 +12975,9 @@ def snapshot_project_cumulative(providers: Dict[str, Any]) -> Dict[str, Dict[str
             tokens = nonnegative_int(item.get("tokens"))
             if not project_id or tokens is None:
                 continue
-            label = display_project_name(project_id)
+            label = str(item.get("name") or "").strip() or display_project_name(
+                str(item.get("path") or project_id)
+            )
             if not label:
                 continue
             out[f"{provider}|{project_id}"] = {
@@ -13169,7 +13236,7 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     try:
         latest_by_provider: Dict[str, Any] = latest_events_by_provider()
     except Exception as exc:
-        latest_by_provider = {"_agentcat_error": str(exc), "path": str(EVENTS_DB)}
+        latest_by_provider = {"_agentcat_error": str(exc), "path": snapshot_source_label(EVENTS_DB)}
     limits_by_provider = configured_limits()
     runtime_limits_by_provider = runtime_limits()
     def _safe_provider(provider_id: str, fn: Any) -> Dict[str, Any]:

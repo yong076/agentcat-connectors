@@ -204,8 +204,12 @@ class GrokAccountingTests(SandboxedCase):
         self.assertEqual(snapshot["dailyTokens"], {today: 220})
         self.assertEqual(snapshot["tokens"]["cacheReadInputTokens"], 140)
         self.assertEqual(snapshot["tokens"]["reasoningTokens"], 25)
-        self.assertEqual(snapshot["projects"]["items"][0]["path"], project_path)
-        self.assertEqual(snapshot["projects"]["items"][0]["tokens"], 220)
+        project = snapshot["projects"]["items"][0]
+        self.assertEqual(project["path"], "Grok Project")
+        self.assertEqual(project["name"], "Grok Project")
+        self.assertEqual(project["id"], agentcat.short_stable_hash(project_path))
+        self.assertEqual(project["tokens"], 220)
+        self.assertNotIn(project_path, json.dumps(snapshot))
         self.assertEqual(snapshot["models"]["grok-fixture"]["totalTokens"], 220)
 
 
