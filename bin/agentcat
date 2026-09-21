@@ -4490,21 +4490,18 @@ def orca_claude_plan_type(metadata: Dict[str, Any]) -> Optional[str]:
     return plan
 
 
-def orca_claude_profile_plan(account: Optional[Dict[str, Any]], now: float) -> Optional[Dict[str, str]]:
-    """Read profile metadata only; no OAuth tokens, Keychain, or auth CLI calls.
+def _orca_claude_profile_metadata(account: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Read Claude profile identity metadata. Never returns tokens or paths.
 
-    None denotes the system-default *slot*. Callers may use it only after the
-    Orca quota provenance and host selection have both identified that slot.
-    Managed profiles require directory marker + email + organization agreement.
-    These checks bind metadata to a profile; they never merge distinct profiles.
+    None denotes the system-default *slot*. Managed profiles require directory
+    marker + email + organization agreement. These checks bind metadata to a
+    profile; they never merge distinct profiles.
     """
-    if os.environ.get("AGENTCAT_ORCA_PLANS", "1").lower() in ("0", "false", "off"):
-        return None
-    # Dev runtimes have a separate data directory. Do not silently read production
-    # metadata when the selected CLI is not the production runtime.
     data_override = os.environ.get("AGENTCAT_ORCA_DATA_DIR")
     cli_override = os.environ.get("AGENTCAT_ORCA_CLI") or os.environ.get("ORCA_CLI_COMMAND")
-    if not data_override and (os.environ.get("ORCA_DEV_REPO_ROOT") or cli_override):
+    # Dev runtimes have a separate data directory. Do not silently read production
+    # Orca store metadata when the selected CLI is not the production runtime.
+    if account is not None and not data_override and (os.environ.get("ORCA_DEV_REPO_ROOT") or cli_override):
         return None
     try:
         if account is None:
@@ -4548,6 +4545,42 @@ def orca_claude_profile_plan(account: Optional[Dict[str, Any]], now: float) -> O
         if account is not None:
             if metadata["emailAddress"] != account.get("email") or metadata["organizationUuid"] != account.get("organizationUuid"):
                 return None
+        return metadata
+    except (OSError, ValueError, RuntimeError):
+        # No raw errors, names, addresses, IDs, or paths enter the snapshot/cache.
+        pass
+    return None
+
+
+def orca_claude_profile_account_uuid(account: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the profile's accountUuid for local matching only. Never serialize it."""
+    metadata = _orca_claude_profile_metadata(account)
+    if not metadata:
+        return None
+    value = metadata.get("accountUuid")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def orca_claude_profile_plan(account: Optional[Dict[str, Any]], now: float) -> Optional[Dict[str, str]]:
+    """Read profile metadata only; no OAuth tokens, Keychain, or auth CLI calls.
+
+    None denotes the system-default *slot*. Callers may use it only after the
+    Orca quota provenance and host selection have both identified that slot.
+    Managed profiles require directory marker + email + organization agreement.
+    These checks bind metadata to a profile; they never merge distinct profiles.
+    """
+    if os.environ.get("AGENTCAT_ORCA_PLANS", "1").lower() in ("0", "false", "off"):
+        return None
+    # Dev runtimes have a separate data directory. Do not silently read production
+    # metadata when the selected CLI is not the production runtime.
+    data_override = os.environ.get("AGENTCAT_ORCA_DATA_DIR")
+    cli_override = os.environ.get("AGENTCAT_ORCA_CLI") or os.environ.get("ORCA_CLI_COMMAND")
+    if not data_override and (os.environ.get("ORCA_DEV_REPO_ROOT") or cli_override):
+        return None
+    metadata = _orca_claude_profile_metadata(account)
+    if not metadata:
+        return None
+    try:
         updated = orca_quota_timestamp(metadata.get("profileFetchedAt"))
         if updated is None or updated > now + 60 or now - updated > 86400:
             return None
@@ -4606,6 +4639,161 @@ def orca_claude_limits(raw: Any, now: float) -> Dict[str, Any]:
     limits["stale"] = bool(now - updated > 300 or raw.get("error") or raw.get("status") != "ok")
     if limits["stale"]:
         limits["reason"] = "orca_quota_stale"
+    return limits
+
+
+def claude_local_usage_cache_paths() -> List[Path]:
+    """Claude Code config files that may hold cachedUsageUtilization.
+
+    Default is ``~/.claude.json`` (and ``~/.claude/.claude.json``). Sibling
+    homes such as ``~/.claude2/.claude.json`` are included. Backups and temp
+    files next to ``~/.claude.json`` are not.
+    """
+    paths: List[Path] = []
+    seen: Set[str] = set()
+
+    def add(path: Path) -> None:
+        if len(paths) >= HOME_DISCOVERY_MAX_CANDIDATES:
+            return
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(HOME.resolve())
+            key = str(resolved)
+        except (OSError, ValueError):
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        paths.append(resolved)
+
+    add(HOME / ".claude.json")
+    add(HOME / ".claude" / ".claude.json")
+    try:
+        siblings = sorted(HOME.glob(".claude*"))
+    except OSError:
+        siblings = []
+    for home in siblings:
+        try:
+            if home.is_dir():
+                add(home / ".claude.json")
+        except OSError:
+            continue
+    return paths
+
+
+def _read_bounded_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.is_file():
+            return None
+        with path.open("rb") as handle:
+            raw = handle.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            return None
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _claude_json_account_uuid(raw: Dict[str, Any]) -> Optional[str]:
+    cache = raw.get("cachedUsageUtilization")
+    if isinstance(cache, dict):
+        value = cache.get("accountUuid")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    oauth = raw.get("oauthAccount")
+    if isinstance(oauth, dict):
+        value = oauth.get("accountUuid")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    value = raw.get("accountUuid")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def claude_local_usage_cache_limits(account_uuid: Any, now: Optional[float] = None) -> Dict[str, Any]:
+    """Map Claude Code's local cachedUsageUtilization into connector limits.
+
+    Local files only: no Anthropic request is made. Observation time is the
+    cache's own fetched-at stamp; callers must not treat that as "now".
+    """
+    source = "claude-local-usage-cache"
+    limits = empty_limits(status="not_configured", reason="claude_local_usage_cache_unavailable")
+    limits["source"] = source
+    if not isinstance(account_uuid, str) or not account_uuid.strip():
+        return limits
+    wanted = account_uuid.strip()
+    now = time.time() if now is None else now
+    best: Optional[Tuple[int, Dict[str, Any]]] = None
+    for path in claude_local_usage_cache_paths():
+        raw = _read_bounded_json_object(path)
+        if not raw:
+            continue
+        cache = raw.get("cachedUsageUtilization")
+        if not isinstance(cache, dict):
+            continue
+        cache_uuid = cache.get("accountUuid")
+        if isinstance(cache_uuid, str) and cache_uuid.strip() and cache_uuid.strip() != wanted:
+            continue
+        if _claude_json_account_uuid(raw) != wanted:
+            continue
+        utilization = cache.get("utilization")
+        if not isinstance(utilization, dict):
+            continue
+        fetched = orca_quota_timestamp(
+            first_present(cache.get("fetchedAtMs"), cache.get("fetched_at"), cache.get("fetchedAt"))
+        )
+        # Keep the observation time even when the file is hours old. Downstream
+        # stale rules dim it and show "checked N ago"; a later poll must not
+        # refresh the stamp. Reject only missing, non-positive, or future values.
+        if fetched is None or fetched <= 0 or fetched > now + 60:
+            continue
+        if best is None or fetched > best[0]:
+            best = (fetched, utilization)
+    if best is None:
+        return limits
+    fetched, utilization = best
+    limits = claude_limits_from_usage_response(utilization, source=source)
+    limits["updatedAt"] = iso_from_timestamp(fetched)
+    # Same freshness window as orca_claude_limits: older than 300s is shown
+    # dimmed, with a source-specific stale reason the app already understands.
+    limits["stale"] = bool(now - fetched > 300)
+    if limits["stale"]:
+        limits["reason"] = "claude_local_usage_cache_stale"
+    return limits
+
+
+def _claude_cached_live_limits_for_uuid(account_uuid: str) -> Optional[Dict[str, Any]]:
+    """Reuse already-fetched OAuth usage for the selected account. Never networks."""
+    identity = _read_bounded_json_object(HOME / ".claude.json")
+    if not identity or _claude_json_account_uuid(identity) != account_uuid:
+        return None
+    cached = cached_live_limits("claude", LIVE_LIMITS_MAX_AGE_SECONDS)
+    if cached and cached.get("quotas"):
+        return cached
+    return None
+
+
+def _orca_claude_limits_with_local_fallback(
+    limits: Dict[str, Any],
+    account: Optional[Dict[str, Any]],
+    selected: bool,
+    now: float,
+) -> Dict[str, Any]:
+    """Fill missing/stale Orca quota from local Claude caches. Fresh Orca wins."""
+    if limits.get("quotas") and not limits.get("stale"):
+        return limits
+    account_uuid = orca_claude_profile_account_uuid(account)
+    if not account_uuid:
+        return limits
+    if selected:
+        live = _claude_cached_live_limits_for_uuid(account_uuid)
+        if live and live.get("quotas"):
+            return live
+    local = claude_local_usage_cache_limits(account_uuid, now)
+    if local.get("quotas"):
+        return local
     return limits
 
 
@@ -4672,6 +4860,8 @@ def orca_claude_instances_from_accounts(payload: Any, now: Optional[float] = Non
         )
         raw = verified_quota(raw, "system" if system_default else f"managed:{account_id}")
         limits = orca_claude_limits(raw, now)
+        account = None if system_default else accounts[account_id]
+        limits = _orca_claude_limits_with_local_fallback(limits, account, selected, now)
         seed = "orca:host:system-default" if system_default else f"orca:host:managed:{account_id}"
         instance_id = provider_instance_id("claude", seed)
         suffix = instance_id.rsplit(":", 1)[-1][-4:].upper()

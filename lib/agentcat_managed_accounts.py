@@ -13,10 +13,12 @@ import hashlib
 import hmac
 import json
 import os
+import subprocess
+import sys
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from agentcat_managed_platform import restrict_private
 
@@ -56,6 +58,237 @@ def unavailable_usage(source: str) -> Dict[str, Any]:
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+AUTH_STATES = ("connected", "expired", "missing", "malformed", "keychain_denied", "unknown")
+_AUTH_PROVIDERS = frozenset({"codex", "claude"})
+_JSON_MAX_BYTES = 2 * 1024 * 1024
+_MISSING = object()
+_MALFORMED = object()
+_UNKNOWN = object()
+
+
+def _cli_home() -> Path:
+    """User home the default CLI would use. Honors $HOME; never Agent Cat's registry home."""
+    return Path.home()
+
+
+def _read_json_object(path: Path) -> Any:
+    """Read a bounded JSON object from disk. Sentinels never include path or payload."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return _MISSING
+    except OSError:
+        return _UNKNOWN
+    if not raw or len(raw) > _JSON_MAX_BYTES:
+        return _MALFORMED
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _MALFORMED
+    return value if isinstance(value, dict) else _MALFORMED
+
+
+def _expiry_epoch(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 10_000_000_000:
+            number /= 1000.0
+        return number
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.timestamp()
+    return None
+
+
+def _record_expiry_epoch(record: Mapping[str, Any]) -> Optional[float]:
+    for key in ("expiresAt", "expires_at", "expiry", "expires"):
+        epoch = _expiry_epoch(record.get(key))
+        if epoch is not None:
+            return epoch
+    return None
+
+
+def _expired(record: Mapping[str, Any]) -> bool:
+    epoch = _record_expiry_epoch(record)
+    return epoch is not None and epoch <= dt.datetime.now(dt.timezone.utc).timestamp()
+
+
+def _codex_tokens(auth: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(auth, dict):
+        return None
+    tokens = auth.get("tokens")
+    if isinstance(tokens, dict):
+        return tokens
+    return None
+
+
+def _codex_account_id(auth: Any) -> Optional[str]:
+    tokens = _codex_tokens(auth)
+    if tokens is None:
+        return None
+    account_id = tokens.get("account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id.strip()
+    return None
+
+
+def _claude_oauth(record: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(record, dict):
+        return None
+    oauth = record.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        oauth = record.get("claude_ai_oauth")
+    if not isinstance(oauth, dict):
+        oauth = record
+    if oauth.get("accessToken") or oauth.get("access_token"):
+        return oauth
+    return None
+
+
+def _claude_json_account_uuid(raw: Any) -> Optional[str]:
+    if not isinstance(raw, dict):
+        return None
+    cache = raw.get("cachedUsageUtilization")
+    if isinstance(cache, dict):
+        value = cache.get("accountUuid")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    oauth = raw.get("oauthAccount")
+    if isinstance(oauth, dict):
+        value = oauth.get("accountUuid")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    value = raw.get("accountUuid")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _claude_keychain_service(profile_dir: Path) -> str:
+    value = str(Path(profile_dir).expanduser().resolve()).encode("utf-8")
+    return "Claude Code-credentials-" + hashlib.sha256(value).hexdigest()[:8]
+
+
+def _auth_fields(state: str, reason: Optional[str], observed_at: str, default_active: bool) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {
+        "authState": state,
+        "authObservedAt": observed_at,
+        "defaultActive": bool(default_active),
+    }
+    if state != "connected":
+        fields["authReason"] = reason or state
+    return fields
+
+
+def _inspect_codex_profile(profile: Path) -> Tuple[str, Optional[str], Optional[str]]:
+    """Return (authState, authReason, account_id) from the managed Codex profile."""
+    auth = _read_json_object(Path(profile) / "auth.json")
+    if auth is _MISSING:
+        return "missing", "credential_missing", None
+    if auth is _UNKNOWN:
+        return "unknown", "unreadable", None
+    if auth is _MALFORMED:
+        return "malformed", "malformed_json", None
+    tokens = _codex_tokens(auth)
+    if tokens is None:
+        return "malformed", "malformed_credential", None
+    account_id = _codex_account_id(auth)
+    if _expired(tokens) or _expired(auth):
+        return "expired", "expired", account_id
+    return "connected", None, account_id
+
+
+def _expiry_fields(record: Mapping[str, Any]) -> Dict[str, Any]:
+    return {key: record[key] for key in ("expiresAt", "expires_at", "expiry", "expires") if key in record}
+
+
+def _read_claude_keychain(profile: Path) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """Read the profile-scoped Keychain item. Only expiry fields leave this helper."""
+    if sys.platform != "darwin":
+        return "skip", None
+    try:
+        raw = subprocess.check_output(
+            ["security", "find-generic-password", "-s", _claude_keychain_service(profile), "-w"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 44:
+            return "missing", None
+        return "denied", None
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown", None
+    if not raw or len(raw) > _JSON_MAX_BYTES:
+        return "malformed", None
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return "malformed", None
+    oauth = _claude_oauth(value)
+    if oauth is None:
+        return "malformed", None
+    return "ok", _expiry_fields(oauth)
+
+
+def _inspect_claude_profile(profile: Path) -> Tuple[str, Optional[str], Optional[str]]:
+    """Return (authState, authReason, account_uuid) from the managed Claude profile."""
+    profile = Path(profile)
+    account_uuid = _claude_json_account_uuid(_read_json_object(profile / ".claude.json"))
+    keychain_state, keychain_oauth = _read_claude_keychain(profile)
+    oauth: Optional[Dict[str, Any]] = keychain_oauth if keychain_state == "ok" else None
+    file_malformed = False
+    file_unknown = False
+    if oauth is None:
+        for name in (".credentials.json", "credentials.json"):
+            record = _read_json_object(profile / name)
+            if record is _MISSING:
+                continue
+            if record is _UNKNOWN:
+                file_unknown = True
+                continue
+            if record is _MALFORMED:
+                file_malformed = True
+                continue
+            candidate = _claude_oauth(record)
+            if candidate is None:
+                file_malformed = True
+                continue
+            oauth = candidate
+            break
+    if oauth is not None:
+        if _expired(oauth):
+            return "expired", "expired", account_uuid
+        return "connected", None, account_uuid
+    if keychain_state == "denied":
+        return "keychain_denied", "keychain_denied", account_uuid
+    if keychain_state == "malformed" or file_malformed:
+        return "malformed", "malformed_json", account_uuid
+    if keychain_state == "unknown" or file_unknown:
+        return "unknown", "unreadable", account_uuid
+    return "missing", "credential_missing", account_uuid
+
+
+def _default_codex_account_id() -> Optional[str]:
+    return _codex_account_id(_read_json_object(_cli_home() / ".codex" / "auth.json"))
+
+
+def _default_claude_account_uuid() -> Optional[str]:
+    home = _cli_home()
+    for path in (home / ".claude.json", home / ".claude" / ".claude.json"):
+        uuid_value = _claude_json_account_uuid(_read_json_object(path))
+        if uuid_value:
+            return uuid_value
+    return None
 
 
 class ManagedAccounts:
@@ -575,10 +808,41 @@ class ManagedAccounts:
             self._write(rows)
             return self.public(row)
 
+    def _auth_snapshot_fields(self, row: Mapping[str, Any], observed_at: str, defaults: Mapping[str, Optional[str]]) -> Dict[str, Any]:
+        provider = row.get("provider")
+        try:
+            profile = self._profile(dict(row))
+            if provider == "codex":
+                state, reason, account_id = _inspect_codex_profile(profile)
+                default_id = defaults.get("codex")
+                active = bool(account_id and default_id and account_id == default_id)
+            elif provider == "claude":
+                state, reason, account_uuid = _inspect_claude_profile(profile)
+                default_id = defaults.get("claude")
+                active = bool(account_uuid and default_id and account_uuid == default_id)
+            else:
+                return {}
+        except Exception:
+            return _auth_fields("unknown", "unknown", observed_at, False)
+        return _auth_fields(state, reason, observed_at, active)
+
     def snapshot(self) -> list[Dict[str, Any]]:
         with self.lock:
             rows = self._rows()
-            return [self.public(row) for row in rows if row.get("status") not in {"removed", "superseded"}]
+            observed_at = now_iso()
+            visible = [row for row in rows if row.get("status") not in {"removed", "superseded"}]
+            need_auth = any(row.get("provider") in _AUTH_PROVIDERS for row in visible)
+            defaults = {
+                "codex": _default_codex_account_id(),
+                "claude": _default_claude_account_uuid(),
+            } if need_auth else {}
+            result = []
+            for row in visible:
+                item = self.public(row)
+                if item.get("provider") in _AUTH_PROVIDERS:
+                    item.update(self._auth_snapshot_fields(row, observed_at, defaults))
+                result.append(item)
+            return result
 
     def resolve_connection_id(self, connection_id: str) -> Optional[Dict[str, Any]]:
         """Resolve only a durable supersession chain for a saved UI selection.

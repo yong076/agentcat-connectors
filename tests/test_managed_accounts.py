@@ -1,10 +1,14 @@
+import datetime as dt
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from agentcat_managed_accounts import ManagedAccounts
+from agentcat_managed_accounts import AUTH_STATES, ManagedAccounts
+import agentcat_managed_accounts as managed_accounts
 
 
 class FakeAdapter:
@@ -325,6 +329,240 @@ class ManagedAccountsTests(unittest.TestCase):
         self.assertIsNone(self.accounts.resolve_connection_id("0" * 32))
         with self.assertRaisesRegex(RuntimeError, "connection_alias_cycle"):
             self.accounts.resolve_connection_id(cycle_one)
+
+
+SHARED_EMAIL = "same-person@example.test"
+CODEX_ACCESS = "codex-secret-access-token-LEAKME"
+CODEX_REFRESH = "codex-secret-refresh-token-LEAKME"
+DEFAULT_CODEX_ACCESS = "default-codex-access-token-LEAKME"
+CLAUDE_ACCESS = "claude-secret-accessToken-LEAKME"
+KEYCHAIN_ACCESS = "keychain-secret-blob-LEAKME"
+PLANTED_PATH = "/tmp/agentcat-secret-credential/auth.json"
+FUTURE_UNIX = 4_102_444_800
+PAST_UNIX = 1
+
+
+class ManagedAccountAuthSnapshotTests(unittest.TestCase):
+    CODEX_MISSING = "a" * 32
+    CODEX_MALFORMED = "b" * 32
+    CODEX_EXPIRED = "c" * 32
+    CODEX_ACTIVE = "d" * 32
+    CODEX_INACTIVE = "e" * 32
+    CLAUDE_MISSING = "f" * 32
+    CLAUDE_MALFORMED = "g" * 32
+    CLAUDE_EXPIRED = "h" * 32
+    CLAUDE_KEYCHAIN_DENIED = "i" * 32
+    CLAUDE_ACTIVE = "j" * 32
+    CLAUDE_INACTIVE = "k" * 32
+    CLAUDE_KEYCHAIN_HEALTHY = "m" * 32
+    KIMI = "n" * 32
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.cli_home = root / "cli-home"
+        self.cli_home.mkdir()
+        self.accounts = ManagedAccounts(root / "agentcat", {
+            "codex": FakeAdapter(), "claude": FakeAdapter(), "kimi": FakeAdapter(),
+        })
+        self.home_patch = patch.object(managed_accounts, "_cli_home", return_value=self.cli_home)
+        self.keychain_patch = patch.object(managed_accounts, "_read_claude_keychain", side_effect=self._keychain)
+        self.home_patch.start()
+        self.keychain_patch.start()
+        self.secret_paths = []
+        self._install_default_cli()
+        self._install_rows()
+
+    def tearDown(self):
+        self.keychain_patch.stop()
+        self.home_patch.stop()
+        self.temp.cleanup()
+
+    def _keychain(self, profile):
+        name = Path(profile).name
+        if name == self.CLAUDE_KEYCHAIN_DENIED:
+            return "denied", None
+        if name == self.CLAUDE_KEYCHAIN_HEALTHY:
+            return "ok", {"accessToken": KEYCHAIN_ACCESS, "expiresAt": FUTURE_UNIX * 1000}
+        return "skip", None
+
+    def _profile(self, provider, connection_id):
+        path = self.accounts.profile_root / provider / connection_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _row(self, connection_id, provider, **extra):
+        row = {
+            "id": connection_id, "provider": provider, "label": extra.pop("label", SHARED_EMAIL),
+            "kind": "managed_native_auth", "scope": "managed_provider_profile",
+            "status": extra.pop("status", "connected"), "createdAt": "2026-01-01T00:00:00Z",
+            "identity": extra.pop("identity", {"email": SHARED_EMAIL, "verification": True, "source": "fixture"}),
+            "usage": {"source": "managed-" + provider, "freshness": "unavailable", "windows": []},
+        }
+        row.update(extra)
+        return row
+
+    def _write_json(self, path, payload):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self.secret_paths.append(path)
+
+    def _install_default_cli(self):
+        default_codex = self.cli_home / ".codex" / "auth.json"
+        self._write_json(default_codex, {
+            "tokens": {
+                "account_id": "acct-default",
+                "access_token": DEFAULT_CODEX_ACCESS,
+                "refresh_token": "default-codex-refresh-token-LEAKME",
+            },
+            "source": PLANTED_PATH,
+            "email": SHARED_EMAIL,
+        })
+        default_claude = self.cli_home / ".claude.json"
+        self._write_json(default_claude, {
+            "oauthAccount": {"accountUuid": "uuid-default", "emailAddress": SHARED_EMAIL},
+            "cachedUsageUtilization": {"accountUuid": "uuid-default"},
+        })
+
+    def _install_rows(self):
+        rows = [
+            self._row(self.CODEX_MISSING, "codex"),
+            self._row(self.CODEX_MALFORMED, "codex"),
+            self._row(self.CODEX_EXPIRED, "codex"),
+            self._row(self.CODEX_ACTIVE, "codex"),
+            self._row(self.CODEX_INACTIVE, "codex"),
+            self._row(self.CLAUDE_MISSING, "claude"),
+            self._row(self.CLAUDE_MALFORMED, "claude"),
+            self._row(self.CLAUDE_EXPIRED, "claude"),
+            self._row(self.CLAUDE_KEYCHAIN_DENIED, "claude"),
+            self._row(self.CLAUDE_ACTIVE, "claude"),
+            self._row(self.CLAUDE_INACTIVE, "claude"),
+            self._row(self.CLAUDE_KEYCHAIN_HEALTHY, "claude"),
+            self._row(self.KIMI, "kimi", label="kimi@example.test"),
+        ]
+        self.accounts._write(rows)
+        (self._profile("codex", self.CODEX_MALFORMED) / "auth.json").write_text("{", encoding="utf-8")
+        self.secret_paths.append(self._profile("codex", self.CODEX_MALFORMED) / "auth.json")
+        self._write_json(self._profile("codex", self.CODEX_EXPIRED) / "auth.json", {
+            "tokens": {"account_id": "acct-expired", "access_token": CODEX_ACCESS, "expires_at": PAST_UNIX},
+            "source": PLANTED_PATH,
+        })
+        self._write_json(self._profile("codex", self.CODEX_ACTIVE) / "auth.json", {
+            "tokens": {"account_id": "acct-default", "access_token": CODEX_ACCESS, "refresh_token": CODEX_REFRESH},
+            "source": PLANTED_PATH,
+        })
+        self._write_json(self._profile("codex", self.CODEX_INACTIVE) / "auth.json", {
+            "tokens": {"account_id": "acct-other", "access_token": CODEX_ACCESS, "refresh_token": CODEX_REFRESH},
+            "email": SHARED_EMAIL,
+            "source": PLANTED_PATH,
+        })
+        (self._profile("claude", self.CLAUDE_MALFORMED) / ".credentials.json").write_text("{", encoding="utf-8")
+        self.secret_paths.append(self._profile("claude", self.CLAUDE_MALFORMED) / ".credentials.json")
+        self._write_json(self._profile("claude", self.CLAUDE_EXPIRED) / ".credentials.json", {
+            "claudeAiOauth": {"accessToken": CLAUDE_ACCESS, "expiresAt": PAST_UNIX * 1000},
+            "source": PLANTED_PATH,
+        })
+        self._write_json(self._profile("claude", self.CLAUDE_ACTIVE) / ".credentials.json", {
+            "claudeAiOauth": {"accessToken": CLAUDE_ACCESS, "expiresAt": FUTURE_UNIX * 1000},
+            "source": PLANTED_PATH,
+        })
+        self._write_json(self._profile("claude", self.CLAUDE_ACTIVE) / ".claude.json", {
+            "oauthAccount": {"accountUuid": "uuid-default", "emailAddress": SHARED_EMAIL},
+        })
+        self._write_json(self._profile("claude", self.CLAUDE_INACTIVE) / ".credentials.json", {
+            "claudeAiOauth": {"accessToken": CLAUDE_ACCESS, "expiresAt": FUTURE_UNIX * 1000},
+            "source": PLANTED_PATH,
+        })
+        self._write_json(self._profile("claude", self.CLAUDE_INACTIVE) / ".claude.json", {
+            "oauthAccount": {"accountUuid": "uuid-other", "emailAddress": SHARED_EMAIL},
+        })
+        self._write_json(self._profile("claude", self.CLAUDE_KEYCHAIN_DENIED) / ".claude.json", {
+            "oauthAccount": {"accountUuid": "uuid-keychain", "emailAddress": SHARED_EMAIL},
+        })
+        self._write_json(self._profile("claude", self.CLAUDE_KEYCHAIN_HEALTHY) / ".claude.json", {
+            "oauthAccount": {"accountUuid": "uuid-keychain-healthy", "emailAddress": SHARED_EMAIL},
+        })
+        self._profile("codex", self.CODEX_MISSING)
+        self._profile("claude", self.CLAUDE_MISSING)
+
+    def _by_id(self):
+        snapshot = self.accounts.snapshot()
+        return snapshot, {row["id"]: row for row in snapshot}
+
+    def test_auth_state_fixture_matrix(self):
+        snapshot, by_id = self._by_id()
+        cases = (
+            (self.CODEX_MISSING, "codex", "missing", "credential_missing", False),
+            (self.CODEX_MALFORMED, "codex", "malformed", "malformed_json", False),
+            (self.CODEX_EXPIRED, "codex", "expired", "expired", False),
+            (self.CODEX_ACTIVE, "codex", "connected", None, True),
+            (self.CODEX_INACTIVE, "codex", "connected", None, False),
+            (self.CLAUDE_MISSING, "claude", "missing", "credential_missing", False),
+            (self.CLAUDE_MALFORMED, "claude", "malformed", "malformed_json", False),
+            (self.CLAUDE_EXPIRED, "claude", "expired", "expired", False),
+            (self.CLAUDE_KEYCHAIN_DENIED, "claude", "keychain_denied", "keychain_denied", False),
+            (self.CLAUDE_ACTIVE, "claude", "connected", None, True),
+            (self.CLAUDE_INACTIVE, "claude", "connected", None, False),
+            (self.CLAUDE_KEYCHAIN_HEALTHY, "claude", "connected", None, False),
+        )
+        observed = {by_id[item_id]["authObservedAt"] for item_id, *_ in cases}
+        self.assertEqual(len(observed), 1)
+        observed_at = observed.pop()
+        dt.datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        self.assertRegex(observed_at, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+        self.assertTrue(observed_at.endswith("Z"))
+        for item_id, provider, state, reason, default_active in cases:
+            with self.subTest(item_id=item_id, provider=provider, state=state):
+                item = by_id[item_id]
+                self.assertEqual(item["provider"], provider)
+                self.assertEqual(item["status"], "connected")
+                self.assertEqual(item["id"], item_id)
+                self.assertEqual(item["kind"], "managed_native_auth")
+                self.assertIn("usage", item)
+                self.assertEqual(item["authState"], state)
+                self.assertIn(item["authState"], AUTH_STATES)
+                self.assertEqual(item["authObservedAt"], observed_at)
+                self.assertIs(item["defaultActive"], default_active)
+                if reason is None:
+                    self.assertNotIn("authReason", item)
+                else:
+                    self.assertEqual(item["authReason"], reason)
+                    self.assertRegex(item["authReason"], r"^[a-z0-9_]+$")
+        kimi = by_id[self.KIMI]
+        for key in ("authState", "authReason", "authObservedAt", "defaultActive"):
+            self.assertNotIn(key, kimi)
+        self.assertEqual(len(snapshot), 13)
+
+    def test_default_active_never_guesses_by_email_or_alias(self):
+        _, by_id = self._by_id()
+        self.assertIs(by_id[self.CODEX_ACTIVE]["defaultActive"], True)
+        self.assertIs(by_id[self.CODEX_INACTIVE]["defaultActive"], False)
+        self.assertIs(by_id[self.CLAUDE_ACTIVE]["defaultActive"], True)
+        self.assertIs(by_id[self.CLAUDE_INACTIVE]["defaultActive"], False)
+        self.assertEqual(by_id[self.CODEX_INACTIVE]["identity"]["email"], SHARED_EMAIL)
+        self.assertEqual(by_id[self.CLAUDE_INACTIVE]["identity"]["email"], SHARED_EMAIL)
+        self.assertEqual(by_id[self.CODEX_INACTIVE]["label"], SHARED_EMAIL)
+
+    def test_snapshot_redacts_tokens_paths_and_keychain_values(self):
+        snapshot, by_id = self._by_id()
+        blob = json.dumps(snapshot)
+        secrets = (
+            CODEX_ACCESS, CODEX_REFRESH, DEFAULT_CODEX_ACCESS, CLAUDE_ACCESS, KEYCHAIN_ACCESS,
+            "default-codex-refresh-token-LEAKME", PLANTED_PATH, "Claude Code-credentials-",
+        )
+        for secret in secrets:
+            self.assertNotIn(secret, blob)
+        for path in self.secret_paths:
+            self.assertNotIn(str(path), blob)
+            self.assertNotIn(str(path.resolve()), blob)
+        self.assertNotIn(str(self.cli_home), blob)
+        self.assertNotIn(str(self.accounts.profile_root), blob)
+        for key in ("access_token", "accessToken", "refresh_token", "refreshToken"):
+            self.assertNotIn(key, blob)
+        healthy = by_id[self.CLAUDE_KEYCHAIN_HEALTHY]
+        self.assertEqual(healthy["authState"], "connected")
+        denied = by_id[self.CLAUDE_KEYCHAIN_DENIED]
+        self.assertEqual(denied["authState"], "keychain_denied")
 
 
 if __name__ == "__main__":
