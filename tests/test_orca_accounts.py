@@ -98,6 +98,35 @@ class OrcaAccountsTests(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
+    def write_local_usage_cache(self, account_uuid="native-private-account", stamp=NOW,
+                                home=".claude2", five_hour=10, seven_day=20, fetched_at_ms="default"):
+        cache = {
+            "accountUuid": account_uuid,
+            "utilization": {
+                "five_hour": {"utilization": five_hour, "resets_at": (stamp or NOW) + 3600},
+                "seven_day": {"utilization": seven_day, "resets_at": (stamp or NOW) + 86400},
+            },
+        }
+        if fetched_at_ms == "default":
+            cache["fetchedAtMs"] = stamp * 1000
+        elif fetched_at_ms is not None:
+            cache["fetchedAtMs"] = fetched_at_ms
+        payload = {
+            "oauthAccount": {
+                "accountUuid": account_uuid,
+                "emailAddress": "private@example.test",
+                "organizationUuid": "private-org",
+            },
+            "cachedUsageUtilization": cache,
+        }
+        if home is None:
+            path = agentcat.HOME / ".claude.json"
+        else:
+            path = agentcat.HOME / home / ".claude.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
     def test_plans_stay_per_profile_and_display_max_multiplier(self):
         self.write_plan(system=True)
         self.write_plan()
@@ -447,6 +476,165 @@ class OrcaAccountsTests(unittest.TestCase):
         with patch.object(agentcat.shutil, "which") as which:
             self.assertEqual(agentcat.orca_account_cli(), "/some path/orca")
             which.assert_not_called()
+
+    def test_missing_orca_quota_fills_from_matching_local_usage_cache(self):
+        self.write_plan()
+        self.write_local_usage_cache()
+        self.payload["result"]["rateLimits"]["inactiveClaudeAccounts"] = []
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            row = self.managed()
+        urlopen.assert_not_called()
+        self.assertEqual(row["limits"]["source"], "claude-local-usage-cache")
+        self.assertEqual(row["limits"]["shortUsedPercent"], 10)
+        self.assertEqual(row["limits"]["weeklyUsedPercent"], 20)
+        self.assertEqual(row["limits"]["updatedAt"], agentcat.iso_from_timestamp(NOW))
+        self.assertFalse(row["limits"].get("stale"))
+        self.assertTrue(row["tracked"])
+        self.assertEqual(row["status"], "connected")
+        serialized = json.dumps(row)
+        for secret in ("native-private-account", "private@example.test", ".claude2"):
+            self.assertNotIn(secret, serialized)
+
+    def test_stale_orca_quota_fills_from_matching_local_usage_cache(self):
+        self.write_plan()
+        self.write_local_usage_cache()
+        self.payload["result"]["rateLimits"]["inactiveClaudeAccounts"][0]["rateLimits"]["updatedAt"] = (NOW - 301) * 1000
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            row = self.managed()
+        urlopen.assert_not_called()
+        self.assertEqual(row["limits"]["source"], "claude-local-usage-cache")
+        self.assertEqual(row["limits"]["shortUsedPercent"], 10)
+        self.assertEqual(row["limits"]["updatedAt"], agentcat.iso_from_timestamp(NOW))
+
+    def test_nonmatching_local_usage_cache_leaves_row_unavailable(self):
+        self.write_plan()
+        self.write_local_usage_cache(account_uuid="other-account-uuid")
+        self.payload["result"]["rateLimits"]["inactiveClaudeAccounts"] = []
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            row = self.managed()
+        urlopen.assert_not_called()
+        self.assertEqual(row["limits"]["quotas"], [])
+        self.assertFalse(row["tracked"])
+        self.assertEqual(row["status"], "discovered")
+
+    def test_fresh_orca_quota_wins_over_local_usage_cache(self):
+        self.write_plan()
+        self.write_local_usage_cache()
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            row = self.managed()
+        urlopen.assert_not_called()
+        self.assertEqual(row["limits"]["source"], "orca-account-list")
+        self.assertEqual(row["limits"]["shortUsedPercent"], 100)
+        self.assertFalse(row["limits"].get("stale"))
+
+    def test_fresh_orca_quota_wins_over_day_old_local_usage_cache(self):
+        self.write_plan()
+        self.write_local_usage_cache(stamp=NOW - 26 * 3600, five_hour=10)
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            row = self.managed()
+        urlopen.assert_not_called()
+        self.assertEqual(row["limits"]["source"], "orca-account-list")
+        self.assertEqual(row["limits"]["shortUsedPercent"], 100)
+        self.assertFalse(row["limits"].get("stale"))
+        self.assertNotEqual(row["limits"].get("reason"), "claude_local_usage_cache_stale")
+
+    def test_local_usage_cache_age_marks_row_stale(self):
+        self.write_plan()
+        self.write_local_usage_cache(stamp=NOW - 301)
+        self.payload["result"]["rateLimits"]["inactiveClaudeAccounts"] = []
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            row = self.managed()
+        urlopen.assert_not_called()
+        self.assertEqual(row["limits"]["source"], "claude-local-usage-cache")
+        self.assertTrue(row["limits"]["stale"])
+        self.assertEqual(row["limits"]["reason"], "claude_local_usage_cache_stale")
+        self.assertEqual(row["limits"]["shortUsedPercent"], 10)
+        self.assertEqual(row["limits"]["updatedAt"], agentcat.iso_from_timestamp(NOW - 301))
+
+    def test_day_old_local_usage_cache_fills_quota_as_stale(self):
+        stamp = NOW - 26 * 3600
+        self.write_plan()
+        self.write_local_usage_cache(stamp=stamp)
+        self.payload["result"]["rateLimits"]["inactiveClaudeAccounts"] = []
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            row = self.managed()
+        urlopen.assert_not_called()
+        self.assertEqual(row["limits"]["source"], "claude-local-usage-cache")
+        self.assertTrue(row["limits"]["quotas"])
+        self.assertEqual(row["limits"]["shortUsedPercent"], 10)
+        self.assertEqual(row["limits"]["updatedAt"], agentcat.iso_from_timestamp(stamp))
+        self.assertTrue(row["limits"]["stale"])
+        self.assertEqual(row["limits"]["reason"], "claude_local_usage_cache_stale")
+        self.assertTrue(row["tracked"])
+        self.assertEqual(row["status"], "connected")
+
+    def test_selected_account_reuses_cached_live_oauth_limits_without_network(self):
+        self.write_plan()
+        self.write_local_usage_cache()
+        (agentcat.HOME / ".claude.json").write_text(json.dumps({
+            "oauthAccount": self.plan_metadata(),
+        }), encoding="utf-8")
+        self.payload["result"]["claude"]["activeAccountIdsByRuntime"]["host"] = "managed-a"
+        self.payload["result"]["rateLimits"]["claude"] = None
+        live = agentcat.empty_limits(status="auto")
+        live["source"] = agentcat.CLAUDE_USAGE_URL
+        live["shortUsedPercent"] = 7
+        live["quotas"] = [{"id": "claude:five_hour", "usedPercent": 7, "remainingPercent": 93}]
+        agentcat.write_live_limits_cache("claude", live)
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            rows = self.rows()
+        urlopen.assert_not_called()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["limits"]["source"], agentcat.CLAUDE_USAGE_URL)
+        self.assertEqual(rows[0]["limits"]["shortUsedPercent"], 7)
+
+    def test_local_usage_cache_helper_reads_default_claude_json(self):
+        self.write_local_usage_cache(home=None, five_hour=33, seven_day=44)
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            limits = agentcat.claude_local_usage_cache_limits("native-private-account", NOW)
+        urlopen.assert_not_called()
+        self.assertEqual(limits["source"], "claude-local-usage-cache")
+        self.assertEqual(limits["shortUsedPercent"], 33)
+        self.assertEqual(limits["weeklyUsedPercent"], 44)
+        self.assertEqual(limits["updatedAt"], agentcat.iso_from_timestamp(NOW))
+        self.assertFalse(limits.get("stale"))
+
+    def test_day_old_local_usage_cache_helper_keeps_observation_time(self):
+        stamp = NOW - 26 * 3600
+        self.write_local_usage_cache(home=None, stamp=stamp, five_hour=33, seven_day=44)
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen:
+            limits = agentcat.claude_local_usage_cache_limits("native-private-account", NOW)
+        urlopen.assert_not_called()
+        self.assertEqual(limits["source"], "claude-local-usage-cache")
+        self.assertEqual(limits["shortUsedPercent"], 33)
+        self.assertEqual(limits["weeklyUsedPercent"], 44)
+        self.assertTrue(limits["quotas"])
+        self.assertEqual(limits["updatedAt"], agentcat.iso_from_timestamp(stamp))
+        self.assertTrue(limits["stale"])
+        self.assertEqual(limits["reason"], "claude_local_usage_cache_stale")
+
+    def test_invalid_or_future_local_usage_cache_stamps_are_rejected(self):
+        cases = (
+            ("missing", {"fetched_at_ms": None}),
+            ("zero", {"stamp": 0}),
+            ("negative", {"stamp": -1}),
+            ("future", {"stamp": NOW + 61}),
+        )
+        self.write_plan()
+        for label, kwargs in cases:
+            with self.subTest(stamp=label):
+                self.write_local_usage_cache(home=None, **kwargs)
+                self.payload = fixture()
+                self.payload["result"]["rateLimits"]["inactiveClaudeAccounts"] = []
+                with patch.object(agentcat.urllib.request, "urlopen",
+                                  side_effect=AssertionError("network")) as urlopen:
+                    limits = agentcat.claude_local_usage_cache_limits("native-private-account", NOW)
+                    row = self.managed()
+                urlopen.assert_not_called()
+                self.assertEqual(limits["quotas"], [])
+                self.assertEqual(limits["reason"], "claude_local_usage_cache_unavailable")
+                self.assertEqual(row["limits"]["quotas"], [])
+                self.assertFalse(row["tracked"])
 
 
 if __name__ == "__main__":
