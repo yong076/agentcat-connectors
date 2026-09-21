@@ -5,6 +5,7 @@ import argparse
 import base64
 import copy
 import csv
+import importlib
 from contextlib import closing
 import logging
 import datetime as dt
@@ -32,6 +33,20 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# Keep protocol-specific process handling outside the monolithic collector.  The
+# installed archive retains ``bin/../lib`` beside this entrypoint.
+_agentcat_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_agentcat_lib) not in sys.path:
+    sys.path.insert(0, str(_agentcat_lib))
+from agentcat_codex_app_server import (
+    CodexAppServer,
+    CodexAppServerError,
+    CodexAppServerUnsupported,
+    app_server_prerequisite,
+)
+from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS
+from agentcat_openrouter_managed import OpenRouterManagedAuth, OpenRouterManagedError, build_adapter as build_openrouter_managed_adapter
+
 
 def resolve_user_home_env() -> str:
     """The user's real home directory, as a string.
@@ -55,6 +70,67 @@ EVENTS_DB = AGENTCAT_HOME / "events.sqlite"
 LATEST_SNAPSHOT = AGENTCAT_HOME / "latest-snapshot.json"
 LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 AGENTCAT_KEYS_FILE = AGENTCAT_HOME / "keys.json"
+OPENROUTER_CONNECTIONS_FILE = AGENTCAT_HOME / "openrouter-connections.json"
+CODEX_CONNECTIONS_FILE = AGENTCAT_HOME / "codex-connections.json"
+CODEX_CONNECTIONS_PROFILES_DIR = AGENTCAT_HOME / "codex-connection-profiles"
+LOOPBACK_CONTROL_TOKEN_FILE = AGENTCAT_HOME / "loopback-control-token"
+
+
+class _UnavailableManagedAdapter:
+    """Advertise an installed-but-unusable provider without a fake Add flow."""
+
+    def __init__(self, provider: str, reason: str) -> None:
+        self.provider = provider
+        self.reason = reason
+
+    def adapter_capability(self) -> Dict[str, Any]:
+        return {"provider": self.provider, "supported": True, "available": False, "reason": self.reason, "modes": []}
+
+
+_MANAGED_ACCOUNTS: Optional[ManagedAccounts] = None
+_MANAGED_ACCOUNTS_HOME: Optional[str] = None
+_OPENROUTER_MANAGED_AUTH: Optional[OpenRouterManagedAuth] = None
+_OPENROUTER_MANAGED_HOME: Optional[str] = None
+_OPENROUTER_OAUTH_CALLBACK_PORT: Optional[int] = None
+
+
+def _native_managed_adapters() -> Dict[str, Any]:
+    """Import provider modules lazily; a missing optional module is explicit."""
+    adapters: Dict[str, Any] = {"antigravity": _UnavailableManagedAdapter("antigravity", "managed_auth_not_supported")}
+    for provider, module_name in (
+        ("kimi", "agentcat_kimi_managed"),
+        ("grok", "agentcat_grok_managed"),
+        ("gemini", "agentcat_google_managed_auth"),
+        ("claude", "agentcat_claude_managed"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+            adapter = module.build_adapter() if callable(getattr(module, "build_adapter", None)) else module
+            adapters[provider] = adapter
+        except Exception:
+            adapters[provider] = _UnavailableManagedAdapter(provider, "provider_adapter_unavailable")
+    return adapters
+
+
+def managed_accounts() -> ManagedAccounts:
+    global _MANAGED_ACCOUNTS, _MANAGED_ACCOUNTS_HOME
+    if _MANAGED_ACCOUNTS is None or _MANAGED_ACCOUNTS_HOME != str(AGENTCAT_HOME):
+        _MANAGED_ACCOUNTS = ManagedAccounts(
+            AGENTCAT_HOME, _native_managed_adapters(),
+            dedup_secret=_provider_instance_secret(),
+        )
+        _MANAGED_ACCOUNTS_HOME = str(AGENTCAT_HOME)
+    return _MANAGED_ACCOUNTS
+
+
+def managed_connection_capabilities() -> Dict[str, Any]:
+    providers = managed_accounts().capabilities()["providers"]
+    codex = codex_connection_capabilities()
+    providers.append({key: codex[key] for key in ("provider", "supported", "available", "reason", "modes")})
+    # Legacy OpenRouter OAuth remains available through its established
+    # callback/key-claim routes while its managed adapter is being wired.
+    providers.append({"provider": "openrouter", "supported": True, "available": True, "reason": None, "modes": ["browser"]})
+    return {"providers": sorted(providers, key=lambda item: str(item["provider"]))}
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 GEMINI_USAGE_CACHE = AGENTCAT_HOME / "gemini-usage-cache.json"
 ANTIGRAVITY_CLI_DIR = HOME / ".gemini" / "antigravity-cli"
@@ -163,7 +239,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.37.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.37.1")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -207,6 +283,9 @@ CONNECTOR_CAPABILITIES = (
     "activity.memory",
     "activity.runtimeModes",
     "connector.config",
+    "connections.openrouter.v1",
+    "connections.codex.appServer.v1",
+    "connections.managedAccounts.v1",
     "desktopApps.localMetadata",
     "events.sqlite",
     "usage.dailyTokens",
@@ -1288,6 +1367,32 @@ def agentcat_settings() -> Dict[str, Any]:
 
 def write_agentcat_settings(settings: Dict[str, Any]) -> None:
     write_json_atomic(AGENTCAT_HOME / "settings.json", settings)
+
+
+def loopback_control_token() -> str:
+    """Return the per-user bearer secret for credential-management routes."""
+    ensure_dirs()
+    try:
+        token = LOOPBACK_CONTROL_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    if token:
+        return token
+    token = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+    # Exclusive creation prevents two daemon starts from silently rotating it.
+    try:
+        fd = os.open(str(LOOPBACK_CONTROL_TOKEN_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
+    except FileExistsError:
+        return loopback_control_token()
+    _chmod_quiet(LOOPBACK_CONTROL_TOKEN_FILE, 0o600)
+    return token
+
+
+def initialize_loopback_control() -> None:
+    """Create the local control token before an app first needs to read it."""
+    loopback_control_token()
 
 
 def settings_value(settings: Dict[str, Any], *paths: Tuple[str, ...]) -> Any:
@@ -6939,7 +7044,15 @@ def prefer_live_limits(live: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[s
     return live
 
 
-def runtime_limits() -> Dict[str, Dict[str, Any]]:
+def runtime_limits(*, remote_quota: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Return snapshot limit overlays without turning routine local scans into auth probes.
+
+    The snapshot loop is a local activity reader.  Its default therefore uses
+    only local runtime/statusline evidence and configured limits.  The legacy
+    on-demand usage endpoint continues to call the provider-specific live
+    helpers directly; callers that must retain the old aggregate probing
+    behavior can opt in explicitly with ``remote_quota=True``.
+    """
     def _safe(fn: Any) -> Dict[str, Any]:
         # Per-provider isolation: one provider raising (e.g. a stat race on a deleted
         # session file, or a deleted cwd) must not freeze the whole snapshot — it
@@ -6951,6 +7064,20 @@ def runtime_limits() -> Dict[str, Dict[str, Any]]:
 
     codex_fallback = _safe(codex_runtime_limits)
     claude_fallback = _safe(claude_runtime_limits)
+    if not remote_quota:
+        # Do not consult live-limit caches here: a cached remote response must
+        # not be presented as a freshly observed local limit.  Providers with
+        # no native local quota artifact contribute an empty overlay while
+        # their local token/log snapshots remain intact.
+        return {
+            "codex": codex_fallback,
+            "claude": claude_fallback,
+            "gemini": empty_limits(),
+            "antigravity": empty_limits(),
+            "grok": empty_limits(),
+            "kimi": empty_limits(),
+            "copilot": empty_limits(),
+        }
     gemini_limits = _safe(gemini_live_limits)
     return {
         "codex": prefer_live_limits(_safe(codex_live_limits), codex_fallback),
@@ -13115,6 +13242,9 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         "events": {
             "latestByProvider": latest_by_provider,
         },
+        # Explicit API connections are independent from observed CLI/provider
+        # subscriptions. Their USD amounts are only for the connected key.
+        "connections": openrouter_connections_snapshot(),
     }
     for data in providers.values():
         try:
@@ -13141,6 +13271,8 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     try:
         provider_instances, complete_providers = provider_instances_snapshot_with_completeness(runtime_limits_by_provider)
         snapshot["providerInstances"] = provider_instances
+        # Schema support is not proof that this particular discovery passed.
+        # Sync clients must require completeness before replacing server current rows.
         # Scalar completeness cannot safely describe the optional Orca bridge.
         # Authority is explicitly per provider; only Codex can currently attest
         # a complete native-account inventory.
@@ -13684,7 +13816,13 @@ def reflect_settings() -> Dict[str, Any]:
 
 
 def reflect_enable() -> Dict[str, Any]:
-    """Enable Reflect without opting into scheduled analysis."""
+    """Enable Reflect without replacing the user's existing configuration.
+
+    This is intentionally a narrow mutation rather than a generic config API:
+    the macOS app may turn the feature on, but cannot modify its runner,
+    schedule, or any future settings. Unknown keys are retained verbatim.
+    Enabling the surface does not opt into scheduled analysis.
+    """
     with _REFLECT_CONFIG_LOCK:
         config = _reflect_mutable_config()
         config["enabled"] = True
@@ -16731,6 +16869,20 @@ def key_mutation_request_error(headers: Any) -> Optional[Tuple[int, str]]:
     return None
 
 
+def connection_control_request_error(headers: Any, *, mutation: bool) -> Optional[Tuple[int, str]]:
+    """Authenticate local credential routes in addition to browser-write guards."""
+    if mutation:
+        guard_error = key_mutation_request_error(headers)
+        if guard_error is not None:
+            return guard_error
+    authorization = str(headers.get("Authorization") or "")
+    prefix = "Bearer "
+    supplied = authorization[len(prefix):] if authorization.startswith(prefix) else ""
+    if not supplied or not hmac.compare_digest(supplied, loopback_control_token()):
+        return 401, "connection_control_token_required"
+    return None
+
+
 class AgentCatHandler(BaseHTTPRequestHandler):
     server_version = "AgentCat/1"
 
@@ -16836,6 +16988,98 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if path == "/v1/keys":
             self.send_json(200, {"openai": {"configured": bool(read_provider_key("openai"))}})
             return
+        if path == "/v1/connections":
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            self.send_json(200, {"connections": openrouter_connections_snapshot() + codex_connections_snapshot() + managed_accounts().snapshot()})
+            return
+        connection_resolve_match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})/resolve", path)
+        if connection_resolve_match:
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            try:
+                result = connection_resolution(connection_resolve_match.group(1))
+            except RuntimeError as error:
+                self.send_json(409, {"error": str(error) if str(error) in {"connection_alias_cycle", "connection_alias_ambiguous"} else "connection_alias_invalid"})
+                return
+            if result is None:
+                self.send_json(404, {"error": "connection_not_found"})
+            else:
+                self.send_json(200, result)
+            return
+        if path == "/v1/connections/capabilities":
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            self.send_json(200, managed_connection_capabilities())
+            return
+        if path == "/v1/connections/codex/capabilities":
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            self.send_json(200, codex_connection_capabilities())
+            return
+        codex_oauth_status_match = re.fullmatch(r"/v1/connections/codex/oauth/([0-9a-f-]{20,})", path)
+        if codex_oauth_status_match:
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            try:
+                self.send_json(200, codex_oauth_status(codex_oauth_status_match.group(1)))
+            except KeyError:
+                self.send_json(404, {"error": "oauth_operation_not_found"})
+            return
+        oauth_status_match = re.fullmatch(r"/v1/connections/openrouter/oauth/([A-Za-z0-9_-]{20,})", path)
+        if oauth_status_match:
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            self.send_json(200, {"status": openrouter_oauth_status(oauth_status_match.group(1))})
+            return
+        managed_status_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/oauth/([A-Za-z0-9_-]{8,})", path)
+        if managed_status_match:
+            guard_error = connection_control_request_error(self.headers, mutation=False)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
+                return
+            provider, operation = managed_status_match.groups()
+            try:
+                self.send_json(200, managed_accounts().status(provider, operation))
+            except KeyError:
+                self.send_json(404, {"error": "oauth_operation_not_found"})
+            except Exception:
+                self.send_json(502, {"error": "managed_oauth_status_failed"})
+            return
+        callback_prefix = "/v1/connections/openrouter/callback/"
+        if path.startswith(callback_prefix):
+            nonce = path[len(callback_prefix):]
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
+            code = (query.get("code") or [""])[0]
+            try:
+                openrouter_finish_oauth(nonce, code)
+            except ValueError:
+                self.send_html(400, "<h1>OpenRouter connection could not be completed</h1><p>Please return to Agent Cat and start again.</p>")
+                return
+            except Exception:
+                self.send_html(502, "<h1>OpenRouter connection could not be completed</h1><p>Please return to Agent Cat and retry.</p>")
+                return
+            self.send_html(200, "<h1>OpenRouter connected</h1><p>You can return to Agent Cat. Your key remains only in this Mac’s Keychain.</p>")
+            return
         if path == "/reflect/report.html":
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
             week = (query.get("week") or [""])[0].strip() or None
@@ -16858,6 +17102,179 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if not self.host_header_ok():
             return
         path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/v1/connections/"):
+            guard_error = connection_control_request_error(self.headers, mutation=True)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_write_forbidden", "message": reason})
+                return
+            try:
+                payload = self.read_json_body(max_bytes=16 * 1024)
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_connection_request", "message": str(exc)})
+                return
+            if path == "/v1/connections/openrouter/import":
+                try:
+                    connection = openrouter_import_connection(str(payload.get("id") or ""), str(payload.get("label") or "OpenRouter"))
+                except ValueError as exc:
+                    self.send_json(400, {"error": "invalid_connection", "message": str(exc)})
+                    return
+                except Exception:
+                    self.send_json(500, {"error": "connection_store_failed"})
+                    return
+                self.send_json(201, {"connection": connection})
+                return
+            if path == "/v1/connections/openrouter/oauth/start":
+                try:
+                    port = int(self.server.server_address[1])
+                    result = openrouter_start_oauth(str(payload.get("label") or "OpenRouter"), port)
+                except Exception:
+                    self.send_json(500, {"error": "oauth_start_failed"})
+                    return
+                self.send_json(200, result)
+                return
+            if path == "/v1/connections/codex/oauth/start":
+                try:
+                    result = codex_start_oauth(
+                        str(payload.get("label") or "Codex / ChatGPT"),
+                        str(payload.get("mode") or "browser"),
+                    )
+                except ValueError as exc:
+                    self.send_json(400, {"error": "invalid_connection", "message": str(exc)})
+                    return
+                except Exception:
+                    self.send_json(502, {"error": "codex_oauth_start_failed"})
+                    return
+                self.send_json(200, result)
+                return
+            managed_start_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/oauth/start", path)
+            if managed_start_match:
+                provider = managed_start_match.group(1)
+                try:
+                    result = managed_accounts().start(
+                        provider,
+                        str(payload.get("label") or provider.title()),
+                        str(payload.get("mode") or "browser"),
+                    )
+                except KeyError:
+                    self.send_json(404, {"error": "provider_not_supported"})
+                    return
+                except RuntimeError as exc:
+                    reason = str(exc)
+                    if reason in SAFE_ADAPTER_START_ERRORS:
+                        self.send_json(502, {"error": reason})
+                    elif reason.endswith(("_unavailable", "_not_supported")):
+                        self.send_json(409, {"error": reason})
+                    else:
+                        self.send_json(502, {"error": "managed_oauth_start_failed"})
+                    return
+                except ValueError:
+                    self.send_json(400, {"error": "invalid_connection"})
+                    return
+                except Exception:
+                    self.send_json(502, {"error": "managed_oauth_start_failed"})
+                    return
+                self.send_json(200, result)
+                return
+            codex_retry_match = re.fullmatch(r"/v1/connections/codex/([0-9a-f]{32})/oauth/retry", path)
+            if codex_retry_match:
+                try:
+                    result = codex_retry_oauth(
+                        codex_retry_match.group(1),
+                        str(payload.get("mode") or "browser"),
+                    )
+                except KeyError:
+                    self.send_json(404, {"error": "connection_not_found"})
+                    return
+                except ValueError as exc:
+                    self.send_json(400, {"error": "invalid_connection", "message": str(exc)})
+                    return
+                except RuntimeError as exc:
+                    error = str(exc)
+                    self.send_json(409, {"error": error if error == "codex_oauth_retry_not_allowed" else "codex_oauth_retry_failed"})
+                    return
+                except Exception:
+                    self.send_json(502, {"error": "codex_oauth_retry_failed"})
+                    return
+                self.send_json(200, result)
+                return
+            codex_cancel_match = re.fullmatch(r"/v1/connections/codex/oauth/([0-9a-f-]{20,})/cancel", path)
+            if codex_cancel_match:
+                self.send_json(200, {"status": codex_cancel_oauth(codex_cancel_match.group(1))})
+                return
+            openrouter_cancel_match = re.fullmatch(r"/v1/connections/openrouter/oauth/([A-Za-z0-9_-]{20,})/cancel", path)
+            if openrouter_cancel_match:
+                self.send_json(200, {"status": openrouter_cancel_oauth(openrouter_cancel_match.group(1))})
+                return
+            managed_retry_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/([0-9a-f]{32})/oauth/retry", path)
+            if managed_retry_match:
+                provider, connection_id = managed_retry_match.groups()
+                try:
+                    result = managed_accounts().retry(provider, connection_id, str(payload.get("mode") or "browser"))
+                except KeyError:
+                    self.send_json(404, {"error": "connection_not_found"})
+                    return
+                except RuntimeError as exc:
+                    reason = str(exc)
+                    if reason == "managed_oauth_retry_not_allowed":
+                        self.send_json(409, {"error": reason})
+                    elif reason in SAFE_ADAPTER_START_ERRORS:
+                        self.send_json(502, {"error": reason})
+                    else:
+                        self.send_json(502, {"error": "managed_oauth_retry_failed"})
+                    return
+                except Exception:
+                    self.send_json(502, {"error": "managed_oauth_retry_failed"})
+                    return
+                self.send_json(200, result)
+                return
+            managed_cancel_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/oauth/([A-Za-z0-9_-]{8,})/cancel", path)
+            if managed_cancel_match:
+                provider, operation = managed_cancel_match.groups()
+                self.send_json(200, {"status": managed_accounts().cancel(provider, operation)})
+                return
+            managed_refresh_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/([0-9a-f]{32})/refresh", path)
+            if managed_refresh_match:
+                provider, connection_id = managed_refresh_match.groups()
+                try:
+                    self.send_json(200, {"connection": managed_accounts().refresh(provider, connection_id)})
+                except KeyError:
+                    self.send_json(404, {"error": "connection_not_found"})
+                except Exception:
+                    self.send_json(502, {"error": "managed_connection_refresh_failed"})
+                return
+            oauth_match = re.fullmatch(r"/v1/connections/openrouter/oauth/([A-Za-z0-9_-]{20,})/(key|complete)", path)
+            if oauth_match:
+                nonce, action = oauth_match.groups()
+                try:
+                    if action == "key":
+                        # The app claims this only to write it through native
+                        # Security.framework; it is not persisted by the daemon.
+                        self.send_json(200, {"key": openrouter_claim_oauth_key(nonce)})
+                    else:
+                        connection = openrouter_complete_oauth(nonce, str(payload.get("id") or ""), str(payload.get("label") or "OpenRouter"))
+                        self.send_json(201, {"connection": connection})
+                except ValueError as exc:
+                    self.send_json(409, {"error": "oauth_not_ready", "message": str(exc)})
+                except Exception:
+                    self.send_json(500, {"error": "oauth_completion_failed"})
+                return
+            match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})/refresh", path)
+            if not match:
+                self.send_json(404, {"error": "not_found"})
+                return
+            connection_id = match.group(1)
+            try:
+                try:
+                    connection = codex_connection_mutation(connection_id, "refresh")
+                except KeyError:
+                    connection = openrouter_connection_mutation(connection_id, "refresh")
+                self.send_json(200, {"connection": connection})
+            except KeyError:
+                self.send_json(404, {"error": "connection_not_found"})
+            except Exception:
+                self.send_json(502, {"error": "connection_refresh_failed"})
+            return
         if path.startswith("/reflect/"):
             try:
                 body = self.read_json_body()
@@ -16972,6 +17389,77 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         event = store_event(provider, source, event_type, payload.get("payload", payload))
         self.send_json(201, event)
 
+    def do_PATCH(self) -> None:
+        if not self.host_header_ok():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})", path)
+        if not match:
+            self.send_json(404, {"error": "not_found"})
+            return
+        guard_error = connection_control_request_error(self.headers, mutation=True)
+        if guard_error is not None:
+            status, reason = guard_error
+            self.send_json(status, {"error": "connection_write_forbidden", "message": reason})
+            return
+        try:
+            payload = self.read_json_body(max_bytes=16 * 1024)
+            try:
+                connection = codex_connection_mutation(match.group(1), "rename", str(payload.get("label") or ""))
+            except KeyError:
+                connection = openrouter_connection_mutation(match.group(1), "rename", str(payload.get("label") or ""))
+        except KeyError:
+            self.send_json(404, {"error": "connection_not_found"})
+            return
+        except ValueError as exc:
+            self.send_json(400, {"error": "invalid_connection", "message": str(exc)})
+            return
+        except Exception:
+            self.send_json(500, {"error": "connection_update_failed"})
+            return
+        self.send_json(200, {"connection": connection})
+
+    def do_DELETE(self) -> None:
+        if not self.host_header_ok():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        managed_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/([0-9a-f]{32})", path)
+        if managed_match:
+            guard_error = connection_control_request_error(self.headers, mutation=True)
+            if guard_error is not None:
+                status, reason = guard_error
+                self.send_json(status, {"error": "connection_write_forbidden", "message": reason})
+                return
+            provider, connection_id = managed_match.groups()
+            try:
+                self.send_json(200, {"connection": managed_accounts().remove(provider, connection_id)})
+            except KeyError:
+                self.send_json(404, {"error": "connection_not_found"})
+            except Exception:
+                self.send_json(500, {"error": "managed_connection_remove_failed"})
+            return
+        match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})", path)
+        if not match:
+            self.send_json(404, {"error": "not_found"})
+            return
+        guard_error = connection_control_request_error(self.headers, mutation=True)
+        if guard_error is not None:
+            status, reason = guard_error
+            self.send_json(status, {"error": "connection_write_forbidden", "message": reason})
+            return
+        try:
+            try:
+                connection = codex_connection_mutation(match.group(1), "remove")
+            except KeyError:
+                connection = openrouter_connection_mutation(match.group(1), "remove")
+        except KeyError:
+            self.send_json(404, {"error": "connection_not_found"})
+            return
+        except Exception:
+            self.send_json(500, {"error": "connection_remove_failed"})
+            return
+        self.send_json(200, {"connection": connection})
+
 
 LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
@@ -16992,6 +17480,10 @@ def resolve_bind_host(host: Optional[str]) -> str:
 
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
+    # Connection clients read this file before their first authenticated request.
+    # Creating it only inside the request guard makes a fresh install unable to
+    # issue that request at all.
+    initialize_loopback_control()
     # Give the long-running daemon a real, leveled log so failures (keychain
     # denials, provider parse errors) leave a diagnosable trail in the launchd
     # stderr file instead of vanishing. Reason codes + ~-relative paths only —
@@ -17043,6 +17535,7 @@ def run_daemon(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        shutdown_codex_app_servers()
         server.server_close()
     return 0
 
@@ -17783,6 +18276,1068 @@ def write_provider_key(provider: str, key: Optional[str]) -> None:
         keys.pop(provider, None)
     write_json_atomic(AGENTCAT_KEYS_FILE, keys)
     _chmod_quiet(AGENTCAT_KEYS_FILE, 0o600)
+
+
+# ---------------------------------------------------------------------------
+# Explicit OpenRouter API-key connections
+#
+# The registry is deliberately metadata-only. API keys are kept in the local
+# macOS Keychain, never in settings, snapshots, logs, or the usage cache.
+OPENROUTER_AUTH_URL = "https://openrouter.ai/auth"
+OPENROUTER_KEY_EXCHANGE_URL = "https://openrouter.ai/api/v1/auth/keys"
+OPENROUTER_CURRENT_KEY_URL = "https://openrouter.ai/api/v1/key"
+OPENROUTER_KEYCHAIN_SERVICE = "com.trappist.agentcat.openrouter"
+OPENROUTER_OAUTH_TTL_SECONDS = 10 * 60
+_OPENROUTER_OAUTH_PENDING: Dict[str, Dict[str, Any]] = {}
+_OPENROUTER_CONNECTIONS_LOCK = threading.RLock()
+_OPENROUTER_OAUTH_LOCK = threading.RLock()
+
+
+def _openrouter_keychain_account(connection_id: str) -> str:
+    return f"connection.{connection_id}"
+
+
+def _openrouter_keychain_read(connection_id: str) -> Optional[str]:
+    if IS_WINDOWS:
+        return None
+    command = [
+        "/usr/bin/security", "find-generic-password", "-w",
+        "-a", _openrouter_keychain_account(connection_id),
+        "-s", OPENROUTER_KEYCHAIN_SERVICE,
+    ]
+    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=10)
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.decode("utf-8", errors="replace").rstrip("\r\n")
+    return value or None
+
+
+def _openrouter_keychain_delete(connection_id: str) -> None:
+    if IS_WINDOWS:
+        return
+    subprocess.run(
+        ["/usr/bin/security", "delete-generic-password", "-a", _openrouter_keychain_account(connection_id), "-s", OPENROUTER_KEYCHAIN_SERVICE],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=10,
+    )
+
+
+def _openrouter_connections() -> List[Dict[str, Any]]:
+    raw = read_json(OPENROUTER_CONNECTIONS_FILE)
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return []
+    rows = raw.get("connections")
+    return [dict(row) for row in rows] if isinstance(rows, list) and all(isinstance(row, dict) for row in rows) else []
+
+
+def _write_openrouter_connections(rows: List[Dict[str, Any]]) -> None:
+    ensure_dirs()
+    # Enforce the no-secret registry contract even if a future caller adds an
+    # accidental credential field to an in-memory row.
+    write_json_atomic(OPENROUTER_CONNECTIONS_FILE, {"version": 1, "connections": [_openrouter_public_connection(row) for row in rows]})
+    _chmod_quiet(OPENROUTER_CONNECTIONS_FILE, 0o600)
+
+
+def _openrouter_public_connection(row: Dict[str, Any]) -> Dict[str, Any]:
+    # Never return the stored key, key hash, or any raw upstream response.
+    keys = ("id", "provider", "label", "kind", "scope", "status", "createdAt", "lastSyncAt", "lastSuccessfulSyncAt", "error", "identity", "identityStatus", "usage")
+    return {key: copy.deepcopy(row[key]) for key in keys if key in row}
+
+
+def openrouter_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        rows = _openrouter_connections()
+        if refresh:
+            changed = False
+            for row in rows:
+                if row.get("status") == "removed":
+                    continue
+                changed = openrouter_refresh_connection(row) or changed
+            if changed:
+                _write_openrouter_connections(rows)
+        return [_openrouter_public_connection(row) for row in rows if row.get("status") != "removed"]
+
+
+def _resolve_connection_alias(rows: List[Dict[str, Any]], connection_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve an exact durable same-provider supersession chain only."""
+    current = next((row for row in rows if row.get("id") == connection_id), None)
+    if current is None:
+        return None
+    provider = current.get("provider")
+    if not isinstance(provider, str):
+        return None
+    alias = False
+    seen: set[str] = set()
+    for _ in range(8):
+        current_id = current.get("id")
+        if not isinstance(current_id, str) or current_id in seen:
+            raise RuntimeError("connection_alias_cycle")
+        seen.add(current_id)
+        if current.get("status") != "superseded":
+            canonical = None if current.get("status") == "removed" else current_id
+            return {"requestConnectionID": connection_id, "canonicalConnectionID": canonical,
+                    "provider": provider, "status": current.get("status"), "alias": alias}
+        alias = True
+        target_id = current.get("supersededBy")
+        if not isinstance(target_id, str):
+            return {"requestConnectionID": connection_id, "canonicalConnectionID": None,
+                    "provider": provider, "status": "missing", "alias": True}
+        target = next((row for row in rows if row.get("id") == target_id and row.get("provider") == provider), None)
+        if target is None:
+            return {"requestConnectionID": connection_id, "canonicalConnectionID": None,
+                    "provider": provider, "status": "missing", "alias": True}
+        current = target
+    raise RuntimeError("connection_alias_cycle")
+
+
+def openrouter_connection_resolution(connection_id: str) -> Optional[Dict[str, Any]]:
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        return _resolve_connection_alias(_openrouter_connections(), connection_id)
+
+
+def _openrouter_usage_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    # Null/absent values remain null. They are never converted to USD 0.
+    def number(name: str) -> Optional[float]:
+        value = data.get(name)
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    return {
+        "currency": "USD",
+        "daily": number("usage_daily"),
+        "weekly": number("usage_weekly"),
+        "monthly": number("usage_monthly"),
+        "total": number("usage"),
+        "limit": number("limit"),
+        "limitRemaining": number("limit_remaining"),
+        "limitReset": data.get("limit_reset") if isinstance(data.get("limit_reset"), str) else None,
+        # BYOK is an estimated market-rate value, not an amount to sum into
+        # OpenRouter spend. The boolean only says whether it counts toward a
+        # configured key limit.
+        "includeByokInLimit": data.get("include_byok_in_limit") if isinstance(data.get("include_byok_in_limit"), bool) else None,
+        "byokDaily": number("byok_usage_daily"),
+        "byokWeekly": number("byok_usage_weekly"),
+        "byokMonthly": number("byok_usage_monthly"),
+        "byokTotal": number("byok_usage"),
+    }
+
+
+def openrouter_refresh_connection(row: Dict[str, Any]) -> bool:
+    """Refresh a single key scope, retaining the previous successful amounts on failure."""
+    row["lastSyncAt"] = now_iso()
+    # The documented current-key response has no account email.  Never retain
+    # an older display label as if it were an authenticated identity.
+    row["label"] = ""
+    row.pop("identity", None)
+    row["identityStatus"] = {"status": "unavailable", "reason": "provider_email_not_exposed"}
+    key = _openrouter_keychain_read(str(row.get("id") or ""))
+    if not key:
+        row["status"] = "needs_reconnect"
+        row["error"] = "Key unavailable locally. Reconnect this OpenRouter key."
+        return True
+    request = urllib.request.Request(
+        OPENROUTER_CURRENT_KEY_URL,
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "AgentCat/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise ValueError("invalid_current_key_response")
+        row["usage"] = _openrouter_usage_payload(data)
+        row["status"] = "connected"
+        row.pop("error", None)
+        row["lastSuccessfulSyncAt"] = row["lastSyncAt"]
+        return True
+    except Exception:
+        row["status"] = "error"
+        row["error"] = "Could not refresh OpenRouter usage. Last successful amounts are retained."
+        return True
+
+
+def _openrouter_new_connection(connection_id: str, label: str, kind: str) -> Dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{32}", connection_id):
+        raise ValueError("invalid_connection_id")
+    row: Dict[str, Any] = {
+        "id": connection_id,
+        "provider": "openrouter",
+        "label": "",
+        "kind": kind,
+        "scope": "api_key_scoped",
+        "status": "connected",
+        "identityStatus": {"status": "unavailable", "reason": "provider_email_not_exposed"},
+        "createdAt": now_iso(),
+        "usage": {"currency": "USD", "daily": None, "weekly": None, "monthly": None, "total": None, "limit": None, "limitRemaining": None, "limitReset": None, "includeByokInLimit": None, "byokDaily": None, "byokWeekly": None, "byokMonthly": None, "byokTotal": None},
+    }
+    openrouter_refresh_connection(row)
+    return row
+
+
+def openrouter_import_connection(connection_id: str, label: str) -> Dict[str, Any]:
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        rows = _openrouter_connections()
+        if any(item.get("id") == connection_id for item in rows):
+            raise ValueError("duplicate_connection_id")
+        row = _openrouter_new_connection(connection_id, label, "imported_key")
+        rows.append(row)
+        _write_openrouter_connections(rows)
+        return _openrouter_public_connection(row)
+
+
+def _openrouter_oauth_operation_rows() -> Dict[str, Dict[str, Any]]:
+    operations_file = AGENTCAT_HOME / "openrouter-oauth-operations.json"
+    try:
+        payload = json.loads(operations_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    rows = payload.get("operations") if isinstance(payload, dict) else None
+    return {str(key): dict(value) for key, value in rows.items() if isinstance(key, str) and isinstance(value, dict)} if isinstance(rows, dict) else {}
+
+
+def _write_openrouter_oauth_operation(operation_id: str, metadata: Optional[Dict[str, Any]]) -> None:
+    """Persist only adapter-provided public operation metadata at 0600."""
+    rows = _openrouter_oauth_operation_rows()
+    if metadata is None:
+        rows.pop(operation_id, None)
+    else:
+        rows[operation_id] = dict(metadata)
+    AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
+    operations_file = AGENTCAT_HOME / "openrouter-oauth-operations.json"
+    tmp = operations_file.with_name(operations_file.name + ".tmp-" + uuid.uuid4().hex)
+    tmp.write_text(json.dumps({"version": 1, "operations": rows}, ensure_ascii=False) + "\n", encoding="utf-8")
+    _chmod_quiet(tmp, 0o600)
+    tmp.replace(operations_file)
+    _chmod_quiet(operations_file, 0o600)
+
+
+def _openrouter_exchange_managed_code(code: str, verifier: str) -> str:
+    request = urllib.request.Request(
+        OPENROUTER_KEY_EXCHANGE_URL,
+        data=json.dumps({"code": code, "code_verifier": verifier, "code_challenge_method": "S256"}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "AgentCat/1.0"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    key = payload.get("key") if isinstance(payload, dict) else None
+    if not isinstance(key, str) or not key:
+        raise RuntimeError("oauth_exchange_failed")
+    return key
+
+
+def _openrouter_register_managed_connection(connection_id: str, label: str, kind: str) -> Dict[str, Any]:
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        rows = _openrouter_connections()
+        if any(item.get("id") == connection_id for item in rows):
+            raise ValueError("duplicate_connection_id")
+        row = _openrouter_new_connection(connection_id, label, kind)
+        rows.append(row)
+        _write_openrouter_connections(rows)
+    return _openrouter_public_connection(row)
+
+
+def openrouter_managed_auth(port: Optional[int] = None) -> OpenRouterManagedAuth:
+    """One PKCE state machine per Agent Cat home; callback/key material stays memory-only."""
+    global _OPENROUTER_MANAGED_AUTH, _OPENROUTER_MANAGED_HOME, _OPENROUTER_OAUTH_CALLBACK_PORT
+    if port is not None:
+        _OPENROUTER_OAUTH_CALLBACK_PORT = port
+    if _OPENROUTER_MANAGED_AUTH is None or _OPENROUTER_MANAGED_HOME != str(AGENTCAT_HOME):
+        def callback_port() -> int:
+            if not isinstance(_OPENROUTER_OAUTH_CALLBACK_PORT, int) or _OPENROUTER_OAUTH_CALLBACK_PORT <= 0:
+                raise OpenRouterManagedError("oauth_callback_port_unavailable")
+            return _OPENROUTER_OAUTH_CALLBACK_PORT
+        _OPENROUTER_MANAGED_AUTH = build_openrouter_managed_adapter(
+            callback_port=callback_port,
+            read_metadata=lambda operation: _openrouter_oauth_operation_rows().get(operation),
+            write_metadata=lambda operation, metadata: _write_openrouter_oauth_operation(operation, dict(metadata)),
+            exchange_code=_openrouter_exchange_managed_code,
+            complete=_openrouter_register_managed_connection,
+        )
+        _OPENROUTER_MANAGED_HOME = str(AGENTCAT_HOME)
+    return _OPENROUTER_MANAGED_AUTH
+
+
+def openrouter_start_oauth(label: str, port: int) -> Dict[str, str]:
+    return openrouter_managed_auth(port).start(None, "browser", label=label)
+
+
+def openrouter_finish_oauth(nonce: str, code: str) -> None:
+    openrouter_managed_auth().callback(nonce, code)
+
+
+def openrouter_oauth_status(nonce: str) -> str:
+    state = openrouter_managed_auth().poll(None, nonce).get("status")
+    return {
+        "pending_browser": "awaiting_browser",
+        "ready": "ready",
+        "claimed": "claimed",
+        "canceled": "canceled",
+        "failed": "failed",
+    }.get(str(state), "failed")
+
+
+def openrouter_claim_oauth_key(nonce: str) -> str:
+    return openrouter_managed_auth().claim(nonce)
+
+
+def openrouter_complete_oauth(nonce: str, connection_id: str, label: str) -> Dict[str, Any]:
+    return openrouter_managed_auth().complete(nonce, connection_id, label)
+
+
+def openrouter_cancel_oauth(nonce: str) -> str:
+    return str(openrouter_managed_auth().cancel(None, nonce).get("status") or "canceled")
+
+
+def openrouter_connection_mutation(connection_id: str, action: str, label: Optional[str] = None) -> Dict[str, Any]:
+    with _OPENROUTER_CONNECTIONS_LOCK:
+        rows = _openrouter_connections()
+        row = next((item for item in rows if item.get("id") == connection_id and item.get("status") != "removed"), None)
+        if row is None:
+            raise KeyError("connection_not_found")
+        if action == "refresh":
+            openrouter_refresh_connection(row)
+        elif action == "rename":
+            raise ValueError("account_label_is_verified_email")
+        elif action == "remove":
+            _openrouter_keychain_delete(connection_id)
+            row["status"] = "removed"
+            row.pop("error", None)
+        else:
+            raise ValueError("unsupported_connection_action")
+        _write_openrouter_connections(rows)
+        return _openrouter_public_connection(row)
+
+
+# ---------------------------------------------------------------------------
+# Explicit managed Codex / ChatGPT connections
+#
+# OAuth is performed only by the installed Codex app-server.  This registry has
+# metadata and a profile id, never OAuth codes, tokens, app-server output, or a
+# copied credential.  ``CODEX_HOME`` is set only in the child process to the
+# profile derived from that id; the owner's existing Codex home is untouched.
+_CODEX_CONNECTIONS_LOCK = threading.RLock()
+_CODEX_APP_SERVERS: Dict[str, CodexAppServer] = {}
+# OAuth URLs and device codes are deliberately process-memory-only.  They are
+# returned solely to the authenticated local app while the matching child is
+# alive, never written to the connection registry or daemon logs.
+_CODEX_OAUTH_SURFACES: Dict[str, Dict[str, str]] = {}
+# A completed OAuth operation is kept in memory for the same bounded lease as a
+# pending operation.  The UI can otherwise observe ``connected`` once, issue a
+# final poll, and receive 404 because the durable connection correctly no
+# longer retains its login ID.  This is deliberately only an operation ->
+# connection-id association: it contains no OAuth surface, credential, or
+# profile path and disappears on daemon restart.
+_CODEX_COMPLETED_OPERATIONS: Dict[str, Tuple[str, dt.datetime]] = {}
+_CODEX_ID_RE = re.compile(r"[0-9a-f]{32}")
+CODEX_OAUTH_PENDING_TTL_SECONDS = 10 * 60
+# Listing connected accounts is allowed to refresh remote usage, but a popover
+# reopen must not repeatedly probe the same managed app-server profile.
+CODEX_IMPLICIT_REFRESH_MIN_INTERVAL_SECONDS = 60
+
+
+def _codex_profile_dir(connection_id: str) -> Path:
+    if not _CODEX_ID_RE.fullmatch(connection_id):
+        raise ValueError("invalid_connection_id")
+    return CODEX_CONNECTIONS_PROFILES_DIR / connection_id
+
+
+def _codex_managed_auth_material(row: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], str]]:
+    """Read only this daemon-owned profile's native auth metadata.
+
+    This never consults the user's Codex home.  The result is ephemeral: the
+    raw document and claims are used only to bind an already provider-verified
+    app-server session to a local HMAC, never returned or written to registry.
+    """
+    connection_id = row.get("id")
+    if not isinstance(connection_id, str) or not _CODEX_ID_RE.fullmatch(connection_id):
+        return None
+    profile = _codex_profile_dir(connection_id)
+    try:
+        root = CODEX_CONNECTIONS_PROFILES_DIR.resolve()
+        if profile.resolve().parent != root:
+            return None
+        auth_path = profile / "auth.json"
+        raw = auth_path.read_bytes()
+        if not raw or len(raw) > 2 * 1024 * 1024:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def _codex_native_claim(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or normalized != value or len(normalized) > 512 or any(ord(char) < 32 for char in normalized):
+        return None
+    return normalized
+
+
+def _codex_managed_provider_identity(auth: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Extract the official Codex compound identity from a controlled profile.
+
+    The native Codex AuthManager uses the selected provider account plus the
+    account-user membership when present, otherwise the ChatGPT user.  These
+    unverified local claims become eligible only after the same profile's
+    official app-server account and usage calls succeed and its file remains
+    fingerprint-stable in ``_codex_refresh_row``.
+    """
+    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else auth
+    provider_account = _codex_native_claim(tokens.get("account_id"))
+    id_claims = _jwt_claims_unverified(tokens.get("id_token")) if isinstance(tokens.get("id_token"), str) else {}
+    access_claims = _jwt_claims_unverified(tokens.get("access_token")) if isinstance(tokens.get("access_token"), str) else {}
+    id_auth = id_claims.get("https://api.openai.com/auth") if isinstance(id_claims.get("https://api.openai.com/auth"), dict) else {}
+    access_auth = access_claims.get("https://api.openai.com/auth") if isinstance(access_claims.get("https://api.openai.com/auth"), dict) else {}
+    provider_account = provider_account or _codex_native_claim(id_auth.get("chatgpt_account_id"))
+    person = _codex_native_claim(id_auth.get("chatgpt_user_id")) or _codex_native_claim(id_auth.get("user_id"))
+    membership = None
+    if provider_account and _codex_native_claim(access_auth.get("chatgpt_account_id")) == provider_account:
+        membership = _codex_native_claim(access_auth.get("chatgpt_account_user_id"))
+    if not provider_account or not person:
+        return None
+    return {"providerAccountID": provider_account, "personID": person, **({"membershipID": membership} if membership else {})}
+
+
+def _codex_dedup_key(identity: Dict[str, str]) -> str:
+    discriminator = identity.get("membershipID") or identity.get("personID")
+    return hmac.new(
+        _provider_instance_secret(),
+        f"agentcat.codex-managed-dedup.v1:{identity['providerAccountID']}:{discriminator}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _codex_connections() -> List[Dict[str, Any]]:
+    raw = read_json(CODEX_CONNECTIONS_FILE)
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return []
+    rows = raw.get("connections")
+    return [dict(row) for row in rows] if isinstance(rows, list) and all(isinstance(row, dict) for row in rows) else []
+
+
+def _codex_public_connection(row: Dict[str, Any]) -> Dict[str, Any]:
+    # Do not expose profile paths, login IDs, process details, or arbitrary raw
+    # protocol payloads.  These keys are the complete public contract.
+    keys = (
+        "id", "provider", "label", "kind", "scope", "status", "createdAt",
+        "lastSyncAt", "lastSuccessfulSyncAt", "error", "identity", "identityStatus", "usage",
+        "operationID",
+    )
+    return {key: copy.deepcopy(row[key]) for key in keys if key in row}
+
+
+def _write_codex_connections(rows: List[Dict[str, Any]]) -> None:
+    ensure_dirs()
+    # Generation is lifecycle metadata needed to reject a dead in-flight
+    # login after a registry reload.  It is never part of the HTTP payload.
+    registry_rows = []
+    for row in rows:
+        stored = _codex_public_connection(row)
+        if isinstance(row.get("appServerGeneration"), int):
+            stored["appServerGeneration"] = row["appServerGeneration"]
+        if isinstance(row.get("pendingStartedAt"), str):
+            stored["pendingStartedAt"] = row["pendingStartedAt"]
+        # These are local pseudonyms/provenance for managed-profile duplicate
+        # reconciliation.  They never contain a token, claim, email, or path.
+        for key in ("dedupKey", "authProofFingerprint", "supersededBy", "completedOperationID"):
+            if isinstance(row.get(key), str):
+                stored[key] = row[key]
+        registry_rows.append(stored)
+    write_json_atomic(CODEX_CONNECTIONS_FILE, {"version": 1, "connections": registry_rows})
+    _chmod_quiet(CODEX_CONNECTIONS_FILE, 0o600)
+
+
+def _codex_server(row: Dict[str, Any]) -> CodexAppServer:
+    connection_id = str(row.get("id") or "")
+    server = _CODEX_APP_SERVERS.get(connection_id)
+    if server is None:
+        server = CodexAppServer(_codex_profile_dir(connection_id))
+        _CODEX_APP_SERVERS[connection_id] = server
+    return server
+
+
+def _codex_unavailable_usage() -> Dict[str, Any]:
+    return {
+        "source": "codex-app-server",
+        "freshness": "unavailable",
+        "windows": [],
+        "credits": None,
+        "spendControl": None,
+        "rateLimitReachedType": None,
+        "tokenUsage": None,
+        "tokenUsageAvailable": False,
+    }
+
+
+def _codex_fail_pending(row: Dict[str, Any], message: str) -> None:
+    row["status"] = "failed"
+    row["error"] = message
+    operation_id = row.pop("operationID", None)
+    if isinstance(operation_id, str):
+        _CODEX_OAUTH_SURFACES.pop(operation_id, None)
+    row.pop("appServerGeneration", None)
+    row.pop("pendingStartedAt", None)
+    server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
+    if server is not None:
+        server.close()
+
+
+def _codex_pending_server(row: Dict[str, Any]) -> Optional[CodexAppServer]:
+    """Return the original live login child; never restart a lost login."""
+    connection_id = str(row.get("id") or "")
+    created = str(row.get("pendingStartedAt") or row.get("createdAt") or "")
+    try:
+        age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(created.replace("Z", "+00:00"))).total_seconds()
+    except ValueError:
+        age = CODEX_OAUTH_PENDING_TTL_SECONDS + 1
+    if age > CODEX_OAUTH_PENDING_TTL_SECONDS:
+        _codex_fail_pending(row, "The Codex sign-in session expired. Start sign-in again.")
+        return None
+    server = _CODEX_APP_SERVERS.get(connection_id)
+    expected = row.get("appServerGeneration")
+    if server is None or not server.is_alive() or expected != server.generation:
+        _codex_fail_pending(row, "The Codex sign-in session was interrupted. Start sign-in again.")
+        return None
+    return server
+
+
+def _codex_pending_lease(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    started = str(row.get("pendingStartedAt") or row.get("createdAt") or "")
+    try:
+        value = dt.datetime.fromisoformat(started.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return {"expiresAt": (value + dt.timedelta(seconds=CODEX_OAUTH_PENDING_TTL_SECONDS)).isoformat().replace("+00:00", "Z")}
+
+
+def _codex_remember_completed_operation(operation_id: str, row: Dict[str, Any]) -> None:
+    """Let a live client observe its terminal result after the durable ID is cleared."""
+    connection_id = row.get("id")
+    if not isinstance(connection_id, str) or not _CODEX_ID_RE.fullmatch(connection_id):
+        return
+    _CODEX_COMPLETED_OPERATIONS[operation_id] = (
+        connection_id,
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=CODEX_OAUTH_PENDING_TTL_SECONDS),
+    )
+
+
+def _codex_completed_operation_row(operation_id: str, rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Find a bounded, live-only terminal operation without reviving stale state."""
+    remembered = _CODEX_COMPLETED_OPERATIONS.get(operation_id)
+    if remembered is None:
+        return None
+    connection_id, expires_at = remembered
+    if dt.datetime.now(dt.timezone.utc) > expires_at:
+        _CODEX_COMPLETED_OPERATIONS.pop(operation_id, None)
+        return None
+    row = next((item for item in rows if item.get("id") == connection_id), None)
+    if row is None or row.get("status") != "connected":
+        _CODEX_COMPLETED_OPERATIONS.pop(operation_id, None)
+        return None
+    return row
+
+
+def codex_connection_capabilities() -> Dict[str, Any]:
+    """Runtime prerequisite signal for the authenticated local settings UI."""
+    reason = app_server_prerequisite()
+    available = reason is None
+    return {
+        "provider": "codex",
+        "supported": True,
+        "available": available,
+        "reason": reason,
+        "modes": ["browser", "device"] if available else [],
+        "pendingTTLSeconds": CODEX_OAUTH_PENDING_TTL_SECONDS,
+        "resume": True,
+        "retry": True,
+    }
+
+
+def _codex_refresh_row(row: Dict[str, Any]) -> bool:
+    """Refresh one explicitly managed profile; no local Codex auto-discovery."""
+    row["lastSyncAt"] = now_iso()
+    auth_before = _codex_managed_auth_material(row)
+    native_identity = _codex_managed_provider_identity(auth_before[0]) if auth_before else None
+    try:
+        identity = _codex_server(row).account()
+        if identity is None:
+            row["status"] = "needs_reconnect"
+            row["error"] = "This managed Codex profile is no longer signed in. Reconnect it."
+            row["usage"] = _codex_unavailable_usage()
+            return True
+        if isinstance(identity, dict) and isinstance(identity.get("email"), str) and identity["email"].strip():
+            # The only caller is the official account/read response from this
+            # connection's isolated app-server child.
+            identity = {**identity, "email": identity["email"].strip().lower(), "verification": True, "source": identity.get("source") or "codex_app_server_account_read"}
+        prior = row.get("identity")
+        if isinstance(prior, dict) and isinstance(prior.get("email"), str) and isinstance(identity.get("email"), str) and prior["email"].lower() != identity["email"].lower():
+            row["status"] = "needs_reconnect"
+            row["error"] = "The signed-in Codex account does not match this connection. Reconnect it."
+            row["usage"] = _codex_unavailable_usage()
+            return True
+        email = identity.get("email") if isinstance(identity, dict) else None
+        if isinstance(email, str) and email.strip() and identity.get("verification") is True:
+            row["identity"] = identity
+            row["label"] = email.strip().lower()
+            row.pop("identityStatus", None)
+        else:
+            row.pop("identity", None)
+            row["identityStatus"] = {"status": "unavailable", "reason": "verified_email_not_exposed"}
+        try:
+            row["usage"] = _codex_server(row).usage()
+            row.pop("error", None)
+            # Native claims are eligible only when this same controlled
+            # profile passed both official account/read and usage proof, and
+            # no credential rotation happened in between those calls.
+            auth_after = _codex_managed_auth_material(row)
+            if native_identity and auth_after and auth_before and auth_after[1] == auth_before[1]:
+                row["dedupKey"] = _codex_dedup_key(native_identity)
+                row["authProofFingerprint"] = auth_after[1]
+            elif auth_after is None or (auth_before and auth_after[1] != auth_before[1]):
+                row.pop("dedupKey", None)
+                row.pop("authProofFingerprint", None)
+        except CodexAppServerError:
+            # Identity is still authoritative.  Do not erase a useful prior
+            # usage snapshot or manufacture zeros when optional usage is down.
+            row.setdefault("usage", _codex_unavailable_usage())
+            row["error"] = "Codex is connected, but detailed usage is temporarily unavailable."
+        row["status"] = "connected"
+        operation_id = row.pop("operationID", None)
+        if isinstance(operation_id, str):
+            _CODEX_OAUTH_SURFACES.pop(operation_id, None)
+            _codex_remember_completed_operation(operation_id, row)
+        row.pop("appServerGeneration", None)
+        row.pop("pendingStartedAt", None)
+        row["lastSuccessfulSyncAt"] = row["lastSyncAt"]
+        return True
+    except CodexAppServerError:
+        row["status"] = "error"
+        row.setdefault("usage", _codex_unavailable_usage())
+        row["error"] = "Could not reach the managed Codex app-server. Retry this connection."
+        return True
+
+
+def _codex_implicit_refresh_due(row: Dict[str, Any]) -> bool:
+    """Whether a list-triggered refresh may probe this connected profile.
+
+    ``lastSyncAt`` is durable, safe attempt metadata.  It throttles both a
+    success and a recoverable failure, so a frequently reopened Home does not
+    repeatedly call remote account/usage methods.  Explicit refresh mutations
+    intentionally bypass this guard.
+    """
+    value = row.get("lastSyncAt")
+    if not isinstance(value, str):
+        return True
+    try:
+        observed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=dt.timezone.utc)
+    except (TypeError, ValueError):
+        return True
+    return (dt.datetime.now(dt.timezone.utc) - observed).total_seconds() >= CODEX_IMPLICIT_REFRESH_MIN_INTERVAL_SECONDS
+
+
+def _codex_close_managed_server(connection_id: str) -> None:
+    """Quiesce only a daemon-owned app-server before profile replacement."""
+    server = _CODEX_APP_SERVERS.pop(connection_id, None)
+    if server is not None:
+        server.close()
+
+
+def _codex_promote_verified_profile(source: Dict[str, Any], canonical: Dict[str, Any]) -> bool:
+    """Atomically install a newly verified managed auth file into canonical.
+
+    Both app-server children are stopped first so an AuthManager with old
+    credentials cannot overwrite the replacement.  The source stays intact;
+    a failed destination validation restores its prior file and recreates both
+    children.  No profile outside the two exact managed ids is touched.
+    """
+    source_material = _codex_managed_auth_material(source)
+    if source_material is None or source.get("authProofFingerprint") != source_material[1]:
+        return False
+    source_identity = _codex_managed_provider_identity(source_material[0])
+    if source_identity is None or source.get("dedupKey") != _codex_dedup_key(source_identity):
+        return False
+    source_path = _codex_profile_dir(str(source["id"])) / "auth.json"
+    destination_path = _codex_profile_dir(str(canonical["id"])) / "auth.json"
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    backup = destination_path.with_name(".agentcat-auth-backup")
+    staged = destination_path.with_name(".agentcat-auth-stage")
+    had_destination = destination_path.exists()
+    try:
+        _codex_close_managed_server(str(source["id"]))
+        _codex_close_managed_server(str(canonical["id"]))
+        if had_destination:
+            shutil.copy2(destination_path, backup)
+            _chmod_quiet(backup, 0o600)
+        staged.write_bytes(source_path.read_bytes())
+        _chmod_quiet(staged, 0o600)
+        os.replace(staged, destination_path)
+        _chmod_quiet(destination_path, 0o600)
+        # Recreate the target child after the atomic swap and require the same
+        # official account/usage proof used to admit native identity.
+        if _codex_server(canonical).account() is None:
+            raise CodexAppServerError("promotion_account_unavailable")
+        _codex_server(canonical).usage()
+        verified = _codex_managed_auth_material(canonical)
+        verified_identity = _codex_managed_provider_identity(verified[0]) if verified else None
+        if verified is None or verified_identity is None or _codex_dedup_key(verified_identity) != source.get("dedupKey"):
+            raise CodexAppServerError("promotion_identity_mismatch")
+        canonical["authProofFingerprint"] = verified[1]
+        canonical["dedupKey"] = source["dedupKey"]
+        backup.unlink(missing_ok=True)
+        return True
+    except (OSError, CodexAppServerError):
+        _codex_close_managed_server(str(canonical["id"]))
+        try:
+            if had_destination and backup.exists():
+                os.replace(backup, destination_path)
+            elif not had_destination:
+                destination_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        finally:
+            staged.unlink(missing_ok=True)
+            backup.unlink(missing_ok=True)
+            # Recreate both managed children from their retained profiles.
+            _codex_server(source)
+            _codex_server(canonical)
+        return False
+
+
+def _codex_reconcile_verified_duplicate(rows: List[Dict[str, Any]], source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fold a proven same-person managed login into its oldest canonical row."""
+    dedup_key = source.get("dedupKey")
+    if source.get("status") != "connected" or not isinstance(dedup_key, str):
+        return None
+    # Backfill a bounded number of older managed rows through their own
+    # app-server proof, never through labels or an email-only comparison.
+    candidates = [item for item in rows if item is not source and item.get("provider") == "codex" and item.get("status") == "connected"]
+    for candidate in candidates[:8]:
+        if not isinstance(candidate.get("dedupKey"), str):
+            _codex_refresh_row(candidate)
+    same = [item for item in candidates if item.get("dedupKey") == dedup_key]
+    if not same:
+        return None
+    canonical = min(same, key=lambda item: (str(item.get("createdAt") or ""), str(item.get("id") or "")))
+    if not _codex_promote_verified_profile(source, canonical):
+        return None
+    # The incoming profile contains the newly validated credentials and wins
+    # over older metadata after promotion succeeds.
+    for key in ("identity", "identityStatus", "usage", "label", "lastSyncAt", "lastSuccessfulSyncAt", "dedupKey", "authProofFingerprint"):
+        if key in source:
+            canonical[key] = copy.deepcopy(source[key])
+    canonical["status"] = "connected"
+    canonical.pop("error", None)
+    source["status"] = "superseded"
+    source["supersededBy"] = canonical["id"]
+    source.pop("error", None)
+    source.pop("appServerGeneration", None)
+    source.pop("pendingStartedAt", None)
+    return canonical
+
+
+def _codex_terminal_connection(row: Dict[str, Any], rows: List[Dict[str, Any]]) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
+    if row.get("status") == "connected":
+        return row, None
+    canonical_id = row.get("supersededBy")
+    if row.get("status") == "superseded" and isinstance(canonical_id, str):
+        canonical = next((item for item in rows if item.get("id") == canonical_id and item.get("status") == "connected"), None)
+        if canonical is not None:
+            return canonical, str(row.get("id") or "")
+    return None
+
+
+def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        changed = False
+        for row in rows:
+            if row.get("status") in {"removed", "canceled"}:
+                continue
+            if row.get("status") in {"pending_browser", "pending_device"}:
+                # A daemon restart cannot safely resume a login listener owned
+                # by the prior child.  Preserve the isolated profile and make
+                # recovery explicit rather than silently attaching another one.
+                server = _codex_pending_server(row)
+                if server is None:
+                    changed = True
+                else:
+                    try:
+                        if server.account() is not None:
+                            changed = _codex_refresh_row(row) or changed
+                    except CodexAppServerError:
+                        pass
+            elif refresh or (row.get("status") == "connected" and _codex_implicit_refresh_due(row)):
+                changed = _codex_refresh_row(row) or changed
+        if changed:
+            _write_codex_connections(rows)
+        # A completed refresh can backfill a legacy key and reveal an existing
+        # duplicate even without a new login.  Only active canonical rows are
+        # listed to the app.
+        for row in list(rows):
+            if row.get("status") == "connected":
+                canonical = _codex_reconcile_verified_duplicate(rows, row)
+                changed = bool(canonical) or changed
+        if changed:
+            _write_codex_connections(rows)
+        return [_codex_public_connection(row) for row in rows if row.get("status") not in {"removed", "superseded"}]
+
+
+def codex_connection_resolution(connection_id: str) -> Optional[Dict[str, Any]]:
+    with _CODEX_CONNECTIONS_LOCK:
+        return _resolve_connection_alias(_codex_connections(), connection_id)
+
+
+def connection_resolution(connection_id: str) -> Optional[Dict[str, Any]]:
+    """Find an exact ID in one registry; no cross-provider aliasing is allowed."""
+    matches = []
+    for resolver in (openrouter_connection_resolution, codex_connection_resolution, managed_accounts().resolve_connection_id):
+        result = resolver(connection_id)
+        if result is not None:
+            matches.append(result)
+    if len(matches) > 1:
+        # IDs are random and should not collide across registries.  Do not
+        # choose a provider if a malformed registry ever creates one.
+        raise RuntimeError("connection_alias_ambiguous")
+    return matches[0] if matches else None
+
+
+def _codex_start_oauth_on_row(row: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    if mode not in {"browser", "device"}:
+        raise ValueError("invalid_oauth_mode")
+    prerequisite = app_server_prerequisite()
+    if prerequisite is not None:
+        raise RuntimeError(prerequisite)
+    prior_operation = row.pop("operationID", None)
+    if isinstance(prior_operation, str):
+        _CODEX_OAUTH_SURFACES.pop(prior_operation, None)
+    row["status"] = "pending_device" if mode == "device" else "pending_browser"
+    row["pendingStartedAt"] = now_iso()
+    row["usage"] = _codex_unavailable_usage()
+    row.pop("error", None)
+    try:
+        login = _codex_server(row).login(mode)
+    except Exception:
+        server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
+        if server is not None:
+            server.close()
+        row["status"] = "error"
+        row["error"] = "Could not start the managed Codex sign-in. Retry this connection."
+        row.pop("pendingStartedAt", None)
+        raise RuntimeError("codex_oauth_start_failed")
+    login_id = login.get("loginId")
+    if not isinstance(login_id, str) or not login_id:
+        server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
+        if server is not None:
+            server.close()
+        row["status"] = "error"
+        row["error"] = "Could not start the managed Codex sign-in. Retry this connection."
+        row.pop("pendingStartedAt", None)
+        raise RuntimeError("codex_oauth_start_failed")
+    row["operationID"] = login_id
+    row["appServerGeneration"] = _codex_server(row).generation
+    result = {"operationID": login_id, "status": row["status"]}
+    surface: Dict[str, str] = {"mode": mode}
+    if isinstance(login.get("authUrl"), str):
+        result["authorizationURL"] = login["authUrl"]
+        surface["authorizationURL"] = login["authUrl"]
+    if isinstance(login.get("verificationUrl"), str):
+        result["verificationURL"] = login["verificationUrl"]
+        surface["verificationURL"] = login["verificationUrl"]
+    if isinstance(login.get("userCode"), str):
+        result["userCode"] = login["userCode"]
+        surface["userCode"] = login["userCode"]
+    _CODEX_OAUTH_SURFACES[login_id] = surface
+    return result
+
+
+def codex_start_oauth(label: str, mode: str = "browser") -> Dict[str, Any]:
+    with _CODEX_CONNECTIONS_LOCK:
+        row: Dict[str, Any] = {
+            "id": uuid.uuid4().hex,
+            "provider": "codex",
+            "label": "",
+            "kind": "chatgpt_oauth",
+            "scope": "managed_app_server_profile",
+            "createdAt": now_iso(),
+            "usage": _codex_unavailable_usage(),
+        }
+        result = _codex_start_oauth_on_row(row, mode)
+        rows = _codex_connections()
+        rows.append(row)
+        _write_codex_connections(rows)
+        return result
+
+
+def codex_retry_oauth(connection_id: str, mode: str = "browser") -> Dict[str, Any]:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        row = next((item for item in rows if item.get("id") == connection_id and item.get("status") != "removed"), None)
+        if row is None:
+            raise KeyError("connection_not_found")
+        if row.get("status") not in {"failed", "canceled", "error", "needs_reconnect"}:
+            raise RuntimeError("codex_oauth_retry_not_allowed")
+        # A retry reuses only this connection's isolated profile.  Clear any
+        # prior local account from that profile before the official login flow;
+        # connected profiles cannot reach this route.
+        server = _CODEX_APP_SERVERS.pop(connection_id, None)
+        if server is None:
+            server = CodexAppServer(_codex_profile_dir(connection_id))
+        try:
+            server.request("account/logout", {})
+        except CodexAppServerError:
+            # Do not launch a new login over an account that could not be
+            # cleared.  Keep this profile and its last known metadata intact
+            # so the user can explicitly reconnect or remove it.
+            row["status"] = "needs_reconnect"
+            row["error"] = "Could not prepare this managed Codex profile for sign-in. Reconnect it."
+            _write_codex_connections(rows)
+            raise RuntimeError("codex_oauth_retry_logout_failed")
+        finally:
+            server.close()
+        result = _codex_start_oauth_on_row(row, mode)
+        _write_codex_connections(rows)
+        return result
+
+
+def _codex_pending_row(operation_id: str) -> Dict[str, Any]:
+    for row in _codex_connections():
+        if row.get("operationID") == operation_id and row.get("status") in {"pending_browser", "pending_device"}:
+            return row
+    raise KeyError("oauth_operation_not_found")
+
+
+def codex_oauth_status(operation_id: str) -> Dict[str, Any]:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        row = next((item for item in rows if item.get("operationID") == operation_id), None)
+        if row is None:
+            durable = next((item for item in rows if item.get("completedOperationID") == operation_id), None)
+            if durable is not None:
+                terminal = _codex_terminal_connection(durable, rows)
+                if terminal is not None:
+                    canonical, superseded = terminal
+                    result = {"status": "connected", "connection": _codex_public_connection(canonical)}
+                    if superseded:
+                        result["supersededConnectionID"] = superseded
+                    return result
+            completed = _codex_completed_operation_row(operation_id, rows)
+            if completed is None:
+                raise KeyError("oauth_operation_not_found")
+            return {"status": "connected", "connection": _codex_public_connection(completed)}
+        if row.get("status") in {"pending_browser", "pending_device"}:
+            server = _codex_pending_server(row)
+            if server is None:
+                _write_codex_connections(rows)
+                return {"status": row["status"], "error": row["error"]}
+            try:
+                if server.account() is not None:
+                    _codex_refresh_row(row)
+                    canonical = _codex_reconcile_verified_duplicate(rows, row)
+                    if canonical is not None:
+                        row["completedOperationID"] = operation_id
+                    _write_codex_connections(rows)
+            except CodexAppServerError:
+                pass
+        terminal = _codex_terminal_connection(row, rows)
+        if terminal is not None:
+            canonical, superseded = terminal
+            result = {"status": "connected", "connection": _codex_public_connection(canonical)}
+            if superseded:
+                result["supersededConnectionID"] = superseded
+            return result
+        result = {"status": row.get("status")}
+        if row.get("status") in {"pending_browser", "pending_device"}:
+            lease = _codex_pending_lease(row)
+            if lease is not None:
+                result["lease"] = lease
+            operation = row.get("operationID")
+            surface = _CODEX_OAUTH_SURFACES.get(operation) if isinstance(operation, str) else None
+            if isinstance(surface, dict):
+                # The surface only exists in this daemon process, for the live
+                # child that owns this exact login lease.
+                result["resume"] = copy.deepcopy(surface)
+        if row.get("status") == "connected":
+            result["connection"] = _codex_public_connection(row)
+        if isinstance(row.get("error"), str):
+            result["error"] = row["error"]
+        return result
+
+
+def codex_cancel_oauth(operation_id: str) -> str:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        row = next((item for item in rows if item.get("operationID") == operation_id), None)
+        if row is None:
+            return "notFound"
+        if _codex_pending_server(row) is None:
+            _write_codex_connections(rows)
+            return "failed"
+        try:
+            result = _codex_server(row).cancel_login(operation_id)
+            status = result.get("status") if isinstance(result, dict) else "canceled"
+        except CodexAppServerError:
+            # The child is owned by this exact lease.  It is safer to end that
+            # lease locally than leave an unusable browser login alive.
+            status = "canceled"
+        if status in {"canceled", "notFound"}:
+            row["status"] = "canceled"
+            row.pop("operationID", None)
+            _CODEX_OAUTH_SURFACES.pop(operation_id, None)
+            row.pop("appServerGeneration", None)
+            row.pop("pendingStartedAt", None)
+            row.pop("error", None)
+            server = _CODEX_APP_SERVERS.pop(str(row.get("id") or ""), None)
+            if server is not None:
+                server.close()
+            _write_codex_connections(rows)
+        return "canceled" if status in {"canceled", "notFound"} else "notFound"
+
+
+def codex_connection_mutation(connection_id: str, action: str, label: Optional[str] = None) -> Dict[str, Any]:
+    with _CODEX_CONNECTIONS_LOCK:
+        rows = _codex_connections()
+        row = next((item for item in rows if item.get("id") == connection_id and item.get("status") != "removed"), None)
+        if row is None:
+            raise KeyError("connection_not_found")
+        if action == "refresh":
+            _codex_refresh_row(row)
+        elif action == "rename":
+            raise ValueError("account_label_is_verified_email")
+        elif action == "remove":
+            # The logout request and the deletion target are both the exact
+            # child-owned profile selected by this connection id.  It cannot
+            # address the user's ~/.codex or another managed profile.
+            server = _CODEX_APP_SERVERS.pop(connection_id, None)
+            if server is None:
+                server = CodexAppServer(_codex_profile_dir(connection_id))
+            try:
+                server.request("account/logout", {})
+            except CodexAppServerError:
+                pass
+            finally:
+                server.close()
+            profile = _codex_profile_dir(connection_id)
+            if profile.parent == CODEX_CONNECTIONS_PROFILES_DIR and profile.exists():
+                shutil.rmtree(profile)
+            row["status"] = "removed"
+            row.pop("error", None)
+        else:
+            raise ValueError("unsupported_connection_action")
+        _write_codex_connections(rows)
+        return _codex_public_connection(row)
+
+
+def shutdown_codex_app_servers() -> None:
+    """Terminate only app-server children started by this daemon."""
+    with _CODEX_CONNECTIONS_LOCK:
+        servers = list(_CODEX_APP_SERVERS.values())
+        _CODEX_APP_SERVERS.clear()
+    for server in servers:
+        server.close()
 
 
 def command_set_key(args: argparse.Namespace) -> int:

@@ -5198,7 +5198,7 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
              _patch.object(agentcat, "codex_runtime_limits", return_value=empty), \
              _patch.object(agentcat, "claude_live_limits", return_value=empty), \
              _patch.object(agentcat, "claude_runtime_limits", return_value=empty):
-            limits = agentcat.runtime_limits()
+            limits = agentcat.runtime_limits(remote_quota=True)
         self.assertFalse(limits["antigravity"].get("quotas"))  # empty, not gemini's
         self.assertEqual(limits["gemini"].get("quotas"), gem["quotas"])
 
@@ -5252,7 +5252,7 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
              _p.object(agentcat, "claude_live_limits", return_value=empty), \
              _p.object(agentcat, "gemini_live_limits", return_value=good), \
              _p.object(agentcat, "antigravity_live_limits", return_value=empty):
-            limits = agentcat.runtime_limits()
+            limits = agentcat.runtime_limits(remote_quota=True)
 
         self.assertEqual(limits["codex"]["status"], "error")  # isolated, did not raise
         self.assertEqual(limits["gemini"]["quotas"], good["quotas"])  # others unaffected

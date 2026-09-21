@@ -1,0 +1,271 @@
+import importlib.util
+import json
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch
+from http.server import ThreadingHTTPServer
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+from sandbox import redirect_module_paths, restore_module_paths
+
+REPO = Path(__file__).resolve().parents[1]
+LOADER = SourceFileLoader("managed_routes_agentcat", str(REPO / "bin" / "agentcat"))
+SPEC = importlib.util.spec_from_loader("managed_routes_agentcat", LOADER)
+agentcat = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(agentcat)
+
+
+class FakeAdapter:
+    def __init__(self):
+        self.number = 0
+        self.connected = set()
+        self.start_error = None
+
+    def adapter_capability(self):
+        return {"provider": "kimi", "supported": True, "available": True, "reason": None, "modes": ["device"]}
+
+    def start(self, profile, mode):
+        if self.start_error is not None:
+            return {"status": "failed", "error": self.start_error}
+        self.number += 1
+        return {"operationID": f"device-{self.number:08d}", "status": "pending_device", "verificationURL": "https://login.example.test/device", "userCode": "CODE-123"}
+
+    def poll(self, profile, operation):
+        if operation in self.connected:
+            return {"status": "connected", "authenticated": True, "identity": {"name": "Local"}, "usage": {"source": "fixture", "freshness": "live", "windows": [], "tokenUsage": None, "tokenUsageAvailable": False}}
+        return {"status": "pending_device"}
+
+    def cancel(self, profile, operation):
+        return "canceled"
+
+    def refresh(self, profile):
+        return {"status": "connected", "authenticated": True, "usage": {"source": "fixture", "freshness": "live", "windows": [], "tokenUsage": None, "tokenUsageAvailable": False}}
+
+    def remove(self, profile):
+        return None
+
+    def promote_verified_profile(self, source, destination, identity):
+        return True
+
+
+GEMINI_UNAVAILABLE_USAGE = {
+    "source": "gemini_code_assist",
+    "freshness": "unavailable",
+    "windows": [],
+    "credits": None,
+    "spendControl": None,
+    "rateLimitReachedType": None,
+    "tokenUsage": None,
+    "tokenUsageAvailable": False,
+    "scope": "gemini_code_assist_request_quota",
+    "reason": "gemini_consumer_tier_unsupported",
+}
+
+
+class ManagedAccountRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "home"
+        self.agentcat_home = Path(self.tmp.name) / "agentcat"
+        self.home.mkdir(); self.agentcat_home.mkdir()
+        self.old_paths = redirect_module_paths(agentcat, self.home, self.agentcat_home)
+        agentcat.LOOPBACK_CONTROL_TOKEN_FILE = self.agentcat_home / "loopback-control-token"
+        self.adapter = FakeAdapter()
+        agentcat._MANAGED_ACCOUNTS = agentcat.ManagedAccounts(self.agentcat_home, {"kimi": self.adapter})
+        agentcat._MANAGED_ACCOUNTS_HOME = str(self.agentcat_home)
+        self.token = agentcat.loopback_control_token()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=3)
+        agentcat._MANAGED_ACCOUNTS = None; agentcat._MANAGED_ACCOUNTS_HOME = None
+        restore_module_paths(agentcat, self.old_paths)
+        self.tmp.cleanup()
+
+    def request(self, path, *, body=None, method=None):
+        headers = {"Authorization": f"Bearer {self.token}"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            body = json.dumps(body).encode()
+        request = Request(self.base + path, data=body, method=method, headers=headers)
+        with urlopen(request, timeout=3) as response:
+            return response.status, json.loads(response.read().decode())
+
+    def test_capability_start_resume_cancel_retry_and_memory_only_registry(self):
+        with self.assertRaises(HTTPError) as denied:
+            urlopen(self.base + "/v1/connections/capabilities", timeout=3)
+        self.assertEqual(denied.exception.code, 401)
+        _, caps = self.request("/v1/connections/capabilities")
+        kimi = next(item for item in caps["providers"] if item["provider"] == "kimi")
+        self.assertTrue(kimi["available"])
+        _, started = self.request("/v1/connections/kimi/oauth/start", body={"label": "Work", "mode": "device"}, method="POST")
+        self.assertEqual(started["status"], "pending_device")
+        operation = started["operationID"]
+        _, pending = self.request(f"/v1/connections/kimi/oauth/{operation}")
+        self.assertEqual(pending["resume"]["userCode"], "CODE-123")
+        stored = (self.agentcat_home / "managed-connections.json").read_text()
+        self.assertNotIn("CODE-123", stored)
+        self.assertNotIn("login.example.test", stored)
+        _, canceled = self.request(f"/v1/connections/kimi/oauth/{operation}/cancel", body={}, method="POST")
+        self.assertEqual(canceled["status"], "canceled")
+        _, listed = self.request("/v1/connections")
+        row = next(item for item in listed["connections"] if item["provider"] == "kimi")
+        _, retried = self.request(f"/v1/connections/kimi/{row['id']}/oauth/retry", body={"mode": "device"}, method="POST")
+        self.assertEqual(retried["status"], "pending_device")
+        self.assertEqual(agentcat.managed_accounts().snapshot()[0]["id"], row["id"])
+
+    def test_retry_exposes_only_allowlisted_start_failures(self):
+        _, started = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
+        self.request(f"/v1/connections/kimi/oauth/{started['operationID']}/cancel", body={}, method="POST")
+        _, listed = self.request("/v1/connections")
+        row = next(item for item in listed["connections"] if item["provider"] == "kimi")
+        for adapter_error, expected in (("kimi_login_surface_unavailable", "kimi_login_surface_unavailable"), ("raw CLI output: secret-looking-detail", "managed_oauth_retry_failed")):
+            with self.subTest(adapter_error=adapter_error):
+                self.adapter.start_error = adapter_error
+                with self.assertRaises(HTTPError) as rejected:
+                    self.request(f"/v1/connections/kimi/{row['id']}/oauth/retry", body={"mode": "device"}, method="POST")
+                self.assertEqual(rejected.exception.code, 502)
+                payload = json.loads(rejected.exception.read().decode())
+                self.assertEqual(payload, {"error": expected})
+                self.assertNotIn("secret-looking-detail", str(payload))
+        self.adapter.start_error = None
+
+    def test_http_managed_connection_preserves_normalized_unavailable_usage(self):
+        class GeminiFixtureAdapter(FakeAdapter):
+            def adapter_capability(self):
+                return {"provider": "gemini", "supported": True, "available": True, "reason": None, "modes": ["browser"]}
+
+            def start(self, profile, mode):
+                self.number += 1
+                return {"operationID": f"browser-{self.number:08d}", "status": "pending_browser", "browserLaunchMode": "provider"}
+
+            def poll(self, profile, operation):
+                return {
+                    "status": "connected", "authenticated": True,
+                    "identity": {"email": "verified@example.invalid", "verification": True, "source": "google_userinfo"},
+                    "usage": GEMINI_UNAVAILABLE_USAGE,
+                }
+
+        self.adapter = GeminiFixtureAdapter()
+        agentcat._MANAGED_ACCOUNTS = agentcat.ManagedAccounts(self.agentcat_home, {"gemini": self.adapter})
+        _, started = self.request("/v1/connections/gemini/oauth/start", body={"mode": "browser"}, method="POST")
+        _, connected = self.request(f"/v1/connections/gemini/oauth/{started['operationID']}")
+        row = connected["connection"]
+        self.assertEqual(row["identity"], {"email": "verified@example.invalid", "verification": True, "source": "google_userinfo"})
+        self.assertEqual(row["usage"], GEMINI_UNAVAILABLE_USAGE)
+        _, listed = self.request("/v1/connections")
+        listed_row = next(item for item in listed["connections"] if item["provider"] == "gemini")
+        self.assertEqual(listed_row["usage"], GEMINI_UNAVAILABLE_USAGE)
+
+    def test_http_claude_browser_route_is_provider_scoped(self):
+        class ClaudeFixtureAdapter(FakeAdapter):
+            def adapter_capability(self):
+                return {"provider": "claude", "supported": True, "available": True,
+                        "reason": None, "modes": ["browser"], "browserLaunchMode": "provider"}
+
+            def start(self, profile, mode):
+                if mode != "browser":
+                    raise AssertionError("Claude adapter received the wrong mode")
+                self.number += 1
+                return {"operationID": f"claude-{self.number:08d}", "status": "pending_browser",
+                        "browserLaunchMode": "provider"}
+
+        self.adapter = ClaudeFixtureAdapter()
+        agentcat._MANAGED_ACCOUNTS = agentcat.ManagedAccounts(self.agentcat_home, {"claude": self.adapter})
+        _, started = self.request("/v1/connections/claude/oauth/start", body={"mode": "browser"}, method="POST")
+        self.assertEqual(started["status"], "pending_browser")
+        _, pending = self.request(f"/v1/connections/claude/oauth/{started['operationID']}")
+        self.assertEqual(pending["resume"]["browserLaunchMode"], "provider")
+
+    def test_protected_connection_resolver_handles_alias_missing_and_cycle(self):
+        canonical, source, missing, cycle_one, cycle_two = ("a" * 32, "b" * 32, "c" * 32, "d" * 32, "e" * 32)
+        accounts = agentcat.ManagedAccounts(self.agentcat_home, {"kimi": self.adapter})
+        accounts._write([
+            {"id": canonical, "provider": "kimi", "status": "connected", "scope": "managed_provider_profile"},
+            {"id": source, "provider": "kimi", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": canonical},
+            {"id": missing, "provider": "kimi", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": "f" * 32},
+            {"id": cycle_one, "provider": "kimi", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": cycle_two},
+            {"id": cycle_two, "provider": "kimi", "status": "superseded", "scope": "managed_provider_profile", "supersededBy": cycle_one},
+        ])
+        agentcat._MANAGED_ACCOUNTS = accounts
+        with self.assertRaises(HTTPError) as denied:
+            urlopen(self.base + f"/v1/connections/{source}/resolve", timeout=3)
+        self.assertEqual(denied.exception.code, 401)
+        _, resolved = self.request(f"/v1/connections/{source}/resolve")
+        self.assertEqual(resolved["canonicalConnectionID"], canonical)
+        self.assertTrue(resolved["alias"])
+        _, unresolved = self.request(f"/v1/connections/{missing}/resolve")
+        self.assertIsNone(unresolved["canonicalConnectionID"])
+        self.assertEqual(unresolved["status"], "missing")
+        with self.assertRaises(HTTPError) as cycle:
+            self.request(f"/v1/connections/{cycle_one}/resolve")
+        self.assertEqual(cycle.exception.code, 409)
+        self.assertEqual(json.loads(cycle.exception.read().decode()), {"error": "connection_alias_cycle"})
+
+    def test_codex_resolution_uses_its_own_same_provider_alias_chain(self):
+        canonical, source, foreign = "a" * 32, "b" * 32, "c" * 32
+        rows = [
+            {"id": canonical, "provider": "codex", "status": "connected"},
+            {"id": source, "provider": "codex", "status": "superseded", "supersededBy": canonical},
+            {"id": foreign, "provider": "kimi", "status": "connected"},
+        ]
+        with patch.object(agentcat, "_codex_connections", return_value=rows):
+            result = agentcat.codex_connection_resolution(source)
+        self.assertEqual(result["canonicalConnectionID"], canonical)
+        self.assertEqual(result["provider"], "codex")
+
+    def test_connected_refresh_and_remove_are_per_account(self):
+        _, started = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
+        self.adapter.connected.add(started["operationID"])
+        _, connected = self.request(f"/v1/connections/kimi/oauth/{started['operationID']}")
+        # A second HTTP poll can race the UI task that consumed terminal state.
+        # It must return the bounded in-memory connected result, not a 404.
+        _, repeated = self.request(f"/v1/connections/kimi/oauth/{started['operationID']}")
+        row = connected["connection"]
+        self.assertEqual(repeated["status"], "connected")
+        self.assertEqual(repeated["connection"]["id"], row["id"])
+        self.assertEqual(row["usage"]["source"], "fixture")
+        _, refreshed = self.request(f"/v1/connections/kimi/{row['id']}/refresh", body={}, method="POST")
+        self.assertEqual(refreshed["connection"]["status"], "connected")
+        _, removed = self.request(f"/v1/connections/kimi/{row['id']}", body={}, method="DELETE")
+        self.assertEqual(removed["connection"]["status"], "removed")
+
+    def test_http_terminal_duplicate_returns_canonical_and_durable_supersession_alias(self):
+        def poll(profile, operation):
+            if operation not in self.adapter.connected:
+                return {"status": "pending_device"}
+            return {
+                "status": "connected", "authenticated": True,
+                "identity": {"email": "verified@example.invalid", "verification": True, "source": "fixture", "accountID": "provider-user-42"},
+                "providerIdentity": {"accountID": "provider-user-42"},
+                "usage": {"source": "fixture", "freshness": "live", "windows": [], "tokenUsage": None, "tokenUsageAvailable": False},
+            }
+        self.adapter.poll = poll
+        _, first = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
+        self.adapter.connected.add(first["operationID"])
+        _, initial = self.request(f"/v1/connections/kimi/oauth/{first['operationID']}")
+        _, second = self.request("/v1/connections/kimi/oauth/start", body={"mode": "device"}, method="POST")
+        self.adapter.connected.add(second["operationID"])
+        _, merged = self.request(f"/v1/connections/kimi/oauth/{second['operationID']}")
+        self.assertEqual(merged["status"], "connected")
+        self.assertEqual(merged["connection"]["id"], initial["connection"]["id"])
+        self.assertIn("supersededConnectionID", merged)
+        self.assertNotEqual(merged["supersededConnectionID"], merged["connection"]["id"])
+        _, repeated = self.request(f"/v1/connections/kimi/oauth/{second['operationID']}")
+        self.assertEqual(repeated["connection"]["id"], initial["connection"]["id"])
+        self.assertEqual(repeated["supersededConnectionID"], merged["supersededConnectionID"])
+        _, listed = self.request("/v1/connections")
+        self.assertEqual(len([row for row in listed["connections"] if row["provider"] == "kimi"]), 1)
+        self.assertNotIn("provider-user-42", json.dumps(listed))
+
+
+if __name__ == "__main__":
+    unittest.main()

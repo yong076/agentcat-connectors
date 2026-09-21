@@ -42,6 +42,20 @@ WP10_CAPABILITIES = (
     "projects.dailyCost", "insights.periods", "insights.burnRate",
     "insights.autoQuota", "insights.recommendation",
 )
+TOKEN_ACCOUNTING_CAPABILITIES = (
+    "usage.tokenAccounting.v1",
+)
+MANAGED_CONNECTION_CAPABILITIES = (
+    "connections.openrouter.v1",
+    "connections.codex.appServer.v1",
+    "connections.managedAccounts.v1",
+)
+EXPECTED_CONNECTOR_CAPABILITIES = (
+    PUBLIC_CAPABILITIES
+    + WP10_CAPABILITIES
+    + TOKEN_ACCOUNTING_CAPABILITIES
+    + MANAGED_CONNECTION_CAPABILITIES
+)
 
 
 class SandboxedCase(unittest.TestCase):
@@ -70,9 +84,20 @@ class SandboxedCase(unittest.TestCase):
 class WP10CapabilityTests(SandboxedCase):
     def test_public_and_wp10_capabilities_are_declared_once(self):
         capabilities = agentcat.CONNECTOR_CAPABILITIES
-        self.assertEqual(len(capabilities), 46)
-        self.assertEqual(len(set(capabilities)), 46)
-        for capability in PUBLIC_CAPABILITIES + WP10_CAPABILITIES:
+        expected = EXPECTED_CONNECTOR_CAPABILITIES
+        extra = sorted(set(capabilities) - set(expected))
+        missing = sorted(set(expected) - set(capabilities))
+        drift = (
+            "CONNECTOR_CAPABILITIES drifted from derived "
+            f"public({len(PUBLIC_CAPABILITIES)}) + wp10({len(WP10_CAPABILITIES)}) "
+            f"+ token accounting {list(TOKEN_ACCOUNTING_CAPABILITIES)} "
+            f"+ managed connections {list(MANAGED_CONNECTION_CAPABILITIES)}; "
+            f"extra={extra} missing={missing}"
+        )
+        self.assertEqual(len(set(expected)), len(expected), "fixture capability lists must not contain duplicates")
+        self.assertEqual(len(capabilities), len(expected), drift)
+        self.assertEqual(len(set(capabilities)), len(expected), drift)
+        for capability in expected:
             self.assertIn(capability, capabilities)
         self.assertEqual(capabilities[capabilities.index("projects.daily") + 1:capabilities.index("projects.daily") + 6], WP10_CAPABILITIES)
 
