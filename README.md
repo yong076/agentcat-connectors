@@ -110,9 +110,9 @@ agentcat setup-prompt
 
 | Provider | Signal | Notes |
 | --- | --- | --- |
-| Codex | local SQLite token totals + Codex OAuth usage API | Shows remaining 5-hour, 7-day, exposed model/review quota percentages, available reset credits, and Codex credit/spend-cap state when `~/.codex/auth.json` is present. |
-| Claude Code | local stats/hooks + Claude Code OAuth usage API | Shows remaining 5-hour, 7-day, model quota, and extra monthly credit data when Claude Code OAuth credentials are present. |
-| Gemini CLI | local telemetry + Gemini Code Assist quota API | Shows remaining Code Assist request quota per model family for Google-login Gemini CLI sessions. |
+| Codex | local SQLite token totals; optional managed OAuth quota | Routine snapshots use local counters. A connected managed account can refresh its official 5-hour, 7-day, model/review, credit, and spend-cap fields separately. |
+| Claude Code | local stats/hooks; explicit legacy OAuth quota refresh | Routine snapshots use local counters; the compatibility usage endpoint may request official quota when invoked. |
+| Gemini CLI | local telemetry; optional managed Code Assist quota | Routine snapshots use local telemetry. A connected managed account refreshes authenticated quota separately when the provider exposes it. |
 | Antigravity | dedicated telemetry or read-only local conversation SQLite | Keeps Antigravity separate from Gemini CLI. On Windows, reads defensive per-generation token metadata and falls back to quota/activity only if the upstream local schema changes. |
 
 ## Included Insights Engine
@@ -253,7 +253,9 @@ On Windows, Agent Cat prefers PowerShell 7 (`pwsh`) when available, tries a fast
 
 ## Limits
 
-Agent Cat reports remaining quota when a provider exposes it through the same local auth state used by its CLI:
+`GET /v1/snapshot` and the background snapshot loop are local-only: they read local logs, configured caps, and native local status artifacts without calling provider quota APIs or discovered credentials. Managed OAuth account cards refresh their own remote quota separately, and `GET /v1/usage` remains the explicit legacy on-demand compatibility endpoint.
+
+When a remote quota refresh is explicitly requested, Agent Cat reports remaining quota when a provider exposes it through the same local auth state used by its CLI:
 
 - Codex: reads `~/.codex/auth.json`, then calls the ChatGPT Codex usage endpoints for rolling 5-hour/7-day utilization, reset times, available reset credits, and Codex credit/spend-cap state. Reset credits are reported only as availability/metadata; this connector never redeems them.
 - Claude Code: reads Claude Code OAuth credentials from Keychain or `~/.claude`, then calls the Claude Code OAuth usage endpoint for 5-hour/7-day/model utilization plus monthly extra-usage credits.
