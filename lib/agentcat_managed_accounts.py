@@ -844,6 +844,42 @@ class ManagedAccounts:
                 result.append(item)
             return result
 
+    def make_default(self, connection_id: str, *, confirmed: bool = False) -> Dict[str, Any]:
+        """Point the default CLI home at this stored Codex or Claude account."""
+        if confirmed is not True:
+            raise ValueError("confirmed_required")
+        with self.lock:
+            rows = self._rows()
+            row = next(
+                (item for item in rows
+                 if item.get("id") == connection_id and item.get("status") not in {"removed", "superseded"}),
+                None,
+            )
+            if row is None:
+                raise KeyError("connection_not_found")
+            provider = row.get("provider")
+            if provider not in _AUTH_PROVIDERS:
+                raise ValueError("provider_not_supported")
+            profile = self._profile(row)
+            public_row = dict(row)
+        from agentcat_account_switch import make_default_account
+        result = make_default_account(
+            agentcat_home=self.home,
+            provider=str(provider),
+            connection_id=connection_id,
+            source_profile=profile,
+            confirmed=True,
+        )
+        observed_at = now_iso()
+        defaults = {
+            "codex": _default_codex_account_id(),
+            "claude": _default_claude_account_uuid(),
+        }
+        public = self.public(public_row)
+        public.update(self._auth_snapshot_fields(public_row, observed_at, defaults))
+        result["connection"] = public
+        return result
+
     def resolve_connection_id(self, connection_id: str) -> Optional[Dict[str, Any]]:
         """Resolve only a durable supersession chain for a saved UI selection.
 
