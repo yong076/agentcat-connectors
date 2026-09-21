@@ -8,6 +8,10 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+# Tests patch ``subprocess.run`` / ``Popen`` on the shared stdlib module.
+# Capture the real constructor so Windows ACL checks still reach icacls.
+_REAL_POPEN = subprocess.Popen
+
 
 _WINDOWS_DAEMON_KEEP = (
     "COMSPEC",
@@ -102,6 +106,14 @@ def patch_daemon_env(updates: dict[str, str]):
     return patch.dict(os.environ, kept, clear=True)
 
 
+def assert_same_path(test, actual, expected) -> None:
+    """Compare filesystem paths the way Windows does (case-insensitive)."""
+    test.assertEqual(
+        os.path.normcase(os.fspath(actual)),
+        os.path.normcase(os.fspath(expected)),
+    )
+
+
 def assert_owner_private(test, path: Path, *, directory: bool = False) -> None:
     """POSIX: 0o600/0o700.  Windows: the NTFS DACL must not grant world read."""
     test.assertTrue(path.exists(), msg=str(path))
@@ -109,13 +121,18 @@ def assert_owner_private(test, path: Path, *, directory: bool = False) -> None:
         expected = 0o700 if directory else 0o600
         test.assertEqual(path.stat().st_mode & 0o777, expected)
         return
-    output = subprocess.check_output(
+    proc = _REAL_POPEN(
         ["icacls", os.fspath(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
-    lowered = output.lower()
+    output, _ = proc.communicate()
+    if proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, ["icacls", os.fspath(path)], output)
+    lowered = (output or "").lower()
     for principal in ("everyone:", "builtin\\users:"):
         test.assertNotIn(
             principal,

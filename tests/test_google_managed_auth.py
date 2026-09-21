@@ -16,7 +16,7 @@ sys.path.insert(0, str(REPO_ROOT / "lib"))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 import agentcat_google_managed_auth as managed
 from agentcat_managed_accounts import ManagedAccounts
-from private_fs import assert_owner_private, write_noop_cli
+from private_fs import assert_owner_private, assert_same_path, write_noop_cli
 
 
 def _unavailable_usage(reason):
@@ -172,7 +172,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
             "USERPROFILE": self.tmp.name,
             "PATH": "",
         }):
-            self.assertEqual(managed._gemini_executable(), str(executable))
+            assert_same_path(self, managed._gemini_executable(), executable)
 
     def test_oauth_metadata_resolves_from_homebrew_realpath_bundle(self):
         bundle = Path(self.tmp.name) / "cellar" / "gemini-cli" / "bundle"

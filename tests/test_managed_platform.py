@@ -1,9 +1,10 @@
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,7 +12,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import agentcat_managed_platform as platform
-from private_fs import assert_owner_private, platform_cli_name, write_noop_cli
+from private_fs import assert_owner_private, assert_same_path, platform_cli_name, write_noop_cli
 
 
 class ManagedPlatformTests(unittest.TestCase):
@@ -27,7 +28,11 @@ class ManagedPlatformTests(unittest.TestCase):
         with patch.object(platform, "IS_WINDOWS", True), patch.dict(os.environ, {"PATHEXT": ".EXE;.CMD"}, clear=False):
             self.assertEqual(
                 platform.cli_names("gemini", bare=False),
-                ["gemini.EXE", "gemini.exe", "gemini.CMD", "gemini.cmd"],
+                ["gemini.EXE", "gemini.CMD"],
+            )
+            self.assertEqual(
+                platform.path_key("gemini.CMD"),
+                platform.path_key("gemini.cmd"),
             )
 
     def test_restrict_private_is_owner_only_on_posix(self):
@@ -53,19 +58,20 @@ class ManagedPlatformTests(unittest.TestCase):
                 "USERPROFILE": tmp,
                 "PATH": "",
             }):
-                self.assertEqual(platform.resolve_cli("gemini", "AGENTCAT_GEMINI_CLI"), str(executable))
+                assert_same_path(self, platform.resolve_cli("gemini", "AGENTCAT_GEMINI_CLI"), executable)
 
     def test_configured_executable_wins_over_which_and_discovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             configured = write_noop_cli(Path(tmp) / "configured-gemini")
             with patch.dict(os.environ, {"AGENTCAT_GEMINI_CLI": str(configured)}):
-                self.assertEqual(
+                assert_same_path(
+                    self,
                     platform.resolve_cli(
                         "gemini",
                         "AGENTCAT_GEMINI_CLI",
                         which=lambda name: "/opt/homebrew/bin/gemini",
                     ),
-                    str(configured),
+                    configured,
                 )
 
     def test_injected_which_path_wins_over_installed_discovery(self):
@@ -95,9 +101,10 @@ class ManagedPlatformTests(unittest.TestCase):
                 "PATH": "",
                 "PATHEXT": ".CMD;.EXE",
             }, clear=False):
-                self.assertEqual(
+                assert_same_path(
+                    self,
                     platform.resolve_cli("gemini", "AGENTCAT_GEMINI_CLI", which=lambda name: None),
-                    str(explicit),
+                    explicit,
                 )
             with patch.object(platform, "IS_WINDOWS", True), patch.dict(os.environ, {
                 "AGENTCAT_GEMINI_CLI": "",
@@ -110,6 +117,23 @@ class ManagedPlatformTests(unittest.TestCase):
                     "gemini", "AGENTCAT_GEMINI_CLI", which=lambda name: None
                 )
                 self.assertIsNotNone(discovered)
-                discovered_path = Path(discovered)
-                self.assertEqual(discovered_path.parent, bindir)
-                self.assertEqual(discovered_path.name.lower(), "gemini.cmd")
+                on_disk = next(entry for entry in bindir.iterdir() if entry.name.lower() == "gemini.cmd")
+                assert_same_path(self, discovered, on_disk)
+                self.assertEqual(Path(discovered).name, on_disk.name)
+
+    def test_augment_search_path_folds_windows_drive_case(self):
+        current = r"C:\Windows\System32"
+        fallback = ";".join([r"c:\windows\system32", r"C:\Trusted"])
+        self.assertEqual(
+            platform.augment_search_path(current, fallback, pathsep=";", windows=True).split(";"),
+            [r"C:\Windows\System32", r"C:\Trusted"],
+        )
+
+    def test_owner_private_check_ignores_patched_subprocess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secret.json"
+            path.write_text("{}", encoding="utf-8")
+            self.assertTrue(platform.restrict_private(path))
+            with patch.object(subprocess, "run", return_value=Mock(returncode=0)), \
+                 patch.object(subprocess, "Popen", side_effect=AssertionError("patched Popen")):
+                assert_owner_private(self, path)

@@ -18,6 +18,7 @@ import agentcat_grok_managed as grok
 import agentcat_kimi_managed as kimi
 from private_fs import (
     assert_owner_private,
+    assert_same_path,
     patch_daemon_env,
     system_only_path,
     write_env_wrapper,
@@ -560,7 +561,7 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         for module, variable, name in ((kimi, "AGENTCAT_KIMI_CLI", "kimi"), (grok, "AGENTCAT_GROK_CLI", "grok")):
             executable = write_noop_cli(directory / name)
             with self.subTest(provider=name), patch.dict(os.environ, {"PATH": "/definitely-empty", variable: str(executable)}, clear=False):
-                self.assertEqual(module._executable(), str(executable))
+                assert_same_path(self, module._executable(), executable)
 
     def test_capability_probe_supplies_path_for_env_interpreter_when_daemon_path_is_empty(self):
         """An absolute CLI wrapper still needs PATH for its interpreter."""
