@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from agentcat_managed_platform import restrict_private
+
 
 class CodexAppServerError(RuntimeError):
     pass
@@ -202,10 +204,7 @@ class CodexAppServer:
         if self.is_alive():
             return
         self.profile_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            self.profile_dir.chmod(0o700)
-        except OSError:
-            pass
+        restrict_private(self.profile_dir, directory=True)
         self.process = subprocess.Popen(
             [self.executable, "app-server", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

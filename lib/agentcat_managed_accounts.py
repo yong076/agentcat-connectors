@@ -18,6 +18,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
 
+from agentcat_managed_platform import restrict_private
+
 
 PENDING = frozenset({"pending_browser", "pending_device"})
 TERMINAL = frozenset({"failed", "canceled", "error", "needs_reconnect"})
@@ -154,10 +156,7 @@ class ManagedAccounts:
 
     def _write(self, rows: list[Dict[str, Any]]) -> None:
         self.home.mkdir(parents=True, exist_ok=True)
-        try:
-            self.home.chmod(0o700)
-        except OSError:
-            pass
+        restrict_private(self.home, directory=True)
         stored = []
         for row in rows:
             stored_row = {key: copy.deepcopy(row[key]) for key in PUBLIC_FIELDS if key in row}
@@ -167,15 +166,9 @@ class ManagedAccounts:
             stored.append(stored_row)
         tmp = self.registry.with_name(self.registry.name + ".tmp-" + uuid.uuid4().hex)
         tmp.write_text(json.dumps({"version": 1, "connections": stored}, ensure_ascii=False) + "\n", encoding="utf-8")
-        try:
-            tmp.chmod(0o600)
-        except OSError:
-            pass
+        restrict_private(tmp)
         tmp.replace(self.registry)
-        try:
-            self.registry.chmod(0o600)
-        except OSError:
-            pass
+        restrict_private(self.registry)
 
     def _adapter(self, provider: str) -> Any:
         adapter = self.adapters.get(provider)

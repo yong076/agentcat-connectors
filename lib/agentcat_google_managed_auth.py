@@ -29,6 +29,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from agentcat_managed_platform import is_runnable_cli, resolve_cli, restrict_private
+
 
 GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -88,10 +90,7 @@ class _AcpSession:
 
     def start(self) -> None:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            self.profile_dir.chmod(0o700)
-        except OSError:
-            pass
+        restrict_private(self.profile_dir, directory=True)
         self.process = subprocess.Popen(
             [self.executable, "--acp", "--skip-trust", "--approval-mode", "plan"],
             cwd=self.profile_dir,
@@ -179,24 +178,11 @@ def _profile_key(profile_dir: Path, operation_id: str) -> Tuple[str, str]:
 
 
 def _gemini_executable() -> Optional[str]:
-    explicit = os.environ.get("AGENTCAT_GEMINI_CLI")
-    if explicit and _is_executable_file(Path(explicit)):
-        return explicit
-    executable = shutil.which("gemini")
-    if executable:
-        return executable
-    for candidate in (
-        Path.home() / ".local" / "bin" / "gemini",
-        Path("/opt/homebrew/bin/gemini"),
-        Path("/usr/local/bin/gemini"),
-    ):
-        if _is_executable_file(candidate):
-            return str(candidate)
-    return None
+    return resolve_cli("gemini", "AGENTCAT_GEMINI_CLI", which=shutil.which)
 
 
 def _is_executable_file(path: Path) -> bool:
-    return path.is_file() and os.access(path, os.X_OK)
+    return is_runnable_cli(Path(path), explicit=True)
 
 
 def child_environment(profile_dir: Path) -> Dict[str, str]:
@@ -376,9 +362,11 @@ def _persist_refreshed_credentials(profile_dir: Path, credentials: Dict[str, Any
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary.write_text(json.dumps(credentials, indent=2) + "\n", encoding="utf-8")
-        temporary.chmod(0o600)
+        if not restrict_private(temporary):
+            raise OSError("private_mode_failed")
         temporary.replace(path)
-        path.chmod(0o600)
+        if not restrict_private(path):
+            raise OSError("private_mode_failed")
     except OSError as error:
         try:
             temporary.unlink()
@@ -524,7 +512,8 @@ def _checked_provider_account_id(identity: Mapping[str, Any]) -> str:
 def _copy_0600(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
-    destination.chmod(0o600)
+    if not restrict_private(destination):
+        raise OSError("private_mode_failed")
 
 
 def promote_verified_profile(source: Path, destination: Path, identity: Mapping[str, Any]) -> bool:
@@ -563,13 +552,13 @@ def promote_verified_profile(source: Path, destination: Path, identity: Mapping[
         destination_credentials.parent.mkdir(parents=True, exist_ok=True)
         os.replace(staged_credentials, destination_credentials)
         replaced = True
-        destination_credentials.chmod(0o600)
+        restrict_private(destination_credentials)
     except Exception as error:
         if replaced:
             try:
                 if had_destination:
                     os.replace(backup_credentials, destination_credentials)
-                    destination_credentials.chmod(0o600)
+                    restrict_private(destination_credentials)
                 else:
                     destination_credentials.unlink(missing_ok=True)
             except OSError:

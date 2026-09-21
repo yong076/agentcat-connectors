@@ -12,9 +12,18 @@ from unittest.mock import Mock, patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "lib"))
+sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 import agentcat_grok_managed as grok
 import agentcat_kimi_managed as kimi
+from private_fs import (
+    assert_owner_private,
+    patch_daemon_env,
+    system_only_path,
+    write_env_wrapper,
+    write_noop_cli,
+    write_path_interpreter,
+)
 
 
 class FakeProcess:
@@ -186,7 +195,7 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
             self.assertFalse(native.exists())
             backups = kimi._reauth_backups(profile)
             self.assertEqual(len(backups), 1)
-            self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+            assert_owner_private(self, backups[0])
             native.write_text('{"access_token":"new-secret","expires_at":2208988800}', encoding="utf-8")
             process.code = 0
             result = kimi.poll(profile, started["operationID"])
@@ -211,7 +220,7 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
             self.assertFalse(native.exists())
             self.assertEqual(kimi.cancel(profile, started["operationID"]), "canceled")
         self.assertEqual(native.read_bytes(), original)
-        self.assertEqual(native.stat().st_mode & 0o777, 0o600)
+        assert_owner_private(self, native)
         self.assertEqual(kimi._reauth_backups(profile), [])
 
     def test_kimi_reauth_spawn_failure_restores_existing_native_token(self):
@@ -507,11 +516,11 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         self.assertEqual(json.loads((destination / "credentials" / "kimi-code.json").read_text(encoding="utf-8"))["access_token"], "source-secret")
         binding = (destination / ".agentcat-kimi-binding.json").read_text(encoding="utf-8")
         self.assertIn("account-new", binding)
-        self.assertEqual((destination / "credentials" / "kimi-code.json").stat().st_mode & 0o777, 0o600)
+        assert_owner_private(self, destination / "credentials" / "kimi-code.json")
         backups = list(destination.glob(".agentcat-kimi-promotion-backup-*"))
         self.assertEqual(len(backups), 1)
         previous = backups[0] / "credentials" / "kimi-code.json"
-        self.assertEqual(previous.stat().st_mode & 0o777, 0o600)
+        assert_owner_private(self, previous)
         self.assertIn("destination-secret", previous.read_text(encoding="utf-8"))
 
     def test_kimi_promote_verified_profile_rejects_missing_id_without_provider_or_file_changes(self):
@@ -549,36 +558,27 @@ class ManagedDeviceAdapterTests(unittest.TestCase):
         directory = Path(self.tmp.name) / "bin"
         directory.mkdir()
         for module, variable, name in ((kimi, "AGENTCAT_KIMI_CLI", "kimi"), (grok, "AGENTCAT_GROK_CLI", "grok")):
-            executable = directory / name
-            executable.write_text("#!/bin/sh\n", encoding="utf-8")
-            executable.chmod(0o700)
+            executable = write_noop_cli(directory / name)
             with self.subTest(provider=name), patch.dict(os.environ, {"PATH": "/definitely-empty", variable: str(executable)}, clear=False):
                 self.assertEqual(module._executable(), str(executable))
 
     def test_capability_probe_supplies_path_for_env_interpreter_when_daemon_path_is_empty(self):
-        """An absolute CLI wrapper still needs PATH for ``/usr/bin/env sh``."""
-        wrapper = Path(self.tmp.name) / "kimi-env-wrapper"
-        wrapper.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
-        wrapper.chmod(0o700)
+        """An absolute CLI wrapper still needs PATH for its interpreter."""
+        wrapper = write_noop_cli(Path(self.tmp.name) / "kimi-env-wrapper")
         kimi._PROBE = None
-        with patch.dict(os.environ, {"AGENTCAT_KIMI_CLI": str(wrapper), "PATH": ""}, clear=True):
+        with patch_daemon_env({"AGENTCAT_KIMI_CLI": str(wrapper), "PATH": ""}):
             capability = kimi.adapter_capability()
         self.assertTrue(capability["available"])
         self.assertIsNone(capability["reason"])
 
     def test_capability_probe_augments_system_only_path_for_env_interpreter(self):
-        """LaunchAgents can have a nonempty PATH that lacks the CLI runtime."""
+        """A daemon PATH can be nonempty yet still lack the CLI runtime."""
         directory = Path(self.tmp.name) / "trusted-bin"
-        directory.mkdir()
-        interpreter = directory / "agentcat-test-runtime"
-        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        interpreter.chmod(0o700)
+        interpreter_name = write_path_interpreter(directory, "agentcat-test-runtime")
         for module, variable, name in ((kimi, "AGENTCAT_KIMI_CLI", "kimi"), (grok, "AGENTCAT_GROK_CLI", "grok")):
-            wrapper = directory / name
-            wrapper.write_text("#!/usr/bin/env agentcat-test-runtime\n", encoding="utf-8")
-            wrapper.chmod(0o700)
+            wrapper = write_env_wrapper(directory / name, interpreter_name)
             module._PROBE = None
-            with self.subTest(provider=name), patch.object(module, "_FALLBACK_PATH", str(directory)), patch.dict(os.environ, {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", variable: str(wrapper)}, clear=True):
+            with self.subTest(provider=name), patch.object(module, "_FALLBACK_PATH", str(directory)), patch_daemon_env({"PATH": system_only_path(), variable: str(wrapper)}):
                 capability = module.adapter_capability()
             self.assertTrue(capability["available"])
             self.assertIsNone(capability["reason"])

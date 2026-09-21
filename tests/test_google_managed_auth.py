@@ -13,8 +13,10 @@ from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "lib"))
+sys.path.insert(0, str(REPO_ROOT / "tests"))
 import agentcat_google_managed_auth as managed
 from agentcat_managed_accounts import ManagedAccounts
+from private_fs import assert_owner_private, write_noop_cli
 
 
 def _unavailable_usage(reason):
@@ -163,11 +165,13 @@ class GoogleManagedAuthTests(unittest.TestCase):
             self.assertEqual(state["usage"]["freshness"], "live")
 
     def test_resolver_uses_trusted_home_fallback_when_launchagent_path_is_minimal(self):
-        executable = Path(self.tmp.name) / ".local" / "bin" / "gemini"
-        executable.parent.mkdir(parents=True)
-        executable.write_text("#!/bin/sh\n", encoding="utf-8")
-        executable.chmod(0o700)
-        with patch.dict(os.environ, {"AGENTCAT_GEMINI_CLI": "", "HOME": self.tmp.name, "PATH": ""}):
+        executable = write_noop_cli(Path(self.tmp.name) / ".local" / "bin" / "gemini")
+        with patch.dict(os.environ, {
+            "AGENTCAT_GEMINI_CLI": "",
+            "HOME": self.tmp.name,
+            "USERPROFILE": self.tmp.name,
+            "PATH": "",
+        }):
             self.assertEqual(managed._gemini_executable(), str(executable))
 
     def test_oauth_metadata_resolves_from_homebrew_realpath_bundle(self):
@@ -208,7 +212,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
         self.assertEqual(saved["access_token"], "refreshed-two")
         self.assertEqual(saved["refresh_token"], "durable-refresh")
         self.assertIsInstance(saved["expiry_date"], int)
-        self.assertEqual(credentials_path.stat().st_mode & 0o777, 0o600)
+        assert_owner_private(self, credentials_path)
 
     def test_acp_setup_error_keeps_a_profile_connected_only_after_verified_refresh(self):
         with patch.object(managed.shutil, "which", return_value="/fake/gemini"), \
@@ -492,7 +496,7 @@ class GoogleManagedAuthTests(unittest.TestCase):
 
         self.assertTrue(source_credentials.exists())
         self.assertEqual(json.loads(destination_credentials.read_text(encoding="utf-8"))["access_token"], "new-managed-token")
-        self.assertEqual(destination_credentials.stat().st_mode & 0o777, 0o600)
+        assert_owner_private(self, destination_credentials)
         self.assertFalse(list(destination.parent.glob(".canonical-profile.gemini-promote-*")))
         self.assertFalse(list(destination_credentials.parent.glob("oauth_creds.json.backup-*")))
 

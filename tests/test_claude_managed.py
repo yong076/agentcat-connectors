@@ -8,8 +8,10 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(ROOT / "tests"))
 import agentcat_claude_managed as managed
 from agentcat_managed_accounts import ManagedAccounts
+from private_fs import assert_owner_private
 
 
 class _Process:
@@ -78,7 +80,7 @@ class ClaudeManagedTests(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
         self.assertNotIn("ANTHROPIC_BASE_URL", env)
-        self.assertEqual(self.profile.stat().st_mode & 0o777, 0o700)
+        assert_owner_private(self, self.profile, directory=True)
         self.assertEqual(managed.cancel(self.profile, started["operationID"]), "canceled")
         self.assertTrue(process.terminated)
 

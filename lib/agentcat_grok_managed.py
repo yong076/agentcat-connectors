@@ -7,7 +7,6 @@ import base64
 import hashlib
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -16,6 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+from agentcat_managed_platform import augment_search_path, default_cli_fallback_path, resolve_cli, restrict_private
 
 
 _LOCK = threading.RLock()
@@ -26,45 +27,19 @@ _OUTPUT_LIMIT = 8192
 _AUTH_SUFFIXES = ("x.ai", "grok.com")
 _CODE_RE = re.compile(r"\b(?:code|user[ _-]?code)\s*[:=]\s*([A-Z0-9-]{4,64})\b", re.I)
 _BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
-_FALLBACK_PATH = ":".join((
-    str(Path.home() / ".local/bin"),
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-))
+_FALLBACK_PATH = default_cli_fallback_path()
 
 
 def _executable() -> Optional[str]:
-    configured = os.environ.get("AGENTCAT_GROK_CLI")
-    candidates = [configured] if configured else []
-    discovered = shutil.which("grok")
-    if discovered:
-        candidates.append(discovered)
-    home = os.environ.get("HOME")
-    if home:
-        candidates.append(str(Path(home) / ".local/bin/grok"))
-    candidates.extend(["/opt/homebrew/bin/grok", "/usr/local/bin/grok"])
-    for candidate in candidates:
-        if isinstance(candidate, str) and Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    return None
+    return resolve_cli("grok", "AGENTCAT_GROK_CLI")
 
 
 def _environment(profile_dir: Path) -> Dict[str, str]:
     env = dict(os.environ)
     # Native CLI wrappers may use ``/usr/bin/env``.  Daemon launches with an
     # empty or system-only PATH must still start an already trusted CLI.
-    path = env.get("PATH")
-    if not isinstance(path, str) or not path.strip():
-        env["PATH"] = _FALLBACK_PATH
-    else:
-        existing = [entry for entry in path.split(":") if entry]
-        missing = [entry for entry in _FALLBACK_PATH.split(":") if entry not in existing]
-        if missing:
-            env["PATH"] = ":".join([*existing, *missing])
+    # Windows uses ``os.pathsep`` (``;``).
+    env["PATH"] = augment_search_path(env.get("PATH"), _FALLBACK_PATH)
     for name in ("GROK_HOME", "XAI_HOME"):
         env.pop(name, None)
     env["GROK_HOME"] = str(profile_dir)
@@ -275,10 +250,7 @@ def start(profile_dir: Path, mode: str) -> Dict[str, Any]:
         return {"status": "failed", "error": "grok_browser_not_supported"}
     profile_dir = Path(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        profile_dir.chmod(0o700)
-    except OSError:
-        pass
+    restrict_private(profile_dir, directory=True)
     operation_id = uuid.uuid4().hex
     before = {item["fingerprint"] for item in _credential_candidates(profile_dir)}
     try:

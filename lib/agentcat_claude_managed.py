@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -16,6 +15,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from agentcat_managed_platform import augment_search_path, default_cli_fallback_path, resolve_cli, restrict_private
 
 _LOCK = threading.RLock()
 _OPERATIONS: Dict[str, Dict[str, Any]] = {}
@@ -36,27 +37,14 @@ _AUTH_ENV = (
     "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR",
 )
-_FALLBACK_PATH = ":".join((str(Path.home() / ".local/bin"), "/opt/homebrew/bin",
-                           "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"))
+_FALLBACK_PATH = default_cli_fallback_path()
 
 def _executable() -> Optional[str]:
-    configured = os.environ.get("AGENTCAT_CLAUDE_CLI")
-    candidates = [configured] if configured else []
-    found = shutil.which("claude")
-    if found:
-        candidates.append(found)
-    candidates.extend(("/opt/homebrew/bin/claude", "/usr/local/bin/claude"))
-    for candidate in candidates:
-        if isinstance(candidate, str) and Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    return None
+    return resolve_cli("claude", "AGENTCAT_CLAUDE_CLI")
 
 def _environment(profile_dir: Path) -> Dict[str, str]:
     env = dict(os.environ)
-    old_path = env.get("PATH")
-    current = [part for part in old_path.split(":") if part] if isinstance(old_path, str) else []
-    fallback = [part for part in _FALLBACK_PATH.split(":") if part not in current]
-    env["PATH"] = ":".join([*current, *fallback]) if current else _FALLBACK_PATH
+    env["PATH"] = augment_search_path(env.get("PATH"), _FALLBACK_PATH)
     for key in _AUTH_ENV:
         env.pop(key, None)
     # Official Claude Code storage resolves both values into a scoped Keychain
@@ -68,10 +56,7 @@ def _environment(profile_dir: Path) -> Dict[str, str]:
 def _prepare_profile(profile_dir: Path) -> Path:
     profile = Path(profile_dir)
     profile.mkdir(parents=True, exist_ok=True)
-    try:
-        profile.chmod(0o700)
-    except OSError:
-        pass
+    restrict_private(profile, directory=True)
     return profile
 
 def _keychain_service(profile_dir: Path) -> str:
@@ -153,9 +138,11 @@ def _persist_profile_oauth(profile_dir: Path, outer: Dict[str, Any], oauth: Dict
         temporary = path.with_name(path.name + ".agentcat-refresh-" + uuid.uuid4().hex)
         try:
             temporary.write_text(encoded, encoding="utf-8")
-            temporary.chmod(0o600)
+            if not restrict_private(temporary):
+                raise OSError("private_mode_failed")
             temporary.replace(path)
-            path.chmod(0o600)
+            if not restrict_private(path):
+                raise OSError("private_mode_failed")
         finally:
             try:
                 temporary.unlink()

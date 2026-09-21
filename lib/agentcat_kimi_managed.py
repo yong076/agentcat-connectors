@@ -13,7 +13,6 @@ import hashlib
 import math
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -23,6 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+from agentcat_managed_platform import augment_search_path, default_cli_fallback_path, resolve_cli, restrict_private
 
 
 _LOCK = threading.RLock()
@@ -40,46 +41,19 @@ _BINDING_NAME = ".agentcat-kimi-binding.json"
 _NATIVE_CREDENTIAL_NAME = "kimi-code.json"
 _REAUTH_BACKUP_PREFIX = ".agentcat-kimi-reauth-"
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_FALLBACK_PATH = ":".join((
-    str(Path.home() / ".local/bin"),
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-))
+_FALLBACK_PATH = default_cli_fallback_path()
 
 
 def _executable() -> Optional[str]:
-    configured = os.environ.get("AGENTCAT_KIMI_CLI")
-    candidates = [configured] if configured else []
-    discovered = shutil.which("kimi")
-    if discovered:
-        candidates.append(discovered)
-    home = os.environ.get("HOME")
-    if home:
-        candidates.append(str(Path(home) / ".local/bin/kimi"))
-    candidates.extend(["/opt/homebrew/bin/kimi", "/usr/local/bin/kimi"])
-    for candidate in candidates:
-        if isinstance(candidate, str) and Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    return None
+    return resolve_cli("kimi", "AGENTCAT_KIMI_CLI")
 
 
 def _environment(profile_dir: Path) -> Dict[str, str]:
     env = dict(os.environ)
     # The CLI is an ``/usr/bin/env node`` wrapper.  A daemon can have an empty
     # or system-only PATH, even after this adapter resolved the wrapper by its
-    # trusted absolute location.
-    path = env.get("PATH")
-    if not isinstance(path, str) or not path.strip():
-        env["PATH"] = _FALLBACK_PATH
-    else:
-        existing = [entry for entry in path.split(":") if entry]
-        missing = [entry for entry in _FALLBACK_PATH.split(":") if entry not in existing]
-        if missing:
-            env["PATH"] = ":".join([*existing, *missing])
+    # trusted absolute location.  Windows uses ``os.pathsep`` (``;``).
+    env["PATH"] = augment_search_path(env.get("PATH"), _FALLBACK_PATH)
     for name in ("KIMI_CODE_HOME", "KIMI_HOME", "KIMI_CODE_DIR", "KIMI_DATA_DIR"):
         env.pop(name, None)
     env["KIMI_CODE_HOME"] = str(profile_dir)
@@ -201,9 +175,11 @@ def _bind_credential(profile_dir: Path, identity: Dict[str, Any], credential_nam
     temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
     try:
         temporary.write_text(json.dumps(binding) + "\n", encoding="utf-8")
-        temporary.chmod(0o600)
+        if not restrict_private(temporary):
+            raise OSError("private_mode_failed")
         temporary.replace(path)
-        path.chmod(0o600)
+        if not restrict_private(path):
+            raise OSError("private_mode_failed")
     except OSError:
         try:
             temporary.unlink()
@@ -292,10 +268,10 @@ def _private_replace(path: Path, data: bytes) -> bool:
     temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
     try:
         temporary.write_bytes(data)
-        temporary.chmod(0o600)
+        if not restrict_private(temporary):
+            raise OSError("private_mode_failed")
         temporary.replace(path)
-        path.chmod(0o600)
-        return True
+        return restrict_private(path)
     except OSError:
         try:
             temporary.unlink()
@@ -336,7 +312,7 @@ def _recover_interrupted_reauth(profile_dir: Path) -> bool:
         return not backups
     try:
         backups[0].replace(source)
-        source.chmod(0o600)
+        restrict_private(source)
         return True
     except OSError:
         return False
@@ -357,7 +333,7 @@ def _stage_native_reauth(profile_dir: Path, operation_id: str) -> Optional[Tuple
     backup = source.with_name(_REAUTH_BACKUP_PREFIX + operation_id + "-" + _NATIVE_CREDENTIAL_NAME + ".bak")
     try:
         source.replace(backup)
-        backup.chmod(0o600)
+        restrict_private(backup)
         return source, backup
     except OSError:
         return None
@@ -374,9 +350,9 @@ def _restore_staged_reauth(staged: Any) -> None:
         if source.exists():
             successor = source.with_name(_REAUTH_BACKUP_PREFIX + uuid.uuid4().hex + "-unverified-" + _NATIVE_CREDENTIAL_NAME + ".bak")
             source.replace(successor)
-            successor.chmod(0o600)
+            restrict_private(successor)
         backup.replace(source)
-        source.chmod(0o600)
+        restrict_private(source)
     except OSError:
         # Leave both private files in place for a later safe recovery; never
         # overwrite an unknown current credential.
@@ -396,10 +372,9 @@ def _commit_staged_reauth(staged: Any) -> None:
 def _private_directory(path: Path) -> bool:
     try:
         path.mkdir(parents=True, exist_ok=True)
-        path.chmod(0o700)
-        return True
     except OSError:
         return False
+    return restrict_private(path, directory=True)
 
 
 def _verified_provider_account(profile_dir: Path, credential_name: Optional[str] = None) -> Optional[str]:
@@ -477,17 +452,17 @@ def promote_verified_profile(source: Path, destination: Path, identity: Mapping[
             return False
         if had_credential:
             destination_credential.replace(backup_credential)
-            backup_credential.chmod(0o600)
+            restrict_private(backup_credential)
             backed_up_credential = True
         if had_binding:
             destination_binding.replace(backup_binding)
-            backup_binding.chmod(0o600)
+            restrict_private(backup_binding)
             backed_up_binding = True
         candidate_credential.replace(destination_credential)
-        destination_credential.chmod(0o600)
+        restrict_private(destination_credential)
         moved_credential = True
         candidate_binding.replace(destination_binding)
-        destination_binding.chmod(0o600)
+        restrict_private(destination_binding)
         moved_binding = True
         if _verified_provider_account(destination, selected["name"]) != expected:
             raise ValueError("destination_identity_mismatch")
@@ -495,12 +470,12 @@ def promote_verified_profile(source: Path, destination: Path, identity: Mapping[
         try:
             if backed_up_credential and backup_credential.exists():
                 backup_credential.replace(destination_credential)
-                destination_credential.chmod(0o600)
+                restrict_private(destination_credential)
             elif moved_credential and not had_credential and destination_credential.exists():
                 destination_credential.unlink()
             if backed_up_binding and backup_binding.exists():
                 backup_binding.replace(destination_binding)
-                destination_binding.chmod(0o600)
+                restrict_private(destination_binding)
             elif moved_binding and not had_binding and destination_binding.exists():
                 destination_binding.unlink()
         except OSError:
@@ -675,10 +650,7 @@ def start(profile_dir: Path, mode: str) -> Dict[str, Any]:
         return {"status": "failed", "error": capability["reason"]}
     profile_dir = Path(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        profile_dir.chmod(0o700)
-    except OSError:
-        pass
+    restrict_private(profile_dir, directory=True)
     operation_id = uuid.uuid4().hex
     # Snapshot before spawning: a zero exit alone never proves this login changed auth.
     before = {item["fingerprint"] for item in _credential_candidates(profile_dir)}
