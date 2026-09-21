@@ -374,7 +374,7 @@ class OrcaAccountsTests(unittest.TestCase):
     def test_snapshot_keeps_codex_and_does_not_mutate_legacy_limits(self):
         legacy = {"claude": {"shortUsedPercent": 80}, "codex": {"status": "auto"}}
         before = copy.deepcopy(legacy)
-        with patch.object(agentcat, "codex_provider_instances", return_value=[{"id": "codex:fixture"}]) as codex, \
+        with patch.object(agentcat, "codex_provider_instances_with_completeness", return_value=([{"id": "codex:fixture"}], True)) as codex, \
              patch.object(agentcat, "orca_claude_provider_instances", return_value=self.rows()):
             rows = agentcat.provider_instances_snapshot(legacy)
         codex.assert_called_once_with(legacy["codex"])
