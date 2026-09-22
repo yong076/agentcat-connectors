@@ -4391,6 +4391,9 @@ def codex_provider_instances_with_completeness(
                 "lastSeenAt": None,
                 "_auth": auth,
             }
+            managed_identity = _codex_managed_provider_identity(auth)
+            if managed_identity:
+                entry["_managedDedupKey"] = _codex_dedup_key(managed_identity)
             grouped[instance_id] = entry
 
         entry["profileCount"] += 1
@@ -4404,17 +4407,27 @@ def codex_provider_instances_with_completeness(
             if not isinstance(previous, (int, float)) or newest > previous:
                 entry["_lastSeenTimestamp"] = float(newest)
 
+    managed_by_dedup: Dict[str, Dict[str, Any]] = {}
+    for row in _codex_connections():
+        dedup_key = row.get("dedupKey")
+        if row.get("status") == "connected" and isinstance(dedup_key, str) and isinstance(row.get("usage"), dict):
+            managed_by_dedup[dedup_key] = row
+
     instances: List[Dict[str, Any]] = []
+    matched_managed: Set[str] = set()
     for entry in grouped.values():
         auth = entry.pop("_auth")
+        managed_dedup_key = entry.pop("_managedDedupKey", None)
         last_seen = entry.pop("_lastSeenTimestamp", None)
         if isinstance(last_seen, (int, float)):
             entry["lastSeenAt"] = iso_from_timestamp(float(last_seen))
         else:
             entry.pop("lastSeenAt", None)
 
-        if entry["active"] and isinstance(current_limits, dict):
-            limits = copy.deepcopy(current_limits)
+        managed = managed_by_dedup.get(managed_dedup_key) if isinstance(managed_dedup_key, str) else None
+        if managed is not None:
+            limits = codex_managed_connection_limits(managed)
+            matched_managed.add(managed_dedup_key)
         else:
             cache_key = f"codex-instance:{entry['id'].rsplit(':', 1)[-1]}"
             try:
@@ -4427,6 +4440,25 @@ def codex_provider_instances_with_completeness(
         entry["status"] = "connected" if entry["tracked"] else "discovered"
         instances.append(entry)
 
+    for dedup_key, managed in managed_by_dedup.items():
+        if dedup_key in matched_managed:
+            continue
+        instance_id = provider_instance_id("codex", f"managed:{dedup_key}")
+        suffix = instance_id.rsplit(":", 1)[-1][-4:].upper()
+        limits = codex_managed_connection_limits(managed)
+        instances.append({
+            "id": instance_id,
+            "providerID": "codex",
+            "label": f"Codex · {suffix}",
+            "identityConfidence": "verified_managed_account",
+            "profileCount": 1,
+            "tracked": True,
+            "active": False,
+            "limits": limits,
+            "planType": limits.get("planType"),
+            "status": "connected",
+        })
+
     return sorted(
         instances,
         key=lambda item: (
@@ -4435,6 +4467,45 @@ def codex_provider_instances_with_completeness(
             str(item.get("label") or ""),
         ),
     ), complete
+
+
+def codex_managed_connection_limits(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Project one verified app-server usage row into provider-instance limits."""
+    usage = row.get("usage")
+    if not isinstance(usage, dict):
+        return empty_limits(status="error", reason="managed_usage_unavailable")
+    quotas: List[Dict[str, Any]] = []
+    for window in usage.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        duration = int_count(window.get("windowDurationMins"))
+        quotas.append({
+            "id": window.get("id"),
+            "label": window.get("name") or ("7d" if duration == 10080 else "quota"),
+            "window": "7d" if duration == 10080 else None,
+            "unit": "percent",
+            "used": None,
+            "remaining": None,
+            "limit": None,
+            "usedPercent": float_percent(window.get("usedPercent")),
+            "remainingPercent": float_percent(window.get("remainingPercent")),
+            "resetAt": int_count(window.get("resetsAt")),
+            "model": window.get("model"),
+            "primary": window.get("primary") is True,
+        })
+    limits = empty_limits(status="auto")
+    limits["source"] = usage.get("source") or "codex-app-server"
+    limits["quotas"] = quotas
+    limits["updatedAt"] = row.get("lastSuccessfulSyncAt") or row.get("lastSyncAt")
+    limits["stale"] = usage.get("freshness") != "live"
+    reached_type = usage.get("rateLimitReachedType")
+    limits["rateLimitReachedType"] = reached_type
+    limits["rateLimitReached"] = bool(reached_type)
+    primary_weekly = next((q for q in quotas if q.get("primary") and q.get("window") == "7d"), None)
+    if primary_weekly:
+        limits["weeklyUsedPercent"] = primary_weekly.get("usedPercent")
+        limits["weeklyResetAt"] = primary_weekly.get("resetAt")
+    return limits
 
 
 # Only normalized, privacy-safe rows are cached, never Orca's raw account list.
