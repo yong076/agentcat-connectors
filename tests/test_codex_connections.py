@@ -173,6 +173,13 @@ class CodexConnectionsTests(unittest.TestCase):
         with patch.object(agentcat, "_codex_refresh_row", return_value=True) as implicit:
             agentcat.codex_connections_snapshot()
         implicit.assert_called_once()
+        cached_before = agentcat.codex_connections_snapshot(allow_implicit_refresh=False)
+        with patch.object(agentcat, "_codex_refresh_row", side_effect=AssertionError("cache-only probe")):
+            cached_after = agentcat.codex_connections_snapshot(allow_implicit_refresh=False)
+        self.assertEqual(cached_after, cached_before)
+        self.assertEqual(cached_after[0]["id"], row["id"])
+        self.assertEqual(cached_after[0]["lastSuccessfulSyncAt"], row["lastSuccessfulSyncAt"])
+        self.assertEqual(cached_after[0]["usage"], row["usage"])
         with patch.object(agentcat, "_codex_refresh_row", return_value=True) as explicit:
             agentcat.codex_connections_snapshot(refresh=True)
         explicit.assert_called_once()
@@ -332,6 +339,11 @@ class CodexConnectionsTests(unittest.TestCase):
                 with self.assertRaises(HTTPError) as denied:
                     urlopen(Request(base + "/v1/connections"), timeout=3)
                 self.assertEqual(denied.exception.code, 401)
+                cached_request = Request(base + "/v1/connections?refresh=false", headers={"Authorization": f"Bearer {token}"})
+                with patch.object(agentcat, "codex_connections_snapshot", wraps=agentcat.codex_connections_snapshot) as cached_snapshot:
+                    with urlopen(cached_request, timeout=3) as response:
+                        self.assertIn("connections", json.loads(response.read().decode()))
+                cached_snapshot.assert_called_once_with(allow_implicit_refresh=False)
                 request = Request(base + "/v1/connections/codex/oauth/start", data=b'{"mode":"browser"}', method="POST", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
                 with urlopen(request, timeout=3) as response:
                     started = json.loads(response.read().decode())
