@@ -136,6 +136,20 @@ class AntigravityParsingTests(unittest.TestCase):
         self.assertEqual(cli_probe.parse_antigravity_quota_summary({"groups": "nope"}), [])
 
 
+class KimiParsingTests(unittest.TestCase):
+    def test_usage_is_weekly_and_limits_are_rate_windows(self):
+        payload = {
+            "usage": {"limit": "100", "used": "21", "remaining": "79", "resetTime": "2026-09-28T07:40:39.489321Z"},
+            "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                        "detail": {"limit": "100", "remaining": "100", "resetTime": "2026-09-24T15:40:39Z"}}],
+        }
+        windows = cli_probe.parse_kimi_usage(payload)
+        self.assertEqual([(w["label"], w["windowDurationMins"], w["usedPercent"]) for w in windows],
+                         [("7d", 10080, 21.0), ("5h", 300, 0.0)])
+        self.assertIsNotNone(windows[0]["resetsAt"])
+        self.assertEqual(cli_probe.parse_kimi_usage({"usage": {"limit": "0"}}), [])
+
+
 class IdentityHintTests(unittest.TestCase):
     def test_org_domain_beats_local_part_for_work_accounts(self):
         self.assertEqual(agentcat.cli_probe_identity_hint("hello@trappist.app"), "tr**")

@@ -245,6 +245,16 @@ def probe_token_home(provider: str, home: Path, module: Any, token_key: str) -> 
     token = live[0][token_key]
     claims = _jwt_claims(token)
     email = _email(claims.get("email")) or _email((live[0].get("raw") or {}).get("email"))
+    if provider == "kimi":
+        try:
+            kimi = fetch_kimi_usage(module, token)
+        except Exception:
+            return _result(provider, home, status="error", reason="usage_unavailable", email=email)
+        return _result(
+            provider, home, email=kimi["email"] or email, windows=kimi["windows"],
+            status="ok" if kimi["windows"] else "error",
+            reason=None if kimi["windows"] else "usage_unavailable",
+        )
     try:
         usage = module._live_usage(token)
     except Exception:
@@ -313,3 +323,74 @@ def parse_antigravity_quota_summary(payload: Any) -> List[Dict[str, Any]]:
                 "primary": weekly,
             })
     return windows
+
+
+def _iso_epoch(value: Any) -> Optional[int]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return int(dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+
+def _number(value: Any) -> Optional[float]:
+    try:
+        return float(value) if value is not None and not isinstance(value, bool) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_kimi_usage(payload: Any) -> List[Dict[str, Any]]:
+    """Kimi Code /usages, mapped as CodexBar does: `usage` is the weekly pool,
+    each `limits[]` entry is a rate window of `window.duration` time units."""
+    windows: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return windows
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+    def window(window_id: str, label: str, mins: Optional[int], detail: Any, primary: bool) -> None:
+        if not isinstance(detail, dict):
+            return
+        limit = _number(detail.get("limit"))
+        used = _number(detail.get("used"))
+        remaining = _number(detail.get("remaining"))
+        if used is None and limit is not None and remaining is not None:
+            used = max(limit - remaining, 0.0)
+        if used is None or not limit:
+            return
+        percent = _clamp(used * 100.0 / limit)
+        windows.append({
+            "id": window_id,
+            "label": label,
+            "windowDurationMins": mins,
+            "usedPercent": percent,
+            "remainingPercent": 100.0 - percent,
+            "resetsAt": _iso_epoch(detail.get("resetTime") or detail.get("reset_time")),
+            "model": None,
+            "primary": primary,
+        })
+
+    window("kimi:7d", "7d", 10080, data.get("usage"), True)
+    for index, item in enumerate(data.get("limits") or []):
+        if not isinstance(item, dict):
+            continue
+        spec = item.get("window") if isinstance(item.get("window"), dict) else {}
+        duration = _number(spec.get("duration"))
+        unit = str(spec.get("timeUnit") or "").upper()
+        factor = 1 if "MINUTE" in unit else 60 if "HOUR" in unit else 1440 if "DAY" in unit else None
+        mins = int(duration * factor) if duration is not None and factor else None
+        label = "5h" if mins == 300 else f"{mins // 60}h" if mins and mins % 60 == 0 else "quota"
+        window(f"kimi:limit:{index}", label, mins, item.get("detail"), False)
+    return windows
+
+
+def fetch_kimi_usage(module: Any, token: str) -> Dict[str, Any]:
+    from urllib.request import Request, urlopen
+
+    request = Request(module._USAGE_URL, headers={"Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": "kimi-code/1.0"})
+    with urlopen(request, timeout=12) as response:
+        payload = json.loads(response.read(1_000_000).decode("utf-8"))
+    identity, _ = module._verified_email_identity(token)
+    email = _email((identity.get("identity") or {}).get("email"))
+    return {"windows": parse_kimi_usage(payload), "email": email}
