@@ -13696,6 +13696,18 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
             limits["reason"] = "cli_probe_stale"
         if row.get("rateLimitReached"):
             limits["rateLimitReached"] = True
+        # Clients decide whether a row has a live meter from these summary
+        # fields, as every other limits source fills them.
+        windows = [w for w in row.get("windows") or [] if isinstance(w, dict)]
+        weekly = next((w for w in windows if w.get("windowDurationMins") == 10080 and not w.get("model")), None)
+        short = next((w for w in windows if w.get("windowDurationMins") == 300), None)
+        if weekly:
+            limits["weeklyUsedPercent"] = weekly.get("usedPercent")
+            limits["weeklyResetAt"] = weekly.get("resetsAt")
+        if short:
+            limits["shortUsedPercent"] = short.get("usedPercent")
+            limits["shortWindowMinutes"] = 300
+            limits["shortResetAt"] = short.get("resetsAt")
         seed = row.get("accountID") or email or row.get("homeKey") or ""
         hint = cli_probe_identity_hint(email) if email else str(row.get("homeKey") or "")[-4:].upper()
         instance = {

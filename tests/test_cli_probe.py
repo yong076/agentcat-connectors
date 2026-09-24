@@ -161,6 +161,9 @@ class SnapshotReplacementTests(unittest.TestCase):
         self.assertEqual(trappist["limits"]["quotas"][0]["remainingPercent"], 100.0)
         self.assertFalse(trappist["limits"]["stale"])
         self.assertEqual(trappist["account"]["email"], "hello@trappist.app")
+        # The app draws a live meter only when the summary fields are present.
+        self.assertEqual(trappist["limits"]["weeklyUsedPercent"], 0.0)
+        self.assertIsNone(trappist["limits"]["shortUsedPercent"])
 
     def test_old_or_failed_rows_are_stale_and_do_not_replace(self):
         old = int(time.time()) - 3600
