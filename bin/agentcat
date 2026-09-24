@@ -18310,6 +18310,21 @@ def _same_path(left: Path, right: Path) -> bool:
         return str(left) == str(right)
 
 
+def adopt_provider_home(provider: str, home: Path) -> bool:
+    """Start reading usage from ``home``; True when the adopted list changed."""
+    # An adopted home must not stay on the exclusion list, or the stronger
+    # exclusion would silently cancel the adoption.
+    _update_home_settings(provider, "excluded", home, remove=True)
+    return _update_home_settings(provider, "adopted", home)
+
+
+def forget_provider_home(provider: str, home: Path) -> bool:
+    """Drop ``home`` from both the adopted and excluded lists."""
+    removed_adopted = _update_home_settings(provider, "adopted", home, remove=True)
+    removed_excluded = _update_home_settings(provider, "excluded", home, remove=True)
+    return removed_adopted or removed_excluded
+
+
 def command_homes(args: argparse.Namespace) -> int:
     """List discovered provider homes, and adopt or exclude one.
 
@@ -18347,19 +18362,14 @@ def command_homes(args: argparse.Namespace) -> int:
                 )
                 return 2
         if adopt:
-            # An adopted home must not stay on the exclusion list, or the
-            # stronger exclusion would silently cancel the adoption.
-            _update_home_settings(provider, "excluded", home, remove=True)
-            changed = _update_home_settings(provider, "adopted", home)
+            changed = adopt_provider_home(provider, home)
             print(f"{'adopted' if changed else 'already adopted'}: {home}")
         elif exclude:
             _update_home_settings(provider, "adopted", home, remove=True)
             changed = _update_home_settings(provider, "excluded", home)
             print(f"{'excluded' if changed else 'already excluded'}: {home}")
         else:
-            removed_adopted = _update_home_settings(provider, "adopted", home, remove=True)
-            removed_excluded = _update_home_settings(provider, "excluded", home, remove=True)
-            if removed_adopted or removed_excluded:
+            if forget_provider_home(provider, home):
                 print(f"forgot: {home}")
             else:
                 print(f"not adopted or excluded: {home}")
@@ -18412,6 +18422,267 @@ def command_homes(args: argparse.Namespace) -> int:
         unread = [c for c in entry["discovered"] if not c["tracked"] and not c["excluded"] and c["files"]]
         if unread:
             print(f"  → adopt with: agentcat homes --provider {name} --adopt {unread[0]['path']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Per-account launcher commands (`agentcat profile ...`).
+#
+# Multi-account without switching: each account gets its own CLI home and a
+# tiny launcher (`codex-work`) that runs the real CLI with that home. The user
+# logs in through the CLI itself; Agent Cat never creates, copies or refreshes
+# a credential (rule R1) and only reads each adopted home.
+# ---------------------------------------------------------------------------
+
+PROFILE_PROVIDERS: Dict[str, Dict[str, str]] = {
+    "codex": {
+        "envVar": "CODEX_HOME",
+        "cli": "codex",
+        "login": "run `{command} login`",
+        "credential": "auth.json",
+    },
+    "claude": {
+        "envVar": "CLAUDE_CONFIG_DIR",
+        "cli": "claude",
+        "login": "run `{command} auth login` (or start `{command}` and type /login)",
+        "credential": ".credentials.json",
+    },
+    # KIMI_CODE_HOME verified against @moonshot-ai/kimi-code (env > ~/.kimi-code).
+    "kimi": {
+        "envVar": "KIMI_CODE_HOME",
+        "cli": "kimi",
+        "login": "start `{command}` and type /login",
+        "credential": "credentials/kimi-code.json",
+    },
+}
+PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+PROFILE_LAUNCHER_MARKER = "# agentcat-profile-launcher"
+# Injectable for tests; must only ever check existence (never `-w`).
+PROFILE_SECURITY_RUNNER: Optional[Any] = None
+
+
+def profile_homes_root() -> Path:
+    return AGENTCAT_HOME / "homes"
+
+
+def profile_bin_dir() -> Path:
+    return HOME / ".local" / "bin"
+
+
+def _profile_marker(provider: str, name: str) -> str:
+    return f"{PROFILE_LAUNCHER_MARKER} provider={provider} name={name}"
+
+
+def _profile_launcher_owner(path: Path) -> Optional[Tuple[str, str]]:
+    """(provider, name) when ``path`` is a launcher Agent Cat wrote, else None."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            head = [fh.readline() for _ in range(3)]
+    except OSError:
+        return None
+    for line in head:
+        if line.startswith(PROFILE_LAUNCHER_MARKER + " "):
+            fields = dict(
+                item.split("=", 1) for item in line.strip().split()[2:] if "=" in item
+            )
+            if fields.get("provider") and fields.get("name"):
+                return fields["provider"], fields["name"]
+    return None
+
+
+def profile_launcher_script(provider: str, name: str, home: Path, cli: str) -> str:
+    env_var = PROFILE_PROVIDERS[provider]["envVar"]
+    return (
+        "#!/bin/sh\n"
+        f"{_profile_marker(provider, name)}\n"
+        f"# Created by `agentcat profile add`; remove with `agentcat profile remove {provider} {name}`.\n"
+        f"exec env {env_var}={shlex.quote(str(home))} {shlex.quote(cli)} \"$@\"\n"
+    )
+
+
+def _profile_registry(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    resolved = agentcat_settings() if settings is None else settings
+    raw = resolved.get("profiles")
+    if not isinstance(raw, dict):
+        return {}
+    return {key: value for key, value in raw.items() if isinstance(value, dict)}
+
+
+def _write_profile_entry(key: str, entry: Optional[Dict[str, Any]]) -> None:
+    settings = agentcat_settings()
+    profiles = settings.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+    if entry is None:
+        profiles.pop(key, None)
+    else:
+        profiles[key] = entry
+    settings["profiles"] = profiles
+    write_agentcat_settings(settings)
+
+
+def _resolve_profile_cli(provider: str, explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        candidate = Path(explicit).expanduser()
+        return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
+    # Skip our own launcher directory's profile scripts; `which` of the bare CLI
+    # name never matches `<provider>-<name>`, so the first hit is the real CLI.
+    return shutil.which(PROFILE_PROVIDERS[provider]["cli"])
+
+
+def profile_logged_in(provider: str, home: Path) -> bool:
+    """Read-only: does the CLI's own login exist for this home?"""
+    credential = home / PROFILE_PROVIDERS[provider]["credential"]
+    if credential.is_file():
+        return True
+    if provider != "claude" or sys.platform != "darwin":
+        return False
+    service = cli_probe.claude_keychain_service(home, default_provider_home("claude"))
+    runner = PROFILE_SECURITY_RUNNER or (
+        lambda argv: subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=5).returncode
+    )
+    try:
+        # Existence only: no -w, so the secret is never read.
+        return runner(["security", "find-generic-password", "-s", service]) == 0
+    except Exception:
+        return False
+
+
+def _profile_adopted(provider: str, home: Path) -> Optional[bool]:
+    if provider not in PROVIDER_HOME_SPECS:
+        return None
+    return any(_same_path(item, home) for item in tracked_provider_homes(provider))
+
+
+def command_profile_add(args: argparse.Namespace) -> int:
+    provider, name = args.provider, args.name
+    if not PROFILE_NAME_RE.match(name):
+        print("profile name must be 1-32 chars of a-z, 0-9 and '-'", file=sys.stderr)
+        return 2
+    command_name = f"{provider}-{name}"
+    home = Path(args.home).expanduser().absolute() if args.home else profile_homes_root() / command_name
+    if _same_path(home, default_provider_home(provider)) or _same_path(home, HOME):
+        print(f"refusing to use {_tilde(home)}: that is the default {provider} home", file=sys.stderr)
+        return 2
+    cli = _resolve_profile_cli(provider, getattr(args, "cli", None))
+    if not cli:
+        print(f"could not find the `{PROFILE_PROVIDERS[provider]['cli']}` CLI on PATH", file=sys.stderr)
+        return 2
+
+    bin_dir = profile_bin_dir()
+    launcher = bin_dir / command_name
+    if launcher.exists() or launcher.is_symlink():
+        if launcher.is_symlink() or _profile_launcher_owner(launcher) != (provider, name):
+            print(f"refusing to overwrite {_tilde(launcher)}: not created by agentcat", file=sys.stderr)
+            return 1
+
+    created_home = not home.exists()
+    home.mkdir(parents=True, exist_ok=True)
+    if created_home:
+        _chmod_quiet(home, 0o700)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    tmp = launcher.with_name(f".{launcher.name}.agentcat-tmp")
+    tmp.write_text(profile_launcher_script(provider, name, home, cli), encoding="utf-8")
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, launcher)
+
+    adopted: Optional[bool] = None
+    if provider in PROVIDER_HOME_SPECS:
+        adopt_provider_home(provider, home)
+        adopted = True
+    _write_profile_entry(command_name, {
+        "provider": provider,
+        "name": name,
+        "home": str(home),
+        "command": str(launcher),
+        "cli": cli,
+        "createdAt": now_iso(),
+    })
+
+    print(f"created {command_name}: {_tilde(launcher)} -> {PROFILE_PROVIDERS[provider]['envVar']}={_tilde(home)}")
+    if adopted:
+        print(f"Agent Cat now reads {_tilde(home)} for {provider} usage and quota.")
+    path_dirs = [Path(item) for item in os.environ.get("PATH", "").split(os.pathsep) if item]
+    if not any(_same_path(item, bin_dir) for item in path_dirs):
+        print(f"note: {_tilde(bin_dir)} is not on PATH; add it to run `{command_name}` directly.")
+    print("next: " + PROFILE_PROVIDERS[provider]["login"].format(command=command_name))
+    return 0
+
+
+def command_profile_remove(args: argparse.Namespace) -> int:
+    provider, name = args.provider, args.name
+    command_name = f"{provider}-{name}"
+    entry = _profile_registry().get(command_name)
+    launcher = Path(entry["command"]) if entry and entry.get("command") else profile_bin_dir() / command_name
+    status = 0
+    if launcher.exists() or launcher.is_symlink():
+        if not launcher.is_symlink() and _profile_launcher_owner(launcher) == (provider, name):
+            launcher.unlink()
+            print(f"removed launcher {_tilde(launcher)}")
+        else:
+            print(f"left {_tilde(launcher)} alone: not created by agentcat", file=sys.stderr)
+            status = 1
+    elif entry is None:
+        print(f"no profile {command_name}", file=sys.stderr)
+        return 1
+
+    if entry and entry.get("home"):
+        home = Path(entry["home"])
+        if provider in PROVIDER_HOME_SPECS and forget_provider_home(provider, home):
+            print(f"stopped reading {_tilde(home)}")
+        if getattr(args, "delete_home", False):
+            if _same_path(home, default_provider_home(provider)) or _same_path(home, HOME):
+                print(f"refusing to delete {_tilde(home)}", file=sys.stderr)
+                status = 1
+            elif home.is_dir():
+                shutil.rmtree(home)
+                print(f"deleted home {_tilde(home)}")
+        else:
+            print(f"kept home {_tilde(home)} (pass --delete-home to delete it)")
+    _write_profile_entry(command_name, None)
+    return status
+
+
+def profile_rows() -> List[Dict[str, Any]]:
+    rows = []
+    for key, entry in sorted(_profile_registry().items()):
+        provider = entry.get("provider")
+        if provider not in PROFILE_PROVIDERS or not entry.get("home"):
+            continue
+        home = Path(str(entry["home"]))
+        launcher = Path(str(entry.get("command") or profile_bin_dir() / key))
+        rows.append({
+            "provider": provider,
+            "name": entry.get("name"),
+            "command": key,
+            "launcher": _profile_launcher_owner(launcher) == (provider, entry.get("name")),
+            "home": _tilde(home),
+            "adopted": _profile_adopted(provider, home),
+            "loggedIn": profile_logged_in(provider, home) if home.is_dir() else False,
+        })
+    return rows
+
+
+def command_profile_list(args: argparse.Namespace) -> int:
+    rows = profile_rows()
+    if getattr(args, "json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if not rows:
+        print("no profiles (add one with: agentcat profile add codex work)")
+        return 0
+
+    def yes_no(value: Optional[bool]) -> str:
+        return "n/a" if value is None else ("yes" if value else "no")
+
+    table = [("PROVIDER", "NAME", "COMMAND", "HOME", "ADOPTED", "LOGGED IN")]
+    for row in rows:
+        command = row["command"] if row["launcher"] else f"{row['command']} (missing)"
+        table.append((row["provider"], str(row["name"]), command, row["home"],
+                      yes_no(row["adopted"]), yes_no(row["loggedIn"])))
+    widths = [max(len(line[i]) for line in table) for i in range(len(table[0]))]
+    for line in table:
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(line)).rstrip())
     return 0
 
 
@@ -19687,6 +19958,23 @@ def build_parser() -> argparse.ArgumentParser:
     homes.add_argument("--forget", help="drop this home from both lists")
     homes.add_argument("--json", action="store_true")
     homes.set_defaults(func=command_homes)
+
+    profile = subparsers.add_parser("profile", help="per-account launcher commands (one CLI home per account)")
+    profile_commands = profile.add_subparsers(dest="profile_command", required=True)
+    profile_add = profile_commands.add_parser("add")
+    profile_add.add_argument("provider", choices=sorted(PROFILE_PROVIDERS))
+    profile_add.add_argument("name")
+    profile_add.add_argument("--home", help="use this directory as the account's home")
+    profile_add.add_argument("--cli", help=argparse.SUPPRESS)
+    profile_add.set_defaults(func=command_profile_add)
+    profile_list = profile_commands.add_parser("list")
+    profile_list.add_argument("--json", action="store_true")
+    profile_list.set_defaults(func=command_profile_list)
+    profile_remove = profile_commands.add_parser("remove")
+    profile_remove.add_argument("provider", choices=sorted(PROFILE_PROVIDERS))
+    profile_remove.add_argument("name")
+    profile_remove.add_argument("--delete-home", action="store_true", help="also delete the account's home directory")
+    profile_remove.set_defaults(func=command_profile_remove)
 
     reflect = subparsers.add_parser("reflect")
     reflect.add_argument("reflect_command", choices=("sync", "analyze", "week"))

@@ -152,6 +152,23 @@ number the product reports, so it stays an explicit choice. Adopted homes are
 deduplicated by inode and session identity, so a mirror that hardlinks or copies
 its sessions is counted once, never twice.
 
+### One command per account
+
+Agent Cat never switches which account a CLI is logged into. For a second
+account, give it its own home and a launcher command:
+
+```
+agentcat profile add codex work      # creates ~/.local/bin/codex-work
+codex-work login                     # log in with the CLI itself
+agentcat profile list                # provider, command, home, adopted, logged in
+agentcat profile remove codex work   # add --delete-home to delete the home too
+```
+
+`add` creates a private home under `~/.agentcat/homes/` (or `--home PATH`), writes
+a launcher that runs the real CLI with `CODEX_HOME` / `CLAUDE_CONFIG_DIR` /
+`KIMI_CODE_HOME` set, and adopts the home for Codex and Claude. It never creates
+or copies credentials, and it refuses to overwrite a file it did not write.
+
 ### Orca Claude account quotas
 
 When the local Orca IDE CLI is available, the connector reads `orca account list
