@@ -170,7 +170,7 @@ class KimiCredentialDiscoveryTests(WP25TestCase):
         self.assertEqual(limits["reason"], "token_missing")
         self.assertEqual(limits["status"], "not_configured")
 
-    def test_expired_env_file_refresh_failure_is_token_expired(self):
+    def test_expired_cli_token_is_reported_never_refreshed(self):
         self.write_kimi_file("kimi-code.json", self.stub_payload())
         self.write_kimi_file(
             "kimi-code-env-dead.json",
@@ -178,12 +178,12 @@ class KimiCredentialDiscoveryTests(WP25TestCase):
         )
 
         def fake_urlopen(request, timeout=None):
-            raise OSError("refresh failed")
+            raise AssertionError("an expired Kimi CLI token must not be refreshed or used (R1)")
 
         with patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen):
             limits = agentcat.kimi_live_limits(force=True)
 
-        self.assertEqual(limits["reason"], "token_expired")
+        self.assertEqual(limits["reason"], "cli_login_expired")
         self.assertNotEqual(limits.get("reason"), "token_missing")
 
 

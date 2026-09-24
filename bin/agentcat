@@ -158,7 +158,6 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/api/codex/usage",
 )
 CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-CODEX_RESET_CREDITS_CONSUME_URL = f"{CODEX_RESET_CREDITS_URL}/consume"
 CODEX_USAGE_BREAKDOWN_URL = "https://chatgpt.com/backend-api/wham/usage/daily-token-usage-breakdown"
 CODEX_USAGE_BREAKDOWN_CACHE = AGENTCAT_HOME / "codex-usage-breakdown-cache.json"
 CODEX_USAGE_BREAKDOWN_TTL_SECONDS = int(os.environ.get("AGENTCAT_CODEX_USAGE_TTL_SECONDS", "900"))
@@ -3765,29 +3764,6 @@ def codex_reset_credits_request(access_token: str, account_id: str) -> Dict[str,
     return payload if isinstance(payload, dict) else {}
 
 
-def codex_reset_credit_consume_request(
-    access_token: str,
-    account_id: str,
-    credit_id: str,
-    redeem_request_id: str,
-) -> Dict[str, Any]:
-    body = json.dumps(
-        {"credit_id": credit_id, "redeem_request_id": redeem_request_id},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    headers = codex_request_headers(access_token, account_id)
-    headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(
-        CODEX_RESET_CREDITS_CONSUME_URL,
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    return payload if isinstance(payload, dict) else {}
-
-
 def codex_window_quota(
     quota_id: str,
     label: str,
@@ -4223,22 +4199,6 @@ def codex_live_limits(force: bool = False) -> Dict[str, Any]:
     return codex_live_limits_for_auth(auth, "codex", force=force)
 
 
-def _codex_consumed_credit(
-    credit_id: str,
-    consume_payload: Dict[str, Any],
-    limits: Dict[str, Any],
-) -> Dict[str, Any]:
-    summaries = codex_reset_credit_summaries([consume_payload.get("credit")])
-    if summaries:
-        return summaries[0]
-    credits = limits.get("resetCredits")
-    if isinstance(credits, list):
-        for credit in credits:
-            if isinstance(credit, dict) and credit.get("id") == credit_id:
-                return dict(credit)
-    return {"id": credit_id}
-
-
 def log_codex_reset_credit_diagnostic(
     ok: bool,
     *,
@@ -4255,67 +4215,6 @@ def log_codex_reset_credit_diagnostic(
         store_event("codex", "agentcat-reset-credit", "reset-credit-consume", payload)
     except Exception:
         logging.debug("failed to persist Codex reset-credit diagnostic")
-
-
-def consume_codex_reset_credit(credit_id: Any, confirmation: Any) -> Dict[str, Any]:
-    if not isinstance(credit_id, str) or not credit_id.strip() or len(credit_id) > 512:
-        raise ValueError("creditId must be a non-empty string")
-    if not isinstance(confirmation, str) or not confirmation.strip() or len(confirmation) > 512:
-        raise ValueError("confirmation must be a non-empty nonce")
-    credit_id = credit_id.strip()
-    confirmation = confirmation.strip()
-
-    auth = read_codex_auth()
-    if not auth:
-        log_codex_reset_credit_diagnostic(False, reason="token_missing")
-        raise RuntimeError("Codex OAuth credentials are not configured")
-    tokens = oauth_tokens(auth)
-    access_token = tokens.get("access_token")
-    account_id = tokens.get("account_id") or auth.get("account_id") or ""
-    if not isinstance(access_token, str) or not access_token:
-        log_codex_reset_credit_diagnostic(False, reason="token_missing")
-        raise RuntimeError("Codex OAuth credentials are not configured")
-
-    try:
-        consume_payload = codex_reset_credit_consume_request(
-            access_token,
-            str(account_id),
-            credit_id,
-            confirmation,
-        )
-    except urllib.error.HTTPError as exc:
-        if exc.code != 401:
-            log_codex_reset_credit_diagnostic(False, reason="upstream_http_error")
-            raise
-        exc.close()
-        try:
-            refreshed = refresh_codex_access_token(auth)
-        except Exception:
-            refreshed = None
-        if not refreshed:
-            log_codex_reset_credit_diagnostic(False, reason="token_expired")
-            raise RuntimeError("Codex OAuth token expired")
-        try:
-            consume_payload = codex_reset_credit_consume_request(
-                refreshed,
-                str(account_id),
-                credit_id,
-                confirmation,
-            )
-        except Exception:
-            log_codex_reset_credit_diagnostic(False, reason="upstream_http_error")
-            raise
-
-    windows_reset = int_count(consume_payload.get("windows_reset"))
-    limits = codex_live_limits(force=True)
-    record_live_limit_reset_signal("codex")
-    log_codex_reset_credit_diagnostic(True, windows_reset=windows_reset)
-    return {
-        "ok": True,
-        "windowsReset": windows_reset if windows_reset is not None else 0,
-        "credit": _codex_consumed_credit(credit_id, consume_payload, limits),
-        "limits": limits,
-    }
 
 
 def _resolved_path_key(path: Path) -> str:
@@ -5380,29 +5279,6 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
     return {"oauth": None, "reason": "token_missing"}
 
 
-def refresh_claude_access_token(refresh_token: str) -> Optional[str]:
-    """Refresh Claude OAuth in memory without modifying Claude Code's auth state."""
-    body = urllib.parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLAUDE_OAUTH_CLIENT_ID,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        CLAUDE_OAUTH_TOKEN_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    token = payload.get("access_token") if isinstance(payload, dict) else None
-    return token.strip() if isinstance(token, str) and token.strip() else None
-
-
 def claude_usage_request(access_token: str) -> Dict[str, Any]:
     req = urllib.request.Request(
         CLAUDE_USAGE_URL,
@@ -5702,20 +5578,10 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
         return credentialed(empty_limits(reason="token_missing"))
     expires_at = int_limit(oauth.get("expiresAt"))
     now_ms = int(time.time() * 1000)
-    refresh_token = oauth.get("refreshToken") or oauth.get("refresh_token")
-    should_refresh = bool(expires_at and now_ms + CLAUDE_OAUTH_EXPIRY_BUFFER_MS >= expires_at)
-    refresh_attempted = False
-    if should_refresh and isinstance(refresh_token, str) and refresh_token:
-        refresh_attempted = True
-        try:
-            refreshed = refresh_claude_access_token(refresh_token)
-        except Exception:
-            refreshed = None
-        if not refreshed:
-            return credentialed(empty_limits(reason="token_expired"))
-        token = refreshed
-    elif expires_at and now_ms >= expires_at:
-        return credentialed(empty_limits(reason="token_expired"))
+    # Claude Code's own login: read only. Refreshing it would rotate the
+    # refresh token and log Claude Code out (oauth-and-usage-probing.md, R1).
+    if expires_at and now_ms >= expires_at:
+        return credentialed(empty_limits(reason="cli_login_expired"))
     last_error: Optional[Exception] = None
     while True:
         try:
@@ -5728,21 +5594,6 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
             return limits
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if (
-                exc.code == 401
-                and not refresh_attempted
-                and isinstance(refresh_token, str)
-                and refresh_token
-            ):
-                refresh_attempted = True
-                try:
-                    refreshed = refresh_claude_access_token(refresh_token)
-                except Exception:
-                    refreshed = None
-                if refreshed:
-                    exc.close()
-                    token = refreshed
-                    continue
             break
         except Exception as exc:
             last_error = exc
@@ -6733,30 +6584,6 @@ def read_kimi_oauth_credentials() -> Dict[str, Any]:
     }
 
 
-def refresh_kimi_access_token(refresh_token: str) -> Optional[str]:
-    # In-memory only — never write Kimi's credentials file.
-    body = urllib.parse.urlencode(
-        {
-            "client_id": KIMI_OAUTH_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        KIMI_OAUTH_TOKEN_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "User-Agent": "kimi-code/1.0",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    token = payload.get("access_token") if isinstance(payload, dict) else None
-    return token.strip() if isinstance(token, str) and token.strip() else None
-
-
 def kimi_usage_number(raw: Any) -> Optional[float]:
     if isinstance(raw, dict):
         for key in ("used", "limit", "remaining", "val", "value"):
@@ -6934,20 +6761,12 @@ def kimi_live_limits(force: bool = False) -> Dict[str, Any]:
     now = int(time.time())
     expired = isinstance(expires_at, int) and expires_at <= now
     refresh_failed = False
+    # Kimi CLI's own login: read only, never refreshed (R1). An expired CLI
+    # token is reported so the person can run `kimi` or connect a managed login.
     if isinstance(access, str) and access and not expired:
         tokens.append(access)
-    if isinstance(refresh, str) and refresh:
-        try:
-            refreshed = refresh_kimi_access_token(refresh)
-        except Exception as exc:
-            last_error = exc
-            refresh_failed = True
-            refreshed = None
-        if refreshed:
-            tokens.append(refreshed)
-            refresh_failed = False
-    if isinstance(access, str) and access and access not in tokens:
-        tokens.append(access)
+    elif expired:
+        return empty_limits(reason="cli_login_expired")
 
     for token in tokens:
         try:
@@ -17736,34 +17555,6 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             status, payload = reflect_http_post(path, body, query)
             self.send_json(status, payload)
             return
-        if path == "/providers/codex/reset-credits/consume":
-            guard_error = key_mutation_request_error(self.headers)
-            if guard_error is not None:
-                status, reason = guard_error
-                self.send_json(status, {"error": "reset_credit_forbidden", "message": reason})
-                return
-            try:
-                payload = self.read_json_body(max_bytes=16 * 1024)
-                response = consume_codex_reset_credit(
-                    payload.get("creditId"),
-                    payload.get("confirmation"),
-                )
-            except ValueError as exc:
-                self.send_json(400, {"error": "invalid_reset_credit_request", "message": str(exc)})
-                return
-            except RuntimeError as exc:
-                self.send_json(409, {"error": "codex_not_configured", "message": str(exc)})
-                return
-            except urllib.error.HTTPError as exc:
-                status = int(exc.code)
-                exc.close()
-                self.send_json(502, {"error": "reset_credit_consume_failed", "upstreamStatus": status})
-                return
-            except Exception:
-                self.send_json(500, {"error": "reset_credit_consume_failed"})
-                return
-            self.send_json(200, response)
-            return
         if path == "/v1/config":
             try:
                 payload = self.read_json_body()
@@ -18067,16 +17858,6 @@ def command_codex_notify(args: argparse.Namespace) -> int:
     payload = read_stdin_payload()
     runtime_mode = codex_runtime_mode_event(payload)
     store_event("codex", "codex-notify", "notify", codex_notify_storage_payload(payload, runtime_mode))
-    return 0
-
-
-def command_codex_reset_credit_consume(args: argparse.Namespace) -> int:
-    try:
-        payload = consume_codex_reset_credit(args.credit_id, str(uuid.uuid4()))
-    except Exception as exc:
-        print(f"agentcat codex reset-credit consume: {exc}", file=sys.stderr)
-        return 1
-    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
@@ -19936,9 +19717,6 @@ def build_parser() -> argparse.ArgumentParser:
     codex_commands = codex.add_subparsers(dest="codex_command", required=True)
     reset_credit = codex_commands.add_parser("reset-credit")
     reset_credit_commands = reset_credit.add_subparsers(dest="reset_credit_command", required=True)
-    reset_credit_consume = reset_credit_commands.add_parser("consume")
-    reset_credit_consume.add_argument("credit_id")
-    reset_credit_consume.set_defaults(func=command_codex_reset_credit_consume)
 
     setup_prompt = subparsers.add_parser("setup-prompt")
     setup_prompt.set_defaults(func=command_setup_prompt)

@@ -754,8 +754,9 @@ class AgentCatConnectorTests(unittest.TestCase):
             agentcat.urllib.request, "urlopen", side_effect=no_network
         ):
             limits = agentcat.claude_live_limits()
+        # Claude Code's own login is never refreshed by the connector (R1).
         self.assertEqual(limits["status"], "not_configured")
-        self.assertEqual(limits["reason"], "token_expired")
+        self.assertEqual(limits["reason"], "cli_login_expired")
 
     def test_gemini_quota_api_payload_builds_model_remaining(self) -> None:
         limits = agentcat.gemini_limits_from_quota_response(
