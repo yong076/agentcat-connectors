@@ -144,6 +144,7 @@ def probe_claude_home(
     executable: Optional[str],
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     cwd: Optional[Path] = None,
+    token_reader: Optional[Callable[[Path, Path], Optional[str]]] = None,
 ) -> Dict[str, Any]:
     identity = claude_identity(home, default_home)
     if not executable:
@@ -170,6 +171,15 @@ def probe_claude_home(
         return _result("claude", home, status="error", reason="cli_failed", **identity)
     windows = parse_claude_usage(completed.stdout or "")
     details = claude_account_details(home, default_home)
+    token = (token_reader or claude_access_token)(home, default_home)
+    if token:
+        try:
+            passes = fetch_claude_passes(token)
+        except Exception:
+            passes = None
+        if passes and passes["eligible"]:
+            details["resetCreditsAvailable"] = passes["available"]
+            details["resetCredits"] = passes["credits"]
     if not windows:
         return _result("claude", home, status="error", reason="usage_unparsed", **identity, **details)
     return _result("claude", home, windows=windows, **identity, **details)
@@ -471,3 +481,75 @@ def claude_account_details(home: Path, default_home: Path, now: Optional[dt.date
     if isinstance(account.get("hasExtraUsageEnabled"), bool):
         details["extraUsageEnabled"] = account["hasExtraUsageEnabled"]
     return details
+
+
+CLAUDE_PASSES_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+
+
+def claude_keychain_service(home: Path, default_home: Path) -> str:
+    """Claude Code keeps each config dir's login under its own Keychain item."""
+    if Path(home) == Path(default_home):
+        return "Claude Code-credentials"
+    scope = hashlib.sha256(os.path.realpath(str(home)).encode("utf-8")).hexdigest()[:8]
+    return f"Claude Code-credentials-{scope}"
+
+
+def claude_access_token(home: Path, default_home: Path, run: Callable[..., Any] = subprocess.run) -> Optional[str]:
+    """The home's current Claude Code access token, read-only; None if expired."""
+    try:
+        completed = run(
+            ["security", "find-generic-password", "-s", claude_keychain_service(home, default_home), "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if completed.returncode != 0:
+            return None
+        oauth = json.loads(completed.stdout).get("claudeAiOauth") or {}
+    except (OSError, ValueError, subprocess.TimeoutExpired, AttributeError):
+        return None
+    token = oauth.get("accessToken")
+    expires = oauth.get("expiresAt")
+    if not isinstance(token, str) or not token:
+        return None
+    if isinstance(expires, (int, float)) and expires / 1000 <= time.time() + 60:
+        return None  # never refresh: that would rotate Claude Code's own login
+    return token
+
+
+def parse_claude_passes(payload: Any) -> Optional[Dict[str, Any]]:
+    """`cedar_ember` from /api/oauth/usage: usage-limit reset grants."""
+    block = payload.get("cedar_ember") if isinstance(payload, dict) else None
+    if not isinstance(block, dict):
+        return None
+    passes = []
+    for grant in block.get("grants") or []:
+        if not isinstance(grant, dict):
+            continue
+        left = grant.get("resets_left")
+        if not isinstance(left, int):
+            continue
+        for _ in range(max(0, left)):
+            passes.append({
+                "status": "available" if grant.get("usable_now") else "unavailable",
+                "resetType": "claudeUsageLimits",
+                "title": str(grant.get("label") or "")[:120],
+                "expiresAt": grant.get("ends_at"),
+            })
+    return {
+        "available": len(passes),
+        "credits": passes,
+        "atLimit": bool(block.get("at_limit")),
+        "eligible": bool(block.get("eligible")),
+    }
+
+
+def fetch_claude_passes(token: str, version: str = "2.1.280") -> Optional[Dict[str, Any]]:
+    from urllib.request import Request, urlopen
+
+    # Read-only. Eligibility is per client surface, so identify as the CLI the
+    # token was issued to; claiming a reset is never sent from here.
+    request = Request(CLAUDE_PASSES_URL, headers={
+        "Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20",
+        "Accept": "application/json", "User-Agent": f"claude-cli/{version} (external, cli)", "x-app": "cli",
+    })
+    with urlopen(request, timeout=15) as response:
+        return parse_claude_passes(json.loads(response.read(2_000_000).decode("utf-8")))

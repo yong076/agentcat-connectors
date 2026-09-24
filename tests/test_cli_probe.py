@@ -70,7 +70,7 @@ class ClaudeProbeTests(unittest.TestCase):
                 seen["args"], seen["env"] = args, kwargs["env"]
                 return subprocess.CompletedProcess(args, 0, stdout=USAGE_TEXT, stderr="")
 
-            row = cli_probe.probe_claude_home(other, default, "/bin/claude", run=run)
+            row = cli_probe.probe_claude_home(other, default, "/bin/claude", run=run, token_reader=lambda *_: None)
         self.assertEqual(seen["args"], ["/bin/claude", "-p", "/usage", "--no-session-persistence"])
         self.assertEqual(seen["env"]["CLAUDE_CONFIG_DIR"], str(other))
         self.assertEqual(row["email"], "yo@example.com")
@@ -83,7 +83,7 @@ class ClaudeProbeTests(unittest.TestCase):
             raise subprocess.TimeoutExpired(args, 60)
 
         with tempfile.TemporaryDirectory() as tmp:
-            row = cli_probe.probe_claude_home(Path(tmp), Path(tmp) / "x", "/bin/claude", run=run)
+            row = cli_probe.probe_claude_home(Path(tmp), Path(tmp) / "x", "/bin/claude", run=run, token_reader=lambda *_: None)
         self.assertEqual((row["status"], row["reason"]), ("error", "cli_timeout"))
 
 
@@ -185,6 +185,28 @@ class BillingAndPassesTests(unittest.TestCase):
         self.assertEqual(details["plan"], "Max 5x")
         self.assertEqual(details["billing"], {"renewsAt": "2026-10-05T04:42:31Z", "estimated": True})
         self.assertTrue(details["extraUsageEnabled"])
+
+
+class ClaudePassesTests(unittest.TestCase):
+    def test_grants_expand_to_one_entry_per_reset_left(self):
+        payload = {"cedar_ember": {"eligible": True, "at_limit": True, "grants": [
+            {"id": "g", "label": "launch reset", "resets_left": 1, "usable_now": True, "ends_at": "2026-10-22T16:00:00+00:00"}]}}
+        passes = cli_probe.parse_claude_passes(payload)
+        self.assertEqual(passes["available"], 1)
+        self.assertTrue(passes["atLimit"])
+        self.assertEqual(passes["credits"][0]["status"], "available")
+        self.assertEqual(passes["credits"][0]["expiresAt"], "2026-10-22T16:00:00+00:00")
+        self.assertIsNone(cli_probe.parse_claude_passes({"cedar_ember": None}))
+
+    def test_keychain_item_is_scoped_per_config_dir(self):
+        default = Path("/h/.claude")
+        self.assertEqual(cli_probe.claude_keychain_service(default, default), "Claude Code-credentials")
+        self.assertTrue(cli_probe.claude_keychain_service(Path("/h/.claude2"), default).startswith("Claude Code-credentials-"))
+
+    def test_expired_token_is_skipped_not_refreshed(self):
+        expired = json.dumps({"claudeAiOauth": {"accessToken": "t", "expiresAt": (time.time() - 10) * 1000}})
+        run = lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=expired, stderr="")
+        self.assertIsNone(cli_probe.claude_access_token(Path("/h/.claude"), Path("/h/.claude"), run=run))
 
 
 class IdentityHintTests(unittest.TestCase):
