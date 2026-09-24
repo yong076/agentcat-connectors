@@ -144,6 +144,23 @@ agentcat homes --provider codex --forget <경로>   # 기본 상태로 되돌림
 바뀌므로 명시적 선택으로 남겨 둡니다. 채택된 홈은 inode와 세션 식별자 기준으로 중복
 제거되므로, 세션을 하드링크하거나 복사해 둔 미러도 한 번만 집계됩니다.
 
+### 계정마다 명령 하나
+
+Agent Cat은 CLI에 로그인된 계정을 바꾸지 않습니다. 두 번째 계정은 별도 홈과 실행
+명령을 만들어 씁니다.
+
+```
+agentcat profile add codex work      # ~/.local/bin/codex-work 생성
+codex-work login                     # CLI로 직접 로그인
+agentcat profile list                # provider, 명령, 홈, 채택 여부, 로그인 여부
+agentcat profile remove codex work   # --delete-home을 붙이면 홈도 삭제
+```
+
+`add`는 `~/.agentcat/homes/` 아래(또는 `--home 경로`)에 비공개 홈을 만들고,
+`CODEX_HOME` / `CLAUDE_CONFIG_DIR` / `KIMI_CODE_HOME`을 지정해 실제 CLI를 실행하는
+명령을 쓰며, Codex와 Claude는 그 홈을 채택합니다. 자격증명은 만들거나 복사하지 않고,
+자기가 만들지 않은 파일은 덮어쓰지 않습니다.
+
 ## 개인정보
 
 커넥터는 local-first로 설계되어 있습니다.

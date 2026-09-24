@@ -73,78 +73,26 @@ class LancelotWP8TestCase(unittest.TestCase):
         return path, original
 
 
-class ClaudeOAuthRefreshTests(LancelotWP8TestCase):
-    def test_refresh_request_is_form_encoded_with_ten_second_timeout(self):
+class ClaudeCliLoginIsReadOnlyTests(LancelotWP8TestCase):
+    """oauth-and-usage-probing.md R1: CLI-owned logins are read, never refreshed."""
+
+    def test_connector_has_no_cli_token_refresh(self):
+        self.assertFalse(hasattr(agentcat, "refresh_claude_access_token"))
+        self.assertFalse(hasattr(agentcat, "refresh_kimi_access_token"))
+
+    def test_unauthorized_usage_is_not_retried_with_a_refreshed_token(self):
+        future_ms = int((time.time() + 3600) * 1000)
+        self.write_claude_credentials({"accessToken": "tok", "refreshToken": "r", "expiresAt": future_ms})
         calls = []
 
-        def fake_urlopen(request, timeout):
-            calls.append((request, timeout))
-            return FakeResponse({"access_token": " refreshed-token "})
+        def unauthorized(token):
+            calls.append(token)
+            raise urllib.error.HTTPError("https://usage.example.test", 401, "unauthorized", {}, None)
 
-        with patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen):
-            token = agentcat.refresh_claude_access_token("refresh-token")
-
-        self.assertEqual(token, "refreshed-token")
-        request, timeout = calls[0]
-        self.assertEqual(request.full_url, agentcat.CLAUDE_OAUTH_TOKEN_URL)
-        self.assertEqual(timeout, 10)
-        self.assertEqual(
-            urllib.parse.parse_qs(request.data.decode("utf-8")),
-            {
-                "grant_type": ["refresh_token"],
-                "refresh_token": ["refresh-token"],
-                "client_id": [agentcat.CLAUDE_OAUTH_CLIENT_ID],
-            },
-        )
-        self.assertEqual(request.headers["Content-type"], "application/x-www-form-urlencoded")
-
-    def test_near_expiry_refreshes_in_memory_before_usage_request(self):
-        credentials_path, original = self.write_claude_credentials(
-            {
-                "accessToken": "old-token",
-                "refreshToken": "refresh-token",
-                "expiresAt": int(time.time() * 1000) + 60_000,
-            }
-        )
-        requests = []
-
-        def fake_urlopen(request, timeout):
-            requests.append((request, timeout))
-            if request.full_url == agentcat.CLAUDE_OAUTH_TOKEN_URL:
-                return FakeResponse({"access_token": "new-token"})
-            self.assertEqual(request.get_header("Authorization"), "Bearer new-token")
-            return FakeResponse({"five_hour": {"utilization": 12, "resets_at": 1770000100}})
-
-        with patch.object(agentcat.sys, "platform", "linux"), patch.object(
-            agentcat.urllib.request, "urlopen", side_effect=fake_urlopen
-        ):
-            limits = agentcat.claude_live_limits(force=True)
-
-        self.assertEqual(limits["status"], "auto")
-        self.assertEqual([request.full_url for request, _timeout in requests], [
-            agentcat.CLAUDE_OAUTH_TOKEN_URL,
-            agentcat.CLAUDE_USAGE_URL,
-        ])
-        self.assertEqual(json.loads(credentials_path.read_text(encoding="utf-8")), original)
-
-    def test_refresh_failure_uses_token_expired_path_without_usage_request(self):
-        self.write_claude_credentials(
-            {
-                "accessToken": "old-token",
-                "refreshToken": "refresh-token",
-                "expiresAt": 1,
-            }
-        )
-
-        with patch.object(agentcat.sys, "platform", "linux"), patch.object(
-            agentcat.urllib.request, "urlopen", side_effect=OSError("refresh failed")
-        ) as urlopen:
-            limits = agentcat.claude_live_limits(force=True)
-
-        self.assertEqual(limits["status"], "not_configured")
-        self.assertEqual(limits["reason"], "token_expired")
-        self.assertEqual(urlopen.call_count, 1)
-        self.assertEqual(urlopen.call_args.args[0].full_url, agentcat.CLAUDE_OAUTH_TOKEN_URL)
+        with patch.object(agentcat.sys, "platform", "linux"), \
+             patch.object(agentcat, "claude_usage_request", side_effect=unauthorized):
+            agentcat.claude_live_limits(force=True)
+        self.assertEqual(calls, ["tok"])
 
 
 class LiveLimitErrorTests(LancelotWP8TestCase):
@@ -216,60 +164,6 @@ class LiveLimitErrorTests(LancelotWP8TestCase):
         self.assertEqual(served["liveErrorReason"], "rate_limited")
         self.assertEqual(cached["status"], "auto")
         self.assertEqual(cached["retryAt"], 2_120)
-
-
-class ClaudeUnauthorizedRefreshTests(LancelotWP8TestCase):
-    def test_unauthorized_usage_refreshes_once_then_retries(self):
-        self.write_claude_credentials(
-            {
-                "accessToken": "old-token",
-                "refreshToken": "refresh-token",
-                "expiresAt": int(time.time() * 1000) + 3_600_000,
-            }
-        )
-        calls = []
-
-        def fake_urlopen(request, timeout):
-            calls.append(request)
-            if len(calls) == 1:
-                raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, io.BytesIO(b""))
-            if request.full_url == agentcat.CLAUDE_OAUTH_TOKEN_URL:
-                return FakeResponse({"access_token": "new-token"})
-            self.assertEqual(request.get_header("Authorization"), "Bearer new-token")
-            return FakeResponse({"five_hour": {"utilization": 5}})
-
-        with patch.object(agentcat.sys, "platform", "linux"), patch.object(
-            agentcat.urllib.request, "urlopen", side_effect=fake_urlopen
-        ):
-            limits = agentcat.claude_live_limits(force=True)
-
-        self.assertEqual(limits["status"], "auto")
-        self.assertEqual(len(calls), 3)
-
-    def test_second_unauthorized_response_reports_token_expired(self):
-        self.write_claude_credentials(
-            {
-                "accessToken": "old-token",
-                "refreshToken": "refresh-token",
-                "expiresAt": int(time.time() * 1000) + 3_600_000,
-            }
-        )
-        calls = []
-
-        def fake_urlopen(request, timeout):
-            calls.append(request)
-            if request.full_url == agentcat.CLAUDE_OAUTH_TOKEN_URL:
-                return FakeResponse({"access_token": "new-token"})
-            raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, io.BytesIO(b""))
-
-        with patch.object(agentcat.sys, "platform", "linux"), patch.object(
-            agentcat.urllib.request, "urlopen", side_effect=fake_urlopen
-        ):
-            limits = agentcat.claude_live_limits(force=True)
-
-        self.assertEqual(limits["status"], "error")
-        self.assertEqual(limits["reason"], "token_expired")
-        self.assertEqual(len(calls), 3)
 
 
 class LiveLimitBackoffTests(LancelotWP8TestCase):
