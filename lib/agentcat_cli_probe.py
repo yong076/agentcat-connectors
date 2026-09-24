@@ -275,3 +275,41 @@ def probe_token_home(provider: str, home: Path, module: Any, token_key: str) -> 
         status="ok" if windows else "error",
         reason=None if windows else "usage_unavailable",
     )
+
+
+def parse_antigravity_quota_summary(payload: Any) -> List[Dict[str, Any]]:
+    """`retrieveUserQuotaSummary` groups -> windows, the same data agy shows."""
+    windows: List[Dict[str, Any]] = []
+    groups = payload.get("groups") if isinstance(payload, dict) else None
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get("displayName") or "")
+        short = "Gemini" if "gemini" in name.lower() else "Claude+GPT" if ("claude" in name.lower() or "gpt" in name.lower()) else (name or "Models")
+        for bucket in group.get("buckets") or []:
+            if not isinstance(bucket, dict):
+                continue
+            fraction = bucket.get("remainingFraction")
+            if not isinstance(fraction, (int, float)) or isinstance(fraction, bool):
+                continue
+            span = str(bucket.get("window") or bucket.get("bucketId") or "").lower()
+            weekly = "week" in span or span.endswith("7d")
+            short_window = "5h" in span or "hour" in span
+            used = _clamp((1.0 - float(fraction)) * 100.0)
+            reset = None
+            if isinstance(bucket.get("resetTime"), str):
+                try:
+                    reset = int(dt.datetime.fromisoformat(bucket["resetTime"].replace("Z", "+00:00")).timestamp())
+                except ValueError:
+                    reset = None
+            windows.append({
+                "id": "antigravity:" + str(bucket.get("bucketId") or f"{short}:{span}"),
+                "label": f"{short} {'7d' if weekly else '5h' if short_window else span}",
+                "windowDurationMins": 10080 if weekly else 300 if short_window else None,
+                "usedPercent": used,
+                "remainingPercent": 100.0 - used,
+                "resetsAt": reset,
+                "model": None,
+                "primary": weekly,
+            })
+    return windows

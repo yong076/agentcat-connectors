@@ -117,6 +117,25 @@ class TokenProbeTests(unittest.TestCase):
         self.assertEqual(row["plan"], "SuperGrok")
 
 
+class AntigravityParsingTests(unittest.TestCase):
+    def test_quota_summary_groups_become_windows(self):
+        payload = {"groups": [
+            {"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-weekly", "window": "weekly", "resetTime": "2026-09-30T02:27:43Z", "remainingFraction": 0.9},
+                {"bucketId": "gemini-5h", "window": "5h", "resetTime": "2026-09-24T15:27:43Z", "remainingFraction": 1},
+            ]},
+            {"displayName": "Claude and GPT models", "buckets": [
+                {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.25},
+            ]},
+        ]}
+        windows = cli_probe.parse_antigravity_quota_summary(payload)
+        self.assertEqual([w["label"] for w in windows], ["Gemini 7d", "Gemini 5h", "Claude+GPT 7d"])
+        self.assertAlmostEqual(windows[0]["usedPercent"], 10.0, places=3)
+        self.assertEqual(windows[1]["windowDurationMins"], 300)
+        self.assertIsNone(windows[2]["resetsAt"])
+        self.assertEqual(cli_probe.parse_antigravity_quota_summary({"groups": "nope"}), [])
+
+
 class IdentityHintTests(unittest.TestCase):
     def test_org_domain_beats_local_part_for_work_accounts(self):
         self.assertEqual(agentcat.cli_probe_identity_hint("hello@trappist.app"), "tr**")

@@ -13595,7 +13595,40 @@ def managed_quota_refresh_loop(interval_seconds: float) -> None:
 CLI_PROBE_INTERVAL_SECONDS = 300.0
 # Two missed rounds before a reading is shown as stale.
 CLI_PROBE_FRESH_SECONDS = 2 * CLI_PROBE_INTERVAL_SECONDS
-CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi"}
+CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi", "gemini": "Antigravity"}
+# agy's own quota source (from its logs): a different host than Code Assist's
+# cloudcode-pa, which answers 403 without an onboarded project.
+ANTIGRAVITY_QUOTA_SUMMARY_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+
+
+def probe_antigravity() -> Optional[Dict[str, Any]]:
+    """Antigravity quota as agy sees it. The apps fold it into the gemini tile."""
+    creds = read_antigravity_oauth_credentials()
+    if not creds:
+        return None
+    home = ANTIGRAVITY_CLI_DIR
+    claims = cli_probe._jwt_claims(str(creds.get("id_token") or ""))
+    email = cli_probe._email(claims.get("email"))
+    try:
+        # Refreshes in memory only; agy's own token file is never rewritten.
+        token = antigravity_access_token()
+        if not token:
+            return cli_probe._result("gemini", home, status="error", reason="cli_login_expired", email=email)
+        req = urllib.request.Request(
+            ANTIGRAVITY_QUOTA_SUMMARY_URL,
+            data=b"{}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "antigravity"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read(1_000_000).decode("utf-8") or "{}")
+    except Exception:
+        return cli_probe._result("gemini", home, status="error", reason="usage_unavailable", email=email)
+    windows = cli_probe.parse_antigravity_quota_summary(payload)
+    return cli_probe._result(
+        "gemini", home, email=email, windows=windows,
+        status="ok" if windows else "error", reason=None if windows else "usage_unavailable",
+    )
 
 
 def _cli_probe_token_module(provider: str) -> Any:
@@ -13633,6 +13666,12 @@ def run_cli_probes() -> Dict[str, Any]:
                 results.append(cli_probe.probe_token_home(provider, home, _cli_probe_token_module(provider), token_key))
             except Exception:
                 results.append(cli_probe._result(provider, home, status="error", reason="cli_failed"))
+    try:
+        antigravity = probe_antigravity()
+        if antigravity:
+            results.append(antigravity)
+    except Exception:
+        pass
     return {"generatedAt": int(time.time()), "results": results}
 
 
@@ -13699,8 +13738,12 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
         # Clients decide whether a row has a live meter from these summary
         # fields, as every other limits source fills them.
         windows = [w for w in row.get("windows") or [] if isinstance(w, dict)]
-        weekly = next((w for w in windows if w.get("windowDurationMins") == 10080 and not w.get("model")), None)
-        short = next((w for w in windows if w.get("windowDurationMins") == 300), None)
+        # The tightest pool-level window of each span is the headline.
+        def tightest(minutes: int) -> Optional[Dict[str, Any]]:
+            pool = [w for w in windows if w.get("windowDurationMins") == minutes and not w.get("model")]
+            return max(pool, key=lambda w: w.get("usedPercent") or 0.0) if pool else None
+
+        weekly, short = tightest(10080), tightest(300)
         if weekly:
             limits["weeklyUsedPercent"] = weekly.get("usedPercent")
             limits["weeklyResetAt"] = weekly.get("resetsAt")
