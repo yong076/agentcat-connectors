@@ -13595,7 +13595,7 @@ def managed_quota_refresh_loop(interval_seconds: float) -> None:
 CLI_PROBE_INTERVAL_SECONDS = 300.0
 # Two missed rounds before a reading is shown as stale.
 CLI_PROBE_FRESH_SECONDS = 2 * CLI_PROBE_INTERVAL_SECONDS
-CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi", "gemini": "Antigravity"}
+CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi", "gemini": "Antigravity", "copilot": "Copilot"}
 # agy's own quota source (from its logs): a different host than Code Assist's
 # cloudcode-pa, which answers 403 without an onboarded project.
 ANTIGRAVITY_QUOTA_SUMMARY_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
@@ -13666,6 +13666,12 @@ def run_cli_probes() -> Dict[str, Any]:
                 results.append(cli_probe.probe_token_home(provider, home, _cli_probe_token_module(provider), token_key))
             except Exception:
                 results.append(cli_probe._result(provider, home, status="error", reason="cli_failed"))
+    if shutil.which("gh"):
+        try:
+            # Copilot rides the GitHub login the gh CLI already holds.
+            results.extend(cli_probe.probe_copilot())
+        except Exception:
+            pass
     try:
         antigravity = probe_antigravity()
         if antigravity:
@@ -13756,7 +13762,8 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
             limits["shortWindowMinutes"] = 300
             limits["shortResetAt"] = short.get("resetsAt")
         seed = row.get("accountID") or email or row.get("homeKey") or ""
-        hint = cli_probe_identity_hint(email) if email else str(row.get("homeKey") or "")[-4:].upper()
+        login = row.get("accountID") if provider == "copilot" and isinstance(row.get("accountID"), str) else None
+        hint = cli_probe_identity_hint(email) if email else (login[:2].lower() + "**" if login else str(row.get("homeKey") or "")[-4:].upper())
         instance = {
             "id": provider_instance_id(provider, f"cli:{seed}"),
             "providerID": provider,

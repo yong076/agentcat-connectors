@@ -209,6 +209,22 @@ class ClaudePassesTests(unittest.TestCase):
         self.assertIsNone(cli_probe.claude_access_token(Path("/h/.claude"), Path("/h/.claude"), run=run))
 
 
+class CopilotTests(unittest.TestCase):
+    def test_premium_requests_become_a_window(self):
+        payload = {"access_type_sku": "copilot_pro", "copilot_plan": "individual", "login": "octo",
+                   "quota_reset_date": "2026-10-01", "quota_snapshots": {
+                       "premium_interactions": {"entitlement": 300, "remaining": 120, "percent_remaining": 40.0, "unlimited": False},
+                       "chat": {"entitlement": 0, "remaining": 0, "unlimited": True}}}
+        parsed = cli_probe.parse_copilot_user(payload)
+        self.assertTrue(parsed["subscribed"])
+        self.assertEqual([(w["label"], w["usedPercent"], w["remainingCount"]) for w in parsed["windows"]], [("Premium", 60.0, 120.0)])
+
+    def test_no_access_is_not_subscribed(self):
+        parsed = cli_probe.parse_copilot_user({"access_type_sku": "no_access", "can_signup_for_limited": True})
+        self.assertFalse(parsed["subscribed"])
+        self.assertTrue(parsed["canSignupFree"])
+
+
 class IdentityHintTests(unittest.TestCase):
     def test_org_domain_beats_local_part_for_work_accounts(self):
         self.assertEqual(agentcat.cli_probe_identity_hint("hello@trappist.app"), "tr**")

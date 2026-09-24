@@ -605,3 +605,88 @@ def fetch_grok_billing(module: Any, token: str) -> Dict[str, Any]:
     request = Request(module._BILLING_URL, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
     with urlopen(request, timeout=12) as response:
         return parse_grok_billing(json.loads(response.read(1_000_000).decode("utf-8")))
+
+
+COPILOT_USER_URL = "https://api.github.com/copilot_internal/user"
+
+
+def parse_copilot_user(payload: Any) -> Dict[str, Any]:
+    """copilot_internal/user: premium requests and chat as monthly windows."""
+    if not isinstance(payload, dict):
+        return {"windows": [], "subscribed": False}
+    sku = str(payload.get("access_type_sku") or "")
+    snapshots = payload.get("quota_snapshots") if isinstance(payload.get("quota_snapshots"), dict) else {}
+    reset = _iso_epoch(payload.get("quota_reset_date_utc") or payload.get("quota_reset_date"))
+    windows = []
+    for key, label in (("premium_interactions", "Premium"), ("chat", "Chat"), ("completions", "Completions")):
+        snap = snapshots.get(key)
+        if not isinstance(snap, dict) or snap.get("unlimited"):
+            continue
+        entitlement = _number(snap.get("entitlement"))
+        remaining = _number(snap.get("remaining"))
+        percent_left = _number(snap.get("percent_remaining"))
+        if percent_left is None and entitlement and remaining is not None:
+            percent_left = remaining * 100.0 / entitlement
+        if percent_left is None or (not entitlement and not remaining):
+            continue  # placeholder snapshot: no usable signal
+        used = _clamp(100.0 - percent_left)
+        windows.append({
+            "id": f"copilot:{key}", "label": label, "windowDurationMins": None,
+            "usedPercent": used, "remainingPercent": 100.0 - used, "resetsAt": reset,
+            "model": None, "primary": key == "premium_interactions",
+            "remainingCount": remaining, "entitlement": entitlement,
+        })
+    return {
+        "windows": windows,
+        "subscribed": bool(windows) or (sku not in ("", "no_access")),
+        "plan": payload.get("copilot_plan") if sku not in ("", "no_access") else None,
+        "login": payload.get("login") if isinstance(payload.get("login"), str) else None,
+        "canSignupFree": bool(payload.get("can_signup_for_limited")),
+    }
+
+
+def gh_accounts(run: Callable[..., Any] = subprocess.run) -> List[Dict[str, str]]:
+    """Every github.com account the gh CLI is logged into: (login, token)."""
+    try:
+        status = run(["gh", "auth", "status", "--hostname", "github.com", "--json", "hosts"],
+                     capture_output=True, text=True, timeout=10)
+        hosts = json.loads(status.stdout).get("hosts", {}).get("github.com", []) if status.returncode == 0 else []
+    except (OSError, ValueError, subprocess.TimeoutExpired, AttributeError):
+        hosts = []
+    logins = [h.get("login") for h in hosts if isinstance(h, dict) and isinstance(h.get("login"), str)]
+    accounts = []
+    for login in logins or [None]:
+        args = ["gh", "auth", "token", "--hostname", "github.com"] + (["--user", login] if login else [])
+        try:
+            out = run(args, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        token = (out.stdout or "").strip()
+        if out.returncode == 0 and token:
+            accounts.append({"login": login or "", "token": token})
+    return accounts
+
+
+def probe_copilot(run: Callable[..., Any] = subprocess.run) -> List[Dict[str, Any]]:
+    from urllib.request import Request, urlopen
+
+    rows = []
+    for account in gh_accounts(run):
+        home = Path("gh") / (account["login"] or "default")
+        try:
+            request = Request(COPILOT_USER_URL, headers={
+                "Authorization": "token " + account["token"], "Accept": "application/json",
+                "Editor-Version": "vscode/1.99.0", "User-Agent": "AgentCat",
+            })
+            with urlopen(request, timeout=15) as response:
+                parsed = parse_copilot_user(json.loads(response.read(1_000_000).decode("utf-8")))
+        except Exception:
+            rows.append(_result("copilot", home, status="error", reason="usage_unavailable"))
+            continue
+        if not parsed["subscribed"]:
+            rows.append(_result("copilot", home, status="error", reason="not_subscribed", accountID=parsed["login"]))
+            continue
+        rows.append(_result("copilot", home, windows=parsed["windows"], plan=parsed["plan"], accountID=parsed["login"],
+                            status="ok" if parsed["windows"] else "error",
+                            reason=None if parsed["windows"] else "usage_unavailable"))
+    return rows
