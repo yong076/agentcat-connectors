@@ -58,6 +58,17 @@ class CodexManagedStalenessTests(unittest.TestCase):
     def test_non_live_freshness_stays_stale(self):
         self.assertTrue(agentcat.codex_managed_connection_limits(_row(_iso(5), freshness="cached"))["stale"])
 
+    def test_daemon_refresh_probes_connected_profiles_and_survives_errors(self):
+        self.assertLess(
+            agentcat.MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS,
+            agentcat.CODEX_MANAGED_USAGE_FRESH_SECONDS,
+        )
+        with patch.object(agentcat, "codex_connections_snapshot", return_value=[]) as listed:
+            self.assertTrue(agentcat.refresh_managed_quotas_once())
+        listed.assert_called_once_with(allow_implicit_refresh=True)
+        with patch.object(agentcat, "codex_connections_snapshot", side_effect=RuntimeError("boom")):
+            self.assertFalse(agentcat.refresh_managed_quotas_once())
+
 
 if __name__ == "__main__":
     unittest.main()

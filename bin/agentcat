@@ -13557,6 +13557,28 @@ def snapshot_refresh_loop(interval_seconds: float) -> None:
             print(f"agentcatd snapshot refresh failed: {exc}", file=sys.stderr, flush=True)
 
 
+# Managed Codex quota is only as fresh as its last app-server probe. It used
+# to refresh only when a client listed /v1/connections, so the popover and menu
+# bar went stale five minutes after the app stopped asking. Keep the interval
+# under CODEX_MANAGED_USAGE_FRESH_SECONDS; the per-row 60s throttle still holds.
+MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS = 120.0
+
+
+def refresh_managed_quotas_once() -> bool:
+    try:
+        codex_connections_snapshot(allow_implicit_refresh=True)
+        return True
+    except Exception as exc:
+        print(f"agentcatd managed quota refresh failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+        return False
+
+
+def managed_quota_refresh_loop(interval_seconds: float) -> None:
+    while True:
+        refresh_managed_quotas_once()
+        time.sleep(interval_seconds)
+
+
 def concise_snapshot_text(snapshot: Dict[str, Any]) -> str:
     lines = ["Agent Cat snapshot"]
     for provider, data in snapshot.get("providers", {}).items():
@@ -17719,6 +17741,11 @@ def run_daemon(args: argparse.Namespace) -> int:
         snapshot_refresh_loop(60.0)
 
     threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
+    threading.Thread(
+        target=managed_quota_refresh_loop,
+        args=(MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS,),
+        daemon=True,
+    ).start()
     update_enabled, _update_reason = auto_update_enabled_status()
     if update_enabled and AUTO_UPDATE_INTERVAL_SECONDS > 0:
         threading.Thread(
