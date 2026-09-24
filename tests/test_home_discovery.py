@@ -670,9 +670,44 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
         agentcat.codex_provider_instances({"status": "auto", "quotas": []})
 
         keys = [call.args[1] for call in self.limits_mock.mock_calls]
-        self.assertEqual(len(keys), 2)  # active account reuses the provider-level result
-        self.assertEqual(len(set(keys)), 2)
+        self.assertEqual(len(keys), 3)
+        self.assertEqual(len(set(keys)), 3)
         self.assertTrue(all(key.startswith("codex-instance:") for key in keys))
+
+    def test_active_account_never_inherits_global_session_limits(self) -> None:
+        self._codex_auth(agentcat.HOME / ".codex", "acct-active", "pro")
+        self.limits_mock.side_effect = lambda auth, cache_key, force=False: {
+            "status": "auto", "weeklyUsedPercent": 3.0, "quotas": []
+        }
+        instances = agentcat.codex_provider_instances(
+            {"status": "auto", "weeklyUsedPercent": 36.0, "quotas": []}
+        )
+        self.assertEqual(instances[0]["limits"]["weeklyUsedPercent"], 3.0)
+        self.assertEqual(self.limits_mock.call_count, 1)
+
+    def test_managed_verified_accounts_supply_authoritative_quota(self) -> None:
+        self._codex_auth(agentcat.HOME / ".codex", "acct-native", "pro")
+        identity = {"providerAccountID": "acct-native", "personID": "person-a"}
+        dedup_key = agentcat._codex_dedup_key(identity)
+        managed = [
+            {"status": "connected", "dedupKey": dedup_key, "lastSuccessfulSyncAt": "2026-09-22T04:56:33Z",
+             "usage": {"source": "codex-app-server", "freshness": "live", "windows": [
+                 {"id": "codex:primary", "usedPercent": 3, "remainingPercent": 97,
+                  "windowDurationMins": 10080, "resetsAt": 1790646503, "primary": True}]}},
+            {"status": "connected", "dedupKey": "verified-second-account", "lastSuccessfulSyncAt": "2026-09-22T04:56:35Z",
+             "usage": {"source": "codex-app-server", "freshness": "live", "rateLimitReachedType": "rate_limit_reached", "windows": [
+                 {"id": "codex:primary", "usedPercent": 100, "remainingPercent": 0,
+                  "windowDurationMins": 10080, "resetsAt": 1790347914, "primary": True}]}},
+        ]
+        with patch.object(agentcat, "_codex_connections", return_value=managed), \
+             patch.object(agentcat, "_codex_managed_provider_identity", return_value=identity):
+            instances = agentcat.codex_provider_instances(
+                {"status": "auto", "weeklyUsedPercent": 36.0, "quotas": []}
+            )
+        remaining = sorted(item["limits"]["quotas"][0]["remainingPercent"] for item in instances)
+        self.assertEqual(remaining, [0.0, 97.0])
+        self.assertTrue(any(item["limits"].get("rateLimitReached") for item in instances))
+        self.assertEqual(self.limits_mock.call_count, 0)
 
     def test_provider_instances_capability_is_advertised(self) -> None:
         self.assertIn("providerInstances.v1", agentcat.CONNECTOR_CAPABILITIES)

@@ -44,7 +44,7 @@ from agentcat_codex_app_server import (
     CodexAppServerUnsupported,
     app_server_prerequisite,
 )
-from agentcat_account_switch import AccountSwitchError, make_default_account
+import agentcat_cli_probe as cli_probe
 from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS
 from agentcat_openrouter_managed import OpenRouterManagedAuth, OpenRouterManagedError, build_adapter as build_openrouter_managed_adapter
 
@@ -73,6 +73,8 @@ LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 AGENTCAT_KEYS_FILE = AGENTCAT_HOME / "keys.json"
 OPENROUTER_CONNECTIONS_FILE = AGENTCAT_HOME / "openrouter-connections.json"
 CODEX_CONNECTIONS_FILE = AGENTCAT_HOME / "codex-connections.json"
+# Per-home account + quota read straight from each CLI (see agentcat_cli_probe).
+CLI_PROBE_CACHE = AGENTCAT_HOME / "cli-probe.json"
 CODEX_CONNECTIONS_PROFILES_DIR = AGENTCAT_HOME / "codex-connection-profiles"
 LOOPBACK_CONTROL_TOKEN_FILE = AGENTCAT_HOME / "loopback-control-token"
 
@@ -155,7 +157,6 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/api/codex/usage",
 )
 CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-CODEX_RESET_CREDITS_CONSUME_URL = f"{CODEX_RESET_CREDITS_URL}/consume"
 CODEX_USAGE_BREAKDOWN_URL = "https://chatgpt.com/backend-api/wham/usage/daily-token-usage-breakdown"
 CODEX_USAGE_BREAKDOWN_CACHE = AGENTCAT_HOME / "codex-usage-breakdown-cache.json"
 CODEX_USAGE_BREAKDOWN_TTL_SECONDS = int(os.environ.get("AGENTCAT_CODEX_USAGE_TTL_SECONDS", "900"))
@@ -240,7 +241,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.37.1")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.39.0")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -3762,29 +3763,6 @@ def codex_reset_credits_request(access_token: str, account_id: str) -> Dict[str,
     return payload if isinstance(payload, dict) else {}
 
 
-def codex_reset_credit_consume_request(
-    access_token: str,
-    account_id: str,
-    credit_id: str,
-    redeem_request_id: str,
-) -> Dict[str, Any]:
-    body = json.dumps(
-        {"credit_id": credit_id, "redeem_request_id": redeem_request_id},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    headers = codex_request_headers(access_token, account_id)
-    headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(
-        CODEX_RESET_CREDITS_CONSUME_URL,
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    return payload if isinstance(payload, dict) else {}
-
-
 def codex_window_quota(
     quota_id: str,
     label: str,
@@ -4220,22 +4198,6 @@ def codex_live_limits(force: bool = False) -> Dict[str, Any]:
     return codex_live_limits_for_auth(auth, "codex", force=force)
 
 
-def _codex_consumed_credit(
-    credit_id: str,
-    consume_payload: Dict[str, Any],
-    limits: Dict[str, Any],
-) -> Dict[str, Any]:
-    summaries = codex_reset_credit_summaries([consume_payload.get("credit")])
-    if summaries:
-        return summaries[0]
-    credits = limits.get("resetCredits")
-    if isinstance(credits, list):
-        for credit in credits:
-            if isinstance(credit, dict) and credit.get("id") == credit_id:
-                return dict(credit)
-    return {"id": credit_id}
-
-
 def log_codex_reset_credit_diagnostic(
     ok: bool,
     *,
@@ -4252,67 +4214,6 @@ def log_codex_reset_credit_diagnostic(
         store_event("codex", "agentcat-reset-credit", "reset-credit-consume", payload)
     except Exception:
         logging.debug("failed to persist Codex reset-credit diagnostic")
-
-
-def consume_codex_reset_credit(credit_id: Any, confirmation: Any) -> Dict[str, Any]:
-    if not isinstance(credit_id, str) or not credit_id.strip() or len(credit_id) > 512:
-        raise ValueError("creditId must be a non-empty string")
-    if not isinstance(confirmation, str) or not confirmation.strip() or len(confirmation) > 512:
-        raise ValueError("confirmation must be a non-empty nonce")
-    credit_id = credit_id.strip()
-    confirmation = confirmation.strip()
-
-    auth = read_codex_auth()
-    if not auth:
-        log_codex_reset_credit_diagnostic(False, reason="token_missing")
-        raise RuntimeError("Codex OAuth credentials are not configured")
-    tokens = oauth_tokens(auth)
-    access_token = tokens.get("access_token")
-    account_id = tokens.get("account_id") or auth.get("account_id") or ""
-    if not isinstance(access_token, str) or not access_token:
-        log_codex_reset_credit_diagnostic(False, reason="token_missing")
-        raise RuntimeError("Codex OAuth credentials are not configured")
-
-    try:
-        consume_payload = codex_reset_credit_consume_request(
-            access_token,
-            str(account_id),
-            credit_id,
-            confirmation,
-        )
-    except urllib.error.HTTPError as exc:
-        if exc.code != 401:
-            log_codex_reset_credit_diagnostic(False, reason="upstream_http_error")
-            raise
-        exc.close()
-        try:
-            refreshed = refresh_codex_access_token(auth)
-        except Exception:
-            refreshed = None
-        if not refreshed:
-            log_codex_reset_credit_diagnostic(False, reason="token_expired")
-            raise RuntimeError("Codex OAuth token expired")
-        try:
-            consume_payload = codex_reset_credit_consume_request(
-                refreshed,
-                str(account_id),
-                credit_id,
-                confirmation,
-            )
-        except Exception:
-            log_codex_reset_credit_diagnostic(False, reason="upstream_http_error")
-            raise
-
-    windows_reset = int_count(consume_payload.get("windows_reset"))
-    limits = codex_live_limits(force=True)
-    record_live_limit_reset_signal("codex")
-    log_codex_reset_credit_diagnostic(True, windows_reset=windows_reset)
-    return {
-        "ok": True,
-        "windowsReset": windows_reset if windows_reset is not None else 0,
-        "credit": _codex_consumed_credit(credit_id, consume_payload, limits),
-        "limits": limits,
-    }
 
 
 def _resolved_path_key(path: Path) -> str:
@@ -4391,6 +4292,9 @@ def codex_provider_instances_with_completeness(
                 "lastSeenAt": None,
                 "_auth": auth,
             }
+            managed_identity = _codex_managed_provider_identity(auth)
+            if managed_identity:
+                entry["_managedDedupKey"] = _codex_dedup_key(managed_identity)
             grouped[instance_id] = entry
 
         entry["profileCount"] += 1
@@ -4404,17 +4308,27 @@ def codex_provider_instances_with_completeness(
             if not isinstance(previous, (int, float)) or newest > previous:
                 entry["_lastSeenTimestamp"] = float(newest)
 
+    managed_by_dedup: Dict[str, Dict[str, Any]] = {}
+    for row in _codex_connections():
+        dedup_key = row.get("dedupKey")
+        if row.get("status") == "connected" and isinstance(dedup_key, str) and isinstance(row.get("usage"), dict):
+            managed_by_dedup[dedup_key] = row
+
     instances: List[Dict[str, Any]] = []
+    matched_managed: Set[str] = set()
     for entry in grouped.values():
         auth = entry.pop("_auth")
+        managed_dedup_key = entry.pop("_managedDedupKey", None)
         last_seen = entry.pop("_lastSeenTimestamp", None)
         if isinstance(last_seen, (int, float)):
             entry["lastSeenAt"] = iso_from_timestamp(float(last_seen))
         else:
             entry.pop("lastSeenAt", None)
 
-        if entry["active"] and isinstance(current_limits, dict):
-            limits = copy.deepcopy(current_limits)
+        managed = managed_by_dedup.get(managed_dedup_key) if isinstance(managed_dedup_key, str) else None
+        if managed is not None:
+            limits = codex_managed_connection_limits(managed)
+            matched_managed.add(managed_dedup_key)
         else:
             cache_key = f"codex-instance:{entry['id'].rsplit(':', 1)[-1]}"
             try:
@@ -4427,6 +4341,25 @@ def codex_provider_instances_with_completeness(
         entry["status"] = "connected" if entry["tracked"] else "discovered"
         instances.append(entry)
 
+    for dedup_key, managed in managed_by_dedup.items():
+        if dedup_key in matched_managed:
+            continue
+        instance_id = provider_instance_id("codex", f"managed:{dedup_key}")
+        suffix = instance_id.rsplit(":", 1)[-1][-4:].upper()
+        limits = codex_managed_connection_limits(managed)
+        instances.append({
+            "id": instance_id,
+            "providerID": "codex",
+            "label": f"Codex · {suffix}",
+            "identityConfidence": "verified_managed_account",
+            "profileCount": 1,
+            "tracked": True,
+            "active": False,
+            "limits": limits,
+            "planType": limits.get("planType"),
+            "status": "connected",
+        })
+
     return sorted(
         instances,
         key=lambda item: (
@@ -4435,6 +4368,55 @@ def codex_provider_instances_with_completeness(
             str(item.get("label") or ""),
         ),
     ), complete
+
+
+CODEX_MANAGED_USAGE_FRESH_SECONDS = 300
+
+
+def codex_managed_connection_limits(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Project one verified app-server usage row into provider-instance limits."""
+    usage = row.get("usage")
+    if not isinstance(usage, dict):
+        return empty_limits(status="error", reason="managed_usage_unavailable")
+    quotas: List[Dict[str, Any]] = []
+    for window in usage.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        duration = int_count(window.get("windowDurationMins"))
+        quotas.append({
+            "id": window.get("id"),
+            "label": window.get("name") or ("7d" if duration == 10080 else "quota"),
+            "window": "7d" if duration == 10080 else None,
+            "unit": "percent",
+            "used": None,
+            "remaining": None,
+            "limit": None,
+            "usedPercent": float_percent(window.get("usedPercent")),
+            "remainingPercent": float_percent(window.get("remainingPercent")),
+            "resetAt": int_count(window.get("resetsAt")),
+            "model": window.get("model"),
+            "primary": window.get("primary") is True,
+        })
+    limits = empty_limits(status="auto")
+    limits["source"] = usage.get("source") or "codex-app-server"
+    limits["quotas"] = quotas
+    limits["updatedAt"] = row.get("lastSuccessfulSyncAt") or row.get("lastSyncAt")
+    # "live" is stamped into the stored row at fetch time and never re-checked,
+    # so a two-day-old reading kept presenting as current. Age decides, with
+    # the same 300s window as the Claude local-cache path.
+    synced = parse_iso_timestamp(limits["updatedAt"])
+    age = (dt.datetime.now(dt.timezone.utc) - synced).total_seconds() if synced and synced.tzinfo else None
+    limits["stale"] = usage.get("freshness") != "live" or age is None or age > CODEX_MANAGED_USAGE_FRESH_SECONDS
+    if limits["stale"]:
+        limits["reason"] = "codex_managed_usage_stale"
+    reached_type = usage.get("rateLimitReachedType")
+    limits["rateLimitReachedType"] = reached_type
+    limits["rateLimitReached"] = bool(reached_type)
+    primary_weekly = next((q for q in quotas if q.get("primary") and q.get("window") == "7d"), None)
+    if primary_weekly:
+        limits["weeklyUsedPercent"] = primary_weekly.get("usedPercent")
+        limits["weeklyResetAt"] = primary_weekly.get("resetAt")
+    return limits
 
 
 # Only normalized, privacy-safe rows are cached, never Orca's raw account list.
@@ -4939,7 +4921,16 @@ def provider_instances_snapshot_with_completeness(
     resolved_limits = limits_by_provider if isinstance(limits_by_provider, dict) else {}
     codex_rows, codex_complete = codex_provider_instances_with_completeness(resolved_limits.get("codex"))
     complete_providers = {"codex"} if codex_complete else set()
-    return codex_rows + orca_claude_provider_instances(), complete_providers
+    rows = codex_rows + orca_claude_provider_instances()
+    # What each CLI says about its own home wins: borrowed Orca/managed rows
+    # for the same provider showed other accounts' numbers (both Codex rows
+    # at 100% while one home had 0% used). They stay on /v1/connections.
+    probed = cli_probe_provider_instances()
+    probed_providers = {row["providerID"] for row in probed if row["limits"].get("quotas")}
+    if probed_providers:
+        rows = [row for row in rows if row.get("providerID") not in probed_providers]
+        complete_providers -= probed_providers
+    return rows + probed, complete_providers
 
 
 def codex_usage_breakdown_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
@@ -5287,29 +5278,6 @@ def read_claude_oauth_credentials() -> Dict[str, Any]:
     return {"oauth": None, "reason": "token_missing"}
 
 
-def refresh_claude_access_token(refresh_token: str) -> Optional[str]:
-    """Refresh Claude OAuth in memory without modifying Claude Code's auth state."""
-    body = urllib.parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLAUDE_OAUTH_CLIENT_ID,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        CLAUDE_OAUTH_TOKEN_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    token = payload.get("access_token") if isinstance(payload, dict) else None
-    return token.strip() if isinstance(token, str) and token.strip() else None
-
-
 def claude_usage_request(access_token: str) -> Dict[str, Any]:
     req = urllib.request.Request(
         CLAUDE_USAGE_URL,
@@ -5609,20 +5577,10 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
         return credentialed(empty_limits(reason="token_missing"))
     expires_at = int_limit(oauth.get("expiresAt"))
     now_ms = int(time.time() * 1000)
-    refresh_token = oauth.get("refreshToken") or oauth.get("refresh_token")
-    should_refresh = bool(expires_at and now_ms + CLAUDE_OAUTH_EXPIRY_BUFFER_MS >= expires_at)
-    refresh_attempted = False
-    if should_refresh and isinstance(refresh_token, str) and refresh_token:
-        refresh_attempted = True
-        try:
-            refreshed = refresh_claude_access_token(refresh_token)
-        except Exception:
-            refreshed = None
-        if not refreshed:
-            return credentialed(empty_limits(reason="token_expired"))
-        token = refreshed
-    elif expires_at and now_ms >= expires_at:
-        return credentialed(empty_limits(reason="token_expired"))
+    # Claude Code's own login: read only. Refreshing it would rotate the
+    # refresh token and log Claude Code out (oauth-and-usage-probing.md, R1).
+    if expires_at and now_ms >= expires_at:
+        return credentialed(empty_limits(reason="cli_login_expired"))
     last_error: Optional[Exception] = None
     while True:
         try:
@@ -5635,21 +5593,6 @@ def claude_live_limits(force: bool = False) -> Dict[str, Any]:
             return limits
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if (
-                exc.code == 401
-                and not refresh_attempted
-                and isinstance(refresh_token, str)
-                and refresh_token
-            ):
-                refresh_attempted = True
-                try:
-                    refreshed = refresh_claude_access_token(refresh_token)
-                except Exception:
-                    refreshed = None
-                if refreshed:
-                    exc.close()
-                    token = refreshed
-                    continue
             break
         except Exception as exc:
             last_error = exc
@@ -6640,30 +6583,6 @@ def read_kimi_oauth_credentials() -> Dict[str, Any]:
     }
 
 
-def refresh_kimi_access_token(refresh_token: str) -> Optional[str]:
-    # In-memory only — never write Kimi's credentials file.
-    body = urllib.parse.urlencode(
-        {
-            "client_id": KIMI_OAUTH_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        KIMI_OAUTH_TOKEN_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "User-Agent": "kimi-code/1.0",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    token = payload.get("access_token") if isinstance(payload, dict) else None
-    return token.strip() if isinstance(token, str) and token.strip() else None
-
-
 def kimi_usage_number(raw: Any) -> Optional[float]:
     if isinstance(raw, dict):
         for key in ("used", "limit", "remaining", "val", "value"):
@@ -6841,20 +6760,12 @@ def kimi_live_limits(force: bool = False) -> Dict[str, Any]:
     now = int(time.time())
     expired = isinstance(expires_at, int) and expires_at <= now
     refresh_failed = False
+    # Kimi CLI's own login: read only, never refreshed (R1). An expired CLI
+    # token is reported so the person can run `kimi` or connect a managed login.
     if isinstance(access, str) and access and not expired:
         tokens.append(access)
-    if isinstance(refresh, str) and refresh:
-        try:
-            refreshed = refresh_kimi_access_token(refresh)
-        except Exception as exc:
-            last_error = exc
-            refresh_failed = True
-            refreshed = None
-        if refreshed:
-            tokens.append(refreshed)
-            refresh_failed = False
-    if isinstance(access, str) and access and access not in tokens:
-        tokens.append(access)
+    elif expired:
+        return empty_limits(reason="cli_login_expired")
 
     for token in tokens:
         try:
@@ -13476,6 +13387,239 @@ def snapshot_refresh_loop(interval_seconds: float) -> None:
             print(f"agentcatd snapshot refresh failed: {exc}", file=sys.stderr, flush=True)
 
 
+# Managed Codex quota is only as fresh as its last app-server probe. It used
+# to refresh only when a client listed /v1/connections, so the popover and menu
+# bar went stale five minutes after the app stopped asking. Keep the interval
+# under CODEX_MANAGED_USAGE_FRESH_SECONDS; the per-row 60s throttle still holds.
+MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS = 120.0
+
+
+def refresh_managed_quotas_once() -> bool:
+    try:
+        codex_connections_snapshot(allow_implicit_refresh=True)
+        return True
+    except Exception as exc:
+        print(f"agentcatd managed quota refresh failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+        return False
+
+
+def managed_quota_refresh_loop(interval_seconds: float) -> None:
+    while True:
+        refresh_managed_quotas_once()
+        time.sleep(interval_seconds)
+
+
+# --- CLI probe: ask each CLI, per home, who it is and how much is left ------
+CLI_PROBE_INTERVAL_SECONDS = 300.0
+# Two missed rounds before a reading is shown as stale.
+CLI_PROBE_FRESH_SECONDS = 2 * CLI_PROBE_INTERVAL_SECONDS
+CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi", "gemini": "Antigravity", "copilot": "Copilot"}
+# agy's own quota source (from its logs): a different host than Code Assist's
+# cloudcode-pa, which answers 403 without an onboarded project.
+ANTIGRAVITY_QUOTA_SUMMARY_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+
+
+def probe_antigravity() -> Optional[Dict[str, Any]]:
+    """Antigravity quota as agy sees it. The apps fold it into the gemini tile."""
+    creds = read_antigravity_oauth_credentials()
+    if not creds:
+        return None
+    home = ANTIGRAVITY_CLI_DIR
+    claims = cli_probe._jwt_claims(str(creds.get("id_token") or ""))
+    email = cli_probe._email(claims.get("email"))
+    try:
+        # Refreshes in memory only; agy's own token file is never rewritten.
+        token = antigravity_access_token()
+        if not token:
+            return cli_probe._result("gemini", home, status="error", reason="cli_login_expired", email=email)
+        req = urllib.request.Request(
+            ANTIGRAVITY_QUOTA_SUMMARY_URL,
+            data=b"{}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "antigravity"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read(1_000_000).decode("utf-8") or "{}")
+    except Exception:
+        return cli_probe._result("gemini", home, status="error", reason="usage_unavailable", email=email)
+    windows = cli_probe.parse_antigravity_quota_summary(payload)
+    return cli_probe._result(
+        "gemini", home, email=email, windows=windows,
+        status="ok" if windows else "error", reason=None if windows else "usage_unavailable",
+    )
+
+
+def _cli_probe_token_module(provider: str) -> Any:
+    import importlib
+
+    return importlib.import_module(f"agentcat_{provider}_managed")
+
+
+def run_cli_probes() -> Dict[str, Any]:
+    results: List[Dict[str, Any]] = []
+    cwd = AGENTCAT_HOME / "cli-probe-cwd"
+    try:
+        cwd.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        cwd = None
+    codex_rows: List[Dict[str, Any]] = []
+    for home in tracked_provider_homes("codex"):
+        codex_rows.append(cli_probe.probe_codex_home(home, CodexAppServer))
+    # Orca keeps its own copy of a local login; one account is one row.
+    seen: Dict[str, Dict[str, Any]] = {}
+    for row in codex_rows:
+        key = row.get("email") or row["homeKey"]
+        current = seen.get(key)
+        if current is None or (current["status"] != "ok" and row["status"] == "ok"):
+            seen[key] = row
+    results.extend(r for r in seen.values() if r.get("email") or r["status"] == "ok")
+    claude = shutil.which("claude") or (str(Path.home() / ".local" / "bin" / "claude") if (Path.home() / ".local" / "bin" / "claude").exists() else None)
+    default_claude = default_provider_home("claude")
+    for home in tracked_provider_homes("claude"):
+        results.append(cli_probe.probe_claude_home(home, default_claude, claude, cwd=cwd))
+    for provider, relative, token_key in (("grok", ".grok", "token"), ("kimi", ".kimi-code", "access")):
+        home = Path.home() / relative
+        if home.is_dir():
+            try:
+                results.append(cli_probe.probe_token_home(provider, home, _cli_probe_token_module(provider), token_key))
+            except Exception:
+                results.append(cli_probe._result(provider, home, status="error", reason="cli_failed"))
+    if shutil.which("gh"):
+        try:
+            # Copilot rides the GitHub login the gh CLI already holds.
+            results.extend(cli_probe.probe_copilot())
+        except Exception:
+            pass
+    try:
+        antigravity = probe_antigravity()
+        if antigravity:
+            results.append(antigravity)
+    except Exception:
+        pass
+    return {"generatedAt": int(time.time()), "results": results}
+
+
+def refresh_cli_probes_once() -> bool:
+    try:
+        write_json_atomic(CLI_PROBE_CACHE, run_cli_probes())
+        return True
+    except Exception as exc:
+        print(f"agentcatd cli probe failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+        return False
+
+
+def cli_probe_loop(interval_seconds: float) -> None:
+    while True:
+        refresh_cli_probes_once()
+        time.sleep(interval_seconds)
+
+
+def _cli_probe_quota(window: Dict[str, Any]) -> Dict[str, Any]:
+    mins = window.get("windowDurationMins")
+    return {
+        "id": window.get("id"),
+        "label": window.get("label") or "quota",
+        "window": "7d" if mins == 10080 else "5h" if mins == 300 else None,
+        "unit": "percent",
+        "used": None,
+        "remaining": None,
+        "limit": None,
+        "usedPercent": window.get("usedPercent"),
+        "remainingPercent": window.get("remainingPercent"),
+        "resetAt": window.get("resetsAt"),
+        "model": window.get("model"),
+        "primary": bool(window.get("primary")),
+    }
+
+
+def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    raw = read_json(CLI_PROBE_CACHE)
+    rows = raw.get("results") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        return []
+    now = time.time() if now is None else now
+    instances: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        provider = row.get("provider")
+        if provider not in CLI_PROBE_PROVIDER_NAMES:
+            continue
+        email = row.get("email") if isinstance(row.get("email"), str) else None
+        quotas = [_cli_probe_quota(w) for w in row.get("windows") or [] if isinstance(w, dict)]
+        fetched = row.get("fetchedAt") if isinstance(row.get("fetchedAt"), (int, float)) else 0
+        limits = empty_limits(status="auto" if quotas else "not_configured")
+        limits["source"] = "cli-probe"
+        limits["quotas"] = quotas
+        limits["updatedAt"] = iso_from_timestamp(fetched) if fetched else None
+        limits["stale"] = bool(not quotas or now - fetched > CLI_PROBE_FRESH_SECONDS)
+        if row.get("reason"):
+            limits["reason"] = row["reason"]
+        elif limits["stale"]:
+            limits["reason"] = "cli_probe_stale"
+        if row.get("rateLimitReached"):
+            limits["rateLimitReached"] = True
+        if isinstance(row.get("resetCreditsAvailable"), int):
+            # Same keys the managed Codex path already fills; clients read them.
+            limits["resetCreditsAvailable"] = row["resetCreditsAvailable"]
+            limits["resetCredits"] = [c for c in row.get("resetCredits") or [] if isinstance(c, dict)]
+        # Clients decide whether a row has a live meter from these summary
+        # fields, as every other limits source fills them.
+        windows = [w for w in row.get("windows") or [] if isinstance(w, dict)]
+        # The tightest pool-level window of each span is the headline.
+        def tightest(minutes: int) -> Optional[Dict[str, Any]]:
+            pool = [w for w in windows if w.get("windowDurationMins") == minutes and not w.get("model")]
+            return max(pool, key=lambda w: w.get("usedPercent") or 0.0) if pool else None
+
+        weekly, short = tightest(10080), tightest(300)
+        if weekly:
+            limits["weeklyUsedPercent"] = weekly.get("usedPercent")
+            limits["weeklyResetAt"] = weekly.get("resetsAt")
+        if short:
+            limits["shortUsedPercent"] = short.get("usedPercent")
+            limits["shortWindowMinutes"] = 300
+            limits["shortResetAt"] = short.get("resetsAt")
+        seed = row.get("accountID") or email or row.get("homeKey") or ""
+        login = row.get("accountID") if provider == "copilot" and isinstance(row.get("accountID"), str) else None
+        hint = cli_probe_identity_hint(email) if email else (login[:2].lower() + "**" if login else str(row.get("homeKey") or "")[-4:].upper())
+        instance = {
+            "id": provider_instance_id(provider, f"cli:{seed}"),
+            "providerID": provider,
+            "label": f"{CLI_PROBE_PROVIDER_NAMES[provider]} · {hint}",
+            "identityConfidence": "cli_reported",
+            "source": "cli-probe",
+            "profileCount": 1,
+            "tracked": bool(quotas),
+            "active": False,
+            "status": "connected" if quotas else "discovered",
+            "limits": limits,
+        }
+        if row.get("plan"):
+            instance["planType"] = row["plan"]
+            limits["planType"] = row["plan"]
+        if email:
+            # Local display only (see the app's LocalConnectorAccount privacy note).
+            instance["account"] = {"email": email, "plan": row.get("plan")}
+        if isinstance(row.get("billing"), dict):
+            instance["billing"] = {k: row["billing"].get(k) for k in ("renewsAt", "estimated")}
+        if isinstance(row.get("extraUsageEnabled"), bool):
+            instance["extraUsageEnabled"] = row["extraUsageEnabled"]
+        if isinstance(row.get("balances"), dict) and row["balances"]:
+            instance["balances"] = {k: v for k, v in row["balances"].items() if isinstance(v, (int, float))}
+        instances.append(instance)
+    return instances
+
+
+def cli_probe_identity_hint(email: str) -> str:
+    """Two letters that tell accounts apart: the org domain, else the local part."""
+    local, _, domain = email.partition("@")
+    public = {"gmail.com", "googlemail.com", "naver.com", "daum.net", "hanmail.net", "kakao.com",
+              "icloud.com", "me.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com",
+              "proton.me", "protonmail.com"}
+    base = local if domain.lower() in public or not domain else domain
+    return (base[:2] or "??").lower() + "**"
+
+
 def concise_snapshot_text(snapshot: Dict[str, Any]) -> str:
     lines = ["Agent Cat snapshot"]
     for provider, data in snapshot.get("providers", {}).items():
@@ -16951,34 +17095,6 @@ def connection_control_request_error(headers: Any, *, mutation: bool) -> Optiona
     return None
 
 
-def switch_default_connection(connection_id: str) -> Dict[str, Any]:
-    """Make a stored Codex/Claude account the default CLI identity."""
-    try:
-        return managed_accounts().make_default(connection_id, confirmed=True)
-    except ValueError:
-        raise
-    except KeyError:
-        pass
-    with _CODEX_CONNECTIONS_LOCK:
-        rows = _codex_connections()
-        row = next(
-            (item for item in rows
-             if item.get("id") == connection_id and item.get("status") not in {"removed", "superseded"}),
-            None,
-        )
-    if row is None:
-        raise KeyError("connection_not_found")
-    result = make_default_account(
-        agentcat_home=AGENTCAT_HOME,
-        provider="codex",
-        connection_id=connection_id,
-        source_profile=_codex_profile_dir(connection_id),
-        confirmed=True,
-    )
-    result["connection"] = _codex_public_connection(row)
-    return result
-
-
 class AgentCatHandler(BaseHTTPRequestHandler):
     server_version = "AgentCat/1"
 
@@ -17090,7 +17206,9 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 status, reason = guard_error
                 self.send_json(status, {"error": "connection_read_forbidden", "message": reason})
                 return
-            self.send_json(200, {"connections": openrouter_connections_snapshot() + codex_connections_snapshot() + managed_accounts().snapshot()})
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            cache_only = query.get("refresh", [""])[0].lower() == "false"
+            self.send_json(200, {"connections": openrouter_connections_snapshot() + codex_connections_snapshot(allow_implicit_refresh=not cache_only) + managed_accounts().snapshot()})
             return
         connection_resolve_match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})/resolve", path)
         if connection_resolve_match:
@@ -17355,33 +17473,6 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 except Exception:
                     self.send_json(500, {"error": "oauth_completion_failed"})
                 return
-            make_default_match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})/make-default", path)
-            if make_default_match:
-                if payload.get("confirmed") is not True:
-                    self.send_json(400, {"error": "confirmed_required"})
-                    return
-                try:
-                    result = switch_default_connection(make_default_match.group(1))
-                except KeyError:
-                    self.send_json(404, {"error": "connection_not_found"})
-                    return
-                except ValueError as exc:
-                    reason = str(exc)
-                    if reason in {"confirmed_required", "provider_not_supported"}:
-                        self.send_json(400, {"error": reason})
-                    else:
-                        self.send_json(400, {"error": "invalid_connection"})
-                    return
-                except AccountSwitchError as exc:
-                    code = str(exc)
-                    status = 409 if code.startswith("target_") else 500
-                    self.send_json(status, {"error": code})
-                    return
-                except Exception:
-                    self.send_json(500, {"error": "switch_failed"})
-                    return
-                self.send_json(200, result)
-                return
             match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})/refresh", path)
             if not match:
                 self.send_json(404, {"error": "not_found"})
@@ -17407,34 +17498,6 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
             status, payload = reflect_http_post(path, body, query)
             self.send_json(status, payload)
-            return
-        if path == "/providers/codex/reset-credits/consume":
-            guard_error = key_mutation_request_error(self.headers)
-            if guard_error is not None:
-                status, reason = guard_error
-                self.send_json(status, {"error": "reset_credit_forbidden", "message": reason})
-                return
-            try:
-                payload = self.read_json_body(max_bytes=16 * 1024)
-                response = consume_codex_reset_credit(
-                    payload.get("creditId"),
-                    payload.get("confirmation"),
-                )
-            except ValueError as exc:
-                self.send_json(400, {"error": "invalid_reset_credit_request", "message": str(exc)})
-                return
-            except RuntimeError as exc:
-                self.send_json(409, {"error": "codex_not_configured", "message": str(exc)})
-                return
-            except urllib.error.HTTPError as exc:
-                status = int(exc.code)
-                exc.close()
-                self.send_json(502, {"error": "reset_credit_consume_failed", "upstreamStatus": status})
-                return
-            except Exception:
-                self.send_json(500, {"error": "reset_credit_consume_failed"})
-                return
-            self.send_json(200, response)
             return
         if path == "/v1/config":
             try:
@@ -17636,6 +17699,16 @@ def run_daemon(args: argparse.Namespace) -> int:
         snapshot_refresh_loop(60.0)
 
     threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
+    threading.Thread(
+        target=cli_probe_loop,
+        args=(CLI_PROBE_INTERVAL_SECONDS,),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=managed_quota_refresh_loop,
+        args=(MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS,),
+        daemon=True,
+    ).start()
     update_enabled, _update_reason = auto_update_enabled_status()
     if update_enabled and AUTO_UPDATE_INTERVAL_SECONDS > 0:
         threading.Thread(
@@ -17729,16 +17802,6 @@ def command_codex_notify(args: argparse.Namespace) -> int:
     payload = read_stdin_payload()
     runtime_mode = codex_runtime_mode_event(payload)
     store_event("codex", "codex-notify", "notify", codex_notify_storage_payload(payload, runtime_mode))
-    return 0
-
-
-def command_codex_reset_credit_consume(args: argparse.Namespace) -> int:
-    try:
-        payload = consume_codex_reset_credit(args.credit_id, str(uuid.uuid4()))
-    except Exception as exc:
-        print(f"agentcat codex reset-credit consume: {exc}", file=sys.stderr)
-        return 1
-    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
@@ -18247,6 +18310,21 @@ def _same_path(left: Path, right: Path) -> bool:
         return str(left) == str(right)
 
 
+def adopt_provider_home(provider: str, home: Path) -> bool:
+    """Start reading usage from ``home``; True when the adopted list changed."""
+    # An adopted home must not stay on the exclusion list, or the stronger
+    # exclusion would silently cancel the adoption.
+    _update_home_settings(provider, "excluded", home, remove=True)
+    return _update_home_settings(provider, "adopted", home)
+
+
+def forget_provider_home(provider: str, home: Path) -> bool:
+    """Drop ``home`` from both the adopted and excluded lists."""
+    removed_adopted = _update_home_settings(provider, "adopted", home, remove=True)
+    removed_excluded = _update_home_settings(provider, "excluded", home, remove=True)
+    return removed_adopted or removed_excluded
+
+
 def command_homes(args: argparse.Namespace) -> int:
     """List discovered provider homes, and adopt or exclude one.
 
@@ -18284,19 +18362,14 @@ def command_homes(args: argparse.Namespace) -> int:
                 )
                 return 2
         if adopt:
-            # An adopted home must not stay on the exclusion list, or the
-            # stronger exclusion would silently cancel the adoption.
-            _update_home_settings(provider, "excluded", home, remove=True)
-            changed = _update_home_settings(provider, "adopted", home)
+            changed = adopt_provider_home(provider, home)
             print(f"{'adopted' if changed else 'already adopted'}: {home}")
         elif exclude:
             _update_home_settings(provider, "adopted", home, remove=True)
             changed = _update_home_settings(provider, "excluded", home)
             print(f"{'excluded' if changed else 'already excluded'}: {home}")
         else:
-            removed_adopted = _update_home_settings(provider, "adopted", home, remove=True)
-            removed_excluded = _update_home_settings(provider, "excluded", home, remove=True)
-            if removed_adopted or removed_excluded:
+            if forget_provider_home(provider, home):
                 print(f"forgot: {home}")
             else:
                 print(f"not adopted or excluded: {home}")
@@ -18349,6 +18422,281 @@ def command_homes(args: argparse.Namespace) -> int:
         unread = [c for c in entry["discovered"] if not c["tracked"] and not c["excluded"] and c["files"]]
         if unread:
             print(f"  → adopt with: agentcat homes --provider {name} --adopt {unread[0]['path']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Per-account launcher commands (`agentcat profile ...`).
+#
+# Multi-account without switching: each account gets its own CLI home and a
+# tiny launcher (`codex-work`) that runs the real CLI with that home. The user
+# logs in through the CLI itself; Agent Cat never creates, copies or refreshes
+# a credential (rule R1) and only reads each adopted home.
+# ---------------------------------------------------------------------------
+
+PROFILE_PROVIDERS: Dict[str, Dict[str, str]] = {
+    "codex": {
+        "envVar": "CODEX_HOME",
+        "cli": "codex",
+        "login": "run `{command} login`",
+        "credential": "auth.json",
+    },
+    "claude": {
+        "envVar": "CLAUDE_CONFIG_DIR",
+        "cli": "claude",
+        "login": "run `{command} auth login` (or start `{command}` and type /login)",
+        "credential": ".credentials.json",
+    },
+    # KIMI_CODE_HOME verified against @moonshot-ai/kimi-code (env > ~/.kimi-code).
+    "kimi": {
+        "envVar": "KIMI_CODE_HOME",
+        "cli": "kimi",
+        "login": "start `{command}` and type /login",
+        "credential": "credentials/kimi-code.json",
+    },
+}
+PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+PROFILE_LAUNCHER_MARKER = "# agentcat-profile-launcher"
+# Injectable for tests; must only ever check existence (never `-w`).
+PROFILE_SECURITY_RUNNER: Optional[Any] = None
+
+
+def profile_homes_root() -> Path:
+    return AGENTCAT_HOME / "homes"
+
+
+def profile_bin_dir() -> Path:
+    return HOME / ".local" / "bin"
+
+
+def _profile_marker(provider: str, name: str) -> str:
+    return f"{PROFILE_LAUNCHER_MARKER} provider={provider} name={name}"
+
+
+def _profile_launcher_owner(path: Path) -> Optional[Tuple[str, str]]:
+    """(provider, name) when ``path`` is a launcher Agent Cat wrote, else None."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            head = [fh.readline() for _ in range(3)]
+    except OSError:
+        return None
+    for line in head:
+        if line.startswith(PROFILE_LAUNCHER_MARKER + " "):
+            fields = dict(
+                item.split("=", 1) for item in line.strip().split()[2:] if "=" in item
+            )
+            if fields.get("provider") and fields.get("name"):
+                return fields["provider"], fields["name"]
+    return None
+
+
+def profile_launcher_script(provider: str, name: str, home: Path, cli: str) -> str:
+    env_var = PROFILE_PROVIDERS[provider]["envVar"]
+    return (
+        "#!/bin/sh\n"
+        f"{_profile_marker(provider, name)}\n"
+        f"# Created by `agentcat profile add`; remove with `agentcat profile remove {provider} {name}`.\n"
+        f"exec env {env_var}={shlex.quote(str(home))} {shlex.quote(cli)} \"$@\"\n"
+    )
+
+
+def _profile_registry(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    resolved = agentcat_settings() if settings is None else settings
+    raw = resolved.get("profiles")
+    if not isinstance(raw, dict):
+        return {}
+    return {key: value for key, value in raw.items() if isinstance(value, dict)}
+
+
+def _write_profile_entry(key: str, entry: Optional[Dict[str, Any]]) -> None:
+    settings = agentcat_settings()
+    profiles = settings.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+    if entry is None:
+        profiles.pop(key, None)
+    else:
+        profiles[key] = entry
+    settings["profiles"] = profiles
+    write_agentcat_settings(settings)
+
+
+def _resolve_profile_cli(provider: str, explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        candidate = Path(explicit).expanduser()
+        return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
+    # Skip our own launcher directory's profile scripts; `which` of the bare CLI
+    # name never matches `<provider>-<name>`, so the first hit is the real CLI.
+    return shutil.which(PROFILE_PROVIDERS[provider]["cli"])
+
+
+def profile_logged_in(provider: str, home: Path) -> bool:
+    """Read-only: does the CLI's own login exist for this home?"""
+    credential = home / PROFILE_PROVIDERS[provider]["credential"]
+    if credential.is_file():
+        return True
+    if provider != "claude" or sys.platform != "darwin":
+        return False
+    service = cli_probe.claude_keychain_service(home, default_provider_home("claude"))
+    runner = PROFILE_SECURITY_RUNNER or (
+        lambda argv: subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=5).returncode
+    )
+    try:
+        # Existence only: no -w, so the secret is never read.
+        return runner(["security", "find-generic-password", "-s", service]) == 0
+    except Exception:
+        return False
+
+
+def _profile_adopted(provider: str, home: Path) -> Optional[bool]:
+    if provider not in PROVIDER_HOME_SPECS:
+        return None
+    return any(_same_path(item, home) for item in tracked_provider_homes(provider))
+
+
+def profile_unsupported_platform() -> bool:
+    """Launchers are POSIX shell scripts in ~/.local/bin; Windows has none."""
+    if os.name == "nt":
+        print("agentcat profile is not available on Windows yet (launchers are shell scripts).", file=sys.stderr)
+        return True
+    return False
+
+
+def command_profile_add(args: argparse.Namespace) -> int:
+    if profile_unsupported_platform():
+        return 2
+    provider, name = args.provider, args.name
+    if not PROFILE_NAME_RE.match(name):
+        print("profile name must be 1-32 chars of a-z, 0-9 and '-'", file=sys.stderr)
+        return 2
+    command_name = f"{provider}-{name}"
+    home = Path(args.home).expanduser().absolute() if args.home else profile_homes_root() / command_name
+    if _same_path(home, default_provider_home(provider)) or _same_path(home, HOME):
+        print(f"refusing to use {_tilde(home)}: that is the default {provider} home", file=sys.stderr)
+        return 2
+    cli = _resolve_profile_cli(provider, getattr(args, "cli", None))
+    if not cli:
+        print(f"could not find the `{PROFILE_PROVIDERS[provider]['cli']}` CLI on PATH", file=sys.stderr)
+        return 2
+
+    bin_dir = profile_bin_dir()
+    launcher = bin_dir / command_name
+    if launcher.exists() or launcher.is_symlink():
+        if launcher.is_symlink() or _profile_launcher_owner(launcher) != (provider, name):
+            print(f"refusing to overwrite {_tilde(launcher)}: not created by agentcat", file=sys.stderr)
+            return 1
+
+    created_home = not home.exists()
+    home.mkdir(parents=True, exist_ok=True)
+    if created_home:
+        _chmod_quiet(home, 0o700)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    tmp = launcher.with_name(f".{launcher.name}.agentcat-tmp")
+    tmp.write_text(profile_launcher_script(provider, name, home, cli), encoding="utf-8")
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, launcher)
+
+    adopted: Optional[bool] = None
+    if provider in PROVIDER_HOME_SPECS:
+        adopt_provider_home(provider, home)
+        adopted = True
+    _write_profile_entry(command_name, {
+        "provider": provider,
+        "name": name,
+        "home": str(home),
+        "command": str(launcher),
+        "cli": cli,
+        "createdAt": now_iso(),
+    })
+
+    print(f"created {command_name}: {_tilde(launcher)} -> {PROFILE_PROVIDERS[provider]['envVar']}={_tilde(home)}")
+    if adopted:
+        print(f"Agent Cat now reads {_tilde(home)} for {provider} usage and quota.")
+    path_dirs = [Path(item) for item in os.environ.get("PATH", "").split(os.pathsep) if item]
+    if not any(_same_path(item, bin_dir) for item in path_dirs):
+        print(f"note: {_tilde(bin_dir)} is not on PATH; add it to run `{command_name}` directly.")
+    print("next: " + PROFILE_PROVIDERS[provider]["login"].format(command=command_name))
+    return 0
+
+
+def command_profile_remove(args: argparse.Namespace) -> int:
+    if profile_unsupported_platform():
+        return 2
+    provider, name = args.provider, args.name
+    command_name = f"{provider}-{name}"
+    entry = _profile_registry().get(command_name)
+    launcher = Path(entry["command"]) if entry and entry.get("command") else profile_bin_dir() / command_name
+    status = 0
+    if launcher.exists() or launcher.is_symlink():
+        if not launcher.is_symlink() and _profile_launcher_owner(launcher) == (provider, name):
+            launcher.unlink()
+            print(f"removed launcher {_tilde(launcher)}")
+        else:
+            print(f"left {_tilde(launcher)} alone: not created by agentcat", file=sys.stderr)
+            status = 1
+    elif entry is None:
+        print(f"no profile {command_name}", file=sys.stderr)
+        return 1
+
+    if entry and entry.get("home"):
+        home = Path(entry["home"])
+        if provider in PROVIDER_HOME_SPECS and forget_provider_home(provider, home):
+            print(f"stopped reading {_tilde(home)}")
+        if getattr(args, "delete_home", False):
+            if _same_path(home, default_provider_home(provider)) or _same_path(home, HOME):
+                print(f"refusing to delete {_tilde(home)}", file=sys.stderr)
+                status = 1
+            elif home.is_dir():
+                shutil.rmtree(home)
+                print(f"deleted home {_tilde(home)}")
+        else:
+            print(f"kept home {_tilde(home)} (pass --delete-home to delete it)")
+    _write_profile_entry(command_name, None)
+    return status
+
+
+def profile_rows() -> List[Dict[str, Any]]:
+    rows = []
+    for key, entry in sorted(_profile_registry().items()):
+        provider = entry.get("provider")
+        if provider not in PROFILE_PROVIDERS or not entry.get("home"):
+            continue
+        home = Path(str(entry["home"]))
+        launcher = Path(str(entry.get("command") or profile_bin_dir() / key))
+        rows.append({
+            "provider": provider,
+            "name": entry.get("name"),
+            "command": key,
+            "launcher": _profile_launcher_owner(launcher) == (provider, entry.get("name")),
+            "home": _tilde(home),
+            "adopted": _profile_adopted(provider, home),
+            "loggedIn": profile_logged_in(provider, home) if home.is_dir() else False,
+        })
+    return rows
+
+
+def command_profile_list(args: argparse.Namespace) -> int:
+    if profile_unsupported_platform():
+        return 2
+    rows = profile_rows()
+    if getattr(args, "json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if not rows:
+        print("no profiles (add one with: agentcat profile add codex work)")
+        return 0
+
+    def yes_no(value: Optional[bool]) -> str:
+        return "n/a" if value is None else ("yes" if value else "no")
+
+    table = [("PROVIDER", "NAME", "COMMAND", "HOME", "ADOPTED", "LOGGED IN")]
+    for row in rows:
+        command = row["command"] if row["launcher"] else f"{row['command']} (missing)"
+        table.append((row["provider"], str(row["name"]), command, row["home"],
+                      yes_no(row["adopted"]), yes_no(row["loggedIn"])))
+    widths = [max(len(line[i]) for line in table) for i in range(len(table[0]))]
+    for line in table:
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(line)).rstrip())
     return 0
 
 
@@ -19173,7 +19521,11 @@ def _codex_terminal_connection(row: Dict[str, Any], rows: List[Dict[str, Any]]) 
     return None
 
 
-def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
+def codex_connections_snapshot(
+    refresh: bool = False,
+    *,
+    allow_implicit_refresh: bool = True,
+) -> List[Dict[str, Any]]:
     with _CODEX_CONNECTIONS_LOCK:
         rows = _codex_connections()
         changed = False
@@ -19181,6 +19533,8 @@ def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
             if row.get("status") in {"removed", "canceled"}:
                 continue
             if row.get("status") in {"pending_browser", "pending_device"}:
+                if not allow_implicit_refresh:
+                    continue
                 # A daemon restart cannot safely resume a login listener owned
                 # by the prior child.  Preserve the isolated profile and make
                 # recovery explicit rather than silently attaching another one.
@@ -19193,7 +19547,11 @@ def codex_connections_snapshot(refresh: bool = False) -> List[Dict[str, Any]]:
                             changed = _codex_refresh_row(row) or changed
                     except CodexAppServerError:
                         pass
-            elif refresh or (row.get("status") == "connected" and _codex_implicit_refresh_due(row)):
+            elif refresh or (
+                allow_implicit_refresh
+                and row.get("status") == "connected"
+                and _codex_implicit_refresh_due(row)
+            ):
                 changed = _codex_refresh_row(row) or changed
         if changed:
             _write_codex_connections(rows)
@@ -19588,9 +19946,6 @@ def build_parser() -> argparse.ArgumentParser:
     codex_commands = codex.add_subparsers(dest="codex_command", required=True)
     reset_credit = codex_commands.add_parser("reset-credit")
     reset_credit_commands = reset_credit.add_subparsers(dest="reset_credit_command", required=True)
-    reset_credit_consume = reset_credit_commands.add_parser("consume")
-    reset_credit_consume.add_argument("credit_id")
-    reset_credit_consume.set_defaults(func=command_codex_reset_credit_consume)
 
     setup_prompt = subparsers.add_parser("setup-prompt")
     setup_prompt.set_defaults(func=command_setup_prompt)
@@ -19617,6 +19972,23 @@ def build_parser() -> argparse.ArgumentParser:
     homes.add_argument("--forget", help="drop this home from both lists")
     homes.add_argument("--json", action="store_true")
     homes.set_defaults(func=command_homes)
+
+    profile = subparsers.add_parser("profile", help="per-account launcher commands (one CLI home per account)")
+    profile_commands = profile.add_subparsers(dest="profile_command", required=True)
+    profile_add = profile_commands.add_parser("add")
+    profile_add.add_argument("provider", choices=sorted(PROFILE_PROVIDERS))
+    profile_add.add_argument("name")
+    profile_add.add_argument("--home", help="use this directory as the account's home")
+    profile_add.add_argument("--cli", help=argparse.SUPPRESS)
+    profile_add.set_defaults(func=command_profile_add)
+    profile_list = profile_commands.add_parser("list")
+    profile_list.add_argument("--json", action="store_true")
+    profile_list.set_defaults(func=command_profile_list)
+    profile_remove = profile_commands.add_parser("remove")
+    profile_remove.add_argument("provider", choices=sorted(PROFILE_PROVIDERS))
+    profile_remove.add_argument("name")
+    profile_remove.add_argument("--delete-home", action="store_true", help="also delete the account's home directory")
+    profile_remove.set_defaults(func=command_profile_remove)
 
     reflect = subparsers.add_parser("reflect")
     reflect.add_argument("reflect_command", choices=("sync", "analyze", "week"))
