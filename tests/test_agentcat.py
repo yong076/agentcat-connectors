@@ -4447,8 +4447,13 @@ class InsightsIntegrationTests(unittest.TestCase):
         agentcat.AGENTCAT_HOME = self.root / ".agentcat"
         agentcat.EVENTS_DB = agentcat.AGENTCAT_HOME / "events.sqlite"
         agentcat.LATEST_SNAPSHOT = agentcat.AGENTCAT_HOME / "latest-snapshot.json"
+        # Every other path (Antigravity trajectories, telemetry logs, CLI
+        # homes) must point at the sandbox too, or the developer's real
+        # usage leaks into the snapshot (R10).
+        self.sandbox_paths = redirect_module_paths(agentcat, self.root, self.root / ".agentcat")
 
     def tearDown(self) -> None:
+        restore_module_paths(agentcat, self.sandbox_paths)
         agentcat.HOME = self.old_home
         agentcat.AGENTCAT_HOME = self.old_agentcat_home
         agentcat.EVENTS_DB = self.old_events_db

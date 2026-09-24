@@ -29,6 +29,7 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(agentcat)
 
 
+@unittest.skipIf(os.name == "nt", "profile launchers are POSIX shell scripts")
 class ProfileCommandTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -170,3 +171,13 @@ class ProfileCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProfileWindowsTests(unittest.TestCase):
+    def test_windows_refuses_instead_of_writing_launchers(self):
+        with patch.object(agentcat.os, "name", "nt"):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertTrue(agentcat.profile_unsupported_platform())
+            self.assertIn("not available on Windows", err.getvalue())
+

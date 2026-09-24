@@ -61,9 +61,14 @@ def parse_claude_reset(text: str, now: Optional[dt.datetime] = None) -> Optional
         hour24 = int(hour) % 12 + (12 if meridiem.lower() == "pm" else 0)
         tz: dt.tzinfo = dt.timezone.utc
         if zone_name:
-            from zoneinfo import ZoneInfo
+            try:
+                from zoneinfo import ZoneInfo
 
-            tz = ZoneInfo(zone_name)
+                tz = ZoneInfo(zone_name)
+            except (ImportError, KeyError, ValueError, OSError):
+                # No tz database (Windows without tzdata). Claude prints the
+                # machine's own zone, so the local offset is the right fallback.
+                tz = now.tzinfo if now is not None and now.tzinfo is not None else dt.datetime.now().astimezone().tzinfo
         now = now or dt.datetime.now(tz)
         now = now.astimezone(tz)
         candidate = dt.datetime(now.year, month, int(day), hour24, int(minute or 0), tzinfo=tz)

@@ -54,6 +54,13 @@ class ClaudeUsageParsingTests(unittest.TestCase):
         reset = cli_probe.parse_claude_reset("Jan 2 at 9am (Asia/Seoul)", december)
         self.assertEqual(dt.datetime.fromtimestamp(reset, dt.timezone.utc).year, 2027)
 
+    def test_missing_tz_database_falls_back_to_the_local_offset(self):
+        from unittest import mock
+        with mock.patch("zoneinfo.ZoneInfo", side_effect=KeyError("Asia/Seoul")):
+            reset = cli_probe.parse_claude_reset("Sep 24 at 11:10pm (Asia/Seoul)", SEOUL_NOON)
+        expected = dt.datetime(2026, 9, 24, 23, 10, tzinfo=dt.timezone(dt.timedelta(hours=9)))
+        self.assertEqual(reset, int(expected.timestamp()))
+
     def test_unparseable_output_yields_no_windows(self):
         self.assertEqual(cli_probe.parse_claude_usage("/usage isn't available in this environment."), [])
 

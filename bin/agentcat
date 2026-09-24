@@ -241,7 +241,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.37.1")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.39.0")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -18554,7 +18554,17 @@ def _profile_adopted(provider: str, home: Path) -> Optional[bool]:
     return any(_same_path(item, home) for item in tracked_provider_homes(provider))
 
 
+def profile_unsupported_platform() -> bool:
+    """Launchers are POSIX shell scripts in ~/.local/bin; Windows has none."""
+    if os.name == "nt":
+        print("agentcat profile is not available on Windows yet (launchers are shell scripts).", file=sys.stderr)
+        return True
+    return False
+
+
 def command_profile_add(args: argparse.Namespace) -> int:
+    if profile_unsupported_platform():
+        return 2
     provider, name = args.provider, args.name
     if not PROFILE_NAME_RE.match(name):
         print("profile name must be 1-32 chars of a-z, 0-9 and '-'", file=sys.stderr)
@@ -18610,6 +18620,8 @@ def command_profile_add(args: argparse.Namespace) -> int:
 
 
 def command_profile_remove(args: argparse.Namespace) -> int:
+    if profile_unsupported_platform():
+        return 2
     provider, name = args.provider, args.name
     command_name = f"{provider}-{name}"
     entry = _profile_registry().get(command_name)
@@ -18664,6 +18676,8 @@ def profile_rows() -> List[Dict[str, Any]]:
 
 
 def command_profile_list(args: argparse.Namespace) -> int:
+    if profile_unsupported_platform():
+        return 2
     rows = profile_rows()
     if getattr(args, "json", False):
         print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
