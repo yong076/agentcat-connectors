@@ -13735,6 +13735,10 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
             limits["reason"] = "cli_probe_stale"
         if row.get("rateLimitReached"):
             limits["rateLimitReached"] = True
+        if isinstance(row.get("resetCreditsAvailable"), int):
+            # Same keys the managed Codex path already fills; clients read them.
+            limits["resetCreditsAvailable"] = row["resetCreditsAvailable"]
+            limits["resetCredits"] = [c for c in row.get("resetCredits") or [] if isinstance(c, dict)]
         # Clients decide whether a row has a live meter from these summary
         # fields, as every other limits source fills them.
         windows = [w for w in row.get("windows") or [] if isinstance(w, dict)]
@@ -13771,6 +13775,10 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
         if email:
             # Local display only (see the app's LocalConnectorAccount privacy note).
             instance["account"] = {"email": email, "plan": row.get("plan")}
+        if isinstance(row.get("billing"), dict):
+            instance["billing"] = {k: row["billing"].get(k) for k in ("renewsAt", "estimated")}
+        if isinstance(row.get("extraUsageEnabled"), bool):
+            instance["extraUsageEnabled"] = row["extraUsageEnabled"]
         instances.append(instance)
     return instances
 

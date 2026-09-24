@@ -169,9 +169,10 @@ def probe_claude_home(
     except OSError:
         return _result("claude", home, status="error", reason="cli_failed", **identity)
     windows = parse_claude_usage(completed.stdout or "")
+    details = claude_account_details(home, default_home)
     if not windows:
-        return _result("claude", home, status="error", reason="usage_unparsed", **identity)
-    return _result("claude", home, windows=windows, **identity)
+        return _result("claude", home, status="error", reason="usage_unparsed", **identity, **details)
+    return _result("claude", home, windows=windows, **identity, **details)
 
 
 def _codex_window(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -207,6 +208,17 @@ def probe_codex_home(home: Path, server_factory: Callable[[Path], Any]) -> Dict[
         except Exception:
             pass
     windows = [w for w in (_codex_window(r) for r in usage.get("windows") or [] if isinstance(r, dict)) if w]
+    extra: Dict[str, Any] = {}
+    reset = usage.get("resetCredits") if isinstance(usage.get("resetCredits"), dict) else None
+    if reset and isinstance(reset.get("availableCount"), int):
+        extra["resetCreditsAvailable"] = reset["availableCount"]
+        extra["resetCredits"] = [
+            {k: str(v) for k, v in item.items() if k in ("status", "resetType", "expiresAt", "grantedAt") and v is not None}
+            for item in reset.get("details") or [] if isinstance(item, dict)
+        ]
+    billing = codex_billing(home)
+    if billing:
+        extra["billing"] = billing
     return _result(
         "codex",
         home,
@@ -216,6 +228,7 @@ def probe_codex_home(home: Path, server_factory: Callable[[Path], Any]) -> Dict[
         rateLimitReached=bool(usage.get("rateLimitReachedType")),
         status="ok" if windows else "error",
         reason=None if windows else "usage_unavailable",
+        **extra,
     )
 
 
@@ -394,3 +407,67 @@ def fetch_kimi_usage(module: Any, token: str) -> Dict[str, Any]:
     identity, _ = module._verified_email_identity(token)
     email = _email((identity.get("identity") or {}).get("email"))
     return {"windows": parse_kimi_usage(payload), "email": email}
+
+
+def next_monthly_renewal(anchor: Any, now: Optional[dt.datetime] = None) -> Optional[Dict[str, Any]]:
+    """Next monthly renewal from a subscription date. A date already past is
+    rolled forward month by month and marked estimated: the CLI only records
+    when the subscription started or was last confirmed."""
+    if not isinstance(anchor, str) or not anchor:
+        return None
+    try:
+        when = dt.datetime.fromisoformat(anchor.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if when > now:
+        return {"renewsAt": when.isoformat().replace("+00:00", "Z"), "estimated": False}
+    months = 0
+    candidate = when
+    while candidate <= now and months < 600:
+        months += 1
+        year = when.year + (when.month - 1 + months) // 12
+        month = (when.month - 1 + months) % 12 + 1
+        day = min(when.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+        candidate = when.replace(year=year, month=month, day=day)
+    return {"renewsAt": candidate.isoformat().replace("+00:00", "Z"), "estimated": True}
+
+
+def codex_billing(home: Path, now: Optional[dt.datetime] = None) -> Optional[Dict[str, Any]]:
+    """Subscription window from the CLI's own id_token claims (dates only)."""
+    try:
+        raw = json.loads((Path(home) / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    tokens = raw.get("tokens") if isinstance(raw, dict) else None
+    token = tokens.get("id_token") if isinstance(tokens, dict) else None
+    claims = _jwt_claims(token) if isinstance(token, str) else {}
+    auth = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else None
+    if not isinstance(auth, dict):
+        return None
+    return next_monthly_renewal(auth.get("chatgpt_subscription_active_until"), now)
+
+
+_CLAUDE_TIERS = {"max_5x": "Max 5x", "max_20x": "Max 20x", "pro": "Pro", "team": "Team", "enterprise": "Enterprise"}
+
+
+def claude_account_details(home: Path, default_home: Path, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
+    config = Path.home() / ".claude.json" if Path(home) == Path(default_home) else Path(home) / ".claude.json"
+    try:
+        raw = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    account = raw.get("oauthAccount") if isinstance(raw, dict) else None
+    if not isinstance(account, dict):
+        return {}
+    tier = str(account.get("organizationRateLimitTier") or account.get("userRateLimitTier") or "")
+    plan = next((label for key, label in _CLAUDE_TIERS.items() if key in tier), None)
+    details: Dict[str, Any] = {"plan": plan}
+    billing = next_monthly_renewal(account.get("subscriptionCreatedAt"), now)
+    if billing:
+        details["billing"] = billing
+    if isinstance(account.get("hasExtraUsageEnabled"), bool):
+        details["extraUsageEnabled"] = account["hasExtraUsageEnabled"]
+    return details

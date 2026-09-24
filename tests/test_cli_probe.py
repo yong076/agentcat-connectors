@@ -150,6 +150,43 @@ class KimiParsingTests(unittest.TestCase):
         self.assertEqual(cli_probe.parse_kimi_usage({"usage": {"limit": "0"}}), [])
 
 
+class BillingAndPassesTests(unittest.TestCase):
+    NOW = dt.datetime(2026, 9, 24, 12, 0, tzinfo=dt.timezone.utc)
+
+    def test_future_renewal_is_exact(self):
+        self.assertEqual(cli_probe.next_monthly_renewal("2026-10-13T15:20:39+00:00", self.NOW),
+                         {"renewsAt": "2026-10-13T15:20:39Z", "estimated": False})
+
+    def test_past_anchor_rolls_monthly_and_is_estimated(self):
+        self.assertEqual(cli_probe.next_monthly_renewal("2024-08-01T13:25:33Z", self.NOW),
+                         {"renewsAt": "2026-10-01T13:25:33Z", "estimated": True})
+        # 31st clamps to the short month instead of skipping it.
+        jan31 = dt.datetime(2026, 2, 10, tzinfo=dt.timezone.utc)
+        self.assertEqual(cli_probe.next_monthly_renewal("2026-01-31T00:00:00Z", jan31)["renewsAt"], "2026-02-28T00:00:00Z")
+        self.assertIsNone(cli_probe.next_monthly_renewal("nope", self.NOW))
+
+    def test_codex_billing_reads_only_subscription_dates_from_id_token(self):
+        import base64
+        claims = {"https://api.openai.com/auth": {"chatgpt_subscription_active_until": "2026-10-13T15:20:39+00:00"}}
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "auth.json").write_text(json.dumps({"tokens": {"id_token": "h." + payload + ".s"}}))
+            billing = cli_probe.codex_billing(Path(tmp), self.NOW)
+        self.assertEqual(billing, {"renewsAt": "2026-10-13T15:20:39Z", "estimated": False})
+
+    def test_claude_details_map_tier_billing_and_extra_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / ".claude2"
+            home.mkdir()
+            (home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+                "organizationRateLimitTier": "default_claude_max_5x",
+                "subscriptionCreatedAt": "2026-09-05T04:42:31Z", "hasExtraUsageEnabled": True}}))
+            details = cli_probe.claude_account_details(home, Path(tmp) / ".claude", self.NOW)
+        self.assertEqual(details["plan"], "Max 5x")
+        self.assertEqual(details["billing"], {"renewsAt": "2026-10-05T04:42:31Z", "estimated": True})
+        self.assertTrue(details["extraUsageEnabled"])
+
+
 class IdentityHintTests(unittest.TestCase):
     def test_org_domain_beats_local_part_for_work_accounts(self):
         self.assertEqual(agentcat.cli_probe_identity_hint("hello@trappist.app"), "tr**")
@@ -176,7 +213,9 @@ class SnapshotReplacementTests(unittest.TestCase):
         self._write([
             {"provider": "codex", "homeKey": "a" * 16, "email": "yo@gmail.com", "plan": "pro", "status": "ok",
              "windows": [{"id": "codex:p", "label": "7d", "windowDurationMins": 10080, "usedPercent": 100.0, "remainingPercent": 0.0, "primary": True}],
-             "fetchedAt": now, "rateLimitReached": True},
+             "fetchedAt": now, "rateLimitReached": True, "resetCreditsAvailable": 1,
+             "resetCredits": [{"status": "available", "resetType": "codexRateLimits"}],
+             "billing": {"renewsAt": "2026-10-13T15:20:39Z", "estimated": False}},
             {"provider": "codex", "homeKey": "b" * 16, "email": "hello@trappist.app", "plan": "pro", "status": "ok",
              "windows": [{"id": "codex:p", "label": "7d", "windowDurationMins": 10080, "usedPercent": 0.0, "remainingPercent": 100.0, "primary": True}],
              "fetchedAt": now},
@@ -194,6 +233,9 @@ class SnapshotReplacementTests(unittest.TestCase):
         self.assertEqual(trappist["limits"]["quotas"][0]["remainingPercent"], 100.0)
         self.assertFalse(trappist["limits"]["stale"])
         self.assertEqual(trappist["account"]["email"], "hello@trappist.app")
+        yo = next(r for r in codex if r["label"].endswith("yo**"))
+        self.assertEqual(yo["limits"]["resetCreditsAvailable"], 1)
+        self.assertEqual(yo["billing"], {"renewsAt": "2026-10-13T15:20:39Z", "estimated": False})
         # The app draws a live meter only when the summary fields are present.
         self.assertEqual(trappist["limits"]["weeklyUsedPercent"], 0.0)
         self.assertIsNone(trappist["limits"]["shortUsedPercent"])
