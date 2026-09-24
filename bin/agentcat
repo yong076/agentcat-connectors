@@ -4469,6 +4469,9 @@ def codex_provider_instances_with_completeness(
     ), complete
 
 
+CODEX_MANAGED_USAGE_FRESH_SECONDS = 300
+
+
 def codex_managed_connection_limits(row: Dict[str, Any]) -> Dict[str, Any]:
     """Project one verified app-server usage row into provider-instance limits."""
     usage = row.get("usage")
@@ -4497,7 +4500,14 @@ def codex_managed_connection_limits(row: Dict[str, Any]) -> Dict[str, Any]:
     limits["source"] = usage.get("source") or "codex-app-server"
     limits["quotas"] = quotas
     limits["updatedAt"] = row.get("lastSuccessfulSyncAt") or row.get("lastSyncAt")
-    limits["stale"] = usage.get("freshness") != "live"
+    # "live" is stamped into the stored row at fetch time and never re-checked,
+    # so a two-day-old reading kept presenting as current. Age decides, with
+    # the same 300s window as the Claude local-cache path.
+    synced = parse_iso_timestamp(limits["updatedAt"])
+    age = (dt.datetime.now(dt.timezone.utc) - synced).total_seconds() if synced and synced.tzinfo else None
+    limits["stale"] = usage.get("freshness") != "live" or age is None or age > CODEX_MANAGED_USAGE_FRESH_SECONDS
+    if limits["stale"]:
+        limits["reason"] = "codex_managed_usage_stale"
     reached_type = usage.get("rateLimitReachedType")
     limits["rateLimitReachedType"] = reached_type
     limits["rateLimitReached"] = bool(reached_type)
