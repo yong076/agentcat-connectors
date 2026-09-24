@@ -45,6 +45,7 @@ from agentcat_codex_app_server import (
     app_server_prerequisite,
 )
 from agentcat_account_switch import AccountSwitchError, make_default_account
+import agentcat_cli_probe as cli_probe
 from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS
 from agentcat_openrouter_managed import OpenRouterManagedAuth, OpenRouterManagedError, build_adapter as build_openrouter_managed_adapter
 
@@ -73,6 +74,8 @@ LIMITS_FILE = AGENTCAT_HOME / "limits.json"
 AGENTCAT_KEYS_FILE = AGENTCAT_HOME / "keys.json"
 OPENROUTER_CONNECTIONS_FILE = AGENTCAT_HOME / "openrouter-connections.json"
 CODEX_CONNECTIONS_FILE = AGENTCAT_HOME / "codex-connections.json"
+# Per-home account + quota read straight from each CLI (see agentcat_cli_probe).
+CLI_PROBE_CACHE = AGENTCAT_HOME / "cli-probe.json"
 CODEX_CONNECTIONS_PROFILES_DIR = AGENTCAT_HOME / "codex-connection-profiles"
 LOOPBACK_CONTROL_TOKEN_FILE = AGENTCAT_HOME / "loopback-control-token"
 
@@ -5020,7 +5023,16 @@ def provider_instances_snapshot_with_completeness(
     resolved_limits = limits_by_provider if isinstance(limits_by_provider, dict) else {}
     codex_rows, codex_complete = codex_provider_instances_with_completeness(resolved_limits.get("codex"))
     complete_providers = {"codex"} if codex_complete else set()
-    return codex_rows + orca_claude_provider_instances(), complete_providers
+    rows = codex_rows + orca_claude_provider_instances()
+    # What each CLI says about its own home wins: borrowed Orca/managed rows
+    # for the same provider showed other accounts' numbers (both Codex rows
+    # at 100% while one home had 0% used). They stay on /v1/connections.
+    probed = cli_probe_provider_instances()
+    probed_providers = {row["providerID"] for row in probed if row["limits"].get("quotas")}
+    if probed_providers:
+        rows = [row for row in rows if row.get("providerID") not in probed_providers]
+        complete_providers -= probed_providers
+    return rows + probed, complete_providers
 
 
 def codex_usage_breakdown_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
@@ -13579,6 +13591,145 @@ def managed_quota_refresh_loop(interval_seconds: float) -> None:
         time.sleep(interval_seconds)
 
 
+# --- CLI probe: ask each CLI, per home, who it is and how much is left ------
+CLI_PROBE_INTERVAL_SECONDS = 300.0
+# Two missed rounds before a reading is shown as stale.
+CLI_PROBE_FRESH_SECONDS = 2 * CLI_PROBE_INTERVAL_SECONDS
+CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi"}
+
+
+def _cli_probe_token_module(provider: str) -> Any:
+    import importlib
+
+    return importlib.import_module(f"agentcat_{provider}_managed")
+
+
+def run_cli_probes() -> Dict[str, Any]:
+    results: List[Dict[str, Any]] = []
+    cwd = AGENTCAT_HOME / "cli-probe-cwd"
+    try:
+        cwd.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        cwd = None
+    codex_rows: List[Dict[str, Any]] = []
+    for home in tracked_provider_homes("codex"):
+        codex_rows.append(cli_probe.probe_codex_home(home, CodexAppServer))
+    # Orca keeps its own copy of a local login; one account is one row.
+    seen: Dict[str, Dict[str, Any]] = {}
+    for row in codex_rows:
+        key = row.get("email") or row["homeKey"]
+        current = seen.get(key)
+        if current is None or (current["status"] != "ok" and row["status"] == "ok"):
+            seen[key] = row
+    results.extend(r for r in seen.values() if r.get("email") or r["status"] == "ok")
+    claude = shutil.which("claude") or (str(Path.home() / ".local" / "bin" / "claude") if (Path.home() / ".local" / "bin" / "claude").exists() else None)
+    default_claude = default_provider_home("claude")
+    for home in tracked_provider_homes("claude"):
+        results.append(cli_probe.probe_claude_home(home, default_claude, claude, cwd=cwd))
+    for provider, relative, token_key in (("grok", ".grok", "token"), ("kimi", ".kimi-code", "access")):
+        home = Path.home() / relative
+        if home.is_dir():
+            try:
+                results.append(cli_probe.probe_token_home(provider, home, _cli_probe_token_module(provider), token_key))
+            except Exception:
+                results.append(cli_probe._result(provider, home, status="error", reason="cli_failed"))
+    return {"generatedAt": int(time.time()), "results": results}
+
+
+def refresh_cli_probes_once() -> bool:
+    try:
+        write_json_atomic(CLI_PROBE_CACHE, run_cli_probes())
+        return True
+    except Exception as exc:
+        print(f"agentcatd cli probe failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+        return False
+
+
+def cli_probe_loop(interval_seconds: float) -> None:
+    while True:
+        refresh_cli_probes_once()
+        time.sleep(interval_seconds)
+
+
+def _cli_probe_quota(window: Dict[str, Any]) -> Dict[str, Any]:
+    mins = window.get("windowDurationMins")
+    return {
+        "id": window.get("id"),
+        "label": window.get("label") or "quota",
+        "window": "7d" if mins == 10080 else "5h" if mins == 300 else None,
+        "unit": "percent",
+        "used": None,
+        "remaining": None,
+        "limit": None,
+        "usedPercent": window.get("usedPercent"),
+        "remainingPercent": window.get("remainingPercent"),
+        "resetAt": window.get("resetsAt"),
+        "model": window.get("model"),
+        "primary": bool(window.get("primary")),
+    }
+
+
+def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    raw = read_json(CLI_PROBE_CACHE)
+    rows = raw.get("results") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        return []
+    now = time.time() if now is None else now
+    instances: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        provider = row.get("provider")
+        if provider not in CLI_PROBE_PROVIDER_NAMES:
+            continue
+        email = row.get("email") if isinstance(row.get("email"), str) else None
+        quotas = [_cli_probe_quota(w) for w in row.get("windows") or [] if isinstance(w, dict)]
+        fetched = row.get("fetchedAt") if isinstance(row.get("fetchedAt"), (int, float)) else 0
+        limits = empty_limits(status="auto" if quotas else "not_configured")
+        limits["source"] = "cli-probe"
+        limits["quotas"] = quotas
+        limits["updatedAt"] = iso_from_timestamp(fetched) if fetched else None
+        limits["stale"] = bool(not quotas or now - fetched > CLI_PROBE_FRESH_SECONDS)
+        if row.get("reason"):
+            limits["reason"] = row["reason"]
+        elif limits["stale"]:
+            limits["reason"] = "cli_probe_stale"
+        if row.get("rateLimitReached"):
+            limits["rateLimitReached"] = True
+        seed = row.get("accountID") or email or row.get("homeKey") or ""
+        hint = cli_probe_identity_hint(email) if email else str(row.get("homeKey") or "")[-4:].upper()
+        instance = {
+            "id": provider_instance_id(provider, f"cli:{seed}"),
+            "providerID": provider,
+            "label": f"{CLI_PROBE_PROVIDER_NAMES[provider]} · {hint}",
+            "identityConfidence": "cli_reported",
+            "source": "cli-probe",
+            "profileCount": 1,
+            "tracked": bool(quotas),
+            "active": False,
+            "status": "connected" if quotas else "discovered",
+            "limits": limits,
+        }
+        if row.get("plan"):
+            instance["planType"] = row["plan"]
+            limits["planType"] = row["plan"]
+        if email:
+            # Local display only (see the app's LocalConnectorAccount privacy note).
+            instance["account"] = {"email": email, "plan": row.get("plan")}
+        instances.append(instance)
+    return instances
+
+
+def cli_probe_identity_hint(email: str) -> str:
+    """Two letters that tell accounts apart: the org domain, else the local part."""
+    local, _, domain = email.partition("@")
+    public = {"gmail.com", "googlemail.com", "naver.com", "daum.net", "hanmail.net", "kakao.com",
+              "icloud.com", "me.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com",
+              "proton.me", "protonmail.com"}
+    base = local if domain.lower() in public or not domain else domain
+    return (base[:2] or "??").lower() + "**"
+
+
 def concise_snapshot_text(snapshot: Dict[str, Any]) -> str:
     lines = ["Agent Cat snapshot"]
     for provider, data in snapshot.get("providers", {}).items():
@@ -17741,6 +17892,11 @@ def run_daemon(args: argparse.Namespace) -> int:
         snapshot_refresh_loop(60.0)
 
     threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
+    threading.Thread(
+        target=cli_probe_loop,
+        args=(CLI_PROBE_INTERVAL_SECONDS,),
+        daemon=True,
+    ).start()
     threading.Thread(
         target=managed_quota_refresh_loop,
         args=(MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS,),

@@ -1,0 +1,277 @@
+"""Ask each installed agent CLI, per home, which account it is and how much
+quota is left — the same answer its own /status or /usage prints.
+
+Every probe is read-only toward the CLI's home:
+- Codex: the official app-server (`account/read`, `account/rateLimits/read`)
+  with CODEX_HOME set to the home.
+- Claude: `claude -p /usage --no-session-persistence` with CLAUDE_CONFIG_DIR
+  for non-default homes; identity from that home's own `oauthAccount`.
+- Grok / Kimi: the CLI's own stored access token against the provider's usage
+  endpoint. An expired token is reported, never refreshed: refreshing would
+  rotate the credential the CLI itself relies on.
+
+Results carry no filesystem paths; homes are keyed by an opaque hash.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+CLAUDE_USAGE_TIMEOUT_SECONDS = 60
+_EMAIL_RE = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,253}$")
+_CLAUDE_LINE_RE = re.compile(
+    r"^\s*Current (session|week)(?: \(([^)]+)\))?:\s*(\d{1,3}(?:\.\d+)?)% used"
+    r"(?:\s*·\s*resets\s+(.+?))?\s*$",
+    re.IGNORECASE,
+)
+_CLAUDE_RESET_RE = re.compile(
+    r"^([A-Z][a-z]{2})\s+(\d{1,2})\s+at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*(?:\(([^)]+)\))?$",
+    re.IGNORECASE,
+)
+
+
+def home_key(home: Path) -> str:
+    return hashlib.sha256(str(Path(home).expanduser()).encode("utf-8")).hexdigest()[:16]
+
+
+def _email(value: Any) -> Optional[str]:
+    return value.strip() if isinstance(value, str) and _EMAIL_RE.match(value.strip()) else None
+
+
+def _clamp(value: float) -> float:
+    return max(0.0, min(100.0, float(value)))
+
+
+def parse_claude_reset(text: str, now: Optional[dt.datetime] = None) -> Optional[int]:
+    """`Sep 24 at 11:10pm (Asia/Seoul)` -> epoch seconds. The year is implied."""
+    match = _CLAUDE_RESET_RE.match(text.strip())
+    if not match:
+        return None
+    month_name, day, hour, minute, meridiem, zone_name = match.groups()
+    try:
+        month = dt.datetime.strptime(month_name.title(), "%b").month
+        hour24 = int(hour) % 12 + (12 if meridiem.lower() == "pm" else 0)
+        tz: dt.tzinfo = dt.timezone.utc
+        if zone_name:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(zone_name)
+        now = now or dt.datetime.now(tz)
+        now = now.astimezone(tz)
+        candidate = dt.datetime(now.year, month, int(day), hour24, int(minute or 0), tzinfo=tz)
+        # A reset is always ahead; a date that already passed belongs to next year.
+        if candidate < now - dt.timedelta(days=1):
+            candidate = candidate.replace(year=now.year + 1)
+        return int(candidate.timestamp())
+    except (ValueError, KeyError, OSError):
+        return None
+
+
+def parse_claude_usage(text: str, now: Optional[dt.datetime] = None) -> List[Dict[str, Any]]:
+    windows: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        match = _CLAUDE_LINE_RE.match(line)
+        if not match:
+            continue
+        span, scope, percent, reset = match.groups()
+        used = _clamp(float(percent))
+        is_session = span.lower() == "session"
+        scope_text = (scope or "").strip()
+        all_models = not scope_text or scope_text.lower() == "all models"
+        if is_session:
+            window_id, label, mins = "claude:5h", "5h", 300
+        elif all_models:
+            window_id, label, mins = "claude:7d", "7d", 10080
+        else:
+            slug = re.sub(r"[^a-z0-9]+", "-", scope_text.lower()).strip("-") or "model"
+            window_id, label, mins = f"claude:7d:{slug}", f"{scope_text} 7d", 10080
+        windows.append({
+            "id": window_id,
+            "label": label,
+            "windowDurationMins": mins,
+            "usedPercent": used,
+            "remainingPercent": 100.0 - used,
+            "resetsAt": parse_claude_reset(reset, now) if reset else None,
+            "model": None if (is_session or all_models) else scope_text,
+            "primary": not is_session and all_models,
+        })
+    return windows
+
+
+def claude_identity(home: Path, default_home: Path) -> Dict[str, Optional[str]]:
+    config = Path.home() / ".claude.json" if Path(home) == Path(default_home) else Path(home) / ".claude.json"
+    try:
+        raw = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"email": None, "accountID": None}
+    account = raw.get("oauthAccount") if isinstance(raw, dict) else None
+    if not isinstance(account, dict):
+        return {"email": None, "accountID": None}
+    account_id = account.get("accountUuid")
+    return {
+        "email": _email(account.get("emailAddress")),
+        "accountID": account_id if isinstance(account_id, str) else None,
+    }
+
+
+def _result(provider: str, home: Path, **fields: Any) -> Dict[str, Any]:
+    row = {
+        "provider": provider,
+        "homeKey": home_key(home),
+        "email": None,
+        "accountID": None,
+        "plan": None,
+        "status": "ok",
+        "reason": None,
+        "windows": [],
+        "fetchedAt": int(time.time()),
+    }
+    row.update(fields)
+    return row
+
+
+def probe_claude_home(
+    home: Path,
+    default_home: Path,
+    executable: Optional[str],
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    cwd: Optional[Path] = None,
+) -> Dict[str, Any]:
+    identity = claude_identity(home, default_home)
+    if not executable:
+        return _result("claude", home, status="error", reason="cli_not_found", **identity)
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    if Path(home) == Path(default_home):
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(home)
+    try:
+        completed = run(
+            [executable, "-p", "/usage", "--no-session-persistence"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_USAGE_TIMEOUT_SECONDS,
+            env=env,
+            cwd=str(cwd) if cwd else None,
+        )
+    except subprocess.TimeoutExpired:
+        return _result("claude", home, status="error", reason="cli_timeout", **identity)
+    except OSError:
+        return _result("claude", home, status="error", reason="cli_failed", **identity)
+    windows = parse_claude_usage(completed.stdout or "")
+    if not windows:
+        return _result("claude", home, status="error", reason="usage_unparsed", **identity)
+    return _result("claude", home, windows=windows, **identity)
+
+
+def _codex_window(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    used = raw.get("usedPercent")
+    if not isinstance(used, (int, float)) or isinstance(used, bool):
+        return None
+    mins = raw.get("windowDurationMins")
+    label = "7d" if mins == 10080 else "5h" if mins == 300 else (raw.get("name") or "quota")
+    return {
+        "id": "codex:" + str(raw.get("id") or label),
+        "label": label,
+        "windowDurationMins": mins if isinstance(mins, int) else None,
+        "usedPercent": _clamp(used),
+        "remainingPercent": 100.0 - _clamp(used),
+        "resetsAt": raw.get("resetsAt") if isinstance(raw.get("resetsAt"), int) else None,
+        "model": raw.get("model") if isinstance(raw.get("model"), str) else None,
+        "primary": bool(raw.get("primary")) and raw.get("limitID") in (None, "default", "codex"),
+    }
+
+
+def probe_codex_home(home: Path, server_factory: Callable[[Path], Any]) -> Dict[str, Any]:
+    server = server_factory(Path(home))
+    try:
+        server.start()
+        account = server.account() or {}
+        usage = server.usage() or {}
+    except Exception as exc:  # the app-server raises its own error type
+        reason = "unauthorized" if "401" in str(exc) or "unauthorized" in str(exc).lower() else "cli_failed"
+        return _result("codex", home, status="error", reason=reason)
+    finally:
+        try:
+            server.close()
+        except Exception:
+            pass
+    windows = [w for w in (_codex_window(r) for r in usage.get("windows") or [] if isinstance(r, dict)) if w]
+    return _result(
+        "codex",
+        home,
+        email=_email(account.get("email")),
+        plan=account.get("planType"),
+        windows=windows,
+        rateLimitReached=bool(usage.get("rateLimitReachedType")),
+        status="ok" if windows else "error",
+        reason=None if windows else "usage_unavailable",
+    )
+
+
+def _jwt_claims(token: str) -> Dict[str, Any]:
+    import base64
+
+    if token.count(".") < 2:
+        return {}
+    try:
+        part = token.split(".", 2)[1]
+        payload = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)).decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (ValueError, UnicodeDecodeError):
+        return {}
+
+
+def probe_token_home(provider: str, home: Path, module: Any, token_key: str) -> Dict[str, Any]:
+    """Grok/Kimi: use the CLI's current access token read-only."""
+    now = int(time.time())
+    candidates = module._credential_candidates(Path(home))
+    if not candidates:
+        return _result(provider, home, status="error", reason="not_signed_in")
+    live = [c for c in candidates if c.get(token_key) and (c.get("expires") is None or c["expires"] > now)]
+    if not live:
+        # Refreshing here would rotate the CLI's own refresh token.
+        return _result(provider, home, status="error", reason="cli_login_expired")
+    token = live[0][token_key]
+    claims = _jwt_claims(token)
+    email = _email(claims.get("email")) or _email((live[0].get("raw") or {}).get("email"))
+    try:
+        usage = module._live_usage(token)
+    except Exception:
+        return _result(provider, home, status="error", reason="usage_unavailable", email=email)
+    windows = []
+    for raw in usage.get("windows") or []:
+        used = raw.get("usedPercent")
+        if not isinstance(used, (int, float)):
+            continue
+        window_id = str(raw.get("id") or f"{provider}:quota")
+        is_week = window_id.endswith("7d")
+        windows.append({
+            "id": window_id,
+            "label": "7d" if is_week else "5h" if window_id.endswith("5h") else "quota",
+            "windowDurationMins": 10080 if is_week else 300 if window_id.endswith("5h") else None,
+            "usedPercent": _clamp(used),
+            "remainingPercent": 100.0 - _clamp(used),
+            "resetsAt": raw.get("resetsAt") if isinstance(raw.get("resetsAt"), int) else None,
+            "model": None,
+            "primary": True,
+        })
+    return _result(
+        provider,
+        home,
+        email=email,
+        plan=usage.get("subscriptionTier"),
+        windows=windows,
+        status="ok" if windows else "error",
+        reason=None if windows else "usage_unavailable",
+    )
