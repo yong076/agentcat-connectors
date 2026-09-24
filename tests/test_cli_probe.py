@@ -106,15 +106,15 @@ class TokenProbeTests(unittest.TestCase):
         self.assertEqual(row["reason"], "cli_login_expired")
         self.assertEqual(module.calls, 0)
 
-    def test_live_token_reads_usage(self):
-        module = _FakeTokenModule(
-            [{"token": "t", "expires": None, "raw": {}}],
-            {"windows": [{"id": "grok:7d", "usedPercent": 33.0}], "subscriptionTier": "SuperGrok"},
-        )
-        row = cli_probe.probe_token_home("grok", Path("/nonexistent"), module, "token")
-        self.assertEqual(row["status"], "ok")
-        self.assertEqual(row["windows"][0]["windowDurationMins"], 10080)
-        self.assertEqual(row["plan"], "SuperGrok")
+    def test_grok_billing_maps_weekly_window_reset_and_balances(self):
+        payload = {"config": {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2026-09-29T06:32:59+00:00"},
+                              "creditUsagePercent": 35.0, "prepaidBalance": {"val": 0}, "onDemandCap": {"val": 0}}}
+        parsed = cli_probe.parse_grok_billing(payload)
+        self.assertEqual(parsed["windows"][0]["usedPercent"], 35.0)
+        self.assertEqual(parsed["windows"][0]["windowDurationMins"], 10080)
+        self.assertIsNotNone(parsed["windows"][0]["resetsAt"])
+        self.assertEqual(parsed["balances"], {"prepaid": 0.0, "onDemandCap": 0.0})
+        self.assertEqual(cli_probe.parse_grok_billing({}), {"windows": []})
 
 
 class AntigravityParsingTests(unittest.TestCase):

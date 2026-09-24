@@ -13779,6 +13779,8 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
             instance["billing"] = {k: row["billing"].get(k) for k in ("renewsAt", "estimated")}
         if isinstance(row.get("extraUsageEnabled"), bool):
             instance["extraUsageEnabled"] = row["extraUsageEnabled"]
+        if isinstance(row.get("balances"), dict) and row["balances"]:
+            instance["balances"] = {k: v for k, v in row["balances"].items() if isinstance(v, (int, float))}
         instances.append(instance)
     return instances
 

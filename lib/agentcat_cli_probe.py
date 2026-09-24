@@ -268,6 +268,16 @@ def probe_token_home(provider: str, home: Path, module: Any, token_key: str) -> 
     token = live[0][token_key]
     claims = _jwt_claims(token)
     email = _email(claims.get("email")) or _email((live[0].get("raw") or {}).get("email"))
+    if provider == "grok":
+        try:
+            grok = fetch_grok_billing(module, token)
+        except Exception:
+            return _result(provider, home, status="error", reason="usage_unavailable", email=email)
+        return _result(
+            provider, home, email=email, windows=grok["windows"], balances=grok.get("balances") or {},
+            status="ok" if grok["windows"] else "error",
+            reason=None if grok["windows"] else "usage_unavailable",
+        )
     if provider == "kimi":
         try:
             kimi = fetch_kimi_usage(module, token)
@@ -553,3 +563,45 @@ def fetch_claude_passes(token: str, version: str = "2.1.280") -> Optional[Dict[s
     })
     with urlopen(request, timeout=15) as response:
         return parse_claude_passes(json.loads(response.read(2_000_000).decode("utf-8")))
+
+
+def parse_grok_billing(payload: Any) -> Dict[str, Any]:
+    """Grok CLI billing: the weekly credit window plus balances (no renewal date:
+    billingPeriod* mirrors the weekly usage period, not the subscription)."""
+    config = payload.get("config") if isinstance(payload, dict) else None
+    if not isinstance(config, dict):
+        return {"windows": []}
+    percent = config.get("creditUsagePercent")
+    period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else {}
+    kind = str(period.get("type") or "").upper()
+    weekly = "WEEK" in kind or not kind
+    windows = []
+    if isinstance(percent, (int, float)) and not isinstance(percent, bool):
+        used = _clamp(percent)
+        windows.append({
+            "id": "grok:7d" if weekly else "grok:period",
+            "label": "7d" if weekly else "period",
+            "windowDurationMins": 10080 if weekly else None,
+            "usedPercent": used,
+            "remainingPercent": 100.0 - used,
+            "resetsAt": _iso_epoch(period.get("end")),
+            "model": None,
+            "primary": True,
+        })
+
+    def val(key: str) -> Optional[float]:
+        raw = config.get(key)
+        return _number(raw.get("val")) if isinstance(raw, dict) else None
+
+    return {
+        "windows": windows,
+        "balances": {k: v for k, v in (("prepaid", val("prepaidBalance")), ("onDemandCap", val("onDemandCap")), ("onDemandUsed", val("onDemandUsed"))) if v is not None},
+    }
+
+
+def fetch_grok_billing(module: Any, token: str) -> Dict[str, Any]:
+    from urllib.request import Request, urlopen
+
+    request = Request(module._BILLING_URL, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+    with urlopen(request, timeout=12) as response:
+        return parse_grok_billing(json.loads(response.read(1_000_000).decode("utf-8")))
