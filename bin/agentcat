@@ -241,7 +241,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.39.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.39.1")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -13582,11 +13582,16 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
         seed = row.get("accountID") or email or row.get("homeKey") or ""
         login = row.get("accountID") if provider == "copilot" and isinstance(row.get("accountID"), str) else None
         hint = cli_probe_identity_hint(email) if email else (login[:2].lower() + "**" if login else str(row.get("homeKey") or "")[-4:].upper())
+        # A probed Codex home replaces its auth.json inventory row. Keep that
+        # row's seed and verified sync identity, or the same account gets a new
+        # id here and a separate stream on every synced machine.
+        native_codex = row.get("accountID") if provider == "codex" and isinstance(row.get("accountID"), str) and row["accountID"].strip() else None
         instance = {
-            "id": provider_instance_id(provider, f"cli:{seed}"),
+            "id": provider_instance_id(provider, f"native:{native_codex}" if native_codex else f"cli:{seed}"),
             "providerID": provider,
             "label": f"{CLI_PROBE_PROVIDER_NAMES[provider]} · {hint}",
-            "identityConfidence": "cli_reported",
+            "identityConfidence": "native_account_id" if native_codex else "cli_reported",
+            **({"syncIdentity": provider_sync_identity("codex", native_codex)} if native_codex else {}),
             "source": "cli-probe",
             "profileCount": 1,
             "tracked": bool(quotas),

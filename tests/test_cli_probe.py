@@ -181,6 +181,18 @@ class BillingAndPassesTests(unittest.TestCase):
             billing = cli_probe.codex_billing(Path(tmp), self.NOW)
         self.assertEqual(billing, {"renewsAt": "2026-10-13T15:20:39Z", "estimated": False})
 
+    def test_codex_account_id_reads_auth_json_only(self):
+        import base64
+        claims = {"https://api.openai.com/auth": {"chatgpt_account_id": "acct-claim"}}
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertIsNone(cli_probe.codex_account_id(home))
+            (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": "h." + payload + ".s"}}))
+            self.assertEqual(cli_probe.codex_account_id(home), "acct-claim")
+            (home / "auth.json").write_text(json.dumps({"tokens": {"account_id": "acct-token", "id_token": "h." + payload + ".s"}}))
+            self.assertEqual(cli_probe.codex_account_id(home), "acct-token")
+
     def test_claude_details_map_tier_billing_and_extra_usage(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / ".claude2"
@@ -284,6 +296,23 @@ class SnapshotReplacementTests(unittest.TestCase):
         # The app draws a live meter only when the summary fields are present.
         self.assertEqual(trappist["limits"]["weeklyUsedPercent"], 0.0)
         self.assertIsNone(trappist["limits"]["shortUsedPercent"])
+
+    def test_probed_codex_keeps_the_verified_identity_it_replaces(self):
+        now = int(time.time())
+        window = [{"id": "codex:p", "label": "7d", "windowDurationMins": 10080, "usedPercent": 10.0, "remainingPercent": 90.0, "primary": True}]
+        self._write([
+            {"provider": "codex", "homeKey": "a" * 16, "email": "yo@gmail.com", "accountID": "acct-yo", "status": "ok", "windows": window, "fetchedAt": now},
+            {"provider": "codex", "homeKey": "b" * 16, "email": "hello@trappist.app", "status": "ok", "windows": window, "fetchedAt": now},
+        ])
+        rows = agentcat.cli_probe_provider_instances()
+        yo = next(r for r in rows if r["label"].endswith("yo**"))
+        self.assertEqual(yo["id"], agentcat.provider_instance_id("codex", "native:acct-yo"))
+        self.assertEqual(yo["identityConfidence"], "native_account_id")
+        self.assertEqual(yo["syncIdentity"], agentcat.provider_sync_identity("codex", "acct-yo"))
+        # Without an account id the row stays a local, unverified stream.
+        tr = next(r for r in rows if r["label"].endswith("tr**"))
+        self.assertEqual(tr["identityConfidence"], "cli_reported")
+        self.assertNotIn("syncIdentity", tr)
 
     def test_old_or_failed_rows_are_stale_and_do_not_replace(self):
         old = int(time.time()) - 3600
