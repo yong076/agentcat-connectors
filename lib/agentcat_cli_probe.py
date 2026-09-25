@@ -238,6 +238,7 @@ def probe_codex_home(home: Path, server_factory: Callable[[Path], Any]) -> Dict[
         "codex",
         home,
         email=_email(account.get("email")),
+        accountID=codex_account_id(home),
         plan=account.get("planType"),
         windows=windows,
         rateLimitReached=bool(usage.get("rateLimitReachedType")),
@@ -458,6 +459,28 @@ def next_monthly_renewal(anchor: Any, now: Optional[dt.datetime] = None) -> Opti
         day = min(when.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
         candidate = when.replace(year=year, month=month, day=day)
     return {"renewsAt": candidate.isoformat().replace("+00:00", "Z"), "estimated": True}
+
+
+def codex_account_id(home: Path) -> Optional[str]:
+    """The ChatGPT account id from the CLI's own auth.json (read only).
+
+    The auth.json inventory derives the verified cross-device identity from
+    this id; a probed row needs the same id or it syncs as a new account on
+    every machine.
+    """
+    try:
+        raw = json.loads((Path(home) / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    tokens = raw.get("tokens") if isinstance(raw.get("tokens"), dict) else {}
+    claims = _jwt_claims(tokens["id_token"]) if isinstance(tokens.get("id_token"), str) else {}
+    auth = claims.get("https://api.openai.com/auth") if isinstance(claims.get("https://api.openai.com/auth"), dict) else {}
+    for value in (tokens.get("account_id"), raw.get("account_id"), auth.get("chatgpt_account_id")):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def codex_billing(home: Path, now: Optional[dt.datetime] = None) -> Optional[Dict[str, Any]]:
