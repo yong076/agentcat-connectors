@@ -49,6 +49,26 @@ class ClaudeUsageParsingTests(unittest.TestCase):
         eight = cli_probe.parse_claude_reset("Sep 29 at 8pm (Asia/Seoul)", SEOUL_NOON)
         self.assertEqual(eight, int(dt.datetime(2026, 9, 29, 20, 0, tzinfo=dt.timezone(dt.timedelta(hours=9))).timestamp()))
 
+    def test_current_cli_comma_reset_format_parses(self):
+        # Claude Code 2026-09 prints `resets Sep 26, 4:09pm (Asia/Seoul)`.
+        kst = dt.timezone(dt.timedelta(hours=9))
+        reset = cli_probe.parse_claude_reset("Sep 26, 4:09pm (Asia/Seoul)", SEOUL_NOON)
+        self.assertEqual(reset, int(dt.datetime(2026, 9, 26, 16, 9, tzinfo=kst).timestamp()))
+        windows = cli_probe.parse_claude_usage(
+            "Current session: 64% used · resets Sep 26, 4:09pm (Asia/Seoul)\n"
+            "Current week (all models): 88% used · resets Sep 29, 7:59pm (Asia/Seoul)\n",
+            SEOUL_NOON,
+        )
+        self.assertEqual([w["id"] for w in windows], ["claude:5h", "claude:7d"])
+        self.assertEqual(windows[1]["resetsAt"], int(dt.datetime(2026, 9, 29, 19, 59, tzinfo=kst).timestamp()))
+
+    def test_time_only_reset_is_the_next_occurrence(self):
+        kst = dt.timezone(dt.timedelta(hours=9))
+        later = cli_probe.parse_claude_reset("4pm (Asia/Seoul)", SEOUL_NOON)
+        self.assertEqual(later, int(dt.datetime(2026, 9, 24, 16, 0, tzinfo=kst).timestamp()))
+        earlier = cli_probe.parse_claude_reset("9am (Asia/Seoul)", SEOUL_NOON)
+        self.assertEqual(earlier, int(dt.datetime(2026, 9, 25, 9, 0, tzinfo=kst).timestamp()))
+
     def test_reset_in_early_january_rolls_into_next_year(self):
         december = dt.datetime(2026, 12, 30, 12, 0, tzinfo=dt.timezone(dt.timedelta(hours=9)))
         reset = cli_probe.parse_claude_reset("Jan 2 at 9am (Asia/Seoul)", december)
@@ -74,12 +94,14 @@ class ClaudeProbeTests(unittest.TestCase):
             seen = {}
 
             def run(args, **kwargs):
-                seen["args"], seen["env"] = args, kwargs["env"]
+                seen["args"], seen["env"], seen["encoding"] = args, kwargs["env"], kwargs.get("encoding")
                 return subprocess.CompletedProcess(args, 0, stdout=USAGE_TEXT, stderr="")
 
             row = cli_probe.probe_claude_home(other, default, "/bin/claude", run=run, token_reader=lambda *_: None)
         self.assertEqual(seen["args"], ["/bin/claude", "-p", "/usage", "--no-session-persistence"])
         self.assertEqual(seen["env"]["CLAUDE_CONFIG_DIR"], str(other))
+        # Windows locale code pages (cp949, cp1252) would mangle the U+00B7 separator.
+        self.assertEqual(seen["encoding"], "utf-8")
         self.assertEqual(row["email"], "yo@example.com")
         self.assertEqual(row["accountID"], "u-1")
         self.assertEqual(row["status"], "ok")
