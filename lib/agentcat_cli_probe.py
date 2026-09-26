@@ -695,6 +695,80 @@ def gh_accounts(run: Callable[..., Any] = subprocess.run) -> List[Dict[str, str]
     return accounts
 
 
+def _money(value: Any) -> Optional[float]:
+    try:
+        amount = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return amount if amount >= 0 and amount == amount and amount != float("inf") else None
+
+
+def parse_auggie_status(raw: Any, now: Optional[float] = None) -> Dict[str, Any]:
+    """`auggie account status --json`: credits left in the billing cycle."""
+    if not isinstance(raw, dict):
+        return {"status": "error", "reason": "usage_unavailable"}
+    remaining = _money(raw.get("amountRemaining"))
+    included = _money(raw.get("amountIncludedPerCycle"))
+    ends = raw.get("billingCycleEndDate")
+    ends_at = None
+    if isinstance(ends, str):
+        try:
+            ends_at = int(dt.datetime.fromisoformat(ends.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            ends_at = None
+    fields: Dict[str, Any] = {"plan": raw.get("planName") if isinstance(raw.get("planName"), str) else None}
+    if remaining is not None:
+        fields["balances"] = {"remainingUsd": remaining, **({"includedUsd": included} if included is not None else {})}
+    if ends_at:
+        fields["billing"] = {"renewsAt": dt.datetime.fromtimestamp(ends_at, dt.timezone.utc).isoformat().replace("+00:00", "Z"), "estimated": False}
+    if not included:
+        # A plan without included credits has no meter to draw.
+        return {**fields, "status": "error", "reason": "not_subscribed"}
+    left = max(0.0, min(100.0, (remaining or 0.0) / included * 100))
+    fields["windows"] = [{
+        "id": "auggie:credits", "label": "credits", "windowDurationMins": None,
+        "usedPercent": round(100 - left, 1), "remainingPercent": round(left, 1),
+        "resetsAt": ends_at, "model": None, "primary": True,
+    }]
+    return {**fields, "status": "ok", "reason": None}
+
+
+def probe_auggie(executable: str, run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+    home = Path.home() / ".augment"
+    try:
+        proc = run([executable, "account", "status", "--json"], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+        raw = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raw = None
+    if raw is None:
+        return _result("auggie", home, status="error", reason="cli_failed")
+    return _result("auggie", home, **parse_auggie_status(raw))
+
+
+_AMP_SIGNED_IN = re.compile(r"Signed in as\s+(\S+)")
+_AMP_CREDITS = re.compile(r"credits:\**\s*\$([0-9][0-9,]*(?:\.[0-9]+)?)\s+remaining", re.IGNORECASE)
+
+
+def parse_amp_usage(text: str) -> Dict[str, Any]:
+    """`amp usage`: signed-in account and the credit balance (no included amount)."""
+    signed_in = _AMP_SIGNED_IN.search(text or "")
+    credits = _AMP_CREDITS.search(text or "")
+    if not credits:
+        return {"status": "error", "reason": "usage_unavailable", "email": _email(signed_in.group(1)) if signed_in else None}
+    return {"status": "ok", "reason": None, "email": _email(signed_in.group(1)) if signed_in else None,
+            "balances": {"remainingUsd": _money(credits.group(1)) or 0.0}}
+
+
+def probe_amp(executable: str, run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+    home = Path.home() / ".amp"
+    try:
+        proc = run([executable, "usage"], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+        text = proc.stdout if proc.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return _result("amp", home, status="error", reason="cli_failed")
+    return _result("amp", home, **parse_amp_usage(text))
+
+
 def probe_copilot(run: Callable[..., Any] = subprocess.run) -> List[Dict[str, Any]]:
     from urllib.request import Request, urlopen
 

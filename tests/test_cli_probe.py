@@ -331,5 +331,47 @@ class SnapshotReplacementTests(unittest.TestCase):
         self.assertNotIn("/", json.dumps(rows).replace("://", ""))
 
 
+class CreditProbeTests(unittest.TestCase):
+    def test_auggie_meter_from_included_credits(self):
+        row = cli_probe.parse_auggie_status({"planName": "Developer", "amountRemaining": "25", "amountIncludedPerCycle": "100",
+                                             "billingCycleEndDate": "2026-10-24T12:52:37Z"})
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["windows"][0]["remainingPercent"], 25.0)
+        self.assertEqual(row["balances"], {"remainingUsd": 25.0, "includedUsd": 100.0})
+        self.assertEqual(row["billing"], {"renewsAt": "2026-10-24T12:52:37Z", "estimated": False})
+
+    def test_auggie_free_plan_has_no_meter(self):
+        row = cli_probe.parse_auggie_status({"planName": "Free Plan", "amountRemaining": "0", "amountIncludedPerCycle": "0"})
+        self.assertEqual(row["reason"], "not_subscribed")
+        self.assertNotIn("windows", row)
+
+    def test_amp_balance_and_account(self):
+        text = "Signed in as someone@example.com\n**Individual credits:** $12.50 remaining - https://ampcode.com/settings\n"
+        row = cli_probe.parse_amp_usage(text)
+        self.assertEqual(row["balances"], {"remainingUsd": 12.5})
+        self.assertEqual(row["email"], "someone@example.com")
+        self.assertEqual(cli_probe.parse_amp_usage("Not signed in")["reason"], "usage_unavailable")
+
+    def test_probe_runs_only_the_read_only_account_command(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args[1:])
+            return subprocess.CompletedProcess(args, 0, stdout='{"planName":"Free Plan","amountRemaining":"0","amountIncludedPerCycle":"0"}', stderr="")
+        cli_probe.probe_auggie("/bin/auggie", run)
+        self.assertEqual(calls, [["account", "status", "--json"]])
+
+    def test_balance_only_row_is_live(self):
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as tmp, patch.object(agentcat, "CLI_PROBE_CACHE", Path(tmp) / "cache.json"):
+            (Path(tmp) / "cache.json").write_text(json.dumps({"results": [
+                {"provider": "amp", "homeKey": "e" * 16, "email": "someone@example.com", "status": "ok",
+                 "windows": [], "balances": {"remainingUsd": 3.0}, "fetchedAt": now}]}))
+            amp = agentcat.cli_probe_provider_instances()[0]
+        self.assertEqual(amp["label"], "Amp · ex**")
+        self.assertEqual(amp["status"], "connected")
+        self.assertFalse(amp["limits"]["stale"])
+        self.assertEqual(amp["balances"], {"remainingUsd": 3.0})
+
+
 if __name__ == "__main__":
     unittest.main()
