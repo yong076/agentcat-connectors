@@ -19957,11 +19957,6 @@ def build_parser() -> argparse.ArgumentParser:
     codex_notify = subparsers.add_parser("codex-notify")
     codex_notify.set_defaults(func=command_codex_notify)
 
-    codex = subparsers.add_parser("codex")
-    codex_commands = codex.add_subparsers(dest="codex_command", required=True)
-    reset_credit = codex_commands.add_parser("reset-credit")
-    reset_credit_commands = reset_credit.add_subparsers(dest="reset_credit_command", required=True)
-
     setup_prompt = subparsers.add_parser("setup-prompt")
     setup_prompt.set_defaults(func=command_setup_prompt)
 

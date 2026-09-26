@@ -373,5 +373,14 @@ class CreditProbeTests(unittest.TestCase):
         self.assertEqual(amp["balances"], {"remainingUsd": 3.0})
 
 
+class CliSurfaceTests(unittest.TestCase):
+    def test_cli_has_no_reset_pass_command(self):
+        # Reset passes are display and hand-off only; no command may spend one.
+        parser = agentcat.build_parser()
+        commands = next(a for a in parser._actions if isinstance(a, agentcat.argparse._SubParsersAction)).choices
+        self.assertNotIn("codex", commands)
+        self.assertFalse(any("reset-credit" in name for name in commands))
+
+
 if __name__ == "__main__":
     unittest.main()
