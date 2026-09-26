@@ -13413,7 +13413,7 @@ def managed_quota_refresh_loop(interval_seconds: float) -> None:
 CLI_PROBE_INTERVAL_SECONDS = 300.0
 # Two missed rounds before a reading is shown as stale.
 CLI_PROBE_FRESH_SECONDS = 2 * CLI_PROBE_INTERVAL_SECONDS
-CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi", "gemini": "Antigravity", "copilot": "Copilot"}
+CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi", "gemini": "Antigravity", "copilot": "Copilot", "auggie": "Augment", "amp": "Amp"}
 # agy's own quota source (from its logs): a different host than Code Assist's
 # cloudcode-pa, which answers 403 without an onboarded project.
 ANTIGRAVITY_QUOTA_SUMMARY_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
@@ -13484,6 +13484,14 @@ def run_cli_probes() -> Dict[str, Any]:
                 results.append(cli_probe.probe_token_home(provider, home, _cli_probe_token_module(provider), token_key))
             except Exception:
                 results.append(cli_probe._result(provider, home, status="error", reason="cli_failed"))
+    # Credit balances straight from each CLI's own account command.
+    for provider, probe in (("auggie", cli_probe.probe_auggie), ("amp", cli_probe.probe_amp)):
+        executable = shutil.which(provider)
+        if executable:
+            try:
+                results.append(probe(executable))
+            except Exception:
+                results.append(cli_probe._result(provider, Path.home(), status="error", reason="cli_failed"))
     if shutil.which("gh"):
         try:
             # Copilot rides the GitHub login the gh CLI already holds.
@@ -13552,7 +13560,9 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
         limits["source"] = "cli-probe"
         limits["quotas"] = quotas
         limits["updatedAt"] = iso_from_timestamp(fetched) if fetched else None
-        limits["stale"] = bool(not quotas or now - fetched > CLI_PROBE_FRESH_SECONDS)
+        # A credit balance (Amp, Augment) is live data even without a meter.
+        has_balance = isinstance(row.get("balances"), dict) and bool(row["balances"])
+        limits["stale"] = bool(not (quotas or has_balance) or now - fetched > CLI_PROBE_FRESH_SECONDS)
         if row.get("reason"):
             limits["reason"] = row["reason"]
         elif limits["stale"]:
@@ -13594,9 +13604,9 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
             **({"syncIdentity": provider_sync_identity("codex", native_codex)} if native_codex else {}),
             "source": "cli-probe",
             "profileCount": 1,
-            "tracked": bool(quotas),
+            "tracked": bool(quotas or has_balance),
             "active": False,
-            "status": "connected" if quotas else "discovered",
+            "status": "connected" if quotas or has_balance else "discovered",
             "limits": limits,
         }
         if row.get("plan"):
