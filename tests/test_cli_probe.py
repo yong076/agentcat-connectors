@@ -314,6 +314,17 @@ class SnapshotReplacementTests(unittest.TestCase):
         self.assertEqual(tr["identityConfidence"], "cli_reported")
         self.assertNotIn("syncIdentity", tr)
 
+    def test_two_homes_on_one_account_yield_one_row(self):
+        now = int(time.time())
+        window = [{"id": "claude:7d", "label": "7d", "windowDurationMins": 10080, "usedPercent": 34.0, "remainingPercent": 66.0, "primary": True}]
+        self._write([
+            {"provider": "claude", "homeKey": "a" * 16, "email": "yo@gmail.com", "accountID": "acct-1", "status": "ok", "windows": window, "fetchedAt": now - 3600},
+            {"provider": "claude", "homeKey": "b" * 16, "email": "yo@gmail.com", "accountID": "acct-1", "status": "ok", "windows": window, "fetchedAt": now},
+        ])
+        rows = agentcat.cli_probe_provider_instances()
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["limits"]["stale"])
+
     def test_old_or_failed_rows_are_stale_and_do_not_replace(self):
         old = int(time.time()) - 3600
         self._write([
