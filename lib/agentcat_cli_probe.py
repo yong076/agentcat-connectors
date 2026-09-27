@@ -32,8 +32,10 @@ _CLAUDE_LINE_RE = re.compile(
     r"(?:\s*·\s*resets\s+(.+?))?\s*$",
     re.IGNORECASE,
 )
+# Claude prints `Sep 24 at 11:10pm`, `Sep 26, 4:09pm` (current CLI) or a bare
+# `4pm` for a reset later today, each optionally followed by `(Zone/Name)`.
 _CLAUDE_RESET_RE = re.compile(
-    r"^([A-Z][a-z]{2})\s+(\d{1,2})\s+at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*(?:\(([^)]+)\))?$",
+    r"^(?:([A-Z][a-z]{2})\s+(\d{1,2})(?:\s+at\s+|\s*,\s*))?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*(?:\(([^)]+)\))?$",
     re.IGNORECASE,
 )
 
@@ -51,13 +53,15 @@ def _clamp(value: float) -> float:
 
 
 def parse_claude_reset(text: str, now: Optional[dt.datetime] = None) -> Optional[int]:
-    """`Sep 24 at 11:10pm (Asia/Seoul)` -> epoch seconds. The year is implied."""
+    """`Sep 24 at 11:10pm (Asia/Seoul)` / `Sep 26, 4:09pm` / `4pm` -> epoch seconds.
+
+    The year is implied; a time without a date is the next occurrence of it."""
     match = _CLAUDE_RESET_RE.match(text.strip())
     if not match:
         return None
     month_name, day, hour, minute, meridiem, zone_name = match.groups()
     try:
-        month = dt.datetime.strptime(month_name.title(), "%b").month
+        month = dt.datetime.strptime(month_name.title(), "%b").month if month_name else None
         hour24 = int(hour) % 12 + (12 if meridiem.lower() == "pm" else 0)
         tz: dt.tzinfo = dt.timezone.utc
         if zone_name:
@@ -71,6 +75,12 @@ def parse_claude_reset(text: str, now: Optional[dt.datetime] = None) -> Optional
                 tz = now.tzinfo if now is not None and now.tzinfo is not None else dt.datetime.now().astimezone().tzinfo
         now = now or dt.datetime.now(tz)
         now = now.astimezone(tz)
+        if month is None:
+            candidate = now.replace(hour=hour24, minute=int(minute or 0), second=0, microsecond=0)
+            # A time-only reset is always ahead of now; an earlier hour means tomorrow.
+            if candidate <= now:
+                candidate += dt.timedelta(days=1)
+            return int(candidate.timestamp())
         candidate = dt.datetime(now.year, month, int(day), hour24, int(minute or 0), tzinfo=tz)
         # A reset is always ahead; a date that already passed belongs to next year.
         if candidate < now - dt.timedelta(days=1):
@@ -166,6 +176,10 @@ def probe_claude_home(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            # `used · resets` carries U+00B7; a cp949/cp1252 locale decode on
+            # Windows mangles it and the reset time is silently dropped.
+            encoding="utf-8",
+            errors="replace",
             timeout=CLAUDE_USAGE_TIMEOUT_SECONDS,
             env=env,
             cwd=str(cwd) if cwd else None,
@@ -677,7 +691,7 @@ def gh_accounts(run: Callable[..., Any] = subprocess.run) -> List[Dict[str, str]
     """Every github.com account the gh CLI is logged into: (login, token)."""
     try:
         status = run(["gh", "auth", "status", "--hostname", "github.com", "--json", "hosts"],
-                     capture_output=True, text=True, timeout=10)
+                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
         hosts = json.loads(status.stdout).get("hosts", {}).get("github.com", []) if status.returncode == 0 else []
     except (OSError, ValueError, subprocess.TimeoutExpired, AttributeError):
         hosts = []
@@ -686,7 +700,7 @@ def gh_accounts(run: Callable[..., Any] = subprocess.run) -> List[Dict[str, str]
     for login in logins or [None]:
         args = ["gh", "auth", "token", "--hostname", "github.com"] + (["--user", login] if login else [])
         try:
-            out = run(args, capture_output=True, text=True, timeout=10)
+            out = run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             continue
         token = (out.stdout or "").strip()
