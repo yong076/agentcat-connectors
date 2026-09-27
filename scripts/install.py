@@ -94,13 +94,35 @@ def read_json(path: Path) -> Dict[str, Any]:
     return data
 
 
+# On Windows os.replace fails with PermissionError while another process holds
+# the target open without FILE_SHARE_DELETE. Claude Code, editors, antivirus and
+# the indexer do this briefly and often, and one such hit used to abort the whole
+# connector install (so the app kept an old connector). Retry for ~3 seconds.
+REPLACE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0)
+
+
+def replace_with_retry(tmp: Path, path: Path, delays=REPLACE_RETRY_DELAYS, sleep=time.sleep) -> None:
+    for delay in (*delays, None):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if delay is None or not IS_WINDOWS:
+                raise
+            sleep(delay)
+
+
 def write_json(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
         fh.write("\n")
-    tmp.replace(path)
+    try:
+        replace_with_retry(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def ensure_windows_user_path() -> None:

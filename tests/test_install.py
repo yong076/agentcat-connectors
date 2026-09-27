@@ -39,6 +39,44 @@ class AgentCatInstallTests(unittest.TestCase):
             setattr(install, name, value)
         self.tmp.cleanup()
 
+    def test_write_json_retries_a_briefly_locked_target_on_windows(self) -> None:
+        # Claude Code holds ~/.claude/settings.json open for a moment; one
+        # PermissionError used to abort the whole connector install.
+        target = self.root / "settings.json"
+        real_replace = Path.replace
+        calls = {"n": 0}
+
+        def flaky_replace(src, dst):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError(5, "Access is denied")
+            return real_replace(src, dst)
+
+        with (
+            mock.patch.object(install, "IS_WINDOWS", True),
+            mock.patch.object(Path, "replace", flaky_replace),
+            mock.patch.object(install.time, "sleep", lambda _s: None),
+        ):
+            install.write_json(target, {"hooks": {}})
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"hooks": {}})
+        self.assertFalse(target.with_suffix(".json.tmp").exists())
+
+    def test_write_json_gives_up_and_cleans_up_when_the_lock_persists(self) -> None:
+        target = self.root / "settings.json"
+
+        def always_locked(src, dst):
+            raise PermissionError(5, "Access is denied")
+
+        with (
+            mock.patch.object(install, "IS_WINDOWS", True),
+            mock.patch.object(Path, "replace", always_locked),
+            mock.patch.object(install.time, "sleep", lambda _s: None),
+        ):
+            with self.assertRaises(PermissionError):
+                install.write_json(target, {"hooks": {}})
+        self.assertFalse(target.with_suffix(".json.tmp").exists())
+
     def test_install_gemini_settings_configures_gemini_only_not_antigravity(self) -> None:
         # Antigravity bills server-side and ignores the local telemetry sub-keys;
         # the install must only write a telemetry block for the real gemini-cli and
