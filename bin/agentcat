@@ -13622,7 +13622,20 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
         if isinstance(row.get("balances"), dict) and row["balances"]:
             instance["balances"] = {k: v for k, v in row["balances"].items() if isinstance(v, (int, float))}
         instances.append(instance)
-    return instances
+    # Two CLI homes signed in to the same account derive the same id. One
+    # account is one row: keep the live one, then the freshest capture.
+    # (Repeated ids crashed the macOS dashboard in 26.39.2/26.39.3.)
+    best: Dict[str, Dict[str, Any]] = {}
+    for instance in instances:
+        kept = best.get(instance["id"])
+        if kept is None or _cli_probe_rank(instance) > _cli_probe_rank(kept):
+            best[instance["id"]] = instance
+    return [instance for instance in instances if best.get(instance["id"]) is instance]
+
+
+def _cli_probe_rank(instance: Dict[str, Any]) -> Tuple[int, int, str]:
+    limits = instance.get("limits") or {}
+    return (0 if limits.get("stale") else 1, 1 if limits.get("quotas") else 0, str(limits.get("updatedAt") or ""))
 
 
 def cli_probe_identity_hint(email: str) -> str:
