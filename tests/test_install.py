@@ -131,6 +131,7 @@ class AgentCatInstallTests(unittest.TestCase):
 
         with (
             mock.patch.object(install, "IS_WINDOWS", False),
+            mock.patch.object(install, "IS_LINUX", False),
             mock.patch.object(install.os, "getuid", return_value=501, create=True),
             mock.patch.object(install, "run", side_effect=fake_run),
         ):
@@ -151,6 +152,7 @@ class AgentCatInstallTests(unittest.TestCase):
 
         with (
             mock.patch.object(install, "IS_WINDOWS", False),
+            mock.patch.object(install, "IS_LINUX", False),
             mock.patch.object(install.os, "getuid", return_value=501, create=True),
             mock.patch.object(install, "PLIST_PATH", plist),
             mock.patch.object(install, "unload_launch_agent"),
@@ -162,6 +164,30 @@ class AgentCatInstallTests(unittest.TestCase):
         self.assertTrue(plist.is_file())
         self.assertIn(["launchctl", "bootstrap", "gui/501", str(plist)], calls)
         self.assertIn(["launchctl", "kickstart", "-k", service], calls)
+
+    def test_load_launch_agent_on_linux_replaces_daemon_without_launchctl(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, check=False):
+            calls.append(args)
+            return mock.Mock(returncode=1 if args[0] == "pgrep" else 0, stderr="")
+
+        bin_path = self.root / "bin" / "agentcat"
+        with (
+            mock.patch.object(install, "IS_WINDOWS", False),
+            mock.patch.object(install, "IS_LINUX", True),
+            mock.patch.object(install, "BIN_PATH", bin_path),
+            mock.patch.object(install, "run", side_effect=fake_run),
+            mock.patch.object(install.subprocess, "Popen") as popen,
+        ):
+            install.load_launch_agent()
+
+        pattern = f"{bin_path} daemon"
+        self.assertEqual(calls[:2], [["pkill", "-f", pattern], ["pgrep", "-f", pattern]])
+        self.assertFalse(any(command[0] == "launchctl" for command in calls))
+        self.assertEqual(popen.call_args.args[0], [str(bin_path), "daemon"])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertTrue((install.AGENTCAT_HOME / "agentcatd.out.log").is_file())
 
     def test_install_uses_bounded_version_check_instead_of_snapshot(self) -> None:
         calls: list[list[str]] = []

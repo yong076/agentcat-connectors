@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -20,6 +21,7 @@ AGENTCAT_HOME = HOME / ".agentcat"
 BACKUPS_DIR = AGENTCAT_HOME / "backups"
 LOCAL_BIN = HOME / ".local" / "bin"
 IS_WINDOWS = os.name == "nt"
+IS_LINUX = sys.platform.startswith("linux")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 BIN_PATH = LOCAL_BIN / ("agentcat.cmd" if IS_WINDOWS else "agentcat")
 PLIST_PATH = HOME / "Library" / "LaunchAgents" / "com.trappist.agentcatd.plist"
@@ -66,7 +68,7 @@ def mkdirs() -> None:
     AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
-    if not IS_WINDOWS:
+    if not IS_WINDOWS and not IS_LINUX:
         PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     GEMINI_TELEMETRY.parent.mkdir(parents=True, exist_ok=True)
 
@@ -377,9 +379,43 @@ def unload_windows_daemon() -> None:
     remove_legacy_windows_startup_script()
 
 
+def linux_daemon_pattern() -> str:
+    return f"{BIN_PATH} daemon"
+
+
+def unload_linux_daemon() -> None:
+    run(["pkill", "-f", linux_daemon_pattern()])
+    # Wait for the old daemon to release 127.0.0.1:8765 before a new one binds.
+    for _ in range(40):
+        if run(["pgrep", "-f", linux_daemon_pattern()]).returncode != 0:
+            break
+        time.sleep(0.05)
+
+
+def load_linux_daemon() -> None:
+    # No init-system registration: the daemon runs for the current login
+    # session, detached from the installer, like the macOS/Windows daemons.
+    unload_linux_daemon()
+    with (AGENTCAT_HOME / "agentcatd.out.log").open("ab") as stdout, (
+        AGENTCAT_HOME / "agentcatd.err.log"
+    ).open("ab") as stderr:
+        subprocess.Popen(
+            [str(BIN_PATH), "daemon"],
+            cwd=str(HOME),
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+    log("started agentcatd")
+
+
 def unload_launch_agent() -> None:
     if IS_WINDOWS:
         unload_windows_daemon()
+        return
+    if IS_LINUX:
+        unload_linux_daemon()
         return
     uid = os.getuid()
     service_target = f"gui/{uid}/{LABEL}"
@@ -402,6 +438,9 @@ def unload_launch_agent() -> None:
 def load_launch_agent() -> None:
     if IS_WINDOWS:
         load_windows_daemon()
+        return
+    if IS_LINUX:
+        load_linux_daemon()
         return
     uid = os.getuid()
     service_target = f"gui/{uid}/{LABEL}"
