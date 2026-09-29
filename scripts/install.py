@@ -379,11 +379,25 @@ def unload_windows_daemon() -> None:
     remove_legacy_windows_startup_script()
 
 
+LINUX_SYSTEMD_UNIT = "agentcatd.service"
+
+
 def linux_daemon_pattern() -> str:
     return f"{BIN_PATH} daemon"
 
 
+def linux_systemd_unit_exists() -> bool:
+    # The installer never writes this unit; users who keep agentcatd under
+    # systemd --user get it restarted there instead of a detached copy.
+    try:
+        return run(["systemctl", "--user", "cat", LINUX_SYSTEMD_UNIT]).returncode == 0
+    except OSError:
+        return False
+
+
 def unload_linux_daemon() -> None:
+    if linux_systemd_unit_exists():
+        run(["systemctl", "--user", "stop", LINUX_SYSTEMD_UNIT])
     run(["pkill", "-f", linux_daemon_pattern()])
     # Wait for the old daemon to release 127.0.0.1:8765 before a new one binds.
     for _ in range(40):
@@ -393,9 +407,15 @@ def unload_linux_daemon() -> None:
 
 
 def load_linux_daemon() -> None:
-    # No init-system registration: the daemon runs for the current login
-    # session, detached from the installer, like the macOS/Windows daemons.
     unload_linux_daemon()
+    if linux_systemd_unit_exists():
+        result = run(["systemctl", "--user", "start", LINUX_SYSTEMD_UNIT])
+        if result.returncode == 0:
+            log(f"restarted systemd user unit {LINUX_SYSTEMD_UNIT}")
+            return
+        log(f"systemd user unit start failed: {result.stderr.strip()}")
+    # No init-system registration: the daemon runs for the current login
+    # session, detached from the installer.
     with (AGENTCAT_HOME / "agentcatd.out.log").open("ab") as stdout, (
         AGENTCAT_HOME / "agentcatd.err.log"
     ).open("ab") as stderr:
