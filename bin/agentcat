@@ -8341,26 +8341,16 @@ def copilot_snapshot() -> Dict[str, Any]:
     workspace_folders = copilot_workspace_folders()
     result = empty_provider_usage(source="~/.copilot/session-state, VS Code workspaceStorage")
     if not legacy_files and not transcript_files:
-        if workspace_folders:
-            result["status"] = "ok"
-            result["events"] = 0
-            result["projects"] = {
-                "status": "ok",
-                "items": [
-                    {
-                        **project_snapshot_identity(folder),
-                        "tokens": 0,
-                        "lastActive": None,
-                    }
-                    for folder in workspace_folders[:20]
-                ],
-            }
-            result["sources"] = {
-                "legacyFiles": 0,
-                "transcriptFiles": 0,
-                "workspaceFolders": len(workspace_folders),
-                "parseMaxFiles": LOCAL_PROVIDER_MAX_FILES,
-            }
+        # VS Code workspace folders exist for anyone who uses VS Code; they are
+        # not evidence of Copilot. Without a Copilot log the provider stays
+        # absent (it used to report "ok" with zero tokens and list every
+        # VS Code project, so Copilot appeared for people who never used it).
+        result["sources"] = {
+            "legacyFiles": 0,
+            "transcriptFiles": 0,
+            "workspaceFolders": len(workspace_folders),
+            "parseMaxFiles": LOCAL_PROVIDER_MAX_FILES,
+        }
         return result
 
     result["status"] = "ok"
@@ -12468,23 +12458,17 @@ def is_newer_connector_version(remote_version: str, current_version: str = CONNE
 
 
 def auto_update_enabled_status() -> Tuple[bool, str]:
-    # Public auto-update remains opt-in. When enabled it executes the trusted
-    # installer already present in the managed checkout; that installer accepts
-    # only a release manifest whose archive matches a mandatory SHA-256.
+    # Auto-update is mandatory on every channel (owner decision 2026-10-02).
+    # The opt-in default from 2026-06-19 left most installs stranded on old
+    # connectors. It still executes only the trusted installer already present
+    # in the managed checkout, which accepts a release manifest whose archive
+    # matches a mandatory SHA-256. There is no user setting to turn it off;
+    # AGENTCAT_AUTO_UPDATE=0 remains a developer/QA kill switch.
     explicit_env = os.environ.get("AGENTCAT_AUTO_UPDATE")
     if explicit_env is not None and not env_flag("AGENTCAT_AUTO_UPDATE", True):
         return False, "disabled by AGENTCAT_AUTO_UPDATE"
     if os.environ.get("AGENTCAT_CONNECTOR_VERSION"):
         return False, "disabled while AGENTCAT_CONNECTOR_VERSION overrides the runtime version"
-    settings = agentcat_settings()
-    configured = settings_value(settings, ("autoUpdate", "enabled"), ("autoUpdateEnabled",))
-    if isinstance(configured, bool) and not configured:
-        return False, "disabled by settings"
-    opted_in = (explicit_env is not None and env_flag("AGENTCAT_AUTO_UPDATE", True)) or (
-        isinstance(configured, bool) and configured
-    )
-    if not opted_in:
-        return False, "free-channel auto-update is off by default; opt in via AGENTCAT_AUTO_UPDATE or settings.autoUpdate.enabled"
     repo_dir = current_connector_repo_dir()
     install_dir = agentcat_connectors_dir()
     if repo_dir is None:
