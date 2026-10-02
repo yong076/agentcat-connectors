@@ -1052,7 +1052,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             state = agentcat.check_auto_update_once(apply_update=True)
 
         self.assertEqual(state["status"], "disabled")
-        self.assertIn("outside managed install", state["reason"])
+        self.assertIn("outside the managed install", state["reason"])
 
     def test_http_snapshot_preserves_cached_provider_generated_at(self) -> None:
         agentcat.LATEST_SNAPSHOT.write_text(
@@ -3737,6 +3737,22 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertGreater(snapshot["models"]["copilot-openai-auto"]["inputTokens"], 0)
         self.assertGreater(snapshot["models"]["copilot-openai-auto"]["week"], 0)
 
+    def test_copilot_is_absent_with_only_vscode_workspaces(self) -> None:
+        # Every VS Code user has workspaceStorage folders; without a Copilot
+        # log they are not evidence of Copilot (owner report 2026-10-02).
+        workspace_dir = agentcat.copilot_workspace_storage_dirs()[0] / "workspace-only"
+        workspace_dir.mkdir(parents=True)
+        (workspace_dir / "workspace.json").write_text(
+            json.dumps({"folder": "file:///Users/example/project"}), encoding="utf-8"
+        )
+        (agentcat.HOME / ".copilot" / "skills").mkdir(parents=True)
+
+        snapshot = agentcat.copilot_snapshot()
+
+        self.assertEqual(snapshot["status"], "not_found")
+        self.assertEqual((snapshot.get("projects") or {}).get("items") or [], [])
+        self.assertEqual(snapshot["sources"]["workspaceFolders"], 1)
+
     def test_classify_gemini_node_wrapper_processes(self) -> None:
         self.assertEqual(
             agentcat.classify_process("node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"),
@@ -4271,14 +4287,26 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(agentcat.resolve_bind_host("192.168.0.5"), "127.0.0.1")
         self.assertEqual(agentcat.resolve_bind_host(""), "127.0.0.1")
 
-    def test_free_channel_auto_update_off_by_default(self) -> None:
-        with patch.dict(agentcat.os.environ, {}, clear=False):
+    def test_auto_update_is_mandatory_for_a_managed_install(self) -> None:
+        # Owner decision 2026-10-02: no opt-in, and a settings file cannot turn
+        # it off. Only the developer kill switch can.
+        install_dir = (agentcat.AGENTCAT_HOME / "connectors").resolve()
+        install_dir.mkdir(parents=True)
+        (install_dir / ("install.ps1" if agentcat.IS_WINDOWS else "install.sh")).write_text(
+            "trusted", encoding="utf-8"
+        )
+        with patch.dict(agentcat.os.environ, {"AGENTCAT_CONNECTORS_DIR": str(install_dir)}), \
+                patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
+                patch.object(agentcat, "agentcat_settings", return_value={"autoUpdate": {"enabled": False}}):
             agentcat.os.environ.pop("AGENTCAT_AUTO_UPDATE", None)
-            agentcat.os.environ.pop("AGENTCAT_INSTALL_SH_SHA256", None)
             agentcat.os.environ.pop("AGENTCAT_CONNECTOR_VERSION", None)
             enabled, reason = agentcat.auto_update_enabled_status()
-        self.assertFalse(enabled)
-        self.assertIn("off by default", reason)
+            self.assertTrue(enabled, reason)
+
+            agentcat.os.environ["AGENTCAT_AUTO_UPDATE"] = "0"
+            killed, kill_reason = agentcat.auto_update_enabled_status()
+            self.assertFalse(killed)
+            self.assertIn("AGENTCAT_AUTO_UPDATE", kill_reason)
 
     def test_free_channel_opt_in_requires_managed_trusted_installer(self) -> None:
         install_dir = (agentcat.AGENTCAT_HOME / "connectors").resolve()
