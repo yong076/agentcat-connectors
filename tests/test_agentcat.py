@@ -1052,7 +1052,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             state = agentcat.check_auto_update_once(apply_update=True)
 
         self.assertEqual(state["status"], "disabled")
-        self.assertIn("outside managed install", state["reason"])
+        self.assertIn("outside the managed install", state["reason"])
 
     def test_http_snapshot_preserves_cached_provider_generated_at(self) -> None:
         agentcat.LATEST_SNAPSHOT.write_text(

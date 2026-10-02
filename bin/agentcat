@@ -12474,7 +12474,8 @@ def auto_update_enabled_status() -> Tuple[bool, str]:
     if repo_dir is None:
         return False, "current connector path is not a managed install"
     if repo_dir != install_dir and not env_flag("AGENTCAT_AUTO_UPDATE_ALLOW_DEV", False):
-        return False, f"current connector path is outside managed install: {repo_dir}"
+        # No path in the reason: it is served in the snapshot (path privacy).
+        return False, "current connector path is outside the managed install"
     installer = repo_dir / ("install.ps1" if IS_WINDOWS else "install.sh")
     if not installer.is_file():
         return False, "managed install is missing its trusted public-channel installer"
