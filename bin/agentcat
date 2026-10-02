@@ -241,7 +241,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.40.2")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.40.3")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -12084,6 +12084,18 @@ def empty_windows_activity_result() -> Dict[str, Any]:
     }
 
 
+def windows_powershell_env(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Environment for a child PowerShell. A daemon started from PowerShell 7
+    inherits its PSModulePath; Windows PowerShell 5.1 then cannot autoload its
+    own modules, so the installer died at Get-FileHash and auto-update never
+    applied on Windows (2026-10-02). Without the variable either edition
+    rebuilds its default module path."""
+    result = dict(os.environ if env is None else env)
+    for key in [key for key in result if key.upper() == "PSMODULEPATH"]:
+        del result[key]
+    return result
+
+
 def windows_powershell_command() -> List[str]:
     for executable in ("pwsh.exe", "pwsh", "powershell.exe", "powershell"):
         found = shutil.which(executable)
@@ -12248,6 +12260,7 @@ $rows | ConvertTo-Json -Compress
             stderr=subprocess.PIPE,
             text=True,
             timeout=windows_process_scan_timeout_seconds(),
+            env=windows_powershell_env(),
             creationflags=CREATE_NO_WINDOW,
         )
     except Exception as exc:
@@ -12600,7 +12613,7 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
             return subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
                 cwd=str(HOME),
-                env=env,
+                env=windows_powershell_env(env),
                 stdout=stdout,
                 stderr=stderr,
                 creationflags=CREATE_NO_WINDOW,

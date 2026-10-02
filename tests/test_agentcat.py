@@ -4349,6 +4349,33 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertNotIn("irm", command_text)
         self.assertNotIn("iex", command_text)
 
+    def test_windows_installer_does_not_inherit_powershell7_module_path(self) -> None:
+        # A daemon started from PowerShell 7 passed its PSModulePath to
+        # Windows PowerShell 5.1, which then could not find Get-FileHash and
+        # the auto-update install died on the owner's Windows PC (2026-10-02).
+        env = agentcat.windows_powershell_env(
+            {"PSModulePath": r"C:\Program Files\PowerShell\7\Modules", "Path": "x", "PsModulePath": "y"}
+        )
+        self.assertEqual(env, {"Path": "x"})
+
+        install_dir = agentcat.agentcat_connectors_dir()
+        install_dir.mkdir(parents=True)
+        (install_dir / "install.ps1").write_text("trusted", encoding="utf-8")
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured.update(kwargs)
+            return type("Proc", (), {"pid": 1})()
+
+        with patch.object(agentcat, "IS_WINDOWS", True), \
+                patch.object(agentcat, "CREATE_NO_WINDOW", 0), \
+                patch.dict(agentcat.os.environ, {"PSModulePath": r"C:\Program Files\PowerShell\7\Modules"}), \
+                patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
+                patch.object(agentcat.subprocess, "Popen", side_effect=fake_popen):
+            agentcat.start_auto_update_install("99.0.0")
+
+        self.assertFalse(any(key.upper() == "PSMODULEPATH" for key in captured["env"]))
+
     def test_public_update_manifest_requires_release_url_and_digest(self) -> None:
         manifest = {
             "version": "26.34.6",
