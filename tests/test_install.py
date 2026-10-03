@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -163,6 +164,7 @@ class AgentCatInstallTests(unittest.TestCase):
         self.assertIn(["launchctl", "bootstrap", "gui/501", str(plist)], calls)
         self.assertIn(["launchctl", "kickstart", "-k", service], calls)
 
+    @unittest.skipIf(os.name == "nt", "launchd install path; PosixPath cannot be built on Windows")
     def test_main_detaches_before_launchctl_and_recovers_booted_out_job(self) -> None:
         plist = self.root / "com.trappist.agentcatd.plist"
         service = "gui/501/com.trappist.agentcatd"
