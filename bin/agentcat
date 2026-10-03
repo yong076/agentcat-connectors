@@ -11964,19 +11964,19 @@ def split_google_cli_snapshots(
     return gemini_snapshot_data, antigravity_provider
 
 
-def command_parts(command: str) -> List[str]:
+def command_parts(command: str, *, windows: Optional[bool] = None) -> List[str]:
     text = command.strip()
     if not text:
         return []
     try:
-        parts = shlex.split(text, posix=not IS_WINDOWS)
+        parts = shlex.split(text, posix=not (IS_WINDOWS if windows is None else windows))
     except ValueError:
         parts = text.split()
     return [part.strip("\"'") for part in parts if part.strip("\"'")]
 
 
-def executable_name(command: str) -> Optional[str]:
-    parts = command_parts(command)
+def executable_path(command: str, *, windows: Optional[bool] = None) -> Optional[str]:
+    parts = command_parts(command, windows=windows)
     if not parts:
         return None
     first = parts[0]
@@ -11986,15 +11986,27 @@ def executable_name(command: str) -> Optional[str]:
 
     executable = basename(first)
     if executable in {"node", "node.exe"} and len(parts) > 1:
-        for part in parts[1:]:
+        arguments = iter(parts[1:])
+        for part in arguments:
+            # Inline code and option values are not executable script names.
+            if part in {"-e", "--eval", "-p", "--print"} or part.startswith(("--eval=", "--print=")):
+                return None
+            if part in {"-r", "--require", "--import", "--loader", "--experimental-loader"}:
+                next(arguments, None)
+                continue
             if part.startswith("-"):
                 continue
             first = part
             break
-    return basename(first)
+    return first
 
 
-def classify_process(command: str) -> Optional[str]:
+def executable_name(command: str) -> Optional[str]:
+    path = executable_path(command)
+    return Path(path.replace("\\", "/")).name.lower() if path else None
+
+
+def classify_process(command: str, *, windows: Optional[bool] = None) -> Optional[str]:
     lower = command.lower()
     normalized = lower.replace("\\", "/")
     if (
@@ -12027,23 +12039,26 @@ def classify_process(command: str) -> Optional[str]:
     if "/.vscode/extensions/openai.chatgpt-" in normalized:
         return None
 
-    executable = executable_name(command)
+    path = executable_path(command, windows=windows)
+    executable_path_normalized = (path or "").lower().replace("\\", "/")
+    executable = Path(executable_path_normalized).name
     if not executable or executable in IGNORED_EXECUTABLES:
         return None
 
-    if executable in {"codex", "codex.exe", "codex.cmd"} or "@openai/codex" in normalized:
+    # Package-based wrappers must match the executed script, never its arguments.
+    if executable in {"codex", "codex.exe", "codex.cmd"} or "@openai/codex" in executable_path_normalized:
         return "codex"
-    if executable in {"claude", "claude.exe", "claude.cmd"} or "@anthropic-ai/claude" in normalized or "claude-code" in normalized:
+    if executable in {"claude", "claude.exe", "claude.cmd"} or "@anthropic-ai/claude" in executable_path_normalized or "claude-code" in executable_path_normalized:
         return "claude"
     if (
         executable in {"agy", "agy.exe", "antigravity", "antigravity.exe", "antigravity-cli"}
-        or "/.gemini/antigravity-cli/" in normalized
-        or "com.google.antigravity" in normalized
+        or "/.gemini/antigravity-cli/" in executable_path_normalized
+        or "com.google.antigravity" in executable_path_normalized
     ):
         return "antigravity"
     if (
         executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli"}
-        or "@google/gemini" in normalized
+        or "@google/gemini" in executable_path_normalized
     ):
         return "gemini"
     if executable in {"kimi", "kimi.exe", "kimi.cmd", "kimi-code", "kimi-code.exe", "kimi-code.cmd"}:
@@ -12173,7 +12188,7 @@ def terminal_activity_snapshot_windows_tasklist(scan_warning: Optional[str] = No
         if len(item) < 2:
             continue
         image_name = item[0]
-        provider = classify_process(image_name)
+        provider = classify_process(image_name, windows=True)
         if provider is None:
             continue
         try:
@@ -12207,11 +12222,13 @@ $ErrorActionPreference = 'SilentlyContinue'
 # cores, like the app's own scan); a single query is a valid instantaneous
 # sample, so no second-sample delta is needed. Without this, CPU was always 0.
 $perf = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | Group-Object IDProcess -AsHashTable -AsString
+# Match image names, never prompt text or a directory containing a provider name.
+$candidatePattern = '^(codex|claude|gemini|gemini-cli|agy|antigravity|antigravity-cli|kimi|kimi-code|grok|grok-code|grock|node)(\.(exe|cmd))?$'
+$processes = @(Get-Process)
 $rows = @(
-Get-Process |
+$processes |
   Where-Object {
-    $text = (($_.ProcessName + ' ' + $_.Path).ToLower())
-    $text -match '(^|[^a-z])(codex|claude|gemini|agy|antigravity)([^a-z]|$)'
+    $_.ProcessName -match $candidatePattern -and $_.ProcessName -notmatch '^node(\.exe)?$'
   } |
   ForEach-Object {
     $cpu = 0
@@ -12222,18 +12239,19 @@ Get-Process |
       ParentProcessId = 0
       Name = $_.ProcessName
       Path = $_.Path
-      CommandLine = $_.Path
       CpuPercent = $cpu
       WorkingSetSize = [int64]$_.WorkingSet64
     }
   }
 )
-if (-not $rows) {
-  $rows = @(
+$includeNative = -not $rows
+# Node's image path cannot identify its CLI script. Collect its command line
+# even when native CLIs were found, without counting the native rows twice.
+if ($includeNative -or ($processes | Where-Object { $_.ProcessName -match '^node(\.exe)?$' })) {
+  $rows += @(
   Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,WorkingSetSize |
     Where-Object {
-      $text = (($_.Name + ' ' + $_.CommandLine).ToLower())
-      $text -match '(^|[^a-z])(codex|claude|gemini|agy|antigravity)([^a-z]|$)'
+      $_.Name -match $candidatePattern -and ($includeNative -or $_.Name -match '^node(\.exe)?$')
     } |
     ForEach-Object {
       $cpu = 0
@@ -12300,10 +12318,12 @@ $rows | ConvertTo-Json -Compress
         if item.get("CommandLine"):
             command = str(item.get("CommandLine"))
         elif item.get("Path"):
-            command = json.dumps(str(item.get("Path")))
+            # Path is a single executable, not an unquoted command line. Windows
+            # paths cannot contain double quotes; preserve backslashes verbatim.
+            command = '"' + str(item.get("Path")) + '"'
         else:
             command = str(item.get("Name") or "")
-        provider = classify_process(command)
+        provider = classify_process(command, windows=True)
         if provider is None:
             continue
         try:
