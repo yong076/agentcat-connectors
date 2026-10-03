@@ -1034,6 +1034,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         }), \
                 patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
                 patch.object(agentcat, "fetch_remote_connector_version", return_value="99.0.0"), \
+                patch.object(agentcat, "connector_rollout_status", return_value={"bucketAllowed": True}), \
                 patch.object(agentcat, "start_auto_update_install", return_value=proc) as starter:
             state = agentcat.check_auto_update_once(apply_update=True)
 

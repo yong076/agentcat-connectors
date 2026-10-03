@@ -29,10 +29,7 @@ jobs:
           test "${GITHUB_REF_NAME}" = "v${version}"
 
       - name: Run release tests
-        env:
-          CODEX_HOME: ""
-          CLAUDE_CONFIG_DIR: ""
-        run: python -m unittest discover -s tests -p '*test*.py'
+        run: python scripts/run_sandboxed_tests.py --previous-version 26.40.5
 
       - name: Build checksum-bound release assets
         run: python scripts/build_public_release.py --output dist --source-ref "${GITHUB_REF_NAME}"
@@ -41,4 +38,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: gh release create "${GITHUB_REF_NAME}" dist/agentcat-connectors-*.zip dist/connector-manifest.json --verify-tag --generate-notes
+        run: gh release create "${GITHUB_REF_NAME}" dist/agentcat-connectors-*.zip dist/connector-manifest.json --verify-tag --generate-notes --prerelease --latest=false

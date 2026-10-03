@@ -38,13 +38,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Compile scripts
-        run: python -m py_compile bin/agentcat scripts/install.py scripts/public_channel_install.py
+        run: python -m py_compile bin/agentcat scripts/install.py scripts/public_channel_install.py scripts/verify_update_path.py scripts/check_promotion.py scripts/run_sandboxed_tests.py
 
-      - name: Validate connector contract
-        run: python -m unittest tests.test_contract tests.test_public_channel_install tests.test_install_ps1
-
-      - name: Run unit tests
-        env:
-          CODEX_HOME: ""
-          CLAUDE_CONFIG_DIR: ""
-        run: python -m unittest discover -s tests -p '*test*.py'
+      - name: Sandboxed suite, update survival, and N-1 to N rehearsal
+        run: python scripts/run_sandboxed_tests.py --previous-version 26.40.5
