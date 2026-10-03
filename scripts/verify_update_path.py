@@ -86,8 +86,18 @@ class Verification:
     def reload(self):
         domain = f"gui/{os.getuid()}"
         # bootout may fail if the failed updater already unloaded the job.
-        subprocess.run(["launchctl", "bootout", f"{domain}/com.trappist.agentcatd"],
+        service = f"{domain}/com.trappist.agentcatd"
+        subprocess.run(["launchctl", "bootout", service],
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False)
+        # bootout returns before the job is gone; bootstrapping while it is
+        # still loaded fails with exit 5 (first real-Mac run, 2026-10-03).
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            loaded = subprocess.run(["launchctl", "print", service], stdin=subprocess.DEVNULL,
+                                    capture_output=True, timeout=30, check=False)
+            if loaded.returncode != 0:
+                break
+            time.sleep(0.5)
         run(["launchctl", "bootstrap", domain, str(self.plist)])
         run(["launchctl", "kickstart", "-k", f"{domain}/com.trappist.agentcatd"])
 

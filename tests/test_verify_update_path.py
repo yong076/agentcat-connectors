@@ -46,6 +46,26 @@ class VerifyUpdatePathTests(unittest.TestCase):
         mocks["wait_served"].side_effect = lambda version: version
         return mocks
 
+    def test_reload_waits_for_bootout_before_bootstrap(self):
+        # The first real-Mac run bootstrapped while the job was still loaded
+        # and launchctl failed with exit 5.
+        calls = []
+        print_results = iter([0, 0, 113])
+
+        def fake_subprocess_run(cmd, **kwargs):
+            calls.append(cmd[:2])
+            code = next(print_results) if cmd[1] == "print" else 0
+            return type("R", (), {"returncode": code})()
+
+        with patch.object(verify.subprocess, "run", side_effect=fake_subprocess_run), \
+             patch.object(verify, "run", side_effect=lambda cmd, **kw: calls.append(cmd[:2])), \
+             patch.object(verify.time, "sleep"):
+            self.verifier.reload()
+
+        self.assertEqual(calls[0], ["launchctl", "bootout"])
+        self.assertEqual(calls[1:4], [["launchctl", "print"]] * 3)
+        self.assertEqual(calls[4:], [["launchctl", "bootstrap"], ["launchctl", "kickstart"]])
+
     def test_success_attests_actual_baseline_and_target(self):
         mocks = self.setup_execute()
         self.verifier.execute(self.report)
