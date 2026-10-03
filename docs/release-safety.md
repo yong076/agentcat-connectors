@@ -22,7 +22,7 @@ Recovery errors fail the command too; inspect its local installer output before 
 On Windows the update command runs in PowerShell 7 with `--apply --force`. The 26.40.5 baseline predates `--force`:
 the verifier checks its help and uses its existing ungated `--apply` behavior. It never changes provider credentials.
 The current macOS rehearsal starts from 26.40.5, which also predates staged rollout. A later gated baseline will defer
-an unpublished target unless the rollout service allows it; this script does not silently bypass the daemon's gate.
+an unpublished target. A daemon whose `AGENTCAT_CONNECTORS_MANIFEST_URL` differs from the public Latest manifest (only set by this script) skips the rollout gate; real installs never set it.
 
 Reports contain only `version`, `archiveSha256`, `fromVersion`, `servedVersion`, `os`, `arch`, `durationSec`, `passed`,
 and `checkedAt`. Upload replaces that OS's earlier report, including a failed result. After both reports pass, the owner

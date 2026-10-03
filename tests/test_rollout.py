@@ -99,6 +99,21 @@ class RolloutTests(unittest.TestCase):
             self.assertEqual(agentcat.check_auto_update_once(apply_update=False)["status"], "update_available")
             rollout.assert_not_called()
 
+    def test_operator_manifest_url_bypasses_the_gate_only_when_overridden(self):
+        # verify_update_path.py points a daemon at a pre-release; the rollout
+        # service answers "not_latest" for it, which would block the gate itself.
+        def run(manifest_url):
+            with patch.object(agentcat, "AUTO_UPDATE_MANIFEST_URL", manifest_url), \
+                 patch.object(agentcat, "auto_update_enabled_status", return_value=(True, "enabled")), \
+                 patch.object(agentcat, "fetch_remote_connector_version", return_value=self.version), \
+                 patch.object(agentcat, "fetch_rollout_json", return_value=dict(version=self.version, percent=0, halted=False, reason="not_latest")), \
+                 patch.object(agentcat, "start_auto_update_install", return_value=type("P", (), {"pid": 7})()):
+                return agentcat.check_auto_update_once(apply_update=True)
+
+        self.assertEqual(run(agentcat.PUBLIC_MANIFEST_URL)["status"], "staged")
+        pre = "https://github.com/yong076/agentcat-connectors/releases/download/v99.0.0/connector-manifest.json"
+        self.assertEqual(run(pre)["status"], "update_started")
+
     def test_cli_forwards_force_flag(self):
         import argparse
         with patch.object(agentcat, "check_auto_update_once", return_value={"status": "update_started"}) as check, patch("sys.stdout", new=io.StringIO()):
