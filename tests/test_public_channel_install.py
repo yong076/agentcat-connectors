@@ -43,6 +43,48 @@ class PublicChannelInstallTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_main_detaches_before_running_installer_and_tolerates_setsid_failure(self) -> None:
+        for error in (None, PermissionError("already a leader"), OSError("setsid failed")):
+            with self.subTest(error=error):
+                calls = []
+
+                def fake_setsid():
+                    calls.append("setsid")
+                    if error is not None:
+                        raise error
+
+                def fake_install(*args):
+                    installer_module.run_installer(self.install_dir)
+                    return {"status": "installed"}
+
+                def fake_run(*args, **kwargs):
+                    calls.append("installer")
+                    return mock.Mock(returncode=0)
+
+                with (
+                    mock.patch.object(installer_module.os, "name", "posix"),
+                    mock.patch.object(installer_module.os, "setsid", side_effect=fake_setsid, create=True),
+                    mock.patch.object(installer_module, "parse_args"),
+                    mock.patch.object(installer_module, "read_manifest"),
+                    mock.patch.object(installer_module, "install_public_archive", side_effect=fake_install),
+                    mock.patch.object(installer_module.subprocess, "run", side_effect=fake_run),
+                ):
+                    self.assertEqual(installer_module.main(), 0)
+                self.assertEqual(calls, ["setsid", "installer"])
+
+    def test_main_does_not_detach_on_windows(self) -> None:
+        with (
+            mock.patch.object(installer_module, "os", wraps=installer_module.os) as mocked_os,
+            mock.patch.object(installer_module, "parse_args"),
+            mock.patch.object(installer_module, "read_manifest"),
+            mock.patch.object(installer_module, "install_public_archive", return_value={}) as run_install,
+        ):
+            mocked_os.name = "nt"
+            mocked_os.setsid = mock.Mock()
+            self.assertEqual(installer_module.main(), 0)
+            mocked_os.setsid.assert_not_called()
+            run_install.assert_called_once()
+
     def make_archive(self, version: str = "26.34.6") -> tuple[Path, dict]:
         source = self.root / f"agentcat-connectors-{version}"
         (source / "bin").mkdir(parents=True)

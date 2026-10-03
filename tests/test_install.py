@@ -163,6 +163,55 @@ class AgentCatInstallTests(unittest.TestCase):
         self.assertIn(["launchctl", "bootstrap", "gui/501", str(plist)], calls)
         self.assertIn(["launchctl", "kickstart", "-k", service], calls)
 
+    def test_main_detaches_before_launchctl_and_recovers_booted_out_job(self) -> None:
+        plist = self.root / "com.trappist.agentcatd.plist"
+        service = "gui/501/com.trappist.agentcatd"
+        for error in (None, PermissionError("already a leader"), OSError("setsid failed")):
+            with self.subTest(error=error):
+                calls = []
+
+                def fake_run(args, **kwargs):
+                    calls.append(args)
+                    missing = args[0] == "launchctl" and args[1] in ("bootout", "unload", "print")
+                    return mock.Mock(returncode=1 if missing else 0, stdout="", stderr="")
+
+                def fake_setsid():
+                    calls.append(["setsid"])
+                    if error is not None:
+                        raise error
+
+                with (
+                    mock.patch.object(install.os, "setsid", side_effect=fake_setsid, create=True),
+                    mock.patch.object(install.os, "name", "posix"),
+                    mock.patch.object(install.os, "getuid", return_value=501, create=True),
+                    mock.patch.object(install, "IS_WINDOWS", False),
+                    mock.patch.object(install, "PLIST_PATH", plist),
+                    mock.patch.object(install, "mkdirs"),
+                    mock.patch.object(install, "install_binary"),
+                    mock.patch.object(install, "install_claude_settings"),
+                    mock.patch.object(install, "install_gemini_settings"),
+                    mock.patch.object(install, "install_codex_config"),
+                    mock.patch.object(install.subprocess, "run", side_effect=fake_run),
+                ):
+                    self.assertEqual(install.main(["install"]), 0)
+
+                self.assertEqual(calls[:2], [["setsid"], ["launchctl", "bootout", service]])
+                bootstrap = ["launchctl", "bootstrap", "gui/501", str(plist)]
+                kickstart = ["launchctl", "kickstart", "-k", service]
+                self.assertLess(calls.index(bootstrap), calls.index(kickstart))
+                self.assertTrue(plist.is_file())
+
+    def test_main_does_not_detach_on_windows(self) -> None:
+        with (
+            mock.patch.object(install, "os", wraps=install.os) as mocked_os,
+            mock.patch.object(install, "install", return_value=0) as run_install,
+        ):
+            mocked_os.name = "nt"
+            mocked_os.setsid = mock.Mock()
+            self.assertEqual(install.main(["install"]), 0)
+            mocked_os.setsid.assert_not_called()
+            run_install.assert_called_once()
+
     def test_install_uses_bounded_version_check_instead_of_snapshot(self) -> None:
         calls: list[list[str]] = []
 

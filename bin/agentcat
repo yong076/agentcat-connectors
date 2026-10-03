@@ -12648,6 +12648,8 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
             env=env,
             stdout=stdout,
             stderr=stderr,
+            # launchctl bootout kills the daemon's process group during install.
+            start_new_session=True,
         )
     finally:
         stdout.close()

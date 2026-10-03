@@ -4431,6 +4431,7 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         def fake_popen(cmd, **kwargs):
             captured["cmd"] = cmd
+            captured.update(kwargs)
             return type("Proc", (), {"pid": 4242})()
 
         with patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
@@ -4443,6 +4444,21 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertNotIn("curl", command_text)
         self.assertNotIn("irm", command_text)
         self.assertNotIn("iex", command_text)
+        if not agentcat.IS_WINDOWS:
+            self.assertTrue(captured["start_new_session"])
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX sessions and bash")
+    def test_detached_auto_update_keeps_stdout_and_stderr_logs(self) -> None:
+        install_dir = agentcat.agentcat_connectors_dir()
+        install_dir.mkdir(parents=True)
+        (install_dir / "install.sh").write_text(
+            "#!/bin/bash\nprintf 'updated\\n'\nprintf 'diagnostic\\n' >&2\n", encoding="utf-8"
+        )
+        with patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir):
+            proc = agentcat.start_auto_update_install("99.0.0")
+            self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertEqual((agentcat.AGENTCAT_HOME / "auto-update.out.log").read_text(), "updated\n")
+        self.assertEqual((agentcat.AGENTCAT_HOME / "auto-update.err.log").read_text(), "diagnostic\n")
 
     def test_windows_installer_does_not_inherit_powershell7_module_path(self) -> None:
         # A daemon started from PowerShell 7 passed its PSModulePath to
@@ -4470,6 +4486,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             agentcat.start_auto_update_install("99.0.0")
 
         self.assertFalse(any(key.upper() == "PSMODULEPATH" for key in captured["env"]))
+        self.assertNotIn("start_new_session", captured)
 
     def test_public_update_manifest_requires_release_url_and_digest(self) -> None:
         manifest = {
