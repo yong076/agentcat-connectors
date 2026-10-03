@@ -696,6 +696,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Older daemons start updates in their own process group. Escape before
+    # bootout terminates that group; setsid preserves inherited log descriptors.
+    if os.name == "posix":
+        try:
+            os.setsid()
+        except OSError:
+            # Already a session/process-group leader (including PermissionError).
+            pass
     parser = build_parser()
     args = parser.parse_args(argv)
     repo_dir = Path(args.repo_dir).expanduser().resolve()

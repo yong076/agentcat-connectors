@@ -372,6 +372,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # Older daemons start updates in their own process group. Escape before
+    # bootout terminates that group; setsid preserves inherited log descriptors.
+    if os.name == "posix":
+        try:
+            os.setsid()
+        except OSError:
+            # Already a session/process-group leader (including PermissionError).
+            pass
     args = parse_args()
     try:
         result = install_public_archive(
