@@ -31,3 +31,16 @@ runners/token readers):
     T=$(mktemp -d); rsync -a --exclude .git ./ "$T"/; H=$(mktemp -d)
     (cd "$T" && HOME="$H" AGENTCAT_HOME="$H/.agentcat" TMPDIR=/tmp \
       python3 -m unittest discover -s tests -q </dev/null)
+
+## Releases: auto-update is mandatory, so verify the update path before Latest
+
+Every managed install updates itself to the GitHub **Latest** release within an hour, so a broken updater
+reaches everyone. Incident 2026-10-03: 26.40.4 went Latest, the macOS daemon's installer called
+`launchctl bootout` and was killed with the job's process group, and daemons stayed stopped.
+
+1. The release workflow marks the new tag Latest; immediately set it to pre-release and point Latest back.
+2. On a real Mac, put the connector on the current Latest, add `AGENTCAT_CONNECTORS_MANIFEST_URL=<pre-release
+   manifest>` and `AGENTCAT_AUTO_UPDATE_INITIAL_DELAY_SECONDS=20` to the LaunchAgent, reload it, and confirm the
+   **daemon itself** installs the new version and serves it (no `Terminated` in `auto-update.err.log`).
+3. On Windows, run `agentcat update-check --apply` from PowerShell 7 and confirm the new version is served.
+4. Only then promote the release to Latest. Never turn auto-update off or make it opt-in to work around a failure.
