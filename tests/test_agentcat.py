@@ -3765,6 +3765,38 @@ class AgentCatConnectorTests(unittest.TestCase):
             "gemini",
         )
 
+    def test_classify_windows_kimi_and_grok_executable_names(self) -> None:
+        with patch.object(agentcat, "IS_WINDOWS", True):
+            for name, provider in (("kimi", "kimi"), ("kimi-code", "kimi"), ("grok", "grok"), ("grok-code", "grok")):
+                for suffix in ("", ".exe", ".cmd"):
+                    command = f'"C:\\Program Files\\Agent Tools\\{name}{suffix}" --prompt hello'
+                    with self.subTest(command=command):
+                        self.assertEqual(agentcat.classify_process(command), provider)
+                        self.assertEqual(
+                            agentcat.classify_process(f'"C:\\Program Files\\nodejs\\node.exe" --no-warnings {command}'),
+                            provider,
+                        )
+
+    def test_classify_windows_ignores_argument_only_kimi_and_grok_mentions(self) -> None:
+        commands = (
+            'notepad.exe --prompt "grok kimi-code"',
+            'node.exe worker.js --prompt "grok kimi-code"',
+            'node.exe worker.js --prompt "@google/gemini @openai/codex @anthropic-ai/claude claude-code"',
+            'node.exe worker.js --prompt "/.gemini/antigravity-cli/ com.google.antigravity"',
+            'node.exe --eval grok',
+            'node.exe --print kimi',
+            'node.exe --require grok worker.js',
+            r'"C:\grok\worker.exe" --prompt kimi-code',
+            'powershell.exe -Command "grok.exe kimi-code.exe"',
+            'python.exe agentcat --prompt grok',
+            r'"C:\Agent Cat\agent-cat-windows.exe" --prompt grok',
+            r'node.exe C:\agentcat-connectors\bin\agentcat --prompt grok',
+        )
+        with patch.object(agentcat, "IS_WINDOWS", True):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertIsNone(agentcat.classify_process(command))
+
     def test_classify_antigravity_cli_processes_as_antigravity(self) -> None:
         self.assertEqual(
             agentcat.classify_process("agy --print hello"),
@@ -4022,6 +4054,69 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(snapshot["processCount"], 4)
         self.assertEqual(snapshot["countsByProvider"], {"codex": 1, "claude": 1, "gemini": 1, "antigravity": 1})
         self.assertEqual(snapshot["totalMemoryBytes"], 37_217_280)
+
+    def test_windows_activity_candidate_filter_accepts_kimi_grok_and_node_only_by_name(self) -> None:
+        completed = agentcat.subprocess.CompletedProcess(["powershell.exe"], 0, "[]", "")
+        with patch.object(agentcat.subprocess, "run", return_value=completed) as run:
+            agentcat.terminal_activity_snapshot_windows()
+        script = run.call_args.args[0][-1]
+        pattern = agentcat.re.search(r"\$candidatePattern = '([^']+)'", script).group(1)
+        for name in ("kimi", "kimi-code", "grok", "grok-code", "node"):
+            for suffix in ("", ".exe", ".cmd"):
+                with self.subTest(name=name, suffix=suffix):
+                    self.assertRegex(name + suffix, pattern)
+        for name in ("powershell.exe", "agent-cat-windows.exe", "grok-helper.exe", "notepad.exe --prompt grok"):
+            with self.subTest(name=name):
+                self.assertNotRegex(name, pattern)
+        # Both scan paths use the same image-name gate. Native results must not
+        # suppress the CIM query needed to identify simultaneous Node wrappers.
+        self.assertIn("$_.ProcessName -match $candidatePattern", script)
+        self.assertIn("$_.Name -match $candidatePattern", script)
+        self.assertIn("if ($includeNative -or ($processes | Where-Object", script)
+        self.assertNotIn("CommandLine = $_.Path", script)
+
+    def test_windows_activity_counts_kimi_grok_and_wrappers_with_spaced_paths(self) -> None:
+        items = [
+            {"ProcessId": 501, "Name": "kimi-code", "Path": r"C:\Program Files\Kimi Code\kimi-code.exe"},
+            {"ProcessId": 502, "Name": "grok", "Path": r"C:\Program Files\Grok CLI\grok.exe"},
+            {"ProcessId": 503, "Name": "grok.cmd", "CommandLine": r'"C:\Users\Test User\bin\grok.cmd" --prompt hello'},
+            {"ProcessId": 504, "Name": "node.exe", "CommandLine": r'"C:\Program Files\nodejs\node.exe" --no-warnings "C:\Users\Test User\bin\grok" --prompt hello'},
+            {"ProcessId": 505, "Name": "node.exe", "CommandLine": r'node.exe "C:\Tools\worker.js" --prompt "grok kimi"'},
+            {"ProcessId": 506, "Name": "powershell.exe", "CommandLine": 'powershell.exe -Command "grok.exe kimi-code.exe"'},
+            {"ProcessId": 507, "Name": "agent-cat-windows", "Path": r"C:\Program Files\Agent Cat\agent-cat-windows.exe"},
+            {"ProcessId": 512, "Name": "node.exe", "CommandLine": 'node.exe worker.js --prompt "@google/gemini claude-code"'},
+            {"ProcessId": 513, "Name": "node.exe", "CommandLine": 'node.exe --eval grok'},
+        ]
+        for pid, name in enumerate(("codex", "claude", "gemini", "agy"), 508):
+            items.append({"ProcessId": pid, "Name": name, "Path": f"C:\\Program Files\\Agent Tools\\{name}.exe"})
+        for item in items:
+            item.update({"WorkingSetSize": 4096, "CpuPercent": 1})
+        completed = agentcat.subprocess.CompletedProcess(["powershell.exe"], 0, json.dumps(items), "")
+        with patch.object(agentcat, "IS_WINDOWS", True), patch.object(agentcat.subprocess, "run", return_value=completed):
+            snapshot = agentcat.terminal_activity_snapshot_windows()
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["processCount"], 8)
+        self.assertEqual(snapshot["countsByProvider"], {"codex": 1, "claude": 1, "gemini": 1, "antigravity": 1, "kimi": 1, "grok": 3})
+        self.assertEqual(snapshot["memoryBytesByProvider"]["grok"], 3 * 4096)
+        self.assertEqual({row["pid"] for row in snapshot["processes"]}, {501, 502, 503, 504, 508, 509, 510, 511})
+        for row in snapshot["processes"]:
+            self.assertEqual(row["command"], f'{row["kind"]} pid {row["pid"]}')
+
+    def test_windows_activity_tasklist_counts_kimi_grok_without_helpers(self) -> None:
+        names = ("kimi.exe", "kimi-code.exe", "grok.exe", "grok.cmd", "grok-code.exe", "grok-code.cmd", "node.exe", "agent-cat-windows.exe", "powershell.exe", "grok-helper.exe")
+        tasklist = agentcat.subprocess.CompletedProcess(
+            ["tasklist.exe"], 0,
+            "\n".join(f'"{name}","{pid}","Console","1","4 K"' for pid, name in enumerate(names, 601)), "",
+        )
+        with patch.object(agentcat, "IS_WINDOWS", True), patch.object(
+            agentcat.subprocess, "run", side_effect=[agentcat.subprocess.TimeoutExpired("powershell.exe", 8), tasklist]
+        ):
+            snapshot = agentcat.terminal_activity_snapshot_windows()
+        self.assertEqual(snapshot["scanSource"], "tasklist")
+        self.assertEqual(snapshot["processCount"], 6)
+        self.assertEqual(snapshot["countsByProvider"]["kimi"], 2)
+        self.assertEqual(snapshot["countsByProvider"]["grok"], 4)
+        self.assertEqual(snapshot["totalMemoryBytes"], 6 * 4096)
 
     def test_claude_runtime_limits_reads_statusline_event(self) -> None:
         agentcat.store_event(
