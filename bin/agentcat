@@ -241,7 +241,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.40.5")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.40.6")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -12570,12 +12570,14 @@ def auto_update_status_snapshot() -> Dict[str, Any]:
             "reason": reason,
             "currentVersion": CONNECTOR_VERSION,
             "channel": update_channel_status_snapshot(),
+            "rollout": {"percent": 0, "bucketAllowed": False, "halted": False, "reason": "not_checked"},
         }
     status = dict(state)
     status.setdefault("enabled", enabled)
     status.setdefault("reason", reason)
     status.setdefault("currentVersion", CONNECTOR_VERSION)
     status["channel"] = update_channel_status_snapshot()
+    status.setdefault("rollout", {"percent": 0, "bucketAllowed": False, "halted": False, "reason": "not_checked"})
     status["installDir"] = _safe_auto_update_path(status.get("installDir"))
     status["repoDir"] = _safe_auto_update_path(status.get("repoDir"))
     return status
@@ -12613,11 +12615,87 @@ def fetch_remote_connector_version() -> str:
     return str(fetch_public_connector_manifest()["version"])
 
 
+ROLLOUT_URL = "https://agentcat-telemetry.vercel.app/v1/connector/rollout"
+PUBLIC_ROLLOUT_URL = "https://github.com/yong076/agentcat-connectors/releases/latest/download/rollout.json"
+PUBLIC_MANIFEST_URL = "https://github.com/yong076/agentcat-connectors/releases/latest/download/connector-manifest.json"
+
+
+def connector_rollout_id() -> str:
+    """Keep the cohort stable locally; this identifier is never transmitted."""
+    AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
+    path = AGENTCAT_HOME / "rollout-id"
+    try:
+        with os.fdopen(os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="ascii") as handle:
+            handle.write(uuid.uuid4().hex)
+    except FileExistsError:
+        pass
+    if os.name == "posix":
+        path.chmod(0o600)
+    value = path.read_text(encoding="ascii").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise ValueError("invalid local rollout identifier")
+    return value
+
+
+def fetch_rollout_json(url: str) -> Any:
+    request = urllib.request.Request(url, headers={"User-Agent": f"AgentCat/{CONNECTOR_VERSION}"})
+    with urllib.request.urlopen(request, timeout=AUTO_UPDATE_HTTP_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read(16 * 1024).decode("utf-8"))
+
+
+def connector_rollout_status(version: str, force: bool = False) -> Dict[str, Any]:
+    status: Dict[str, Any] = {"percent": 0, "bucketAllowed": False, "halted": False, "reason": None}
+    if force:
+        return dict(status, percent=100, bucketAllowed=True, reason="operator_force")
+    try:
+        rollout_id = connector_rollout_id()
+    except (OSError, ValueError):
+        return dict(status, reason="rollout_id_unavailable")
+    bucket = int(hashlib.sha256(f"{rollout_id}:{version}".encode()).hexdigest()[:8], 16) % 100
+    try:
+        payload = fetch_rollout_json(ROLLOUT_URL + "?" + urllib.parse.urlencode({"version": version}))
+    except (OSError, TimeoutError):
+        # An unavailable service cannot stall mandatory updates indefinitely.
+        # Only the matching, public promotion timestamp can unlock the fallback.
+        try:
+            public = fetch_rollout_json(PUBLIC_ROLLOUT_URL)
+            if not isinstance(public, dict) or public.get("version") != version:
+                return dict(status, reason="not_latest")
+            promoted = dt.datetime.fromisoformat(public["promotedAt"].replace("Z", "+00:00"))
+            if promoted.tzinfo is None:
+                raise ValueError("promotion time needs a timezone")
+            age = (dt.datetime.now(dt.timezone.utc) - promoted).total_seconds()
+            allowed = age > 72 * 3600
+            return dict(status, percent=100 if allowed else 0, bucketAllowed=allowed,
+                        reason="fallback_72h" if allowed else "fallback_wait")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return dict(status, reason="rollout_unavailable")
+    except (ValueError, TypeError):
+        return dict(status, reason="invalid_rollout")
+    if not isinstance(payload, dict) or payload.get("version") != version:
+        return dict(status, reason="invalid_rollout")
+    percent, halted = payload.get("percent"), payload.get("halted")
+    reason = payload.get("reason")
+    if (type(percent) is not int or not 0 <= percent <= 100 or type(halted) is not bool
+            or (reason is not None and not isinstance(reason, str))):
+        return dict(status, reason="invalid_rollout")
+    allowed = not halted and bucket < percent
+    return dict(status, percent=percent, bucketAllowed=allowed, halted=halted,
+                reason=reason or ("halted" if halted else None if allowed else "cohort_wait"))
+
+
 def start_auto_update_install(remote_version: str) -> subprocess.Popen:
     ensure_dirs()
     env = os.environ.copy()
     env["AGENTCAT_CONNECTORS_DIR"] = str(agentcat_connectors_dir())
-    env["AGENTCAT_CONNECTORS_MANIFEST_URL"] = AUTO_UPDATE_MANIFEST_URL
+    for key in ("AGENTCAT_CONNECTORS_ARCHIVE_URL", "AGENTCAT_CONNECTORS_SHA256",
+                "AGENTCAT_CONNECTORS_VERSION", "AGENTCAT_CONNECTORS_CONTRACT_VERSION"):
+        env.pop(key, None)
+    # Pin the version that passed rollout, even if Latest moves during download.
+    env["AGENTCAT_CONNECTORS_MANIFEST_URL"] = (
+        f"https://github.com/yong076/agentcat-connectors/releases/download/v{remote_version}/connector-manifest.json"
+        if AUTO_UPDATE_MANIFEST_URL == PUBLIC_MANIFEST_URL else AUTO_UPDATE_MANIFEST_URL
+    )
     stdout_path = AGENTCAT_HOME / "auto-update.out.log"
     stderr_path = AGENTCAT_HOME / "auto-update.err.log"
     stdout = stdout_path.open("ab")
@@ -12656,7 +12734,7 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
         stderr.close()
 
 
-def check_auto_update_once(apply_update: bool = True) -> Dict[str, Any]:
+def check_auto_update_once(apply_update: bool = True, force: bool = False) -> Dict[str, Any]:
     checked_at = now_iso()
     enabled, reason = auto_update_enabled_status()
     repo_dir = current_connector_repo_dir()
@@ -12681,6 +12759,16 @@ def check_auto_update_once(apply_update: bool = True) -> Dict[str, Any]:
             return state
         if not apply_update:
             state["status"] = "update_available"
+            write_auto_update_state(state)
+            return state
+        # A non-public manifest URL only exists when an operator points a machine
+        # at a pre-release to verify it (scripts/verify_update_path.py); real
+        # installs never set it. Without this, a daemon with the rollout gate
+        # could never take an unpromoted build, so the publish gate could not run.
+        operator_manifest = AUTO_UPDATE_MANIFEST_URL != PUBLIC_MANIFEST_URL
+        state["rollout"] = connector_rollout_status(remote_version, force=force or operator_manifest)
+        if not state["rollout"]["bucketAllowed"]:
+            state.update(status="staged", reason=state["rollout"]["reason"])
             write_auto_update_state(state)
             return state
         proc = start_auto_update_install(remote_version)
@@ -17877,7 +17965,7 @@ def command_version(args: argparse.Namespace) -> int:
 
 
 def command_update_check(args: argparse.Namespace) -> int:
-    state = check_auto_update_once(apply_update=bool(args.apply))
+    state = check_auto_update_once(apply_update=bool(args.apply), force=bool(getattr(args, "force", False)))
     if args.json:
         print(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
     else:
@@ -20009,6 +20097,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     update_check = subparsers.add_parser("update-check")
     update_check.add_argument("--apply", action="store_true")
+    update_check.add_argument("--force", action="store_true", help="Bypass staged rollout for an operator update")
     update_check.add_argument("--json", action="store_true")
     update_check.set_defaults(func=command_update_check)
 

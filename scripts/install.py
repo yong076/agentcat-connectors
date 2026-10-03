@@ -198,7 +198,10 @@ def install_binary(repo_dir: Path, backup_dir: Path) -> None:
             ')',
             "",
         ])
-        BIN_PATH.write_text(shim, encoding="utf-8", newline="")
+        # Path.write_text(newline=) needs Python 3.10; Windows installs on 3.9
+        # failed here (caught by the update-survival test, 2026-10-03).
+        with open(BIN_PATH, "w", encoding="utf-8", newline="") as handle:
+            handle.write(shim)
         ensure_windows_user_path()
         log(f"installed {BIN_PATH}")
         return

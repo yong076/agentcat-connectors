@@ -1,0 +1,44 @@
+name: Promote verified connector
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Connector version without v (requires macOS and Windows attestations)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: connector-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Download and validate pre-release evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(gh release view "v$VERSION" --json isPrerelease --jq .isPrerelease)" = true
+          mkdir evidence
+          gh release download "v$VERSION" --dir evidence --pattern connector-manifest.json --pattern verify-macos.json --pattern verify-windows.json
+          python scripts/check_promotion.py --version "$VERSION" --directory evidence
+      - name: Publish rollout timestamp and promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          gh release upload "v$VERSION" evidence/rollout.json --clobber
+          gh release edit "v$VERSION" --prerelease=false --latest
