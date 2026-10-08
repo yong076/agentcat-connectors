@@ -3175,6 +3175,135 @@ class AgentCatConnectorTests(unittest.TestCase):
             "local_sqlite_trajectory",
         )
 
+    def _antigravity_wal_database(self, target: Path, timestamps: List[int]) -> None:
+        """Place a WAL-mode DB whose rows live only in an un-checkpointed -wal,
+        with no -shm: what Antigravity leaves behind after it exits mid-WAL."""
+        staging = self.root / "staging"
+        staging.mkdir(exist_ok=True)
+        source = staging / target.name
+        writer = sqlite3.connect(source)
+        try:
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("pragma wal_autocheckpoint=0")
+            writer.execute("create table gen_metadata (data blob)")
+            for timestamp in timestamps:
+                writer.execute(
+                    "insert into gen_metadata(data) values (?)",
+                    (_antigravity_fixture_blob(timestamp=timestamp),),
+                )
+            writer.commit()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            target.with_name(target.name + "-wal").write_bytes(
+                source.with_name(source.name + "-wal").read_bytes()
+            )
+        finally:
+            writer.close()
+
+    def test_antigravity_reads_wal_db_without_shm_and_never_writes_beside_it(self) -> None:
+        # releases#44 items 3+4: the app's new folder, a WAL DB with no -shm.
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        conversations = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        database = conversations / "94d815b6.db"
+        self._antigravity_wal_database(database, [now, now])
+        before = {path.name: path.read_bytes() for path in conversations.iterdir()}
+        self.assertEqual(sorted(before), ["94d815b6.db", "94d815b6.db-wal"])
+
+        usage = agentcat.antigravity_sqlite_usage()
+
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage["events"], 2)
+        self.assertEqual(usage["tokens"]["totalTokens"], 284)
+        after = {path.name: path.read_bytes() for path in conversations.iterdir()}
+        self.assertEqual(after, before)  # no -shm created, nothing rewritten
+
+    def test_antigravity_clean_wal_db_is_read_in_place_without_side_files(self) -> None:
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        conversations = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        conversations.mkdir(parents=True)
+        database = conversations / "c768066c.db"
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("pragma journal_mode=wal")
+            connection.execute("create table gen_metadata (data blob)")
+            connection.execute(
+                "insert into gen_metadata(data) values (?)",
+                (_antigravity_fixture_blob(timestamp=now),),
+            )
+            connection.commit()
+        for suffix in ("-wal", "-shm"):
+            side = database.with_name(database.name + suffix)
+            if side.exists():
+                side.unlink()
+        before = {path.name: path.read_bytes() for path in conversations.iterdir()}
+
+        with patch.object(agentcat, "_antigravity_rows_from_copy", side_effect=AssertionError("no copy needed")):
+            usage = agentcat.antigravity_sqlite_usage()
+
+        self.assertEqual(usage["tokens"]["totalTokens"], 142)
+        self.assertEqual({path.name: path.read_bytes() for path in conversations.iterdir()}, before)
+
+    def test_antigravity_scans_both_conversation_folders_once_each(self) -> None:
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        legacy = agentcat.ANTIGRAVITY_CLI_DIR / "conversations"
+        current = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        for folder, name, count in ((legacy, "old.db", 1), (current, "new.db", 2), (legacy, "both.db", 1), (current, "both.db", 3)):
+            folder.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(folder / name)) as connection:
+                connection.execute("create table gen_metadata (data blob)")
+                for _ in range(count):
+                    connection.execute(
+                        "insert into gen_metadata(data) values (?)",
+                        (_antigravity_fixture_blob(timestamp=now),),
+                    )
+                connection.commit()
+        stale = legacy / "both.db"
+        os.utime(stale, (now - 3600, now - 3600))
+
+        reads: List[str] = []
+        real_read = agentcat.antigravity_read_gen_rows
+
+        def counting_read(database):
+            reads.append(str(database))
+            return real_read(database)
+
+        with patch.object(agentcat, "antigravity_read_gen_rows", side_effect=counting_read):
+            usage = agentcat.antigravity_sqlite_usage()
+            # A conversation id in both folders counts once (the newer copy).
+            self.assertEqual(usage["events"], 1 + 2 + 3)
+            self.assertNotIn(str(stale), reads)
+            self.assertEqual(agentcat.antigravity_conversations_dir(), current)
+            # Unchanged databases are not opened again on the next tick.
+            reads.clear()
+            self.assertEqual(agentcat.antigravity_sqlite_usage()["events"], 6)
+            self.assertEqual(reads, [])
+
+    def test_antigravity_reads_the_app_login_when_agy_has_none(self) -> None:
+        # releases#44 item 5: the desktop app stores its login as
+        # ~/.gemini/jetski-standalone-oauth-token, same nested shape.
+        app_token = agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN
+        app_token.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"auth_method": "consumer", "token": {
+            "access_token": "app-access", "refresh_token": "app-refresh",
+            "token_type": "Bearer", "expiry": "2026-09-06T17:23:00+09:00",
+        }}
+        app_token.write_text(json.dumps(payload), encoding="utf-8")
+        before = app_token.read_bytes()
+
+        creds = agentcat.read_antigravity_oauth_credentials()
+        self.assertEqual(creds["access_token"], "app-access")
+        self.assertEqual(creds["refresh_token"], "app-refresh")
+        self.assertEqual(app_token.read_bytes(), before)
+
+        # agy's own token, when present, still wins.
+        agentcat.ANTIGRAVITY_OAUTH_TOKEN.parent.mkdir(parents=True, exist_ok=True)
+        agentcat.ANTIGRAVITY_OAUTH_TOKEN.write_text(
+            json.dumps({"token": {"access_token": "agy-access", "refresh_token": "agy-refresh"}}),
+            encoding="utf-8",
+        )
+        self.assertEqual(agentcat.read_antigravity_oauth_credentials()["access_token"], "agy-access")
+        # Gemini's own reader still never picks up an Antigravity login.
+        self.assertIsNone(agentcat.read_gemini_oauth_credentials())
+
     def test_gemini_snapshot_distributes_cumulative_counter_deltas_by_day(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
         # Local noon, not UTC noon: the product buckets on the local calendar date,
@@ -5512,10 +5641,12 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.saved = {
             "ANTIGRAVITY_OAUTH_TOKEN": agentcat.ANTIGRAVITY_OAUTH_TOKEN,
+            "ANTIGRAVITY_APP_OAUTH_TOKEN": agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN,
             "ANTIGRAVITY_CLIENT_CACHE": agentcat.ANTIGRAVITY_CLIENT_CACHE,
             "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
         }
         agentcat.ANTIGRAVITY_OAUTH_TOKEN = self.root / "antigravity-oauth-token"
+        agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN = self.root / "jetski-standalone-oauth-token"
         agentcat.ANTIGRAVITY_CLIENT_CACHE = self.root / "antigravity-oauth-client.json"
         agentcat.LIVE_LIMITS_CACHE = self.root / "live-limits-cache.json"
 

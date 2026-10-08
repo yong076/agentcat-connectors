@@ -140,6 +140,12 @@ ANTIGRAVITY_CLI_DIR = HOME / ".gemini" / "antigravity-cli"
 ANTIGRAVITY_TELEMETRY = AGENTCAT_HOME / "gemini" / "antigravity-telemetry.log"
 ANTIGRAVITY_USAGE_CACHE = AGENTCAT_HOME / "antigravity-usage-cache.json"
 ANTIGRAVITY_OAUTH_TOKEN = ANTIGRAVITY_CLI_DIR / "antigravity-oauth-token"
+# The Antigravity desktop app (internal codename "jetski") keeps its own state
+# next to the CLI's: conversations under ~/.gemini/antigravity and its login in
+# ~/.gemini/jetski-standalone-oauth-token (same {"token": {...}} shape). Both are
+# only ever read.
+ANTIGRAVITY_APP_DIR = HOME / ".gemini" / "antigravity"
+ANTIGRAVITY_APP_OAUTH_TOKEN = HOME / ".gemini" / "jetski-standalone-oauth-token"
 ANTIGRAVITY_CLIENT_CACHE = AGENTCAT_HOME / "antigravity-oauth-client.json"
 # Antigravity refresh tokens are minted by Antigravity's own OAuth client, not the
 # gemini-cli client, so gemini's scraped credentials cannot refresh them. The agy
@@ -5994,11 +6000,24 @@ def refresh_antigravity_access_token(creds: Dict[str, Any]) -> Dict[str, Any]:
     raise RuntimeError(f"Antigravity token refresh failed for all client candidates: {last_error}")
 
 
+def antigravity_oauth_token_paths() -> List[Path]:
+    """agy's token file first, then the Antigravity app's (releases#44 item 5)."""
+    return [ANTIGRAVITY_OAUTH_TOKEN, ANTIGRAVITY_APP_OAUTH_TOKEN]
+
+
 def read_antigravity_oauth_credentials() -> Optional[Dict[str, Any]]:
-    raw = read_json(ANTIGRAVITY_OAUTH_TOKEN)
-    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
-        return None
-    return unwrap_antigravity_oauth_token(raw)
+    """Read (never write) the first Antigravity login that carries a token."""
+    fallback: Optional[Dict[str, Any]] = None
+    for path in antigravity_oauth_token_paths():
+        raw = read_json(path)
+        if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+            continue
+        creds = unwrap_antigravity_oauth_token(raw)
+        if creds.get("access_token") or creds.get("refresh_token"):
+            return creds
+        if fallback is None:
+            fallback = creds
+    return fallback
 
 
 def antigravity_expiry_ms(creds: Dict[str, Any]) -> int:
@@ -11861,53 +11880,167 @@ def _antigravity_gen_metrics(blob: bytes) -> Optional[Tuple[str, Optional[dt.dat
     }
 
 
+def antigravity_conversations_dirs() -> List[Path]:
+    """Trajectory DB folders, current layout first (releases#44 item 4).
+
+    The Antigravity app writes ~/.gemini/antigravity/conversations; agy and
+    older builds wrote ~/.gemini/antigravity-cli/conversations. Both can hold
+    live sessions at the same time.
+    """
+    return [ANTIGRAVITY_APP_DIR / "conversations", ANTIGRAVITY_CLI_DIR / "conversations"]
+
+
 def antigravity_conversations_dir() -> Path:
-    return ANTIGRAVITY_CLI_DIR / "conversations"
+    """The folder named in source labels: the first one that exists."""
+    candidates = antigravity_conversations_dirs()
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[-1]
+
+
+_ANTIGRAVITY_GEN_QUERY = "select data from gen_metadata where length(data) < 100000 order by rowid"
+# database path -> ((db size, db mtime_ns, wal size, wal mtime_ns), parsed
+# generations). An unchanged database is not opened or copied again.
+_ANTIGRAVITY_DB_MEMO: Dict[str, Tuple[Tuple[int, int, int, int], List[Tuple[str, Optional[dt.datetime], Dict[str, int]]]]] = {}
+_ANTIGRAVITY_DB_MEMO_LOCK = threading.Lock()
+
+
+def _antigravity_db_signature(database: Path) -> Optional[Tuple[int, int, int, int]]:
+    try:
+        stat = database.stat()
+    except OSError:
+        return None
+    try:
+        wal = database.with_name(database.name + "-wal").stat()
+        wal_sig = (wal.st_size, wal.st_mtime_ns)
+    except OSError:
+        wal_sig = (-1, -1)
+    return (stat.st_size, stat.st_mtime_ns, wal_sig[0], wal_sig[1])
+
+
+def _antigravity_rows_from_copy(database: Path) -> List[Any]:
+    with tempfile.TemporaryDirectory(prefix="agentcat-antigravity-") as temp_dir:
+        copied = Path(temp_dir) / "conversation.db"
+        shutil.copyfile(database, copied)
+        for suffix in ("-wal", "-shm"):
+            try:
+                shutil.copyfile(
+                    database.with_name(database.name + suffix),
+                    copied.with_name(copied.name + suffix),
+                )
+            except FileNotFoundError:
+                continue
+        with closing(sqlite3.connect(str(copied))) as connection:
+            return connection.execute(_ANTIGRAVITY_GEN_QUERY).fetchall()
+
+
+def antigravity_read_gen_rows(database: Path) -> List[Any]:
+    """Read gen_metadata blobs without creating or changing any file next to the DB.
+
+    Antigravity's trajectory DBs are in WAL mode. Opening one with plain
+    ``mode=ro`` needs the ``-shm`` index: depending on the SQLite build it
+    either fails once Antigravity has exited and removed it (releases#44 item
+    3) or creates ``-shm``/``-wal`` files in Antigravity's folder. So:
+
+    - ``-wal`` and ``-shm`` present (Antigravity running): ``mode=ro`` in
+      place, a normal concurrent reader that creates nothing;
+    - no ``-wal`` (cleanly closed, fully checkpointed): ``immutable=1``, which
+      reads the file without locks or side files;
+    - otherwise, or if the in-place read fails: read a private temp copy of
+      the db with its ``-wal``/``-shm`` so recent WAL frames still count.
+    """
+    wal = database.with_name(database.name + "-wal")
+    shm = database.with_name(database.name + "-shm")
+    try:
+        wal_size: Optional[int] = wal.stat().st_size
+    except OSError:
+        wal_size = None
+    if wal_size is None or wal_size == 0:
+        uri = f"file:{database}?mode=ro&immutable=1"
+    elif shm.exists():
+        uri = f"file:{database}?mode=ro"
+    else:
+        uri = None
+    if uri is not None:
+        try:
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                return connection.execute(_ANTIGRAVITY_GEN_QUERY).fetchall()
+        except sqlite3.Error as exc:
+            if "no such table" in str(exc):
+                raise
+        except OSError:
+            pass
+    return _antigravity_rows_from_copy(database)
 
 
 def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
     """Return real Antigravity usage from local read-only trajectory databases."""
-    conversations = antigravity_conversations_dir()
-    if not conversations.exists():
+    existing = [folder for folder in antigravity_conversations_dirs() if folder.exists()]
+    if not existing:
         return None
-    try:
-        # Do not preflight candidates with Path.is_file(): on older pathlib
-        # versions it uses Path.stat(), which can hide an otherwise readable DB.
-        databases = sorted(conversations.glob("*.db"))
-    except OSError:
-        return None
-    result = empty_provider_usage(source=str(conversations))
+    # The same conversation id in both folders is one conversation: keep the
+    # most recently written copy.
+    chosen: Dict[str, Tuple[Path, float]] = {}
+    for folder in existing:
+        try:
+            # Do not preflight candidates with Path.is_file(): on older pathlib
+            # versions it uses Path.stat(), which can hide an otherwise readable DB.
+            databases = sorted(folder.glob("*.db"))
+        except OSError:
+            continue
+        for database in databases:
+            try:
+                mtime = database.stat().st_mtime
+            except OSError:
+                mtime = float("-inf")
+            previous = chosen.get(database.name)
+            if previous is None or mtime > previous[1]:
+                chosen[database.name] = (database, mtime)
+    result = empty_provider_usage(source=str(existing[0]))
     events = 0
-    for database in databases:
-        connection: Optional[sqlite3.Connection] = None
+    seen: Set[str] = set()
+    for name in sorted(chosen):
+        database = chosen[name][0]
+        key = str(database)
+        seen.add(key)
         try:
             database_when = dt.datetime.fromtimestamp(database.stat().st_mtime, dt.timezone.utc)
         except (OSError, OverflowError, ValueError):
             database_when = None
-        try:
-            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-            rows = connection.execute(
-                "select data from gen_metadata where length(data) < 100000 order by rowid"
-            ).fetchall()
-        except (OSError, sqlite3.Error):
-            continue
-        finally:
-            if connection is not None:
-                connection.close()
-        for (blob,) in rows:
-            if not isinstance(blob, (bytes, bytearray)):
+        signature = _antigravity_db_signature(database)
+        with _ANTIGRAVITY_DB_MEMO_LOCK:
+            memo = _ANTIGRAVITY_DB_MEMO.get(key)
+        if signature is not None and memo is not None and memo[0] == signature:
+            generations = memo[1]
+        else:
+            try:
+                rows = antigravity_read_gen_rows(database)
+            except (OSError, sqlite3.Error):
                 continue
-            parsed = _antigravity_gen_metrics(bytes(blob))
-            if parsed is None:
-                continue
-            model, when, metrics = parsed
-            if add_usage_metrics(result, model, metrics, when or database_when):
+            generations = []
+            for (blob,) in rows:
+                if not isinstance(blob, (bytes, bytearray)):
+                    continue
+                parsed = _antigravity_gen_metrics(bytes(blob))
+                if parsed is None:
+                    continue
+                model, when, metrics = parsed
+                generations.append((model, when or database_when, metrics))
+            if signature is not None:
+                with _ANTIGRAVITY_DB_MEMO_LOCK:
+                    _ANTIGRAVITY_DB_MEMO[key] = (signature, generations)
+        for model, when, metrics in generations:
+            if add_usage_metrics(result, model, dict(metrics), when):
                 events += 1
+    with _ANTIGRAVITY_DB_MEMO_LOCK:
+        for stale_key in [key for key in _ANTIGRAVITY_DB_MEMO if key not in seen]:
+            del _ANTIGRAVITY_DB_MEMO[stale_key]
     if events == 0:
         return None
     result["status"] = "ok"
     result["events"] = events
-    result["source"] = snapshot_source_label(conversations)
+    result["source"] = snapshot_source_label(existing[0])
     return result
 
 
