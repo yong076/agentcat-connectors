@@ -3288,6 +3288,73 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(usage["tokens"]["totalTokens"], 142)
         self.assertEqual({path.name: path.read_bytes() for path in conversations.iterdir()}, before)
 
+    def _recording_connect(self, uris: List[str]):
+        real_connect = agentcat.sqlite3.connect
+
+        def connect(target, *args, **kwargs):
+            uris.append(str(target))
+            return real_connect(target, *args, **kwargs)
+
+        return patch.object(agentcat.sqlite3, "connect", side_effect=connect)
+
+    def test_antigravity_running_app_with_empty_wal_is_not_read_immutable(self) -> None:
+        # While Antigravity runs, a checkpoint can leave a 0-byte -wal next to
+        # its -shm. immutable=1 would skip the writer's locks; use mode=ro.
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        conversations = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        conversations.mkdir(parents=True)
+        database = conversations / "live.db"
+        writer = sqlite3.connect(database)
+        try:
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("create table gen_metadata (data blob)")
+            writer.execute("insert into gen_metadata(data) values (?)", (_antigravity_fixture_blob(timestamp=now),))
+            writer.commit()
+            writer.execute("pragma wal_checkpoint(TRUNCATE)")
+            self.assertEqual(database.with_name("live.db-wal").stat().st_size, 0)
+            self.assertTrue(database.with_name("live.db-shm").exists())
+            uris: List[str] = []
+            with self._recording_connect(uris):
+                rows = agentcat.antigravity_read_gen_rows(database)
+        finally:
+            writer.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(uris), 1)
+        self.assertIn("mode=ro", uris[0])
+        self.assertNotIn("immutable", uris[0])
+
+    def test_antigravity_side_file_combinations_pick_the_safe_reader(self) -> None:
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        conversations = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        conversations.mkdir(parents=True)
+        database = conversations / "c.db"
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("create table gen_metadata (data blob)")
+            connection.execute("insert into gen_metadata(data) values (?)", (_antigravity_fixture_blob(timestamp=now),))
+            connection.commit()
+        wal = database.with_name("c.db-wal")
+        shm = database.with_name("c.db-shm")
+
+        uris: List[str] = []
+        with self._recording_connect(uris):
+            agentcat.antigravity_read_gen_rows(database)
+        self.assertEqual(len(uris), 1)
+        self.assertIn("immutable=1", uris[0])  # neither side file
+
+        for present in ((wal,), (shm,)):
+            for side in (wal, shm):
+                if side.exists():
+                    side.unlink()
+            for side in present:
+                side.write_bytes(b"")
+            uris.clear()
+            with self._recording_connect(uris):
+                rows = agentcat.antigravity_read_gen_rows(database)
+            # Only one side file: never in place, always the private copy.
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(uris), 1, present)
+            self.assertNotIn(str(conversations), uris[0])
+
     def test_antigravity_scans_both_conversation_folders_once_each(self) -> None:
         now = int(dt.datetime.now(dt.timezone.utc).timestamp())
         legacy = agentcat.ANTIGRAVITY_CLI_DIR / "conversations"

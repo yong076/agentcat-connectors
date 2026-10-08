@@ -12088,23 +12088,21 @@ def antigravity_read_gen_rows(database: Path) -> List[Any]:
     either fails once Antigravity has exited and removed it (releases#44 item
     3) or creates ``-shm``/``-wal`` files in Antigravity's folder. So:
 
-    - ``-wal`` and ``-shm`` present (Antigravity running): ``mode=ro`` in
-      place, a normal concurrent reader that creates nothing;
-    - no ``-wal`` (cleanly closed, fully checkpointed): ``immutable=1``, which
-      reads the file without locks or side files;
-    - otherwise, or if the in-place read fails: read a private temp copy of
-      the db with its ``-wal``/``-shm`` so recent WAL frames still count.
+    - ``-wal`` and ``-shm`` both present (Antigravity running, even with a
+      0-byte ``-wal``): ``mode=ro`` in place, a normal concurrent reader
+      that creates nothing and takes the writer's locks into account;
+    - neither present (cleanly closed, fully checkpointed): ``immutable=1``,
+      which reads the file without locks or side files;
+    - anything else, or if the in-place read fails: read a private temp copy
+      of the db with its ``-wal``/``-shm`` so recent WAL frames still count.
     """
-    wal = database.with_name(database.name + "-wal")
-    shm = database.with_name(database.name + "-shm")
-    try:
-        wal_size: Optional[int] = wal.stat().st_size
-    except OSError:
-        wal_size = None
-    if wal_size is None or wal_size == 0:
+    wal_exists = database.with_name(database.name + "-wal").exists()
+    shm_exists = database.with_name(database.name + "-shm").exists()
+    if wal_exists and shm_exists:
+        uri: Optional[str] = f"file:{database}?mode=ro"
+    elif not wal_exists and not shm_exists:
+        # immutable=1 skips locking, so it is only safe with no live writer.
         uri = f"file:{database}?mode=ro&immutable=1"
-    elif shm.exists():
-        uri = f"file:{database}?mode=ro"
     else:
         uri = None
     if uri is not None:
