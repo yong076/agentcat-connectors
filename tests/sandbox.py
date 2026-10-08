@@ -42,6 +42,8 @@ def _redirect(home: Path, agentcat_home: Path) -> dict:
         "ANTIGRAVITY_TELEMETRY": agentcat_home / "gemini" / "antigravity-telemetry.log",
         "ANTIGRAVITY_USAGE_CACHE": agentcat_home / "antigravity-usage-cache.json",
         "ANTIGRAVITY_OAUTH_TOKEN": home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token",
+        "ANTIGRAVITY_APP_DIR": home / ".gemini" / "antigravity",
+        "ANTIGRAVITY_APP_OAUTH_TOKEN": home / ".gemini" / "jetski-standalone-oauth-token",
         "ANTIGRAVITY_CLIENT_CACHE": agentcat_home / "antigravity-oauth-client.json",
         "PRICING_CACHE_FILE": agentcat_home / "pricing-cache.json",
         "REFLECT_DB": agentcat_home / "reflect.db",

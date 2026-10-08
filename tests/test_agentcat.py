@@ -400,7 +400,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIsNone(sanitized["shortUsedPercent"])
         self.assertEqual(sanitized["weeklyUsedPercent"], 24.0)
 
-    def test_codex_live_limits_tries_wham_before_refresh_after_codex_403(self) -> None:
+    def test_codex_live_limits_tries_wham_after_codex_403(self) -> None:
         (agentcat.HOME / ".codex").mkdir(parents=True)
         (agentcat.HOME / ".codex" / "auth.json").write_text(
             json.dumps({"tokens": {"access_token": "access", "refresh_token": "refresh", "account_id": "acct"}}),
@@ -419,14 +419,147 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         with patch.object(agentcat, "CODEX_USAGE_URLS", ("https://chatgpt.com/backend-api/codex/usage", "https://chatgpt.com/backend-api/wham/usage")), \
             patch.object(agentcat, "codex_usage_request", side_effect=usage_side_effect), \
-            patch.object(agentcat, "codex_reset_credits_request", return_value={"available_count": 2, "credits": []}), \
-            patch.object(agentcat, "refresh_codex_access_token", side_effect=AssertionError("refresh should wait until all usage URLs fail")):
+            patch.object(agentcat, "codex_reset_credits_request", return_value={"available_count": 2, "credits": []}):
             limits = agentcat.codex_live_limits()
 
         self.assertEqual(limits["source"], "https://chatgpt.com/backend-api/wham/usage")
         self.assertEqual(limits["resetCreditsAvailable"], 2)
         self.assertEqual(limits["codexCredits"]["approxCloudMessages"], 0)
         self.assertEqual(limits["quotas"][0]["remainingPercent"], 80.0)
+        self.assertNotIn("reason", limits)
+
+    def _codex_unauthorized_network(self, requests: list):
+        """urlopen stand-in: record every request and answer each with 401."""
+
+        def fake_urlopen(request, *args, **kwargs):
+            url = request.full_url if hasattr(request, "full_url") else str(request)
+            method = request.get_method() if hasattr(request, "get_method") else "GET"
+            requests.append((method, url))
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, io.BytesIO(b""))
+
+        return patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen)
+
+    def test_codex_401_never_refreshes_cli_grant_and_serves_stale_limits(self) -> None:
+        # Rule R1: Codex rotates refresh tokens, so spending the CLI's refresh
+        # token here would log the CLI out. A 401 must only read, never POST.
+        self.assertFalse(hasattr(agentcat, "refresh_codex_access_token"))
+        codex_home = agentcat.HOME / ".codex"
+        codex_home.mkdir(parents=True)
+        auth_path = codex_home / "auth.json"
+        auth_path.write_text(
+            json.dumps({"tokens": {"access_token": "expired", "refresh_token": "cli-owned", "account_id": "acct"}}),
+            encoding="utf-8",
+        )
+        auth_before = auth_path.read_bytes()
+        good = agentcat.codex_limits_from_usage_response(
+            {"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 30, "reset_at": 1770000000}}},
+            source="https://chatgpt.com/backend-api/wham/usage",
+        )
+        agentcat.write_live_limits_cache("codex", good)
+
+        requests: list = []
+        with self._codex_unauthorized_network(requests):
+            limits = agentcat.codex_live_limits(force=True)
+
+        self.assertEqual([method for method, _url in requests], ["GET"] * len(agentcat.CODEX_USAGE_URLS))
+        self.assertEqual([url for _method, url in requests], list(agentcat.CODEX_USAGE_URLS))
+        self.assertFalse(any("oauth" in url or "auth.openai.com" in url for _method, url in requests))
+        self.assertEqual(auth_path.read_bytes(), auth_before)
+        self.assertEqual(limits["reason"], "cli_login_expired")
+        self.assertEqual(limits["liveErrorReason"], "cli_login_expired")
+        self.assertTrue(limits["stale"])
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 70.0)
+
+        # The next tick sits inside the error backoff: no network at all, and
+        # the row is still labelled stale + cli_login_expired.
+        requests.clear()
+        with self._codex_unauthorized_network(requests):
+            again = agentcat.codex_live_limits()
+        self.assertEqual(requests, [])
+        self.assertEqual(again["reason"], "cli_login_expired")
+        self.assertTrue(again["stale"])
+        self.assertEqual(again["quotas"][0]["remainingPercent"], 70.0)
+
+    def test_codex_401_backoff_holds_even_when_forced_until_relogin(self) -> None:
+        codex_home = agentcat.HOME / ".codex"
+        codex_home.mkdir(parents=True)
+        auth_path = codex_home / "auth.json"
+
+        def write_token(token: str) -> None:
+            auth_path.write_text(
+                json.dumps({"tokens": {"access_token": token, "refresh_token": "cli-owned", "account_id": "acct"}}),
+                encoding="utf-8",
+            )
+
+        write_token("expired")
+        start = 1_800_000_000
+        requests: list = []
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start):
+            first = agentcat.codex_live_limits()
+        self.assertEqual(first["reason"], "cli_login_expired")
+        self.assertFalse([key for key in first if key.startswith("_")])
+        sent = len(requests)
+        self.assertGreater(sent, 0)
+
+        # Inside the 5 min window the same expired token sends nothing, even
+        # through the forced /v1/usage path.
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 299):
+            held = agentcat.codex_live_limits(force=True)
+        self.assertEqual(len(requests), sent)
+        self.assertEqual(held["reason"], "cli_login_expired")
+        self.assertFalse([key for key in held if key.startswith("_")])
+
+        # After the window it retries once; the next window doubles.
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 301):
+            agentcat.codex_live_limits()
+        self.assertEqual(len(requests), 2 * sent)
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 301 + 599):
+            agentcat.codex_live_limits()
+        self.assertEqual(len(requests), 2 * sent)
+
+        # The CLI refreshed its own login: the new token is tried at once.
+        write_token("fresh-after-login")
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 302):
+            agentcat.codex_live_limits()
+        self.assertEqual(len(requests), 3 * sent)
+        cache_text = agentcat.LIVE_LIMITS_CACHE.read_text(encoding="utf-8")
+        self.assertNotIn("fresh-after-login", cache_text)
+        self.assertNotIn('"expired"', cache_text)
+
+    def test_codex_401_without_cache_reports_cli_login_expired(self) -> None:
+        codex_home = agentcat.HOME / ".codex"
+        codex_home.mkdir(parents=True)
+        (codex_home / "auth.json").write_text(
+            json.dumps({"tokens": {"access_token": "expired", "refresh_token": "cli-owned", "account_id": "acct"}}),
+            encoding="utf-8",
+        )
+        requests: list = []
+        with self._codex_unauthorized_network(requests):
+            limits = agentcat.codex_live_limits()
+        self.assertTrue(all(method == "GET" for method, _url in requests))
+        self.assertFalse(any("oauth" in url for _method, url in requests))
+        self.assertEqual(limits["status"], "error")
+        self.assertEqual(limits["reason"], "cli_login_expired")
+        self.assertEqual(limits["quotas"], [])
+
+    def test_codex_provider_instances_never_refresh_cli_homes_on_401(self) -> None:
+        for name in (".codex", ".codex-work"):
+            home = agentcat.HOME / name
+            home.mkdir(parents=True)
+            (home / "sessions").mkdir()
+            (home / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": f"expired-{name}", "refresh_token": "cli-owned", "account_id": f"acct{name}"}}),
+                encoding="utf-8",
+            )
+        requests: list = []
+        with self._codex_unauthorized_network(requests), \
+            patch.object(agentcat, "_codex_connections", return_value=[]):
+            instances = agentcat.codex_provider_instances()
+        self.assertEqual(len(instances), 2)
+        self.assertTrue(requests)
+        self.assertTrue(all(method == "GET" for method, _url in requests))
+        self.assertFalse(any("oauth" in url for _method, url in requests))
+        self.assertEqual({row["limits"].get("reason") for row in instances}, {"cli_login_expired"})
 
     def test_claude_usage_api_payload_builds_weekly_and_monthly_remaining(self) -> None:
         limits = agentcat.claude_limits_from_usage_response(
@@ -2450,6 +2583,157 @@ class AgentCatConnectorTests(unittest.TestCase):
             fh.write(self._claude_usage_event(now, "cache_req_2", "cache_msg_2", 30))
         self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 80})
 
+    def test_claude_usage_by_source_reads_only_appended_lines(self) -> None:
+        # Issue #15: during an active Claude session one journal changes every
+        # tick. Only that journal's new bytes may be read, never the corpus.
+        now = dt.datetime.now(dt.timezone.utc)
+        project = agentcat.CLAUDE_PROJECTS_DIR / "busy-project"
+        project.mkdir(parents=True)
+        active = project / "active.jsonl"
+        idle = project / "idle.jsonl"
+        active.write_text(
+            self._claude_usage_event(now, "a1", "a1", 10) + self._claude_usage_event(now, "a2", "a2", 20),
+            encoding="utf-8",
+        )
+        idle.write_text(self._claude_usage_event(now, "i1", "i1", 5), encoding="utf-8")
+
+        parsed: List[int] = []
+        opened: List[str] = []
+        real_parse = agentcat.parse_claude_usage_line
+        real_read = agentcat._read_claude_journal_tokens
+
+        def counting_parse(obj):
+            parsed.append(1)
+            return real_parse(obj)
+
+        def counting_read(path, offset):
+            opened.append(path.name)
+            return real_read(path, offset)
+
+        def tick():
+            parsed.clear()
+            opened.clear()
+            with patch.object(agentcat, "parse_claude_usage_line", side_effect=counting_parse), \
+                patch.object(agentcat, "_read_claude_journal_tokens", side_effect=counting_read):
+                return agentcat.claude_usage_by_source()["bySurface"]
+
+        self.assertEqual(tick(), {"cli": 35})
+        self.assertEqual(len(parsed), 3)
+        self.assertEqual(sorted(opened), ["active.jsonl", "idle.jsonl"])
+
+        # Nothing changed: no journal is opened or parsed.
+        self.assertEqual(tick(), {"cli": 35})
+        self.assertEqual((len(parsed), opened), (0, []))
+
+        # One append: only that file is opened, and only the new line parsed.
+        with active.open("a", encoding="utf-8") as fh:
+            fh.write(self._claude_usage_event(now, "a3", "a3", 7))
+        self.assertEqual(tick(), {"cli": 42})
+        self.assertEqual((len(parsed), opened), (1, ["active.jsonl"]))
+
+        # A half-written line is not counted twice once the writer finishes it.
+        line = self._claude_usage_event(now, "a4", "a4", 100)
+        with active.open("a", encoding="utf-8") as fh:
+            fh.write(line[:20])
+        self.assertEqual(tick(), {"cli": 42})
+        with active.open("a", encoding="utf-8") as fh:
+            fh.write(line[20:])
+        self.assertEqual(tick(), {"cli": 142})
+        self.assertEqual(opened, ["active.jsonl"])
+        self.assertEqual(tick(), {"cli": 142})
+        self.assertEqual((len(parsed), opened), (0, []))
+
+        # A rewritten (shrunk) journal is re-read from the start.
+        active.write_text(self._claude_usage_event(now, "b1", "b1", 1), encoding="utf-8")
+        self.assertEqual(tick(), {"cli": 6})
+
+        # A deleted journal drops out of the total and the memo.
+        idle.unlink()
+        self.assertEqual(tick(), {"cli": 1})
+        self.assertNotIn(str(idle), agentcat._CLAUDE_SOURCE_FILE_MEMO)
+
+    def test_claude_split_rereads_a_replaced_or_rewritten_journal(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        project = agentcat.CLAUDE_PROJECTS_DIR / "rewrite-project"
+        project.mkdir(parents=True)
+        journal = project / "session.jsonl"
+        journal.write_text(
+            self._claude_usage_event(now, "r1", "r1", 10) + self._claude_usage_event(now, "r2", "r2", 20),
+            encoding="utf-8",
+        )
+        self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 30})
+
+        # Replaced by a different, larger file (new inode): not an append.
+        replacement = project / "session.jsonl.new"
+        replacement.write_text(
+            "".join(self._claude_usage_event(now, f"n{i}", f"n{i}", 1) for i in range(5)),
+            encoding="utf-8",
+        )
+        os.replace(replacement, journal)
+        self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 5})
+
+        # Rewritten in place, larger, with no newline where the last counted
+        # line used to end: re-read from the start.
+        memo = agentcat._CLAUDE_SOURCE_FILE_MEMO[str(journal)]
+        offset = memo[3]
+        body = self._claude_usage_event(now, "w1", "w1", 7)
+        while len(body.encode()) < offset + 10:
+            body = body.rstrip("\n") + " " * 50 + "\n"
+        body = body + self._claude_usage_event(now, "w2", "w2", 9)
+        self.assertNotEqual(body.encode()[offset - 1:offset], b"\n")
+        with journal.open("r+b") as fh:
+            fh.write(body.encode())
+            fh.truncate()
+        self.assertEqual(agentcat._CLAUDE_SOURCE_FILE_MEMO[str(journal)][0], journal.stat().st_ino)
+        self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 16})
+
+    def test_desktop_session_index_is_parsed_only_when_it_changes(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        desktop_sid = "5f0c2a8e-1111-4222-8333-944455556666"
+        project = agentcat.CLAUDE_PROJECTS_DIR / "shared"
+        project.mkdir(parents=True)
+        (project / f"{desktop_sid}.jsonl").write_text(
+            self._claude_usage_event(now, "d1", "d1", 30), encoding="utf-8",
+        )
+        (project / "cli-only.jsonl").write_text(
+            self._claude_usage_event(now, "c1", "c1", 70), encoding="utf-8",
+        )
+        sessions = agentcat.HOME / "Library" / "Application Support" / "Claude" / "claude-code-sessions" / "acct"
+        sessions.mkdir(parents=True)
+        (sessions / "other.json").write_text(json.dumps({"cliSessionId": "not-a-journal"}), encoding="utf-8")
+
+        index_reads: List[str] = []
+        journal_reads: List[str] = []
+        real_index = agentcat._claude_desktop_session_id_from_file
+        real_read = agentcat._read_claude_journal_tokens
+
+        def counting_index(path):
+            index_reads.append(path.name)
+            return real_index(path)
+
+        def counting_read(path, offset):
+            journal_reads.append(path.name)
+            return real_read(path, offset)
+
+        def tick():
+            index_reads.clear()
+            journal_reads.clear()
+            with patch.object(agentcat, "_claude_desktop_session_id_from_file", side_effect=counting_index), \
+                patch.object(agentcat, "_read_claude_journal_tokens", side_effect=counting_read):
+                return agentcat.claude_usage_by_source()["bySurface"]
+
+        self.assertEqual(tick(), {"cli": 100})
+        self.assertEqual(index_reads, ["other.json"])
+
+        self.assertEqual(tick(), {"cli": 100})
+        self.assertEqual((index_reads, journal_reads), ([], []))
+
+        # A new desktop index entry re-parses only that file and moves the
+        # matching journal to "app" without re-reading the journal itself.
+        (sessions / "local_new.json").write_text(json.dumps({"cliSessionId": desktop_sid}), encoding="utf-8")
+        self.assertEqual(tick(), {"cli": 70, "app": 30})
+        self.assertEqual((index_reads, journal_reads), (["local_new.json"], []))
+
     def test_codexbar_cost_cache_floors_claude_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()
         cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"
@@ -2971,6 +3255,202 @@ class AgentCatConnectorTests(unittest.TestCase):
             antigravity_provider["sources"]["antigravityCli"]["collectionMethod"],
             "local_sqlite_trajectory",
         )
+
+    def _antigravity_wal_database(self, target: Path, timestamps: List[int]) -> None:
+        """Place a WAL-mode DB whose rows live only in an un-checkpointed -wal,
+        with no -shm: what Antigravity leaves behind after it exits mid-WAL."""
+        staging = self.root / "staging"
+        staging.mkdir(exist_ok=True)
+        source = staging / target.name
+        writer = sqlite3.connect(source)
+        try:
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("pragma wal_autocheckpoint=0")
+            writer.execute("create table gen_metadata (data blob)")
+            for timestamp in timestamps:
+                writer.execute(
+                    "insert into gen_metadata(data) values (?)",
+                    (_antigravity_fixture_blob(timestamp=timestamp),),
+                )
+            writer.commit()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            target.with_name(target.name + "-wal").write_bytes(
+                source.with_name(source.name + "-wal").read_bytes()
+            )
+        finally:
+            writer.close()
+
+    def test_antigravity_reads_wal_db_without_shm_and_never_writes_beside_it(self) -> None:
+        # releases#44 items 3+4: the app's new folder, a WAL DB with no -shm.
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        conversations = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        database = conversations / "94d815b6.db"
+        self._antigravity_wal_database(database, [now, now])
+        before = {path.name: path.read_bytes() for path in conversations.iterdir()}
+        self.assertEqual(sorted(before), ["94d815b6.db", "94d815b6.db-wal"])
+
+        usage = agentcat.antigravity_sqlite_usage()
+
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage["events"], 2)
+        self.assertEqual(usage["tokens"]["totalTokens"], 284)
+        after = {path.name: path.read_bytes() for path in conversations.iterdir()}
+        self.assertEqual(after, before)  # no -shm created, nothing rewritten
+
+    def test_antigravity_clean_wal_db_is_read_in_place_without_side_files(self) -> None:
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        conversations = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        conversations.mkdir(parents=True)
+        database = conversations / "c768066c.db"
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("pragma journal_mode=wal")
+            connection.execute("create table gen_metadata (data blob)")
+            connection.execute(
+                "insert into gen_metadata(data) values (?)",
+                (_antigravity_fixture_blob(timestamp=now),),
+            )
+            connection.commit()
+        for suffix in ("-wal", "-shm"):
+            side = database.with_name(database.name + suffix)
+            if side.exists():
+                side.unlink()
+        before = {path.name: path.read_bytes() for path in conversations.iterdir()}
+
+        with patch.object(agentcat, "_antigravity_rows_from_copy", side_effect=AssertionError("no copy needed")):
+            usage = agentcat.antigravity_sqlite_usage()
+
+        self.assertEqual(usage["tokens"]["totalTokens"], 142)
+        self.assertEqual({path.name: path.read_bytes() for path in conversations.iterdir()}, before)
+
+    def _recording_connect(self, uris: List[str]):
+        real_connect = agentcat.sqlite3.connect
+
+        def connect(target, *args, **kwargs):
+            uris.append(str(target))
+            return real_connect(target, *args, **kwargs)
+
+        return patch.object(agentcat.sqlite3, "connect", side_effect=connect)
+
+    def test_antigravity_running_app_with_empty_wal_is_not_read_immutable(self) -> None:
+        # While Antigravity runs, a checkpoint can leave a 0-byte -wal next to
+        # its -shm. immutable=1 would skip the writer's locks; use mode=ro.
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        conversations = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        conversations.mkdir(parents=True)
+        database = conversations / "live.db"
+        writer = sqlite3.connect(database)
+        try:
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("create table gen_metadata (data blob)")
+            writer.execute("insert into gen_metadata(data) values (?)", (_antigravity_fixture_blob(timestamp=now),))
+            writer.commit()
+            writer.execute("pragma wal_checkpoint(TRUNCATE)")
+            self.assertEqual(database.with_name("live.db-wal").stat().st_size, 0)
+            self.assertTrue(database.with_name("live.db-shm").exists())
+            uris: List[str] = []
+            with self._recording_connect(uris):
+                rows = agentcat.antigravity_read_gen_rows(database)
+        finally:
+            writer.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(uris), 1)
+        self.assertIn("mode=ro", uris[0])
+        self.assertNotIn("immutable", uris[0])
+
+    def test_antigravity_side_file_combinations_pick_the_safe_reader(self) -> None:
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        conversations = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        conversations.mkdir(parents=True)
+        database = conversations / "c.db"
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("create table gen_metadata (data blob)")
+            connection.execute("insert into gen_metadata(data) values (?)", (_antigravity_fixture_blob(timestamp=now),))
+            connection.commit()
+        wal = database.with_name("c.db-wal")
+        shm = database.with_name("c.db-shm")
+
+        uris: List[str] = []
+        with self._recording_connect(uris):
+            agentcat.antigravity_read_gen_rows(database)
+        self.assertEqual(len(uris), 1)
+        self.assertIn("immutable=1", uris[0])  # neither side file
+
+        for present in ((wal,), (shm,)):
+            for side in (wal, shm):
+                if side.exists():
+                    side.unlink()
+            for side in present:
+                side.write_bytes(b"")
+            uris.clear()
+            with self._recording_connect(uris):
+                rows = agentcat.antigravity_read_gen_rows(database)
+            # Only one side file: never in place, always the private copy.
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(uris), 1, present)
+            self.assertNotIn(str(conversations), uris[0])
+
+    def test_antigravity_scans_both_conversation_folders_once_each(self) -> None:
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        legacy = agentcat.ANTIGRAVITY_CLI_DIR / "conversations"
+        current = agentcat.ANTIGRAVITY_APP_DIR / "conversations"
+        for folder, name, count in ((legacy, "old.db", 1), (current, "new.db", 2), (legacy, "both.db", 1), (current, "both.db", 3)):
+            folder.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(folder / name)) as connection:
+                connection.execute("create table gen_metadata (data blob)")
+                for _ in range(count):
+                    connection.execute(
+                        "insert into gen_metadata(data) values (?)",
+                        (_antigravity_fixture_blob(timestamp=now),),
+                    )
+                connection.commit()
+        stale = legacy / "both.db"
+        os.utime(stale, (now - 3600, now - 3600))
+
+        reads: List[str] = []
+        real_read = agentcat.antigravity_read_gen_rows
+
+        def counting_read(database):
+            reads.append(str(database))
+            return real_read(database)
+
+        with patch.object(agentcat, "antigravity_read_gen_rows", side_effect=counting_read):
+            usage = agentcat.antigravity_sqlite_usage()
+            # A conversation id in both folders counts once (the newer copy).
+            self.assertEqual(usage["events"], 1 + 2 + 3)
+            self.assertNotIn(str(stale), reads)
+            self.assertEqual(agentcat.antigravity_conversations_dir(), current)
+            # Unchanged databases are not opened again on the next tick.
+            reads.clear()
+            self.assertEqual(agentcat.antigravity_sqlite_usage()["events"], 6)
+            self.assertEqual(reads, [])
+
+    def test_antigravity_reads_the_app_login_when_agy_has_none(self) -> None:
+        # releases#44 item 5: the desktop app stores its login as
+        # ~/.gemini/jetski-standalone-oauth-token, same nested shape.
+        app_token = agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN
+        app_token.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"auth_method": "consumer", "token": {
+            "access_token": "app-access", "refresh_token": "app-refresh",
+            "token_type": "Bearer", "expiry": "2026-09-06T17:23:00+09:00",
+        }}
+        app_token.write_text(json.dumps(payload), encoding="utf-8")
+        before = app_token.read_bytes()
+
+        creds = agentcat.read_antigravity_oauth_credentials()
+        self.assertEqual(creds["access_token"], "app-access")
+        self.assertEqual(creds["refresh_token"], "app-refresh")
+        self.assertEqual(app_token.read_bytes(), before)
+
+        # agy's own token, when present, still wins.
+        agentcat.ANTIGRAVITY_OAUTH_TOKEN.parent.mkdir(parents=True, exist_ok=True)
+        agentcat.ANTIGRAVITY_OAUTH_TOKEN.write_text(
+            json.dumps({"token": {"access_token": "agy-access", "refresh_token": "agy-refresh"}}),
+            encoding="utf-8",
+        )
+        self.assertEqual(agentcat.read_antigravity_oauth_credentials()["access_token"], "agy-access")
+        # Gemini's own reader still never picks up an Antigravity login.
+        self.assertIsNone(agentcat.read_gemini_oauth_credentials())
 
     def test_gemini_snapshot_distributes_cumulative_counter_deltas_by_day(self) -> None:
         agentcat.GEMINI_TELEMETRY.parent.mkdir(parents=True)
@@ -4931,9 +5411,14 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(cost["total"], 73.5)
 
     def test_gpt_5_6_current_rates_aliases_and_long_context(self) -> None:
+        promo_day = agentcat.active_pricing_overrides(agentcat.dt.date(2026, 10, 8))
+        patcher = patch.object(agentcat, "active_pricing_overrides", return_value=promo_day)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         expected = {
-            "gpt-5.6": (5.0, 30.0, 0.5, 6.25),
-            "gpt-5.6-sol": (5.0, 30.0, 0.5, 6.25),
+            # Sol: OpenAI's promotional rate through at least 2026-11-21.
+            "gpt-5.6": (4.0, 20.0, 0.4, 5.0),
+            "gpt-5.6-sol": (4.0, 20.0, 0.4, 5.0),
             "gpt-5.6-terra": (2.0, 12.0, 0.2, 2.5),
             "gpt-5.6-luna": (0.2, 1.2, 0.02, 0.25),
         }
@@ -4967,6 +5452,130 @@ class PricingTests(unittest.TestCase):
             (above["input"], above["output"], above["cache_read"], above["cache_write"]),
             (4.0, 18.0, 0.4, 5.0),
         )
+
+    # Official list prices per 1M tokens (input, output, cache read, cache
+    # write), checked on the providers' pricing pages on 2026-10-08. These are
+    # the rates a user sees whenever the LiteLLM cache is cold (issue #17).
+    OFFICIAL_LIST_PRICES = {
+        "claude-opus-4-5": (5.0, 25.0, 0.5, 6.25),
+        "claude-opus-4-6": (5.0, 25.0, 0.5, 6.25),
+        "claude-opus-4-7": (5.0, 25.0, 0.5, 6.25),
+        "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25),
+        "claude-sonnet-4-6": (3.0, 15.0, 0.3, 3.75),
+        "gpt-5.5": (5.0, 30.0, 0.5, 5.0),
+        "o3": (2.0, 8.0, 0.5, 2.0),
+        "o3-mini": (1.1, 4.4, 0.55, 1.1),
+        "o4-mini": (1.1, 4.4, 0.275, 1.1),
+        "gemini-2.5-pro": (1.25, 10.0, 0.125, 1.25),
+        "gemini-2.5-flash": (0.3, 2.5, 0.03, 0.3),
+        "gemini-3-flash-preview": (0.5, 3.0, 0.05, 0.5),
+        "gemini-2.5-flash-lite": (0.1, 0.4, 0.01, 0.1),
+        "gpt-5-nano": (0.05, 0.4, 0.005, 0.05),
+        "gpt-5.4": (2.5, 15.0, 0.25, 2.5),
+        "gpt-5.4-mini": (0.75, 4.5, 0.075, 0.75),
+        "gpt-5.5-pro": (30.0, 180.0, 0.0, 30.0),
+        "o3-pro": (20.0, 80.0, 0.0, 20.0),
+        "claude-fable-5-1": (10.0, 50.0, 0.25, 12.5),
+        "claude-mythos-5-1": (10.0, 50.0, 0.25, 12.5),
+    }
+
+    def test_variant_ids_never_borrow_the_base_row(self) -> None:
+        table = agentcat.MODEL_PRICING
+        # A point release or -pro/-nano/-lite/-mini variant is never priced as
+        # its base model; with no row of its own it is unknown (None).
+        for model in ("gpt-5.3", "gpt-5.7-codex", "gpt-5-pro", "o4-mini-pro", "gemini-2.5-pro-lite", "claude-haiku-4-5-nano"):
+            with self.subTest(model=model):
+                self.assertIsNone(agentcat._lookup_pricing(model, table))
+        # Ordinary suffixes still resolve to the base row.
+        self.assertIs(agentcat._lookup_pricing("gpt-5.5-codex", table), table["gpt-5.5"])
+        self.assertIs(agentcat._lookup_pricing("claude-opus-4-7-1m", table), table["claude-opus-4-7"])
+        self.assertIs(agentcat._lookup_pricing("o4-mini-high", table), table["o4-mini"])
+        self.assertIs(agentcat._lookup_pricing("gpt-5.4-mini-codex", table), table["gpt-5.4-mini"])
+        self.assertIs(agentcat._lookup_pricing("gemini-2.5-flash-lite-preview", table), table["gemini-2.5-flash-lite"])
+
+    def test_sol_promotion_ends_after_its_last_day(self) -> None:
+        during = agentcat.active_pricing_overrides(agentcat.dt.date(2026, 11, 21))
+        after = agentcat.active_pricing_overrides(agentcat.dt.date(2026, 11, 22))
+        self.assertEqual(during["gpt-5.6-sol"]["input"], 4.0)
+        self.assertEqual(during["gpt-5.6"]["output"], 20.0)
+        self.assertNotIn("gpt-5.6-sol", after)
+        self.assertIn("gpt-5.6-terra", after)
+        # After the promotion a cold cache falls back to the bundled list rate,
+        # and a warm feed is no longer overridden.
+        with patch.object(agentcat, "active_pricing_overrides", return_value=after):
+            agentcat._PRICING_TABLE_MEMO = None
+            self.assertEqual(agentcat.estimate_cost("gpt-5.6-sol", 1_000_000, 0, 0, 0)["input"], 5.0)
+        agentcat._PRICING_TABLE_MEMO = None
+
+    def test_cold_cache_uses_official_list_prices(self) -> None:
+        self.assertFalse(agentcat.pricing_cache_file().exists())
+        self.assertEqual(agentcat.merged_pricing_table()[1]["source"], "bundled")
+        for model, rates in self.OFFICIAL_LIST_PRICES.items():
+            with self.subTest(model=model):
+                cost = agentcat.estimate_cost(model, 1_000_000, 1_000_000, 1_000_000, 1_000_000)
+                self.assertEqual(
+                    tuple(round(cost[key], 6) for key in ("input", "output", "cache_read", "cache_write")),
+                    rates,
+                )
+        # Dated and suffixed ids resolve to the same rows.
+        self.assertEqual(agentcat.estimate_cost("claude-opus-4-7-20260415", 1_000_000, 0, 0, 0)["input"], 5.0)
+        self.assertEqual(agentcat.estimate_cost("claude-haiku-4-5-20251001", 0, 1_000_000, 0, 0)["output"], 5.0)
+        self.assertEqual(agentcat.estimate_cost("gpt-5.5-codex", 0, 1_000_000, 0, 0)["output"], 30.0)
+
+    def test_cold_cache_long_context_tiers(self) -> None:
+        def rates(model, context):
+            cost = agentcat.estimate_cost(model, 1_000_000, 1_000_000, 1_000_000, 1_000_000, context_tokens=context)
+            return tuple(round(cost[key], 6) for key in ("input", "output", "cache_read", "cache_write"))
+
+        self.assertEqual(rates("gpt-5.5", 272_000), (5.0, 30.0, 0.5, 5.0))
+        self.assertEqual(rates("gpt-5.5", 272_001), (10.0, 45.0, 1.0, 10.0))
+        self.assertEqual(rates("gemini-2.5-pro", 200_000), (1.25, 10.0, 0.125, 1.25))
+        self.assertEqual(rates("gemini-2.5-pro", 200_001), (2.5, 15.0, 0.25, 2.5))
+
+    def test_bundled_rows_match_checked_in_feed_snapshot(self) -> None:
+        """Fail when a bundled row drifts from the dated feed snapshot.
+
+        The fixture is a subset of the public LiteLLM feed whose rows were
+        checked against the providers' pricing pages. When prices change,
+        refresh the fixture and the bundled row together.
+        """
+        fixture = REPO_ROOT / "tests" / "fixtures" / "pricing" / "litellm-subset-2026-10-08.json"
+        feed = agentcat.litellm_price_table(json.loads(fixture.read_text(encoding="utf-8")))
+        feed_key = {"gemini-3-flash": "gemini-3-flash-preview"}
+        unchecked = {"gpt-5.5-mini", "gemini-3-pro"}  # not on any current price list
+        # Sol's bundled row is the list rate; on the fixture's date OpenAI bills
+        # the promotional rate, which is what the feed carries.
+        rows = dict(agentcat.MODEL_PRICING)
+        rows.update(agentcat.active_pricing_overrides(agentcat.dt.date(2026, 10, 8)))
+        self.assertEqual(
+            set(rows) - unchecked,
+            {key for key in rows if feed_key.get(key, key) in feed},
+        )
+        buckets = ("input", "output", "cache_read", "cache_write")
+        for model, bundled in rows.items():
+            if model in unchecked:
+                continue
+            with self.subTest(model=model):
+                expected = feed[feed_key.get(model, model)]
+                base = agentcat._tier_rates(bundled, None)
+                feed_base = agentcat._tier_rates(expected, None)
+                for bucket in buckets:
+                    self.assertAlmostEqual(base[bucket], feed_base[bucket], places=6, msg=bucket)
+                for bundled_tier in bundled.get("tiers") or []:
+                    # The feed's "above_272k" threshold is 272_000; the bundled
+                    # rows use the first token past it.
+                    self.assertTrue(any(
+                        abs(tier["threshold"] - bundled_tier["threshold"]) <= 1
+                        for tier in expected.get("tiers") or []
+                    ), bundled_tier)
+                    ours = agentcat._tier_rates(bundled, bundled_tier["threshold"])
+                    theirs = agentcat._tier_rates(expected, bundled_tier["threshold"])
+                    for bucket in buckets:
+                        if bucket == "cache_write" and "cache_write" not in expected:
+                            # No write premium (Gemini, OpenAI): the bundled
+                            # tier uses its input rate, as the base row does.
+                            continue
+                        self.assertAlmostEqual(ours[bucket], theirs[bucket], places=6, msg=bucket)
 
     def test_cache_read_is_cheaper_than_input(self) -> None:
         cost = agentcat.estimate_cost(
@@ -5223,10 +5832,12 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.saved = {
             "ANTIGRAVITY_OAUTH_TOKEN": agentcat.ANTIGRAVITY_OAUTH_TOKEN,
+            "ANTIGRAVITY_APP_OAUTH_TOKEN": agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN,
             "ANTIGRAVITY_CLIENT_CACHE": agentcat.ANTIGRAVITY_CLIENT_CACHE,
             "LIVE_LIMITS_CACHE": agentcat.LIVE_LIMITS_CACHE,
         }
         agentcat.ANTIGRAVITY_OAUTH_TOKEN = self.root / "antigravity-oauth-token"
+        agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN = self.root / "jetski-standalone-oauth-token"
         agentcat.ANTIGRAVITY_CLIENT_CACHE = self.root / "antigravity-oauth-client.json"
         agentcat.LIVE_LIMITS_CACHE = self.root / "live-limits-cache.json"
 
@@ -5268,6 +5879,40 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         }):
             cands = agentcat.antigravity_oauth_client_candidates()
         self.assertEqual(cands, [("envid.apps.googleusercontent.com", "GOCSPX-envsecret")])
+
+    def _write_app_token(self, expiry: str) -> None:
+        agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN.write_text(
+            json.dumps({"auth_method": "consumer", "token": {
+                "access_token": "app-access", "refresh_token": "app-refresh",
+                "token_type": "Bearer", "expiry": expiry,
+            }}),
+            encoding="utf-8",
+        )
+
+    def test_app_login_is_read_only_and_never_refreshed(self) -> None:
+        # The Antigravity app owns ~/.gemini/jetski-standalone-oauth-token.
+        # Refreshing it with agy's client is a grant the connector does not own
+        # (rule R1); an expired one is reported, not fixed.
+        agentcat.ANTIGRAVITY_CLIENT_CACHE.write_text(
+            json.dumps({"client_id": "agy.apps.googleusercontent.com", "client_secret": "GOCSPX-agy"}),
+            encoding="utf-8",
+        )
+        future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat()
+        self._write_app_token(future)
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("no refresh")):
+            self.assertEqual(agentcat.antigravity_access_token(), "app-access")
+
+        self._write_app_token("2020-01-01T00:00:00+00:00")
+        before = agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN.read_bytes()
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("no refresh")), \
+            patch.object(agentcat, "refresh_antigravity_access_token", side_effect=AssertionError("no refresh")):
+            self.assertIsNone(agentcat.antigravity_access_token())
+            limits = agentcat.antigravity_live_limits(force=True)
+            probed = agentcat.probe_antigravity()
+        self.assertEqual(limits["reason"], "cli_login_expired")
+        self.assertEqual(probed["reason"], "cli_login_expired")
+        self.assertEqual(agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN.read_bytes(), before)
+        self.assertTrue(agentcat.ANTIGRAVITY_CLIENT_CACHE.exists())  # agy's client kept
 
     def test_refresh_tries_candidates_and_caches_winner(self) -> None:
         self._write_token()

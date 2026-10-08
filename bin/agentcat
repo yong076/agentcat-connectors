@@ -140,6 +140,12 @@ ANTIGRAVITY_CLI_DIR = HOME / ".gemini" / "antigravity-cli"
 ANTIGRAVITY_TELEMETRY = AGENTCAT_HOME / "gemini" / "antigravity-telemetry.log"
 ANTIGRAVITY_USAGE_CACHE = AGENTCAT_HOME / "antigravity-usage-cache.json"
 ANTIGRAVITY_OAUTH_TOKEN = ANTIGRAVITY_CLI_DIR / "antigravity-oauth-token"
+# The Antigravity desktop app (internal codename "jetski") keeps its own state
+# next to the CLI's: conversations under ~/.gemini/antigravity and its login in
+# ~/.gemini/jetski-standalone-oauth-token (same {"token": {...}} shape). Both are
+# only ever read.
+ANTIGRAVITY_APP_DIR = HOME / ".gemini" / "antigravity"
+ANTIGRAVITY_APP_OAUTH_TOKEN = HOME / ".gemini" / "jetski-standalone-oauth-token"
 ANTIGRAVITY_CLIENT_CACHE = AGENTCAT_HOME / "antigravity-oauth-client.json"
 # Antigravity refresh tokens are minted by Antigravity's own OAuth client, not the
 # gemini-cli client, so gemini's scraped credentials cannot refresh them. The agy
@@ -162,8 +168,12 @@ CODEX_USAGE_BREAKDOWN_CACHE = AGENTCAT_HOME / "codex-usage-breakdown-cache.json"
 CODEX_USAGE_BREAKDOWN_TTL_SECONDS = int(os.environ.get("AGENTCAT_CODEX_USAGE_TTL_SECONDS", "900"))
 # Codex's seven-day window in minutes; upstream values may drift by one minute.
 CODEX_WEEKLY_WINDOW_MINUTES = 10080
-CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+# Reason code for a Codex CLI login whose access token the usage API rejects.
+# The connector never refreshes a CLI-owned grant (OAuth rule R1: Codex rotates
+# refresh tokens, so refreshing here would log the CLI out). The CLI refreshes
+# its own token the next time it runs; until then the last numbers are served
+# as stale with this reason.
+CODEX_CLI_LOGIN_EXPIRED_REASON = "cli_login_expired"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
 OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
@@ -247,6 +257,8 @@ CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
 WINDOWS_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOWS_RUN_VALUE = "AgentCatD"
+# Hidden sign-in launcher the installer writes under AGENTCAT_HOME.
+WINDOWS_HIDDEN_LAUNCHER_NAME = "AgentCatD.vbs"
 WINDOWS_LEGACY_STARTUP_SCRIPT = (
     Path(os.environ.get("APPDATA", str(HOME / "AppData" / "Roaming")))
     / "Microsoft"
@@ -375,9 +387,19 @@ TOKEN_CLASS_KEYS = (
 #   cache_read   — tokens served from prompt cache (typically much cheaper)
 #   cache_write  — tokens written into prompt cache (≈ input or slightly more)
 #
-# Source: public provider pricing pages through 2026-07. Estimates only —
+# These rows are what users see whenever the LiteLLM cache is cold (first run,
+# offline, fetch failure), so they must match current list prices. Rows were
+# checked against the providers' own pricing pages on 2026-10-08:
+#   Anthropic  platform.claude.com/docs/en/about-claude/pricing
+#   OpenAI     developers.openai.com/api/docs/pricing (Standard tier)
+#   Google     ai.google.dev/gemini-api/docs/pricing (paid tier)
+# cache_write is the 5-minute write rate where the provider charges one
+# (Anthropic 1.25x input); OpenAI and Gemini bill no write premium, so it is
+# the input rate. tests/fixtures/pricing pins these rows. Estimates only —
 # never bill from these. Unknown models intentionally return None so the
 # caller emits a `pricing_missing` finding instead of silently guessing.
+# GPT-5.6 Sol: the list rate bundled since 26.31.0. OpenAI currently bills a
+# promotional rate (below), "available at least through November 21, 2026".
 _GPT_5_6_SOL_PRICING: Dict[str, Any] = {
     "input": 5.0,
     "output": 30.0,
@@ -391,6 +413,20 @@ _GPT_5_6_SOL_PRICING: Dict[str, Any] = {
         "cache_write": 12.5,
     }],
 }
+_GPT_5_6_SOL_PROMO_PRICING: Dict[str, Any] = {
+    "input": 4.0,
+    "output": 20.0,
+    "cache_read": 0.4,
+    "cache_write": 5.0,
+    "tiers": [{
+        "threshold": 272_001,
+        "input": 8.0,
+        "output": 30.0,
+        "cache_read": 0.8,
+        "cache_write": 10.0,
+    }],
+}
+GPT_5_6_SOL_PROMO_LAST_DAY = dt.date(2026, 11, 21)
 _GPT_5_6_TERRA_PRICING: Dict[str, Any] = {
     "input": 2.0,
     "output": 12.0,
@@ -422,39 +458,80 @@ _GPT_5_6_LUNA_PRICING: Dict[str, Any] = {
 # with a newer verified provider rate here and apply them after the feed.
 # `gpt-5.6` is OpenAI's alias for GPT-5.6 Sol.
 OFFICIAL_PRICING_OVERRIDES: Dict[str, Dict[str, Any]] = {
-    "gpt-5.6": _GPT_5_6_SOL_PRICING,
-    "gpt-5.6-sol": _GPT_5_6_SOL_PRICING,
     "gpt-5.6-terra": _GPT_5_6_TERRA_PRICING,
     "gpt-5.6-luna": _GPT_5_6_LUNA_PRICING,
 }
+# Time-boxed provider promotions: (last day, inclusive, UTC; rows). They win
+# over the feed only until that day; afterwards the feed, or the bundled list
+# rate when the feed is cold, applies again.
+PROMOTIONAL_PRICING_OVERRIDES: Tuple[Tuple[dt.date, Dict[str, Dict[str, Any]]], ...] = (
+    (GPT_5_6_SOL_PROMO_LAST_DAY, {
+        "gpt-5.6": _GPT_5_6_SOL_PROMO_PRICING,
+        "gpt-5.6-sol": _GPT_5_6_SOL_PROMO_PRICING,
+    }),
+)
+
+
+def active_pricing_overrides(today: Optional[dt.date] = None) -> Dict[str, Dict[str, Any]]:
+    day = today or dt.datetime.now(dt.timezone.utc).date()
+    overrides = dict(OFFICIAL_PRICING_OVERRIDES)
+    for last_day, rows in PROMOTIONAL_PRICING_OVERRIDES:
+        if day <= last_day:
+            overrides.update(rows)
+    return overrides
 
 MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # OpenAI / Codex
     "gpt-5":         {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": 1.25},
     "gpt-5-mini":    {"input": 0.25, "output": 2.0,  "cache_read": 0.025, "cache_write": 0.25},
-    "gpt-5.5":       {"input": 2.5,  "output": 15.0, "cache_read": 0.25,  "cache_write": 2.5},
+    "gpt-5-nano":    {"input": 0.05, "output": 0.4,  "cache_read": 0.005, "cache_write": 0.05},
+    "gpt-5.4":       {"input": 2.5,  "output": 15.0, "cache_read": 0.25,  "cache_write": 2.5,
+                      "tiers": [{"threshold": 272_001, "input": 5.0, "output": 22.5,
+                                 "cache_read": 0.5, "cache_write": 5.0}]},
+    "gpt-5.4-mini":  {"input": 0.75, "output": 4.5,  "cache_read": 0.075, "cache_write": 0.75},
+    "gpt-5.5":       {"input": 5.0,  "output": 30.0, "cache_read": 0.5,   "cache_write": 5.0,
+                      "tiers": [{"threshold": 272_001, "input": 10.0, "output": 45.0,
+                                 "cache_read": 1.0, "cache_write": 10.0}]},
+    # Pro models offer no cached-input rate (cache_read 0, writes at input).
+    "gpt-5.5-pro":   {"input": 30.0, "output": 180.0,
+                      "tiers": [{"threshold": 272_001, "input": 60.0, "output": 270.0}]},
+    # Not on OpenAI's current price list; unverified, left unchanged.
     "gpt-5.5-mini":  {"input": 0.3,  "output": 2.4,  "cache_read": 0.03,  "cache_write": 0.3},
+    "gpt-5.6":       _GPT_5_6_SOL_PRICING,
+    "gpt-5.6-sol":   _GPT_5_6_SOL_PRICING,
     **OFFICIAL_PRICING_OVERRIDES,
-    "o3":            {"input": 4.0,  "output": 16.0, "cache_read": 0.4,   "cache_write": 4.0},
-    "o3-mini":       {"input": 0.55, "output": 2.2,  "cache_read": 0.055, "cache_write": 0.55},
-    "o4-mini":       {"input": 0.55, "output": 2.2,  "cache_read": 0.055, "cache_write": 0.55},
+    "o3":            {"input": 2.0,  "output": 8.0,  "cache_read": 0.5,   "cache_write": 2.0},
+    "o3-pro":        {"input": 20.0, "output": 80.0},
+    "o3-mini":       {"input": 1.1,  "output": 4.4,  "cache_read": 0.55,  "cache_write": 1.1},
+    "o4-mini":       {"input": 1.1,  "output": 4.4,  "cache_read": 0.275, "cache_write": 1.1},
     # Anthropic / Claude
-    "claude-opus-4-5":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
-    "claude-opus-4-6":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
-    "claude-opus-4-7":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    "claude-opus-4-5":   {"input": 5.0,  "output": 25.0, "cache_read": 0.5,  "cache_write": 6.25},
+    "claude-opus-4-6":   {"input": 5.0,  "output": 25.0, "cache_read": 0.5,  "cache_write": 6.25},
+    "claude-opus-4-7":   {"input": 5.0,  "output": 25.0, "cache_read": 0.5,  "cache_write": 6.25},
     # Claude Fable/Mythos 5: $10/M input, $50/M output, 90% cache-read
     # discount ($1/M). LiteLLM's combined cache-write fallback is $12.50/M.
     "claude-fable-5":    {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
     "claude-mythos-5":   {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
+    # 5.1 reads its cache at 0.025x input.
+    "claude-fable-5-1":  {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
+    "claude-mythos-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
     "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
     "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
-    "claude-haiku-4-5":  {"input": 0.8,  "output": 4.0,  "cache_read": 0.08, "cache_write": 1.0},
+    "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0,  "cache_read": 0.1,  "cache_write": 1.25},
     # Google / Gemini
-    "gemini-2.5-pro":   {"input": 1.25, "output": 5.0,  "cache_read": 0.31, "cache_write": 1.25},
-    "gemini-2.5-flash": {"input": 0.15, "output": 0.6,  "cache_read": 0.04, "cache_write": 0.15},
+    "gemini-2.5-pro":   {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": 1.25,
+                         "tiers": [{"threshold": 200_001, "input": 2.5, "output": 15.0,
+                                    "cache_read": 0.25, "cache_write": 2.5}]},
+    "gemini-2.5-flash": {"input": 0.3,  "output": 2.5,  "cache_read": 0.03, "cache_write": 0.3},
+    "gemini-2.5-flash-lite": {"input": 0.1, "output": 0.4, "cache_read": 0.01, "cache_write": 0.1},
+    # gemini-3-pro is no longer on Google's price list and not in the feed;
+    # left as it was until there is a source to check it against.
     "gemini-3-pro":     {"input": 2.5,  "output": 10.0, "cache_read": 0.62, "cache_write": 2.5},
-    "gemini-3-flash":   {"input": 0.2,  "output": 0.8,  "cache_read": 0.05, "cache_write": 0.2},
+    "gemini-3-flash":   {"input": 0.5,  "output": 3.0,  "cache_read": 0.05, "cache_write": 0.5},
 }
+
+
+_PRICING_VARIANT_SUFFIX_RE = re.compile(r"^(?:\.\d|-(?:pro|nano|lite|mini)(?:$|[-.]))")
 
 
 def _lookup_pricing(
@@ -491,6 +568,10 @@ def _lookup_pricing(
         # end of the string (audit #13).
         rest = trimmed[len(key):]
         if rest and rest[0] not in "-.":
+            continue
+        # A point release or a tier variant is a different price, never the
+        # base row: gpt-5 must not price gpt-5.4, gpt-5-nano or o3-pro.
+        if _PRICING_VARIANT_SUFFIX_RE.match(rest):
             continue
         if best_key is None or len(key) > len(best_key):
             best_key = key
@@ -598,7 +679,7 @@ _LITELLM_TIER_KEY_RE = re.compile(
     r"cache_creation_input_token_cost)_above_(\d+)k_tokens$"
 )
 _PRICING_TABLE_LOCK = threading.Lock()
-_PRICING_TABLE_MEMO: Optional[Tuple[Tuple[str, Optional[int], Optional[int]], Dict[str, Dict[str, Any]], Dict[str, Any]]] = None
+_PRICING_TABLE_MEMO: Optional[Tuple[Tuple[Any, ...], Dict[str, Dict[str, Any]], Dict[str, Any]]] = None
 
 
 def pricing_cache_file() -> Path:
@@ -728,11 +809,14 @@ def merged_pricing_table() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """
     global _PRICING_TABLE_MEMO
     path = pricing_cache_file()
+    overrides = active_pricing_overrides()
+    # The active override set changes when a promotion ends.
+    override_key = tuple(sorted((name, id(row)) for name, row in overrides.items()))
     try:
         stat = path.stat()
-        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        key = (str(path), stat.st_mtime_ns, stat.st_size, override_key)
     except OSError:
-        key = (str(path), None, None)
+        key = (str(path), None, None, override_key)
     with _PRICING_TABLE_LOCK:
         memo = _PRICING_TABLE_MEMO
     if memo is not None and memo[0] == key:
@@ -744,7 +828,7 @@ def merged_pricing_table() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
         meta = {"source": "litellm", "fetchedAt": cache.get("fetchedAt")}
     else:
         meta = {"source": "bundled", "fetchedAt": None}
-    table.update(OFFICIAL_PRICING_OVERRIDES)
+    table.update(overrides)
     with _PRICING_TABLE_LOCK:
         _PRICING_TABLE_MEMO = (key, table, meta)
     return table, meta
@@ -761,9 +845,9 @@ def pricing_refresh_loop(interval_seconds: float, initial_delay_seconds: float) 
         try:
             state = refresh_litellm_pricing()
             if state.get("status") == "error":
-                print(f"agentcatd pricing refresh failed: {state.get('error')}", file=sys.stderr, flush=True)
+                print(f"agentcatd pricing refresh failed: {_tilde_text(str(state.get('error')))}", file=sys.stderr, flush=True)
         except Exception as exc:
-            print(f"agentcatd pricing loop failed: {exc}", file=sys.stderr, flush=True)
+            print(f"agentcatd pricing loop failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
         time.sleep(max(60.0, interval_seconds))
 
 
@@ -2100,13 +2184,26 @@ def _daemon_status_snapshot_uncached() -> Dict[str, Any]:
     """
     if IS_WINDOWS:
         task = _status_command(
-            ["schtasks.exe", "/Query", "/TN", WINDOWS_TASK_NAME, "/FO", "LIST"]
+            ["schtasks.exe", "/Query", "/TN", WINDOWS_TASK_NAME, "/FO", "LIST", "/V"]
         )
         run_entry = _status_command(
             ["reg.exe", "query", WINDOWS_RUN_KEY, "/v", WINDOWS_RUN_VALUE]
         )
         task_registered = bool(task is not None and task.returncode == 0)
         run_registered = bool(run_entry is not None and run_entry.returncode == 0)
+        # A registration that starts the hidden launcher only works while the
+        # launcher file exists; without it nothing starts at sign-in.
+        launcher_present = (AGENTCAT_HOME / WINDOWS_HIDDEN_LAUNCHER_NAME).is_file()
+        launcher_name = WINDOWS_HIDDEN_LAUNCHER_NAME.lower()
+
+        def needs_missing_launcher(result: Any) -> bool:
+            text = str(getattr(result, "stdout", "") or "").lower()
+            return launcher_name in text and not launcher_present
+
+        if task_registered and needs_missing_launcher(task):
+            task_registered = False
+        if run_registered and needs_missing_launcher(run_entry):
+            run_registered = False
         legacy_present = False
         if WINDOWS_LEGACY_STARTUP_SCRIPT.is_file():
             try:
@@ -2136,6 +2233,7 @@ def _daemon_status_snapshot_uncached() -> Dict[str, Any]:
             "taskRegistered": task_registered,
             "runEntryRegistered": run_registered,
             "legacyStartupPresent": legacy_present,
+            "launcherPresent": launcher_present,
         }
 
     if sys.platform == "darwin":
@@ -3326,6 +3424,7 @@ def serve_stale_live_limits(
     stale: Dict[str, Any],
     exc: Exception,
     project_id: Optional[str] = None,
+    reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return the last-good live limits during a probe failure, re-stamping the
     cache so the daemon does not re-probe (and re-refresh the OAuth token) on every
@@ -3333,11 +3432,16 @@ def serve_stale_live_limits(
     never advances once the good entry goes stale, so one revoked/expired token
     turns into a full refresh POST — and for Antigravity a ~140MB binary re-scan —
     every tick. Re-stamping throttles re-probing to one attempt per max-age window.
+
+    ``reason`` overrides the generic HTTP-derived reason code when the caller
+    knows more (e.g. a CLI-owned login that expired).
     """
     stale = dict(stale)
     stale["liveError"] = str(exc)
     error_limits = live_limit_error(exc, str(stale.get("source") or provider), project_id=project_id)
-    stale["liveErrorReason"] = error_limits.get("reason")
+    stale["liveErrorReason"] = reason or error_limits.get("reason")
+    if reason:
+        stale["reason"] = reason
     stale.pop("retryAt", None)
     if error_limits.get("retryAt") is not None:
         stale["retryAt"] = error_limits["retryAt"]
@@ -3720,28 +3824,59 @@ def provider_sync_identity(provider: str, native_account_id: str) -> str:
     ).hexdigest()
 
 
-def refresh_codex_access_token(auth: Dict[str, Any]) -> Optional[str]:
-    tokens = oauth_tokens(auth)
-    refresh_token = tokens.get("refresh_token")
-    if not isinstance(refresh_token, str) or not refresh_token:
-        return None
+# A failed Codex usage probe waits 5 min, doubling to 60 min, before the next
+# request (rule R6). A 401 with the same token cannot succeed until the CLI
+# refreshes its own login, so polling it every tick only burns requests.
+CODEX_FAILURE_BACKOFF_SECONDS = 300
+CODEX_FAILURE_BACKOFF_MAX_SECONDS = 3600
 
-    body = urllib.parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CODEX_OAUTH_CLIENT_ID,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        CODEX_OAUTH_TOKEN_URL,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+
+def codex_failure_backoff_seconds(streak: int) -> int:
+    """Backoff after the ``streak``-th consecutive failure (1-based)."""
+    exponent = max(0, min(int(streak) - 1, 6))
+    return min(CODEX_FAILURE_BACKOFF_SECONDS * (2 ** exponent), CODEX_FAILURE_BACKOFF_MAX_SECONDS)
+
+
+def codex_token_fingerprint(access_token: str) -> str:
+    """Device-keyed, truncated HMAC of an access token; never the token itself.
+
+    Stored next to a failure backoff so that a re-login (the CLI writes a new
+    token) lifts the backoff at once instead of waiting it out.
+    """
+    return hmac.new(
+        _provider_instance_secret(),
+        f"agentcat.codex-token-fingerprint.v1:{access_token}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:16]
+
+
+def _codex_public_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop cache-only bookkeeping (``_``-prefixed keys) before serving limits."""
+    return {key: value for key, value in limits.items() if not (isinstance(key, str) and key.startswith("_"))}
+
+
+def _codex_limits_login_expired(limits: Optional[Dict[str, Any]]) -> bool:
+    return isinstance(limits, dict) and CODEX_CLI_LOGIN_EXPIRED_REASON in (
+        limits.get("reason"), limits.get("liveErrorReason")
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    token = payload.get("access_token")
-    return token if isinstance(token, str) and token else None
+
+
+def mark_codex_cli_login_expired(limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Label Codex limits whose CLI access token the usage API rejected.
+
+    Every auth document that reaches the HTTP usage path is read from a Codex
+    CLI home (``~/.codex*``, an adopted or Orca runtime home). Agent Cat's own
+    managed Codex logins never come through here: they are delegated to
+    ``codex app-server`` in a private CODEX_HOME, which refreshes its own grant.
+    So there is no grant on this path the connector may refresh. The numbers
+    stay visible but are never presented as live.
+    """
+    out = dict(limits)
+    if out.get("quotas"):
+        out["stale"] = True
+    out["reason"] = CODEX_CLI_LOGIN_EXPIRED_REASON
+    out["liveErrorReason"] = CODEX_CLI_LOGIN_EXPIRED_REASON
+    return out
 
 
 def codex_request_headers(access_token: str, account_id: str) -> Dict[str, str]:
@@ -4151,53 +4286,85 @@ def codex_live_limits_for_auth(
     cache_key: str,
     force: bool = False,
 ) -> Dict[str, Any]:
-    """Fetch one Codex identity's quota without sharing another identity's cache."""
-    cached = None if force else cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS)
-    if cached:
-        return sanitize_codex_cached_limits(cached)
+    """Fetch one Codex identity's quota without sharing another identity's cache.
+
+    ``auth`` is a Codex CLI home's own ``auth.json``: it is read, never
+    refreshed or written back (rule R1). A 401 means the CLI's access token
+    lapsed; the last numbers are served as stale with ``cli_login_expired``
+    until the CLI refreshes its own token on its next run.
+    """
     tokens = oauth_tokens(auth)
     access_token = tokens.get("access_token")
     account_id = tokens.get("account_id") or auth.get("account_id") or ""
+    fingerprint = codex_token_fingerprint(access_token) if isinstance(access_token, str) and access_token else None
+    now = int(time.time())
+    cached = None if force else cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS)
+    previous = cached or cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+    same_login = bool(fingerprint) and isinstance(previous, dict) and previous.get("_tokenFingerprint") == fingerprint
+    if _codex_limits_login_expired(previous):
+        retry_at = int_limit(previous.get("_loginRetryAt"))
+        window_open = retry_at > now if retry_at is not None else cached is not None
+        # The same expired token inside its backoff: no request, even when
+        # forced. A new token (re-login) skips the wait.
+        if window_open and (same_login or fingerprint is None):
+            return _codex_public_limits(mark_codex_cli_login_expired(sanitize_codex_cached_limits(previous)))
+    elif cached:
+        return _codex_public_limits(sanitize_codex_cached_limits(cached))
     if not isinstance(access_token, str) or not access_token:
         return empty_limits()
 
     last_error: Optional[Exception] = None
-    for attempt in range(2):
-        for url in CODEX_USAGE_URLS:
+    login_expired = False
+    for url in CODEX_USAGE_URLS:
+        try:
+            payload = codex_usage_request(access_token, str(account_id), url)
+            limits = codex_limits_from_usage_response(payload, source=url)
             try:
-                payload = codex_usage_request(access_token, str(account_id), url)
-                limits = codex_limits_from_usage_response(payload, source=url)
-                try:
-                    reset_payload = codex_reset_credits_request(access_token, str(account_id))
-                    merge_codex_reset_credit_details(limits, reset_payload)
-                except Exception:
-                    pass
-                write_live_limits_cache(cache_key, limits)
-                return limits
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                # Codex currently exposes several adjacent usage endpoints.
-                # Some valid sessions receive 403 on /codex/usage while
-                # /wham/usage succeeds with the same access token, so exhaust
-                # the URL list before attempting token refresh.
-                continue
-            except Exception as exc:
-                last_error = exc
-        if attempt == 0:
-            try:
-                refreshed = refresh_codex_access_token(auth)
-            except Exception as exc:
-                last_error = exc
-                refreshed = None
-            if not refreshed:
-                break
-            access_token = refreshed
+                reset_payload = codex_reset_credits_request(access_token, str(account_id))
+                merge_codex_reset_credit_details(limits, reset_payload)
+            except Exception:
+                pass
+            write_live_limits_cache(cache_key, limits)
+            return limits
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 401:
+                login_expired = True
+            # Codex currently exposes several adjacent usage endpoints.
+            # Some valid sessions receive 403 on /codex/usage while
+            # /wham/usage succeeds with the same access token, so exhaust
+            # the URL list before reporting a failure.
+            continue
+        except Exception as exc:
+            last_error = exc
+    error = last_error or RuntimeError("Codex usage API failed")
+    reason = CODEX_CLI_LOGIN_EXPIRED_REASON if login_expired else None
+    login_state: Dict[str, Any] = {}
+    if login_expired:
+        streak = 1
+        if same_login and _codex_limits_login_expired(previous):
+            streak = (int_count(previous.get("_loginExpiredStreak")) or 0) + 1
+        login_state = {
+            "_tokenFingerprint": fingerprint,
+            "_loginExpiredStreak": streak,
+            "_loginRetryAt": now + codex_failure_backoff_seconds(streak),
+        }
     stale = cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
     if stale:
-        return serve_stale_live_limits(cache_key, stale, last_error or RuntimeError("Codex usage API failed"))
-    limits = live_limit_error(last_error or RuntimeError("Codex usage API failed"), "codex-usage-api")
+        # Start from the last numbers without any older login bookkeeping.
+        stale = _codex_public_limits(stale)
+        if not login_expired and stale.get("reason") == CODEX_CLI_LOGIN_EXPIRED_REASON:
+            # The latest failure was not a 401; don't keep an older login label.
+            stale.pop("reason", None)
+        stale.update(login_state)
+        served = serve_stale_live_limits(cache_key, stale, error, reason=reason)
+        return _codex_public_limits(mark_codex_cli_login_expired(served) if login_expired else served)
+    limits = live_limit_error(error, "codex-usage-api")
+    if reason:
+        limits["reason"] = reason
+    limits.update(login_state)
     write_live_limits_cache(cache_key, limits)
-    return limits
+    return _codex_public_limits(limits)
 
 
 def codex_live_limits(force: bool = False) -> Dict[str, Any]:
@@ -5092,12 +5259,17 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
             pass
         return validated
 
-    def stale_or_unavailable() -> Dict[str, Any]:
+    def stale_or_unavailable(reason: Optional[str] = None) -> Dict[str, Any]:
         if cached_data is not None:
             stale = dict(cached_data)
             stale["stale"] = True
-            return stale
-        return not_available
+        else:
+            stale = dict(not_available)
+        if reason:
+            stale["reason"] = reason
+        return stale
+
+    failure = cached.get("failure") if isinstance(cached, dict) and isinstance(cached.get("failure"), dict) else {}
 
     try:
         auth = read_codex_auth()
@@ -5113,29 +5285,53 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
     account_id = tokens.get("account_id") or auth.get("account_id") or ""
     if not isinstance(access_token, str) or not access_token:
         return stale_or_unavailable()
-    for attempt in range(2):
+    now = int(time.time())
+    fingerprint = codex_token_fingerprint(access_token)
+    same_login = failure.get("tokenFingerprint") == fingerprint
+    failure_reason = failure.get("reason") if failure.get("reason") == CODEX_CLI_LOGIN_EXPIRED_REASON else None
+    retry_at = int_limit(failure.get("retryAt"))
+    if same_login and retry_at is not None and retry_at > now:
+        # Inside the backoff after a failure with this same token: serve the
+        # last breakdown, no request (rule R6).
+        return stale_or_unavailable(failure_reason)
+
+    def record_failure(reason: Optional[str] = None) -> Dict[str, Any]:
+        streak = ((int_count(failure.get("streak")) or 0) + 1) if same_login else 1
+        entry: Dict[str, Any] = {
+            "retryAt": now + codex_failure_backoff_seconds(streak),
+            "streak": streak,
+            "tokenFingerprint": fingerprint,
+        }
+        if reason:
+            entry["reason"] = reason
+        document: Dict[str, Any] = {"failure": entry}
+        if cached_data is not None and fetched_at is not None:
+            document["fetched_at"] = fetched_at
+            document["data"] = cached_data
         try:
-            payload = codex_usage_breakdown_request(access_token, str(account_id), CODEX_USAGE_BREAKDOWN_URL)
-            parsed = codex_usage_breakdown_from_response(payload)
-            if parsed.get("status") != "ok":
-                # A 200 with an unknown schema is still a failed refresh. Keep
-                # the last known-good cache rather than replacing it with an
-                # empty section. A legitimate data: [] response parses as ok.
-                return stale_or_unavailable()
-            return cache_and_return(parsed)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401 and attempt == 0:
-                try:
-                    refreshed = refresh_codex_access_token(auth)
-                except Exception:
-                    refreshed = None
-                if refreshed:
-                    access_token = refreshed
-                    continue
-            return stale_or_unavailable()
+            write_json_atomic(CODEX_USAGE_BREAKDOWN_CACHE, document)
         except Exception:
-            return stale_or_unavailable()
-    return stale_or_unavailable()
+            pass
+        return stale_or_unavailable(reason)
+
+    try:
+        payload = codex_usage_breakdown_request(access_token, str(account_id), CODEX_USAGE_BREAKDOWN_URL)
+        parsed = codex_usage_breakdown_from_response(payload)
+        if parsed.get("status") != "ok":
+            # A 200 with an unknown schema is still a failed refresh. Keep
+            # the last known-good cache rather than replacing it with an
+            # empty section. A legitimate data: [] response parses as ok.
+            return record_failure()
+        return cache_and_return(parsed)
+    except urllib.error.HTTPError as exc:
+        # This is the Codex CLI's own login: never refresh it (rule R1). The
+        # CLI refreshes its token on its next run; until then keep the last
+        # breakdown, marked stale.
+        if exc.code == 401:
+            return record_failure(CODEX_CLI_LOGIN_EXPIRED_REASON)
+        return record_failure()
+    except Exception:
+        return record_failure()
 
 
 def codex_usage_breakdown() -> Dict[str, Any]:
@@ -5965,11 +6161,41 @@ def refresh_antigravity_access_token(creds: Dict[str, Any]) -> Dict[str, Any]:
     raise RuntimeError(f"Antigravity token refresh failed for all client candidates: {last_error}")
 
 
+def antigravity_oauth_token_paths() -> List[Path]:
+    """agy's token file first, then the Antigravity app's (releases#44 item 5)."""
+    return [ANTIGRAVITY_OAUTH_TOKEN, ANTIGRAVITY_APP_OAUTH_TOKEN]
+
+
+# Marks credentials read from the Antigravity app's own login file. The app
+# owns that grant: the connector uses its access token read-only and never
+# refreshes it (rule R1), even though Google refresh tokens do not rotate.
+ANTIGRAVITY_CREDS_SOURCE_KEY = "_agentcatSource"
+ANTIGRAVITY_APP_SOURCE = "antigravity-app"
+
+
 def read_antigravity_oauth_credentials() -> Optional[Dict[str, Any]]:
-    raw = read_json(ANTIGRAVITY_OAUTH_TOKEN)
-    if not isinstance(raw, dict) or raw.get("_agentcat_error"):
-        return None
-    return unwrap_antigravity_oauth_token(raw)
+    """Read (never write) the first Antigravity login that carries a token."""
+    fallback: Optional[Dict[str, Any]] = None
+    for path in antigravity_oauth_token_paths():
+        raw = read_json(path)
+        if not isinstance(raw, dict) or raw.get("_agentcat_error"):
+            continue
+        creds = unwrap_antigravity_oauth_token(raw)
+        if path == ANTIGRAVITY_APP_OAUTH_TOKEN:
+            creds[ANTIGRAVITY_CREDS_SOURCE_KEY] = ANTIGRAVITY_APP_SOURCE
+        if creds.get("access_token") or creds.get("refresh_token"):
+            return creds
+        if fallback is None:
+            fallback = creds
+    return fallback
+
+
+def antigravity_app_login_expired(creds: Optional[Dict[str, Any]]) -> bool:
+    """True for the app's own login once its access token has expired."""
+    if not isinstance(creds, dict) or creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) != ANTIGRAVITY_APP_SOURCE:
+        return False
+    expires_at = antigravity_expiry_ms(creds)
+    return not creds.get("access_token") or not expires_at or time.time() * 1000 >= expires_at - 60_000
 
 
 def antigravity_expiry_ms(creds: Dict[str, Any]) -> int:
@@ -5989,6 +6215,14 @@ def antigravity_access_token() -> Optional[str]:
     creds = read_antigravity_oauth_credentials()
     if not creds:
         return None
+    if creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) == ANTIGRAVITY_APP_SOURCE:
+        # The Antigravity app's grant: read-only until it expires; the app
+        # refreshes it itself. Never refreshed here, so a failure can never
+        # drop agy's cached OAuth client or trigger a binary rescan.
+        if antigravity_app_login_expired(creds):
+            return None
+        token = creds.get("access_token")
+        return token if isinstance(token, str) and token else None
     expires_at = antigravity_expiry_ms(creds)
     if not expires_at or time.time() * 1000 >= expires_at - 60_000:
         creds = refresh_antigravity_access_token(creds)
@@ -6203,8 +6437,11 @@ def antigravity_live_limits(force: bool = False) -> Dict[str, Any]:
     cached = None if force else cached_live_limits("antigravity", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
         return normalize_gemini_limits(cached)
-    if read_antigravity_oauth_credentials() is None:
+    creds = read_antigravity_oauth_credentials()
+    if creds is None:
         return empty_limits()
+    if antigravity_app_login_expired(creds):
+        return empty_limits(reason=CODEX_CLI_LOGIN_EXPIRED_REASON)
     project_id = gemini_local_project_id(antigravity_local_project_path())
     try:
         token = antigravity_access_token()
@@ -8943,7 +9180,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
                                 if last_dt is None or when > last_dt:
                                     proj["last_active"] = when.isoformat().replace("+00:00", "Z")
         except OSError as exc:
-            logging.warning("codex_sessions_snapshot: cannot read %s: %s", path_str, exc)
+            warn_unreadable_path("codex_sessions_snapshot", path, exc)
             continue
 
         changed = True
@@ -10234,7 +10471,7 @@ def rebuild_claude_journal_projects(now: "dt.datetime") -> Dict[str, Dict[str, A
                         if rec:
                             _apply_record_to_totals(scratch_totals, rec, now, projects)
             except OSError as exc:
-                logging.warning("rebuild_claude_journal_projects: cannot read %s: %s", str(path), exc)
+                warn_unreadable_path("rebuild_claude_journal_projects", path, exc)
                 continue
     return projects
 
@@ -10339,7 +10576,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                             )
                             lines_parsed += 1
             except OSError as exc:
-                logging.warning("scan_claude_journal: cannot read %s: %s", path_str, exc)
+                warn_unreadable_path("scan_claude_journal", path, exc)
                 continue
             if offsets.get(path_str) != new_offset:
                 changed = True
@@ -10496,6 +10733,25 @@ def _classify_claude_journal_root(root: Path) -> str:
     return "cli"
 
 
+# Desktop session index memo: path -> (size, mtime_ns, cliSessionId or None).
+# Only index files whose size or mtime changed are re-parsed on a tick.
+_CLAUDE_DESKTOP_SESSION_LOCK = threading.Lock()
+_CLAUDE_DESKTOP_SESSION_MEMO: Dict[str, Tuple[int, int, Optional[str]]] = {}
+
+
+def _claude_desktop_session_id_from_file(path: Path) -> Optional[str]:
+    """Read one desktop ``claude-code-sessions`` index file's ``cliSessionId``."""
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(obj, dict):
+        sid = obj.get("cliSessionId")
+        if isinstance(sid, str) and sid:
+            return sid
+    return None
+
+
 def _desktop_originated_claude_session_ids() -> Set[str]:
     """Session ids of Claude Code runs launched from the Claude desktop app.
 
@@ -10505,110 +10761,169 @@ def _desktop_originated_claude_session_ids() -> Set[str]:
     ``<app-support>/claude-code-sessions/**/*.json`` with a ``cliSessionId`` that
     equals the journal filename stem, letting us reattribute those journals to
     the desktop ("app") surface. Defensive against unreadable/partial indexes.
+
+    The index grows with every desktop session and this runs on each snapshot
+    tick, so files are memoized on (size, mtime_ns): a tick only stats them and
+    re-parses the ones that changed.
     """
     ids: Set[str] = set()
-    for data_root in desktop_app_data_roots("claude"):
-        sessions_dir = data_root / "claude-code-sessions"
-        try:
-            paths = sessions_dir.rglob("*.json")
-        except OSError:
-            continue
-        for path in paths:
+    seen: Set[str] = set()
+    with _CLAUDE_DESKTOP_SESSION_LOCK:
+        for data_root in desktop_app_data_roots("claude"):
+            sessions_dir = data_root / "claude-code-sessions"
             try:
-                obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-            except (OSError, json.JSONDecodeError, ValueError):
+                paths = list(sessions_dir.rglob("*.json"))
+            except OSError:
                 continue
-            if isinstance(obj, dict):
-                sid = obj.get("cliSessionId")
-                if isinstance(sid, str) and sid:
+            for path in paths:
+                key = str(path)
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                seen.add(key)
+                memo = _CLAUDE_DESKTOP_SESSION_MEMO.get(key)
+                if memo is not None and memo[0] == stat.st_size and memo[1] == stat.st_mtime_ns:
+                    sid = memo[2]
+                else:
+                    sid = _claude_desktop_session_id_from_file(path)
+                    _CLAUDE_DESKTOP_SESSION_MEMO[key] = (stat.st_size, stat.st_mtime_ns, sid)
+                if sid:
                     ids.add(sid)
+        for key in [key for key in _CLAUDE_DESKTOP_SESSION_MEMO if key not in seen]:
+            del _CLAUDE_DESKTOP_SESSION_MEMO[key]
     return ids
 
 
+# Per-journal memo for the CLI/desktop split:
+# path -> (inode, size, mtime_ns, offset, committed_tokens, tail_tokens).
+# ``offset`` is the byte just past the last newline-terminated line folded into
+# ``committed_tokens``; ``tail_tokens`` counts an unterminated final line, which
+# is re-read (not double counted) once the writer finishes it.
 _CLAUDE_USAGE_BY_SOURCE_LOCK = threading.Lock()
-_CLAUDE_USAGE_BY_SOURCE_KEY: Optional[Tuple] = None
-_CLAUDE_USAGE_BY_SOURCE_VALUE: Optional[Dict[str, Any]] = None
+_CLAUDE_SOURCE_FILE_MEMO: Dict[str, Tuple[int, int, int, int, int, int]] = {}
 
 
-def _claude_journal_signature() -> Tuple:
-    """Cheap fingerprint of every Claude journal file: (path, mtime_ns, size).
+def _claude_journal_line_tokens(raw_line: bytes) -> int:
+    line = raw_line.decode("utf-8", errors="replace").strip()
+    if not line:
+        return 0
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return 0
+    if not isinstance(obj, dict):
+        return 0
+    rec = parse_claude_usage_line(obj)
+    return claude_record_total(rec) if rec else 0
 
-    Walking + stat'ing is orders of magnitude cheaper than reading and
-    JSON-parsing the whole corpus, so it lets ``claude_usage_by_source`` skip
-    the full re-scan on the 60s snapshot tick unless a file actually changed.
+
+def _read_claude_journal_tokens(path: Path, offset: int) -> Tuple[int, int, int, bool]:
+    """Sum usage tokens from ``offset``.
+
+    Returns (committed tokens, new offset, tail tokens, restarted). Before
+    resuming, the byte just before ``offset`` must be the newline that ended
+    the last counted line; if it is not, the file was rewritten under the
+    same name and is read again from the start (``restarted``).
     """
-    entries = []
-    for root, paths in claude_journal_files_by_root():
-        surface = _classify_claude_journal_root(root)
-        for path in paths:
-            try:
-                stat = path.stat()
-                entries.append((str(path), surface, stat.st_mtime_ns, stat.st_size))
-            except OSError:
-                continue
-    return tuple(entries)
+    committed = 0
+    tail = 0
+    restarted = False
+    with path.open("rb") as fh:
+        if offset > 0:
+            fh.seek(offset - 1)
+            if fh.read(1) != b"\n":
+                offset = 0
+                restarted = True
+        new_offset = offset
+        fh.seek(offset)
+        for raw_line in fh:
+            if not raw_line.endswith(b"\n"):
+                # Writer mid-append (or a final line without a newline). Count
+                # it for now, but resume before it so it is never added twice.
+                tail = _claude_journal_line_tokens(raw_line)
+                break
+            new_offset += len(raw_line)
+            committed += _claude_journal_line_tokens(raw_line)
+    return committed, new_offset, tail, restarted
+
+
+def _claude_journal_file_tokens(path: Path) -> Optional[int]:
+    """Usage tokens in one journal, reading only bytes appended since last tick.
+
+    Claude Code journals are append-only JSONL. An unchanged file (same inode,
+    size and mtime) is not opened at all; a grown file is read from the stored
+    offset once the newline before it checks out; a replaced, shrunk or
+    rewritten file is re-read from the start.
+    Callers hold ``_CLAUDE_USAGE_BY_SOURCE_LOCK``.
+    """
+    key = str(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        _CLAUDE_SOURCE_FILE_MEMO.pop(key, None)
+        return None
+    memo = _CLAUDE_SOURCE_FILE_MEMO.get(key)
+    same_file = memo is not None and memo[0] == stat.st_ino
+    if same_file and memo[1] == stat.st_size and memo[2] == stat.st_mtime_ns:
+        return memo[4] + memo[5]
+    if same_file and stat.st_size > memo[1] and memo[3] <= stat.st_size:
+        offset, committed = memo[3], memo[4]
+    else:
+        offset, committed = 0, 0
+    try:
+        added, new_offset, tail, restarted = _read_claude_journal_tokens(path, offset)
+    except OSError as exc:
+        _CLAUDE_SOURCE_FILE_MEMO.pop(key, None)
+        warn_unreadable_path("claude_usage_by_source", path, exc)
+        return None
+    committed = added if restarted else committed + added
+    _CLAUDE_SOURCE_FILE_MEMO[key] = (stat.st_ino, stat.st_size, stat.st_mtime_ns, new_offset, committed, tail)
+    return committed + tail
 
 
 def claude_usage_by_source() -> Dict[str, Any]:
     """Sum Claude journal tokens split by surface (CLI vs Desktop app).
 
-    Standalone scan over the same journal roots used by the merged totals;
-    deliberately independent of the incremental cursor so this stays purely
-    additive and cannot perturb existing offsets/totals. Defensive against
-    unreadable files and malformed lines.
+    Separate from the dedupe cursor in ``scan_claude_journal`` so it stays
+    purely additive and cannot perturb existing offsets/totals. Defensive
+    against unreadable files and malformed lines.
 
-    Memoized on the journal file signature so the daemon's 60s snapshot tick
-    only re-reads the (potentially hundreds of MB) corpus when a file changed,
-    instead of every cycle.
+    Incremental: each journal's total is memoized on (size, mtime_ns) and grown
+    from its last byte offset, so the 60s snapshot tick during an active Claude
+    session reads only the newly appended lines instead of the whole corpus
+    (which can be hundreds of MB).
     """
-    global _CLAUDE_USAGE_BY_SOURCE_KEY, _CLAUDE_USAGE_BY_SOURCE_VALUE
-    # Desktop-launched Claude Code journals live in the shared CLI dir; reattribute
-    # them to "app" by session id. Fold the id set into the cache key so the split
-    # recomputes when the desktop session index changes.
-    desktop_ids = _desktop_originated_claude_session_ids()
-    signature = (_claude_journal_signature(), tuple(sorted(desktop_ids)))
     with _CLAUDE_USAGE_BY_SOURCE_LOCK:
-        if _CLAUDE_USAGE_BY_SOURCE_VALUE is not None and _CLAUDE_USAGE_BY_SOURCE_KEY == signature:
-            return dict(_CLAUDE_USAGE_BY_SOURCE_VALUE)
-
-    per_source: Dict[str, int] = {"cli": 0, "app": 0}
-    for root, paths in claude_journal_files_by_root():
-        surface = _classify_claude_journal_root(root)
-        for path in paths:
-            # A CLI-root journal whose session id was launched from the desktop
-            # app is really desktop usage.
-            file_surface = "app" if (surface == "cli" and path.stem in desktop_ids) else surface
-            try:
-                with path.open("rb") as fh:
-                    for raw_line in fh:
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-                        if not isinstance(obj, dict):
-                            continue
-                        rec = parse_claude_usage_line(obj)
-                        if rec:
-                            per_source[file_surface] += claude_record_total(rec)
-            except OSError as exc:
-                logging.warning("claude_usage_by_source: cannot read %s: %s", str(path), exc)
-                continue
+        # Desktop-launched Claude Code journals live in the shared CLI dir;
+        # reattribute them to "app" by session id. Totals are memoized per file
+        # and classified at sum time, so a new desktop index entry moves an
+        # existing journal to "app" without re-reading it.
+        desktop_ids = _desktop_originated_claude_session_ids()
+        per_source: Dict[str, int] = {"cli": 0, "app": 0}
+        seen: Set[str] = set()
+        for root, paths in claude_journal_files_by_root():
+            surface = _classify_claude_journal_root(root)
+            for path in paths:
+                tokens = _claude_journal_file_tokens(path)
+                if tokens is None:
+                    continue
+                seen.add(str(path))
+                # A CLI-root journal whose session id was launched from the
+                # desktop app is really desktop usage.
+                file_surface = "app" if (surface == "cli" and path.stem in desktop_ids) else surface
+                per_source[file_surface] += tokens
+        for key in [key for key in _CLAUDE_SOURCE_FILE_MEMO if key not in seen]:
+            del _CLAUDE_SOURCE_FILE_MEMO[key]
     cli_tokens = per_source["cli"]
     app_tokens = per_source["app"]
     by_surface = {k: v for k, v in {"cli": cli_tokens, "app": app_tokens}.items() if v > 0}
-    value = {
+    return {
         "status": "ok" if (cli_tokens > 0 or app_tokens > 0) else "not_available",
         "units": "tokens",
         "bySurface": by_surface,
         "source": "claude-journal-split",
     }
-    with _CLAUDE_USAGE_BY_SOURCE_LOCK:
-        _CLAUDE_USAGE_BY_SOURCE_KEY = signature
-        _CLAUDE_USAGE_BY_SOURCE_VALUE = value
-    return dict(value)
 
 
 def claude_snapshot() -> Dict[str, Any]:
@@ -11768,53 +12083,165 @@ def _antigravity_gen_metrics(blob: bytes) -> Optional[Tuple[str, Optional[dt.dat
     }
 
 
+def antigravity_conversations_dirs() -> List[Path]:
+    """Trajectory DB folders, current layout first (releases#44 item 4).
+
+    The Antigravity app writes ~/.gemini/antigravity/conversations; agy and
+    older builds wrote ~/.gemini/antigravity-cli/conversations. Both can hold
+    live sessions at the same time.
+    """
+    return [ANTIGRAVITY_APP_DIR / "conversations", ANTIGRAVITY_CLI_DIR / "conversations"]
+
+
 def antigravity_conversations_dir() -> Path:
-    return ANTIGRAVITY_CLI_DIR / "conversations"
+    """The folder named in source labels: the first one that exists."""
+    candidates = antigravity_conversations_dirs()
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[-1]
+
+
+_ANTIGRAVITY_GEN_QUERY = "select data from gen_metadata where length(data) < 100000 order by rowid"
+# database path -> ((db size, db mtime_ns, wal size, wal mtime_ns), parsed
+# generations). An unchanged database is not opened or copied again.
+_ANTIGRAVITY_DB_MEMO: Dict[str, Tuple[Tuple[int, int, int, int], List[Tuple[str, Optional[dt.datetime], Dict[str, int]]]]] = {}
+_ANTIGRAVITY_DB_MEMO_LOCK = threading.Lock()
+
+
+def _antigravity_db_signature(database: Path) -> Optional[Tuple[int, int, int, int]]:
+    try:
+        stat = database.stat()
+    except OSError:
+        return None
+    try:
+        wal = database.with_name(database.name + "-wal").stat()
+        wal_sig = (wal.st_size, wal.st_mtime_ns)
+    except OSError:
+        wal_sig = (-1, -1)
+    return (stat.st_size, stat.st_mtime_ns, wal_sig[0], wal_sig[1])
+
+
+def _antigravity_rows_from_copy(database: Path) -> List[Any]:
+    with tempfile.TemporaryDirectory(prefix="agentcat-antigravity-") as temp_dir:
+        copied = Path(temp_dir) / "conversation.db"
+        shutil.copyfile(database, copied)
+        for suffix in ("-wal", "-shm"):
+            try:
+                shutil.copyfile(
+                    database.with_name(database.name + suffix),
+                    copied.with_name(copied.name + suffix),
+                )
+            except FileNotFoundError:
+                continue
+        with closing(sqlite3.connect(str(copied))) as connection:
+            return connection.execute(_ANTIGRAVITY_GEN_QUERY).fetchall()
+
+
+def antigravity_read_gen_rows(database: Path) -> List[Any]:
+    """Read gen_metadata blobs without creating or changing any file next to the DB.
+
+    Antigravity's trajectory DBs are in WAL mode. Opening one with plain
+    ``mode=ro`` needs the ``-shm`` index: depending on the SQLite build it
+    either fails once Antigravity has exited and removed it (releases#44 item
+    3) or creates ``-shm``/``-wal`` files in Antigravity's folder. So:
+
+    - ``-wal`` and ``-shm`` both present (Antigravity running, even with a
+      0-byte ``-wal``): ``mode=ro`` in place, a normal concurrent reader
+      that creates nothing and takes the writer's locks into account;
+    - neither present (cleanly closed, fully checkpointed): ``immutable=1``,
+      which reads the file without locks or side files;
+    - anything else, or if the in-place read fails: read a private temp copy
+      of the db with its ``-wal``/``-shm`` so recent WAL frames still count.
+    """
+    wal_exists = database.with_name(database.name + "-wal").exists()
+    shm_exists = database.with_name(database.name + "-shm").exists()
+    if wal_exists and shm_exists:
+        uri: Optional[str] = f"file:{database}?mode=ro"
+    elif not wal_exists and not shm_exists:
+        # immutable=1 skips locking, so it is only safe with no live writer.
+        uri = f"file:{database}?mode=ro&immutable=1"
+    else:
+        uri = None
+    if uri is not None:
+        try:
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                return connection.execute(_ANTIGRAVITY_GEN_QUERY).fetchall()
+        except sqlite3.Error as exc:
+            if "no such table" in str(exc):
+                raise
+        except OSError:
+            pass
+    return _antigravity_rows_from_copy(database)
 
 
 def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
     """Return real Antigravity usage from local read-only trajectory databases."""
-    conversations = antigravity_conversations_dir()
-    if not conversations.exists():
+    existing = [folder for folder in antigravity_conversations_dirs() if folder.exists()]
+    if not existing:
         return None
-    try:
-        # Do not preflight candidates with Path.is_file(): on older pathlib
-        # versions it uses Path.stat(), which can hide an otherwise readable DB.
-        databases = sorted(conversations.glob("*.db"))
-    except OSError:
-        return None
-    result = empty_provider_usage(source=str(conversations))
+    # The same conversation id in both folders is one conversation: keep the
+    # most recently written copy.
+    chosen: Dict[str, Tuple[Path, float]] = {}
+    for folder in existing:
+        try:
+            # Do not preflight candidates with Path.is_file(): on older pathlib
+            # versions it uses Path.stat(), which can hide an otherwise readable DB.
+            databases = sorted(folder.glob("*.db"))
+        except OSError:
+            continue
+        for database in databases:
+            try:
+                mtime = database.stat().st_mtime
+            except OSError:
+                mtime = float("-inf")
+            previous = chosen.get(database.name)
+            if previous is None or mtime > previous[1]:
+                chosen[database.name] = (database, mtime)
+    result = empty_provider_usage(source=str(existing[0]))
     events = 0
-    for database in databases:
-        connection: Optional[sqlite3.Connection] = None
+    seen: Set[str] = set()
+    for name in sorted(chosen):
+        database = chosen[name][0]
+        key = str(database)
+        seen.add(key)
         try:
             database_when = dt.datetime.fromtimestamp(database.stat().st_mtime, dt.timezone.utc)
         except (OSError, OverflowError, ValueError):
             database_when = None
-        try:
-            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-            rows = connection.execute(
-                "select data from gen_metadata where length(data) < 100000 order by rowid"
-            ).fetchall()
-        except (OSError, sqlite3.Error):
-            continue
-        finally:
-            if connection is not None:
-                connection.close()
-        for (blob,) in rows:
-            if not isinstance(blob, (bytes, bytearray)):
+        signature = _antigravity_db_signature(database)
+        with _ANTIGRAVITY_DB_MEMO_LOCK:
+            memo = _ANTIGRAVITY_DB_MEMO.get(key)
+        if signature is not None and memo is not None and memo[0] == signature:
+            generations = memo[1]
+        else:
+            try:
+                rows = antigravity_read_gen_rows(database)
+            except (OSError, sqlite3.Error):
                 continue
-            parsed = _antigravity_gen_metrics(bytes(blob))
-            if parsed is None:
-                continue
-            model, when, metrics = parsed
-            if add_usage_metrics(result, model, metrics, when or database_when):
+            generations = []
+            for (blob,) in rows:
+                if not isinstance(blob, (bytes, bytearray)):
+                    continue
+                parsed = _antigravity_gen_metrics(bytes(blob))
+                if parsed is None:
+                    continue
+                model, when, metrics = parsed
+                generations.append((model, when or database_when, metrics))
+            if signature is not None:
+                with _ANTIGRAVITY_DB_MEMO_LOCK:
+                    _ANTIGRAVITY_DB_MEMO[key] = (signature, generations)
+        for model, when, metrics in generations:
+            if add_usage_metrics(result, model, dict(metrics), when):
                 events += 1
+    with _ANTIGRAVITY_DB_MEMO_LOCK:
+        for stale_key in [key for key in _ANTIGRAVITY_DB_MEMO if key not in seen]:
+            del _ANTIGRAVITY_DB_MEMO[stale_key]
     if events == 0:
         return None
     result["status"] = "ok"
     result["events"] = events
-    result["source"] = snapshot_source_label(conversations)
+    result["source"] = snapshot_source_label(existing[0])
     return result
 
 
@@ -12795,9 +13222,9 @@ def auto_update_loop(interval_seconds: float, initial_delay_seconds: float) -> N
             if state.get("status") == "update_started":
                 print(state.get("message", "agentcatd update started"), file=sys.stderr, flush=True)
             elif state.get("status") == "error":
-                print(f"agentcatd update check failed: {state.get('error')}", file=sys.stderr, flush=True)
+                print(f"agentcatd update check failed: {_tilde_text(str(state.get('error')))}", file=sys.stderr, flush=True)
         except Exception as exc:
-            print(f"agentcatd update loop failed: {exc}", file=sys.stderr, flush=True)
+            print(f"agentcatd update loop failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
         time.sleep(max(60.0, interval_seconds))
 
 
@@ -13502,7 +13929,7 @@ def snapshot_refresh_loop(interval_seconds: float) -> None:
         try:
             build_snapshot()
         except Exception as exc:
-            print(f"agentcatd snapshot refresh failed: {exc}", file=sys.stderr, flush=True)
+            print(f"agentcatd snapshot refresh failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
 
 
 # Managed Codex quota is only as fresh as its last app-server probe. It used
@@ -17214,6 +17641,30 @@ def local_http_origin_allowed(origin: Optional[str]) -> bool:
     )
 
 
+SAFE_FETCH_SITES = frozenset({"same-origin", "same-site", "none"})
+
+
+def mutating_request_origin_error(headers: Any) -> Optional[Tuple[int, str]]:
+    """Reject cross-site browser writes on every mutating route (CSRF guard).
+
+    Browsers attach Origin to every cross-origin POST/PATCH/DELETE (forms
+    included) and Sec-Fetch-Site to every request, so a request with neither
+    comes from a native client on this machine: the macOS app's URLSession,
+    the Windows app's Rust proxy, the CLI or curl. Those stay allowed.
+
+    Unlike ``key_mutation_request_error`` this does not require a JSON
+    Content-Type: the macOS app sends body-less POSTs without one
+    (``/reflect/enable``, ``/reflect/analyze/<id>``).
+    """
+    origin = headers.get("Origin")
+    fetch_site = str(headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if fetch_site and fetch_site not in SAFE_FETCH_SITES:
+        return 403, "cross_site_request"
+    if not local_http_origin_allowed(origin):
+        return 403, "foreign_origin"
+    return None
+
+
 def key_mutation_request_error(headers: Any) -> Optional[Tuple[int, str]]:
     """Reject simple/cross-site browser writes while preserving native loopback JSON."""
     content_type = str(headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -17251,6 +17702,19 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if host_header_allowed(self.headers.get("Host")):
             return True
         self.send_json(403, {"error": "forbidden", "message": "host_not_allowed"})
+        return False
+
+    def origin_guard_ok(self) -> bool:
+        """CSRF guard: every POST/PATCH/DELETE, plus GETs that spend network.
+
+        A cross-site page can also fire a GET (``<img src=…>``); browsers send
+        ``Sec-Fetch-Site: cross-site`` on it, which this rejects.
+        """
+        guard_error = mutating_request_origin_error(self.headers)
+        if guard_error is None:
+            return True
+        status, reason = guard_error
+        self.send_json(status, {"error": "forbidden", "message": reason})
         return False
 
     def write_response_body(self, body: bytes) -> bool:
@@ -17338,6 +17802,10 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return
         if path == "/v1/usage":
+            # Forces a live fetch from every provider; a web page must not be
+            # able to trigger that (and skip their backoffs) with an <img>.
+            if not self.origin_guard_ok():
+                return
             try:
                 self.send_json(200, fetch_llm_usage_fresh())
             except Exception as exc:
@@ -17460,6 +17928,8 @@ class AgentCatHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if not self.host_header_ok():
+            return
+        if not self.origin_guard_ok():
             return
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/v1/connections/"):
@@ -17724,6 +18194,8 @@ class AgentCatHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         if not self.host_header_ok():
             return
+        if not self.origin_guard_ok():
+            return
         path = urllib.parse.urlparse(self.path).path
         match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})", path)
         if not match:
@@ -17753,6 +18225,8 @@ class AgentCatHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         if not self.host_header_ok():
+            return
+        if not self.origin_guard_ok():
             return
         path = urllib.parse.urlparse(self.path).path
         managed_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/([0-9a-f]{32})", path)
@@ -17810,6 +18284,158 @@ def resolve_bind_host(host: Optional[str]) -> str:
     return "127.0.0.1"
 
 
+# --- Daemon log hygiene -------------------------------------------------------
+# launchd's StandardErrorPath (and the Windows installer) points the daemon's
+# stderr at ~/.agentcat/agentcatd.err.log and nothing rotated it: one Mac had
+# 703 MB, almost all per-tick "cannot read <absolute path>" warnings. The log is
+# now capped at DAEMON_LOG_MAX_BYTES plus one ".1" backup of the same size, and
+# repeated per-file warnings are logged once with ~-relative paths.
+DAEMON_ERR_LOG_NAME = "agentcatd.err.log"
+DAEMON_LOG_MAX_BYTES = int(os.environ.get("AGENTCAT_DAEMON_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+DAEMON_LOG_ROTATE_INTERVAL_SECONDS = 300.0
+_UNREADABLE_WARNED: Set[Tuple[str, str, str]] = set()
+_UNREADABLE_WARNED_LOCK = threading.Lock()
+_UNREADABLE_WARNED_MAX = 2048
+
+
+def daemon_err_log_path() -> Path:
+    return AGENTCAT_HOME / DAEMON_ERR_LOG_NAME
+
+
+def _tilde_text(text: str) -> str:
+    """Collapse $HOME to ~ inside free text such as an exception message."""
+    home = str(HOME)
+    if not home or home == "/":
+        return text
+    return re.sub(re.escape(home) + r"(?=[/\\\s'\":]|$)", "~", text)
+
+
+def log_safe_error(exc: BaseException) -> str:
+    return _tilde_text(str(exc))
+
+
+def warn_unreadable_path(context: str, path: Any, exc: BaseException) -> None:
+    """Log that a usage file could not be read, once per file and reason.
+
+    These readers run on every 60 s tick for every file, so an unreadable
+    file used to add a line per tick forever. The path is ~-relative and the
+    reason is the OS error text without the filename.
+    """
+    reason = getattr(exc, "strerror", None) or type(exc).__name__
+    key = (context, str(path), str(reason))
+    with _UNREADABLE_WARNED_LOCK:
+        if key in _UNREADABLE_WARNED or len(_UNREADABLE_WARNED) >= _UNREADABLE_WARNED_MAX:
+            return
+        _UNREADABLE_WARNED.add(key)
+    logging.warning("%s: cannot read %s: %s", context, _tilde(path), reason)
+
+
+def _fd_refers_to(fd: int, path: Path) -> bool:
+    try:
+        fd_stat = os.fstat(fd)
+        path_stat = path.stat()
+    except OSError:
+        return False
+    return bool(path_stat.st_ino) and (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino)
+
+
+def _copy_log_tail(source: Path, target: Path, max_bytes: int) -> None:
+    """Write the last ``max_bytes`` of ``source`` (from a line start) to ``target``."""
+    size = source.stat().st_size
+    tmp = unique_atomic_tmp_path(target)
+    with source.open("rb") as src, tmp.open("wb") as dst:
+        if size > max_bytes:
+            src.seek(size - max_bytes)
+            src.readline()  # drop the partial first line
+        shutil.copyfileobj(src, dst)
+    os.replace(tmp, target)
+
+
+def _reopen_stderr(path: Path) -> None:
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.dup2(fd, 2)
+    finally:
+        os.close(fd)
+
+
+def ensure_daemon_stderr_appends(path: Optional[Path] = None) -> bool:
+    """Reopen fd 2 in append mode when it is the daemon log.
+
+    On Windows the installer hands the daemon an inherited handle with no
+    append semantics, so after the copy-truncate rotation the next write
+    lands at the old offset and the file fills with NUL bytes up to it.
+    An O_APPEND descriptor always writes at the current end. Harmless where
+    launchd already opened the file for appending.
+    """
+    log_path = path or daemon_err_log_path()
+    if not _fd_refers_to(2, log_path):
+        return False
+    try:
+        _reopen_stderr(log_path)
+    except OSError:
+        return False
+    return True
+
+
+def rotate_daemon_log(path: Optional[Path] = None, max_bytes: Optional[int] = None) -> bool:
+    """Cap the daemon log at ``max_bytes`` plus one ``.1`` backup of the same size.
+
+    When the daemon's own stderr is this file (launchd), the file is renamed
+    to ``.1`` and stderr is reopened onto a fresh file, so no line is lost or
+    written into a hole. Where the rename fails (Windows locks open files),
+    the tail is copied to ``.1`` and the file is truncated in place.
+    """
+    path = path or daemon_err_log_path()
+    limit = DAEMON_LOG_MAX_BYTES if max_bytes is None else int(max_bytes)
+    if limit <= 0:
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= limit:
+        return False
+    backup = path.with_name(path.name + ".1")
+    stderr_is_log = _fd_refers_to(2, path)
+    try:
+        os.replace(path, backup)
+    except OSError:
+        try:
+            _copy_log_tail(path, backup, limit)
+            with path.open("r+b") as fh:
+                fh.truncate(0)
+        except OSError as exc:
+            logging.warning("agentcatd: could not rotate %s: %s", _tilde(path), type(exc).__name__)
+            return False
+    else:
+        if stderr_is_log:
+            try:
+                _reopen_stderr(path)
+            except OSError:
+                pass
+        try:
+            # The first rotation of an old, unbounded log keeps only its tail.
+            _copy_log_tail(backup, backup, limit)
+        except OSError:
+            pass
+    logging.info("agentcatd: rotated %s at %d MB", _tilde(path), size // (1024 * 1024))
+    return True
+
+
+def daemon_log_rotation_loop(interval_seconds: float = DAEMON_LOG_ROTATE_INTERVAL_SECONDS) -> None:
+    while True:
+        time.sleep(max(1.0, interval_seconds))
+        try:
+            rotate_daemon_log()
+        except Exception as exc:  # noqa: BLE001 — log hygiene must never stop the daemon
+            print(f"agentcatd log rotation failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+
+
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
     # Connection clients read this file before their first authenticated request.
@@ -17825,8 +18451,6 @@ def run_daemon(args: argparse.Namespace) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     args.host = resolve_bind_host(getattr(args, "host", "127.0.0.1"))
-    # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
-    prune_events()
     # Bind and start accepting connections BEFORE the initial snapshot build (audit #3).
     # The first build_snapshot() streams the full local history — gigabytes, minutes, for
     # the heaviest users — and previously ran before the port bind, so the app got
@@ -17834,14 +18458,36 @@ def run_daemon(args: argparse.Namespace) -> int:
     # snapshot_for_http() already serves the cached latest-snapshot.json, we bind first
     # and move the initial build into the background: returning users see their last
     # snapshot instantly while it refreshes underneath them.
-    server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
+    except OSError as exc:
+        # One line, not a traceback: launchd restarts us (ThrottleInterval
+        # spaces the retries) and the usual cause is another agentcatd.
+        print(
+            f"agentcatd cannot listen on {args.host}:{args.port}: "
+            f"{exc.strerror or type(exc).__name__} (is another agentcatd running?)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+    # Only the instance that owns the port maintains shared state: a second
+    # agentcatd that loses the bind must not rotate the live daemon's log or
+    # vacuum its database.
+    try:
+        # Bound the launchd/installer stderr file (#121).
+        ensure_daemon_stderr_appends()
+        rotate_daemon_log()
+    except Exception:
+        pass
+    # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
+    prune_events()
     print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
 
     def _initial_build_then_refresh() -> None:
         try:
             build_snapshot()
         except Exception as exc:
-            print(f"agentcatd initial snapshot build failed: {exc}", file=sys.stderr, flush=True)
+            print(f"agentcatd initial snapshot build failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
         snapshot_refresh_loop(60.0)
 
     threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
@@ -17872,6 +18518,7 @@ def run_daemon(args: argparse.Namespace) -> int:
     # loop re-reads it every tick, so flipping the file to true needs no restart.
     reflect_write_default_config()
     threading.Thread(target=reflect_scheduler_loop, args=(60.0,), daemon=True).start()
+    threading.Thread(target=daemon_log_rotation_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

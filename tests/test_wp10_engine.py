@@ -425,7 +425,9 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
             result = agentcat.codex_usage_breakdown()
         self.assertTrue(result["stale"])
         self.assertEqual(result["bySurface"], section["bySurface"])
-        self.assertEqual(json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text()), original)
+        stored = json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text())
+        self.assertEqual({key: stored[key] for key in ("fetched_at", "data")}, original)
+        self.assertEqual(stored["failure"]["streak"], 1)
 
         agentcat.CODEX_USAGE_BREAKDOWN_CACHE.unlink()
         with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), patch.object(
@@ -460,37 +462,89 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
             self.assertEqual(result, agentcat.empty_codex_usage_breakdown())
             json.dumps(result, allow_nan=False)
 
-    def test_401_refreshes_exactly_once_and_second_401_fails_soft(self):
-        error = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))
-        with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), patch.object(
-            agentcat, "codex_usage_breakdown_request", side_effect=[error, self.RAW]
-        ) as request, patch.object(agentcat, "refresh_codex_access_token", return_value="fresh") as refresh:
+    @staticmethod
+    def _unauthorized_network(requests):
+        """urlopen stand-in: record every request and answer each with 401."""
+
+        def fake_urlopen(request, *args, **kwargs):
+            url = request.full_url if hasattr(request, "full_url") else str(request)
+            method = request.get_method() if hasattr(request, "get_method") else "GET"
+            requests.append((method, url))
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, io.BytesIO(b""))
+
+        return patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen)
+
+    def test_401_never_refreshes_the_cli_grant_and_serves_stale_breakdown(self):
+        # Rule R1: the Codex CLI's refresh token must never be spent by the
+        # connector. A 401 makes exactly one usage request, never a POST.
+        self.assertFalse(hasattr(agentcat, "refresh_codex_access_token"))
+        section = self.section()
+        agentcat.write_json_atomic(agentcat.CODEX_USAGE_BREAKDOWN_CACHE, {
+            "fetched_at": int(agentcat.time.time()) - agentcat.CODEX_USAGE_BREAKDOWN_TTL_SECONDS - 5,
+            "data": section,
+        })
+        requests = []
+        with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), self._unauthorized_network(requests):
             result = agentcat.codex_usage_breakdown()
+        self.assertEqual(requests, [("GET", agentcat.CODEX_USAGE_BREAKDOWN_URL)])
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(request.call_count, 2)
-        refresh.assert_called_once()
-        error.close()
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["reason"], "cli_login_expired")
+        self.assertEqual(result["bySurface"], section["bySurface"])
 
         agentcat.CODEX_USAGE_BREAKDOWN_CACHE.unlink()
-        error_one = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))
-        error_two = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))
-        with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), patch.object(
-            agentcat, "codex_usage_breakdown_request", side_effect=[error_one, error_two]
-        ) as request, patch.object(agentcat, "refresh_codex_access_token", return_value="fresh") as refresh:
+        requests.clear()
+        with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), self._unauthorized_network(requests):
             result = agentcat.codex_usage_breakdown()
+        self.assertEqual(requests, [("GET", agentcat.CODEX_USAGE_BREAKDOWN_URL)])
         self.assertEqual(result["status"], "not_available")
-        self.assertEqual(request.call_count, 2)
-        refresh.assert_called_once()
-        error_one.close()
-        error_two.close()
+        self.assertEqual(result["reason"], "cli_login_expired")
+
+    def test_401_backoff_skips_requests_until_retry_or_relogin(self):
+        # Rule R6: an expired CLI token is retried after 5 min, doubling to
+        # 60 min, and a new token (re-login) lifts the backoff at once.
+        requests = []
+        start = 1_800_000_000
+        auth = self.auth()
+        with patch.object(agentcat, "read_codex_auth", side_effect=lambda: auth), \
+            self._unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start):
+            first = agentcat.codex_usage_breakdown()
+            again = agentcat.codex_usage_breakdown()
+        self.assertEqual(len(requests), 1)
+        self.assertEqual((first["reason"], again["reason"]), ("cli_login_expired", "cli_login_expired"))
+        stored = json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text())
+        self.assertEqual(stored["failure"]["retryAt"], start + 300)
+        self.assertNotIn("access", json.dumps(stored))  # a fingerprint, never the token
+
+        with patch.object(agentcat, "read_codex_auth", side_effect=lambda: auth), \
+            self._unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 301):
+            agentcat.codex_usage_breakdown()
+        self.assertEqual(len(requests), 2)
+        stored = json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text())
+        self.assertEqual((stored["failure"]["streak"], stored["failure"]["retryAt"]), (2, start + 301 + 600))
+
+        relogin = {"tokens": {"access_token": "fresh-after-login", "account_id": "acct"}}
+        with patch.object(agentcat, "read_codex_auth", return_value=relogin), patch.object(
+            agentcat, "codex_usage_breakdown_request", return_value=self.RAW
+        ) as request, patch.object(agentcat.time, "time", return_value=start + 302):
+            result = agentcat.codex_usage_breakdown()
+        request.assert_called_once()
+        self.assertEqual(result["status"], "ok")
+        self.assertNotIn("failure", json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text()))
+        self.assertEqual(agentcat.codex_failure_backoff_seconds(10), 3600)
 
     def test_403_timeout_and_no_auth_fail_soft_without_unwanted_refresh(self):
         forbidden = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b""))
         for failure in (forbidden, TimeoutError("timed out")):
+            if agentcat.CODEX_USAGE_BREAKDOWN_CACHE.exists():
+                agentcat.CODEX_USAGE_BREAKDOWN_CACHE.unlink()  # drop the recorded backoff
             with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), patch.object(
                 agentcat, "codex_usage_breakdown_request", side_effect=failure
-            ), patch.object(agentcat, "refresh_codex_access_token", side_effect=AssertionError("must not refresh")):
-                self.assertEqual(agentcat.codex_usage_breakdown()["status"], "not_available")
+            ) as request:
+                result = agentcat.codex_usage_breakdown()
+            self.assertEqual(result["status"], "not_available")
+            self.assertNotIn("reason", result)
+            self.assertEqual(request.call_count, 1)
         forbidden.close()
         with patch.object(agentcat, "read_codex_auth", return_value=None), patch.object(
             agentcat, "codex_usage_breakdown_request", side_effect=AssertionError("no auth must skip network")
