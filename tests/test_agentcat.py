@@ -3317,7 +3317,7 @@ class AgentCatConnectorTests(unittest.TestCase):
                 side.unlink()
         before = {path.name: path.read_bytes() for path in conversations.iterdir()}
 
-        with patch.object(agentcat, "_antigravity_rows_from_copy", side_effect=AssertionError("no copy needed")):
+        with patch.object(agentcat.shutil, "copyfile", side_effect=AssertionError("no copy needed")):
             usage = agentcat.antigravity_sqlite_usage()
 
         self.assertEqual(usage["tokens"]["totalTokens"], 142)
@@ -4021,6 +4021,94 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(agentcat.classify_process("/Users/me/.kimi-code/bin/kimi-code"), "kimi")
         self.assertEqual(agentcat.classify_process("grok --prompt hello"), "grok")
         self.assertEqual(agentcat.classify_process("grock --prompt hello"), "grok")
+
+    def test_foreign_sqlite_readers_preserve_source_files_and_read_wal_rows(self) -> None:
+        def files(folder):
+            return {p.name: (p.stat().st_size, p.stat().st_mtime_ns, p.read_bytes())
+                    for p in folder.iterdir()}
+
+        for reader in ("hermes", "opencode", "codex", "cursor"):
+            for wal_only in (False, True):
+                with self.subTest(reader=reader, wal_only=wal_only):
+                    # Spaces, percent signs and fragments must be URI-escaped.
+                    folder = self.root / f"{reader} # % {wal_only}"
+                    folder.mkdir()
+                    database = folder / "state.db"
+                    staging = self.root / f"staging-{reader}-{wal_only}.db"
+                    writer = sqlite3.connect(staging if wal_only else database)
+                    try:
+                        writer.execute("pragma journal_mode=wal")
+                        writer.execute("pragma wal_autocheckpoint=0")
+                        if reader == "hermes":
+                            writer.execute("create table sessions (model text, input_tokens integer)")
+                            writer.execute("insert into sessions values ('test-model', 123)")
+                        elif reader == "opencode":
+                            writer.execute("create table session (id text, time_archived integer, parent_id text)")
+                            writer.execute("create table message (session_id text, time_created integer, data text)")
+                            writer.execute("insert into message values (null, ?, ?)", (
+                                int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000),
+                                json.dumps({"role": "assistant", "modelID": "test-model", "tokens": {"input": 123}}),
+                            ))
+                        elif reader == "codex":
+                            writer.execute("create table threads (tokens_used integer, model text)")
+                            writer.execute("insert into threads values (123, 'test-model')")
+                        else:
+                            writer.execute("create table blobs (data text)")
+                            writer.execute("insert into blobs values (?)", (
+                                json.dumps({"role": "assistant", "content": "fixture response"}),
+                            ))
+                        writer.commit()
+                        if wal_only:
+                            database.write_bytes(staging.read_bytes())
+                            database.with_name(database.name + "-wal").write_bytes(
+                                staging.with_name(staging.name + "-wal").read_bytes())
+                    finally:
+                        writer.close()
+                    self.assertFalse(database.with_name(database.name + "-shm").exists())
+                    self.assertEqual(database.with_name(database.name + "-wal").exists(), wal_only)
+                    if reader == "opencode":
+                        database = database.rename(folder / "opencode.db")
+                        if wal_only:
+                            (folder / "state.db-wal").rename(folder / "opencode.db-wal")
+                    before = files(folder)
+                    if reader == "hermes":
+                        with patch.dict(os.environ, {"HERMES_HOME": str(folder)}):
+                            result = agentcat.hermes_snapshot()
+                    elif reader == "opencode":
+                        with patch.object(agentcat, "opencode_data_dir", return_value=folder):
+                            result = agentcat.opencode_snapshot()
+                    elif reader == "codex":
+                        with patch.object(agentcat, "codex_state_sqlite_paths", return_value=[database]):
+                            result = agentcat.codex_sqlite_snapshot()
+                    else:
+                        result = list(agentcat.reflect_read_cursor_turns(database))
+                    self.assertEqual(files(folder), before)
+                    if reader == "cursor":
+                        self.assertEqual(len(result), 1)
+                        self.assertEqual(result[0]["text"], "fixture response")
+                    else:
+                        self.assertEqual(result["status"], "ok")
+                        self.assertEqual(result["tokens"]["all"], 123)
+
+    def test_foreign_sqlite_retries_failed_read_on_private_copy(self) -> None:
+        database = self.root / "retry.db"
+        with closing(sqlite3.connect(database)) as writer:
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+        calls = []
+
+        def read(connection):
+            calls.append(connection)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("unable to open database file")
+            return connection.execute("select value from fixture").fetchall()
+
+        self.assertEqual(agentcat.read_foreign_sqlite(database, read), [(123,)])
+        self.assertEqual(len(calls), 2)
+        for connection in calls:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("select 1")
 
     def test_hermes_snapshot_reads_sqlite_sessions_and_preserves_unknown_cost(self) -> None:
         hermes_home = self.root / "hermes-home"

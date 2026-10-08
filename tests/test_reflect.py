@@ -521,12 +521,11 @@ class IndexerTests(ReflectTestCase):
         self.assertEqual((digest["tool_call_counts"], digest["tokens"]), ({"read_file": 1}, 105))
         self.assertFalse(digest["counts_only"])
 
-    def test_cursor_reader_copies_sqlite_and_yields_shared_turns(self):
+    def test_cursor_reader_preserves_sqlite_and_yields_shared_turns(self):
         path = self.write_cursor_session()
-        with patch.object(agentcat.shutil, "copy2", wraps=shutil.copy2) as copied:
-            turns = list(agentcat.reflect_read_cursor_turns(path))
-        self.assertEqual(copied.call_count, 1)
-        self.assertNotEqual(Path(copied.call_args.args[1]), path)
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        turns = list(agentcat.reflect_read_cursor_turns(path))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         self.assertTrue(all(set(turn) == {"role", "text", "tool", "ts"} for turn in turns))
         digest = agentcat.reflect_parse_cursor_session(path)
         self.assertEqual((digest["project"], digest["user_turns"]), ("cursor-repo", 1))
