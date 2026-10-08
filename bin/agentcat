@@ -6150,6 +6150,13 @@ def antigravity_oauth_token_paths() -> List[Path]:
     return [ANTIGRAVITY_OAUTH_TOKEN, ANTIGRAVITY_APP_OAUTH_TOKEN]
 
 
+# Marks credentials read from the Antigravity app's own login file. The app
+# owns that grant: the connector uses its access token read-only and never
+# refreshes it (rule R1), even though Google refresh tokens do not rotate.
+ANTIGRAVITY_CREDS_SOURCE_KEY = "_agentcatSource"
+ANTIGRAVITY_APP_SOURCE = "antigravity-app"
+
+
 def read_antigravity_oauth_credentials() -> Optional[Dict[str, Any]]:
     """Read (never write) the first Antigravity login that carries a token."""
     fallback: Optional[Dict[str, Any]] = None
@@ -6158,11 +6165,21 @@ def read_antigravity_oauth_credentials() -> Optional[Dict[str, Any]]:
         if not isinstance(raw, dict) or raw.get("_agentcat_error"):
             continue
         creds = unwrap_antigravity_oauth_token(raw)
+        if path == ANTIGRAVITY_APP_OAUTH_TOKEN:
+            creds[ANTIGRAVITY_CREDS_SOURCE_KEY] = ANTIGRAVITY_APP_SOURCE
         if creds.get("access_token") or creds.get("refresh_token"):
             return creds
         if fallback is None:
             fallback = creds
     return fallback
+
+
+def antigravity_app_login_expired(creds: Optional[Dict[str, Any]]) -> bool:
+    """True for the app's own login once its access token has expired."""
+    if not isinstance(creds, dict) or creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) != ANTIGRAVITY_APP_SOURCE:
+        return False
+    expires_at = antigravity_expiry_ms(creds)
+    return not creds.get("access_token") or not expires_at or time.time() * 1000 >= expires_at - 60_000
 
 
 def antigravity_expiry_ms(creds: Dict[str, Any]) -> int:
@@ -6182,6 +6199,14 @@ def antigravity_access_token() -> Optional[str]:
     creds = read_antigravity_oauth_credentials()
     if not creds:
         return None
+    if creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) == ANTIGRAVITY_APP_SOURCE:
+        # The Antigravity app's grant: read-only until it expires; the app
+        # refreshes it itself. Never refreshed here, so a failure can never
+        # drop agy's cached OAuth client or trigger a binary rescan.
+        if antigravity_app_login_expired(creds):
+            return None
+        token = creds.get("access_token")
+        return token if isinstance(token, str) and token else None
     expires_at = antigravity_expiry_ms(creds)
     if not expires_at or time.time() * 1000 >= expires_at - 60_000:
         creds = refresh_antigravity_access_token(creds)
@@ -6396,8 +6421,11 @@ def antigravity_live_limits(force: bool = False) -> Dict[str, Any]:
     cached = None if force else cached_live_limits("antigravity", LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
         return normalize_gemini_limits(cached)
-    if read_antigravity_oauth_credentials() is None:
+    creds = read_antigravity_oauth_credentials()
+    if creds is None:
         return empty_limits()
+    if antigravity_app_login_expired(creds):
+        return empty_limits(reason=CODEX_CLI_LOGIN_EXPIRED_REASON)
     project_id = gemini_local_project_id(antigravity_local_project_path())
     try:
         token = antigravity_access_token()

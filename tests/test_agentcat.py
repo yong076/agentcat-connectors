@@ -5845,6 +5845,40 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
             cands = agentcat.antigravity_oauth_client_candidates()
         self.assertEqual(cands, [("envid.apps.googleusercontent.com", "GOCSPX-envsecret")])
 
+    def _write_app_token(self, expiry: str) -> None:
+        agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN.write_text(
+            json.dumps({"auth_method": "consumer", "token": {
+                "access_token": "app-access", "refresh_token": "app-refresh",
+                "token_type": "Bearer", "expiry": expiry,
+            }}),
+            encoding="utf-8",
+        )
+
+    def test_app_login_is_read_only_and_never_refreshed(self) -> None:
+        # The Antigravity app owns ~/.gemini/jetski-standalone-oauth-token.
+        # Refreshing it with agy's client is a grant the connector does not own
+        # (rule R1); an expired one is reported, not fixed.
+        agentcat.ANTIGRAVITY_CLIENT_CACHE.write_text(
+            json.dumps({"client_id": "agy.apps.googleusercontent.com", "client_secret": "GOCSPX-agy"}),
+            encoding="utf-8",
+        )
+        future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat()
+        self._write_app_token(future)
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("no refresh")):
+            self.assertEqual(agentcat.antigravity_access_token(), "app-access")
+
+        self._write_app_token("2020-01-01T00:00:00+00:00")
+        before = agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN.read_bytes()
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("no refresh")), \
+            patch.object(agentcat, "refresh_antigravity_access_token", side_effect=AssertionError("no refresh")):
+            self.assertIsNone(agentcat.antigravity_access_token())
+            limits = agentcat.antigravity_live_limits(force=True)
+            probed = agentcat.probe_antigravity()
+        self.assertEqual(limits["reason"], "cli_login_expired")
+        self.assertEqual(probed["reason"], "cli_login_expired")
+        self.assertEqual(agentcat.ANTIGRAVITY_APP_OAUTH_TOKEN.read_bytes(), before)
+        self.assertTrue(agentcat.ANTIGRAVITY_CLIENT_CACHE.exists())  # agy's client kept
+
     def test_refresh_tries_candidates_and_caches_winner(self) -> None:
         self._write_token()
         creds = agentcat.read_antigravity_oauth_credentials()
