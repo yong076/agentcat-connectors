@@ -257,6 +257,8 @@ CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
 WINDOWS_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOWS_RUN_VALUE = "AgentCatD"
+# Hidden sign-in launcher the installer writes under AGENTCAT_HOME.
+WINDOWS_HIDDEN_LAUNCHER_NAME = "AgentCatD.vbs"
 WINDOWS_LEGACY_STARTUP_SCRIPT = (
     Path(os.environ.get("APPDATA", str(HOME / "AppData" / "Roaming")))
     / "Microsoft"
@@ -2182,13 +2184,26 @@ def _daemon_status_snapshot_uncached() -> Dict[str, Any]:
     """
     if IS_WINDOWS:
         task = _status_command(
-            ["schtasks.exe", "/Query", "/TN", WINDOWS_TASK_NAME, "/FO", "LIST"]
+            ["schtasks.exe", "/Query", "/TN", WINDOWS_TASK_NAME, "/FO", "LIST", "/V"]
         )
         run_entry = _status_command(
             ["reg.exe", "query", WINDOWS_RUN_KEY, "/v", WINDOWS_RUN_VALUE]
         )
         task_registered = bool(task is not None and task.returncode == 0)
         run_registered = bool(run_entry is not None and run_entry.returncode == 0)
+        # A registration that starts the hidden launcher only works while the
+        # launcher file exists; without it nothing starts at sign-in.
+        launcher_present = (AGENTCAT_HOME / WINDOWS_HIDDEN_LAUNCHER_NAME).is_file()
+        launcher_name = WINDOWS_HIDDEN_LAUNCHER_NAME.lower()
+
+        def needs_missing_launcher(result: Any) -> bool:
+            text = str(getattr(result, "stdout", "") or "").lower()
+            return launcher_name in text and not launcher_present
+
+        if task_registered and needs_missing_launcher(task):
+            task_registered = False
+        if run_registered and needs_missing_launcher(run_entry):
+            run_registered = False
         legacy_present = False
         if WINDOWS_LEGACY_STARTUP_SCRIPT.is_file():
             try:
@@ -2218,6 +2233,7 @@ def _daemon_status_snapshot_uncached() -> Dict[str, Any]:
             "taskRegistered": task_registered,
             "runEntryRegistered": run_registered,
             "legacyStartupPresent": legacy_present,
+            "launcherPresent": launcher_present,
         }
 
     if sys.platform == "darwin":

@@ -64,6 +64,33 @@ class ConnectorContractTests(unittest.TestCase):
         self.assertNotIn("command", json.dumps(status).lower())
         self.assertNotIn("path", json.dumps(status).lower())
 
+    def test_windows_hidden_launch_counts_only_while_its_launcher_exists(self) -> None:
+        def run(args: list[str], **_: object) -> subprocess.CompletedProcess:
+            if args[0] == "schtasks.exe":
+                return subprocess.CompletedProcess(
+                    args, 0,
+                    stdout='Task To Run: wscript.exe //B //NoLogo "C:\\Users\\u\\.agentcat\\AgentCatD.vbs"\n',
+                    stderr="",
+                )
+            return completed(args, 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch.object(agentcat, "IS_WINDOWS", True), \
+                    patch.object(agentcat, "AGENTCAT_HOME", home), \
+                    patch.object(agentcat, "WINDOWS_LEGACY_STARTUP_SCRIPT", home / "legacy" / "AgentCatD.vbs"), \
+                    patch.object(agentcat.subprocess, "run", side_effect=run):
+                missing = agentcat.daemon_status_snapshot(force=True)
+                (home / "AgentCatD.vbs").write_text("launcher", encoding="utf-8")
+                present = agentcat.daemon_status_snapshot(force=True)
+
+        self.assertEqual((missing["status"], missing["persistent"]), ("missing", False))
+        self.assertFalse(missing["taskRegistered"])
+        self.assertFalse(missing["launcherPresent"])
+        self.assertEqual((present["status"], present["registration"]), ("registered", "scheduled_task"))
+        self.assertTrue(present["launcherPresent"])
+        self.assertNotIn("users", json.dumps(present).lower())
+
     def test_windows_run_key_is_a_supported_fallback(self) -> None:
         def run(args: list[str], **_: object) -> subprocess.CompletedProcess:
             return completed(args, 0 if args[0] == "reg.exe" else 1)

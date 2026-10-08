@@ -20,7 +20,8 @@
     },
     "taskRegistered": { "type": "boolean" },
     "runEntryRegistered": { "type": "boolean" },
-    "legacyStartupPresent": { "type": "boolean" }
+    "legacyStartupPresent": { "type": "boolean" },
+    "launcherPresent": { "type": "boolean" }
   },
   "additionalProperties": true
 }

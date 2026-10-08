@@ -371,9 +371,57 @@ def remove_windows_hidden_launcher() -> None:
         log(f"removed Windows startup launcher {path}")
 
 
+WSH_SETTINGS_KEY = r"Software\Microsoft\Windows Script Host\Settings"
+
+
+def _wsh_disabled_by_policy() -> bool:
+    """True when Windows Script Host is switched off (Settings value Enabled = 0).
+
+    Either hive counts: an administrator's HKLM switch or the user's own HKCU
+    one. Erring towards "disabled" only costs the hidden window.
+    """
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(hive, WSH_SETTINGS_KEY) as key:
+                value, _kind = winreg.QueryValueEx(key, "Enabled")
+        except OSError:
+            continue
+        if str(value).strip() == "0":
+            return True
+    return False
+
+
+def windows_script_host_available() -> bool:
+    """wscript.exe exists and WSH is not disabled, so the hidden launcher can run."""
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+    wscript = Path(system_root) / "System32" / "wscript.exe"
+    if not wscript.is_file() and not shutil.which("wscript.exe"):
+        return False
+    return not _wsh_disabled_by_policy()
+
+
+def windows_console_startup_command(shim: str) -> str:
+    """The pre-#46 launch: works without WSH but shows a console window."""
+    return f'cmd.exe /d /c ""{shim}" daemon"'
+
+
 def load_windows_daemon() -> None:
-    launcher = write_windows_hidden_launcher()
-    task_command = windows_startup_command(str(launcher))
+    if windows_script_host_available():
+        launcher = write_windows_hidden_launcher()
+        task_command = windows_startup_command(str(launcher))
+        # REG_EXPAND_SZ + %USERPROFILE% keeps the value ASCII for any username.
+        run_command = windows_startup_command(_windows_shim_path(launcher))
+    else:
+        # Without Windows Script Host the hidden launcher would never start the
+        # daemon at all; a visible console window is the lesser problem.
+        log("Windows Script Host is unavailable or disabled; agentcatd will start in a console window")
+        remove_windows_hidden_launcher()
+        task_command = windows_console_startup_command(str(BIN_PATH))
+        run_command = windows_console_startup_command(_windows_shim_path(BIN_PATH))
     result = run(
         [
             "schtasks.exe",
@@ -393,8 +441,6 @@ def load_windows_daemon() -> None:
     else:
         task_error = result.stderr.strip() or f"exit code {result.returncode}"
         log(f"Windows startup task registration failed: {task_error}")
-        # REG_EXPAND_SZ + %USERPROFILE% keeps the value ASCII for any username.
-        run_command = windows_startup_command(_windows_shim_path(launcher))
         fallback = run(
             [
                 "reg.exe",
