@@ -63,10 +63,14 @@ class MutationOriginGuardUnitTests(unittest.TestCase):
         ):
             self.assertIsNone(agentcat.mutating_request_origin_error(headers), headers)
 
-    def test_tauri_webview_origins_pass_even_though_cross_site(self):
+    def test_tauri_webview_origins_get_no_exemption(self):
+        # No shipped client needs one: the Windows app calls the daemon through
+        # its native Rust proxy, which sends no Origin.
+        self.assertFalse(hasattr(agentcat, "TRUSTED_APP_ORIGINS"))
         for origin in TAURI_ORIGINS:
             headers = {"Origin": origin, "Sec-Fetch-Site": "cross-site"}
-            self.assertIsNone(agentcat.mutating_request_origin_error(headers), origin)
+            self.assertEqual(agentcat.mutating_request_origin_error(headers)[0], 403, origin)
+            self.assertEqual(agentcat.mutating_request_origin_error({"Origin": origin})[0], 403, origin)
 
     def test_cross_site_and_foreign_origins_are_rejected(self):
         for headers in CROSS_SITE_HEADER_SETS:
@@ -176,7 +180,7 @@ class MutationOriginGuardHTTPTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
         self.assertEqual(self.event_count(), 1)
 
-    def test_tauri_webview_origin_is_allowed(self):
+    def test_tauri_webview_origin_is_rejected(self):
         with self.server_url() as url:
             for origin in TAURI_ORIGINS:
                 status, payload = self.send(
@@ -184,9 +188,9 @@ class MutationOriginGuardHTTPTests(unittest.TestCase):
                     body=json.dumps({"provider": "codex", "eventType": "tauri"}).encode(),
                     headers={"Content-Type": "application/json", "Origin": origin, "Sec-Fetch-Site": "cross-site"},
                 )
-                self.assertEqual(status, 201, origin)
-                self.assertEqual(payload["eventType"], "tauri")
-        self.assertEqual(self.event_count(), len(TAURI_ORIGINS))
+                self.assertEqual(status, 403, origin)
+                self.assertEqual(payload["error"], "forbidden")
+        self.assertEqual(self.event_count(), 0)
 
     def test_forced_usage_fetch_rejects_cross_site_get(self):
         # GET /v1/usage forces a live fetch from every provider and skips their
@@ -220,19 +224,19 @@ class MutationOriginGuardHTTPTests(unittest.TestCase):
             self.assertEqual(status, 200)
 
     def test_credential_routes_keep_their_stricter_guard(self):
-        # The general guard admits a Tauri origin; /v1/connections/* still
-        # requires a loopback-or-no Origin plus the control bearer token.
+        # The general guard admits a loopback page; /v1/connections/* still
+        # requires a JSON body plus the control bearer token.
         with self.server_url() as url:
             status, payload = self.send(
                 url + "/v1/connections/openrouter/oauth/start", "POST",
                 body=b"{}",
                 headers={
-                    "Content-Type": "application/json",
-                    "Origin": "http://tauri.localhost",
+                    "Content-Type": "text/plain",
+                    "Origin": "http://127.0.0.1:8765",
                     "Authorization": f"Bearer {agentcat.loopback_control_token()}",
                 },
             )
-            self.assertEqual(status, 403)
+            self.assertEqual(status, 415)
             self.assertEqual(payload["error"], "connection_write_forbidden")
 
 

@@ -247,6 +247,9 @@ class DaemonLogHygieneTests(unittest.TestCase):
         stderr = io.StringIO()
         try:
             with patch.object(agentcat.logging, "basicConfig"), \
+                patch.object(agentcat, "rotate_daemon_log", side_effect=AssertionError("loser must not rotate")), \
+                patch.object(agentcat, "ensure_daemon_stderr_appends", side_effect=AssertionError("loser must not touch stderr")), \
+                patch.object(agentcat, "prune_events", side_effect=AssertionError("loser must not prune")), \
                 patch.object(agentcat, "build_snapshot", side_effect=AssertionError("must not build")), \
                 patch.object(agentcat.threading, "Thread", side_effect=AssertionError("must not start loops")), \
                 contextlib.redirect_stderr(stderr):

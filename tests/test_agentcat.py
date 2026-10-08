@@ -2652,6 +2652,41 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(tick(), {"cli": 1})
         self.assertNotIn(str(idle), agentcat._CLAUDE_SOURCE_FILE_MEMO)
 
+    def test_claude_split_rereads_a_replaced_or_rewritten_journal(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        project = agentcat.CLAUDE_PROJECTS_DIR / "rewrite-project"
+        project.mkdir(parents=True)
+        journal = project / "session.jsonl"
+        journal.write_text(
+            self._claude_usage_event(now, "r1", "r1", 10) + self._claude_usage_event(now, "r2", "r2", 20),
+            encoding="utf-8",
+        )
+        self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 30})
+
+        # Replaced by a different, larger file (new inode): not an append.
+        replacement = project / "session.jsonl.new"
+        replacement.write_text(
+            "".join(self._claude_usage_event(now, f"n{i}", f"n{i}", 1) for i in range(5)),
+            encoding="utf-8",
+        )
+        os.replace(replacement, journal)
+        self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 5})
+
+        # Rewritten in place, larger, with no newline where the last counted
+        # line used to end: re-read from the start.
+        memo = agentcat._CLAUDE_SOURCE_FILE_MEMO[str(journal)]
+        offset = memo[3]
+        body = self._claude_usage_event(now, "w1", "w1", 7)
+        while len(body.encode()) < offset + 10:
+            body = body.rstrip("\n") + " " * 50 + "\n"
+        body = body + self._claude_usage_event(now, "w2", "w2", 9)
+        self.assertNotEqual(body.encode()[offset - 1:offset], b"\n")
+        with journal.open("r+b") as fh:
+            fh.write(body.encode())
+            fh.truncate()
+        self.assertEqual(agentcat._CLAUDE_SOURCE_FILE_MEMO[str(journal)][0], journal.stat().st_ino)
+        self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 16})
+
     def test_desktop_session_index_is_parsed_only_when_it_changes(self) -> None:
         now = dt.datetime.now(dt.timezone.utc)
         desktop_sid = "5f0c2a8e-1111-4222-8333-944455556666"

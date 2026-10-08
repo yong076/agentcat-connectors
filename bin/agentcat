@@ -10796,12 +10796,12 @@ def _desktop_originated_claude_session_ids() -> Set[str]:
 
 
 # Per-journal memo for the CLI/desktop split:
-# path -> (size, mtime_ns, offset, committed_tokens, tail_tokens).
+# path -> (inode, size, mtime_ns, offset, committed_tokens, tail_tokens).
 # ``offset`` is the byte just past the last newline-terminated line folded into
 # ``committed_tokens``; ``tail_tokens`` counts an unterminated final line, which
 # is re-read (not double counted) once the writer finishes it.
 _CLAUDE_USAGE_BY_SOURCE_LOCK = threading.Lock()
-_CLAUDE_SOURCE_FILE_MEMO: Dict[str, Tuple[int, int, int, int, int]] = {}
+_CLAUDE_SOURCE_FILE_MEMO: Dict[str, Tuple[int, int, int, int, int, int]] = {}
 
 
 def _claude_journal_line_tokens(raw_line: bytes) -> int:
@@ -10818,12 +10818,24 @@ def _claude_journal_line_tokens(raw_line: bytes) -> int:
     return claude_record_total(rec) if rec else 0
 
 
-def _read_claude_journal_tokens(path: Path, offset: int) -> Tuple[int, int, int]:
-    """Sum usage tokens from ``offset``: (committed tokens, new offset, tail tokens)."""
+def _read_claude_journal_tokens(path: Path, offset: int) -> Tuple[int, int, int, bool]:
+    """Sum usage tokens from ``offset``.
+
+    Returns (committed tokens, new offset, tail tokens, restarted). Before
+    resuming, the byte just before ``offset`` must be the newline that ended
+    the last counted line; if it is not, the file was rewritten under the
+    same name and is read again from the start (``restarted``).
+    """
     committed = 0
     tail = 0
-    new_offset = offset
+    restarted = False
     with path.open("rb") as fh:
+        if offset > 0:
+            fh.seek(offset - 1)
+            if fh.read(1) != b"\n":
+                offset = 0
+                restarted = True
+        new_offset = offset
         fh.seek(offset)
         for raw_line in fh:
             if not raw_line.endswith(b"\n"):
@@ -10833,15 +10845,16 @@ def _read_claude_journal_tokens(path: Path, offset: int) -> Tuple[int, int, int]
                 break
             new_offset += len(raw_line)
             committed += _claude_journal_line_tokens(raw_line)
-    return committed, new_offset, tail
+    return committed, new_offset, tail, restarted
 
 
 def _claude_journal_file_tokens(path: Path) -> Optional[int]:
     """Usage tokens in one journal, reading only bytes appended since last tick.
 
-    Claude Code journals are append-only JSONL. An unchanged file (same size and
-    mtime) is not opened at all; a grown file is read from the stored offset; a
-    file that shrank or was rewritten in place is re-read from the start.
+    Claude Code journals are append-only JSONL. An unchanged file (same inode,
+    size and mtime) is not opened at all; a grown file is read from the stored
+    offset once the newline before it checks out; a replaced, shrunk or
+    rewritten file is re-read from the start.
     Callers hold ``_CLAUDE_USAGE_BY_SOURCE_LOCK``.
     """
     key = str(path)
@@ -10851,20 +10864,21 @@ def _claude_journal_file_tokens(path: Path) -> Optional[int]:
         _CLAUDE_SOURCE_FILE_MEMO.pop(key, None)
         return None
     memo = _CLAUDE_SOURCE_FILE_MEMO.get(key)
-    if memo is not None and memo[0] == stat.st_size and memo[1] == stat.st_mtime_ns:
-        return memo[3] + memo[4]
-    if memo is not None and stat.st_size > memo[0] and memo[2] <= stat.st_size:
-        offset, committed = memo[2], memo[3]
+    same_file = memo is not None and memo[0] == stat.st_ino
+    if same_file and memo[1] == stat.st_size and memo[2] == stat.st_mtime_ns:
+        return memo[4] + memo[5]
+    if same_file and stat.st_size > memo[1] and memo[3] <= stat.st_size:
+        offset, committed = memo[3], memo[4]
     else:
         offset, committed = 0, 0
     try:
-        added, new_offset, tail = _read_claude_journal_tokens(path, offset)
+        added, new_offset, tail, restarted = _read_claude_journal_tokens(path, offset)
     except OSError as exc:
         _CLAUDE_SOURCE_FILE_MEMO.pop(key, None)
         warn_unreadable_path("claude_usage_by_source", path, exc)
         return None
-    committed += added
-    _CLAUDE_SOURCE_FILE_MEMO[key] = (stat.st_size, stat.st_mtime_ns, new_offset, committed, tail)
+    committed = added if restarted else committed + added
+    _CLAUDE_SOURCE_FILE_MEMO[key] = (stat.st_ino, stat.st_size, stat.st_mtime_ns, new_offset, committed, tail)
     return committed + tail
 
 
@@ -17627,13 +17641,6 @@ def local_http_origin_allowed(origin: Optional[str]) -> bool:
     )
 
 
-# First-party WebView origins. Tauri serves its UI from http(s)://tauri.localhost
-# on Windows and tauri://localhost on macOS/Linux. Such a page is cross-site to
-# 127.0.0.1 (so it carries Sec-Fetch-Site: cross-site), yet it is the Agent Cat
-# app itself. A web page cannot claim these origins: browsers set Origin and
-# scripts cannot override it. The shipped Windows app posts through its native
-# Rust proxy (no Origin); these entries keep a WebView fallback working.
-TRUSTED_APP_ORIGINS = frozenset({"http://tauri.localhost", "https://tauri.localhost", "tauri://localhost"})
 SAFE_FETCH_SITES = frozenset({"same-origin", "same-site", "none"})
 
 
@@ -17650,8 +17657,6 @@ def mutating_request_origin_error(headers: Any) -> Optional[Tuple[int, str]]:
     (``/reflect/enable``, ``/reflect/analyze/<id>``).
     """
     origin = headers.get("Origin")
-    if str(origin or "").strip().lower() in TRUSTED_APP_ORIGINS:
-        return None
     fetch_site = str(headers.get("Sec-Fetch-Site") or "").strip().lower()
     if fetch_site and fetch_site not in SAFE_FETCH_SITES:
         return 403, "cross_site_request"
@@ -18437,12 +18442,6 @@ def run_daemon(args: argparse.Namespace) -> int:
     # Creating it only inside the request guard makes a fresh install unable to
     # issue that request at all.
     initialize_loopback_control()
-    # Bound the launchd/installer stderr file before writing to it (#121).
-    try:
-        ensure_daemon_stderr_appends()
-        rotate_daemon_log()
-    except Exception:
-        pass
     # Give the long-running daemon a real, leveled log so failures (keychain
     # denials, provider parse errors) leave a diagnosable trail in the launchd
     # stderr file instead of vanishing. Reason codes + ~-relative paths only —
@@ -18452,8 +18451,6 @@ def run_daemon(args: argparse.Namespace) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     args.host = resolve_bind_host(getattr(args, "host", "127.0.0.1"))
-    # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
-    prune_events()
     # Bind and start accepting connections BEFORE the initial snapshot build (audit #3).
     # The first build_snapshot() streams the full local history — gigabytes, minutes, for
     # the heaviest users — and previously ran before the port bind, so the app got
@@ -18473,6 +18470,17 @@ def run_daemon(args: argparse.Namespace) -> int:
             flush=True,
         )
         return 1
+    # Only the instance that owns the port maintains shared state: a second
+    # agentcatd that loses the bind must not rotate the live daemon's log or
+    # vacuum its database.
+    try:
+        # Bound the launchd/installer stderr file (#121).
+        ensure_daemon_stderr_appends()
+        rotate_daemon_log()
+    except Exception:
+        pass
+    # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
+    prune_events()
     print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
 
     def _initial_build_then_refresh() -> None:
