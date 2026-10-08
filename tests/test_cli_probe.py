@@ -116,7 +116,9 @@ class ClaudeProbeTests(unittest.TestCase):
             for source in ("environment", "settings"):
                 with self.subTest(setting=setting, source=source), tempfile.TemporaryDirectory() as tmp:
                     home = Path(tmp)
-                    env = {setting: value} if source == "environment" else {}
+                    env = {"HOME": str(home), "USERPROFILE": str(home)}
+                    if source == "environment":
+                        env[setting] = value
                     if source == "settings":
                         (home / "settings.json").write_text(json.dumps({"env": {setting: value}}))
                     with patch.dict(cli_probe.os.environ, env, clear=True), \
@@ -131,7 +133,8 @@ class ClaudeProbeTests(unittest.TestCase):
                     self.assertNotIn("fixture-token", json.dumps(row))
 
     def test_subscription_probe_does_not_borrow_default_home_billing_settings(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(cli_probe.os.environ, {}, clear=True):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(cli_probe.os.environ,
+                {"HOME": tmp, "USERPROFILE": tmp}, clear=True):
             default, other = Path(tmp) / "default", Path(tmp) / "other"
             default.mkdir()
             other.mkdir()
@@ -144,6 +147,30 @@ class ClaudeProbeTests(unittest.TestCase):
         self.assertEqual(row["status"], "ok")
         self.assertIsNone(row["reason"])
         self.assertTrue(row["windows"])
+
+    def test_selected_home_supplies_identity_and_details_without_global_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default = Path(tmp) / "selected-user" / ".claude"
+            other = Path(tmp) / "alternate-config"
+            for home, config in ((default, default.parent / ".claude.json"),
+                                 (other, other / ".claude.json")):
+                with self.subTest(default_home=home == default):
+                    home.mkdir(parents=True)
+                    config.write_text(json.dumps({"oauthAccount": {
+                        "emailAddress": "selected@example.com", "accountUuid": "selected-account",
+                        "organizationRateLimitTier": "max_5x", "hasExtraUsageEnabled": False,
+                    }}))
+                    with patch.dict(cli_probe.os.environ,
+                            {"HOME": tmp, "USERPROFILE": tmp}, clear=True), \
+                         patch.object(Path, "home", side_effect=RuntimeError("Could not determine home directory")):
+                        row = cli_probe.probe_claude_home(home, default, "/bin/claude",
+                            run=lambda args, **kw: subprocess.CompletedProcess(args, 0, stdout=USAGE_TEXT),
+                            token_reader=lambda *_: None)
+                    self.assertEqual(row["status"], "ok")
+                    self.assertEqual(row["email"], "selected@example.com")
+                    self.assertEqual(row["accountID"], "selected-account")
+                    self.assertEqual(row["plan"], "Max 5x")
+                    self.assertFalse(row["extraUsageEnabled"])
 
     def test_timeout_is_an_error_row_not_an_exception(self):
         def run(args, **kwargs):

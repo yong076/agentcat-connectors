@@ -121,8 +121,16 @@ def parse_claude_usage(text: str, now: Optional[dt.datetime] = None) -> List[Dic
     return windows
 
 
+def _claude_account_config(home: Path, default_home: Path) -> Path:
+    # The default .claude home keeps account metadata beside it; alternate
+    # config homes keep it inside. Resolve both from the selected home, without
+    # consulting the daemon user's HOME/USERPROFILE or platform account database.
+    home = Path(home)
+    return (home.parent if home == Path(default_home) else home) / ".claude.json"
+
+
 def claude_identity(home: Path, default_home: Path) -> Dict[str, Optional[str]]:
-    config = Path.home() / ".claude.json" if Path(home) == Path(default_home) else Path(home) / ".claude.json"
+    config = _claude_account_config(home, default_home)
     try:
         raw = json.loads(config.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -545,7 +553,7 @@ _CLAUDE_TIERS = {"max_5x": "Max 5x", "max_20x": "Max 20x", "pro": "Pro", "team":
 
 
 def claude_account_details(home: Path, default_home: Path, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
-    config = Path.home() / ".claude.json" if Path(home) == Path(default_home) else Path(home) / ".claude.json"
+    config = _claude_account_config(home, default_home)
     try:
         raw = json.loads(config.read_text(encoding="utf-8"))
     except (OSError, ValueError):
