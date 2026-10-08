@@ -17714,8 +17714,26 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if guard_error is None:
             return True
         status, reason = guard_error
+        self.discard_request_body()
         self.send_json(status, {"error": "forbidden", "message": reason})
         return False
+
+    def discard_request_body(self, max_bytes: int = 256 * 1024) -> None:
+        """Read a rejected request's small body before answering.
+
+        Closing with unread bytes makes Windows reset the connection
+        (WinError 10053), so the client may never see the 403. Oversized or
+        malformed lengths are left unread; that response may still be reset.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            return
+        if 0 < length <= max_bytes:
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
 
     def write_response_body(self, body: bytes) -> bool:
         try:
