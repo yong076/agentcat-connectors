@@ -3753,6 +3753,43 @@ def provider_sync_identity(provider: str, native_account_id: str) -> str:
     ).hexdigest()
 
 
+# A failed Codex usage probe waits 5 min, doubling to 60 min, before the next
+# request (rule R6). A 401 with the same token cannot succeed until the CLI
+# refreshes its own login, so polling it every tick only burns requests.
+CODEX_FAILURE_BACKOFF_SECONDS = 300
+CODEX_FAILURE_BACKOFF_MAX_SECONDS = 3600
+
+
+def codex_failure_backoff_seconds(streak: int) -> int:
+    """Backoff after the ``streak``-th consecutive failure (1-based)."""
+    exponent = max(0, min(int(streak) - 1, 6))
+    return min(CODEX_FAILURE_BACKOFF_SECONDS * (2 ** exponent), CODEX_FAILURE_BACKOFF_MAX_SECONDS)
+
+
+def codex_token_fingerprint(access_token: str) -> str:
+    """Device-keyed, truncated HMAC of an access token; never the token itself.
+
+    Stored next to a failure backoff so that a re-login (the CLI writes a new
+    token) lifts the backoff at once instead of waiting it out.
+    """
+    return hmac.new(
+        _provider_instance_secret(),
+        f"agentcat.codex-token-fingerprint.v1:{access_token}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:16]
+
+
+def _codex_public_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop cache-only bookkeeping (``_``-prefixed keys) before serving limits."""
+    return {key: value for key, value in limits.items() if not (isinstance(key, str) and key.startswith("_"))}
+
+
+def _codex_limits_login_expired(limits: Optional[Dict[str, Any]]) -> bool:
+    return isinstance(limits, dict) and CODEX_CLI_LOGIN_EXPIRED_REASON in (
+        limits.get("reason"), limits.get("liveErrorReason")
+    )
+
+
 def mark_codex_cli_login_expired(limits: Dict[str, Any]) -> Dict[str, Any]:
     """Label Codex limits whose CLI access token the usage API rejected.
 
@@ -4185,15 +4222,23 @@ def codex_live_limits_for_auth(
     lapsed; the last numbers are served as stale with ``cli_login_expired``
     until the CLI refreshes its own token on its next run.
     """
-    cached = None if force else cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS)
-    if cached:
-        cached = sanitize_codex_cached_limits(cached)
-        if CODEX_CLI_LOGIN_EXPIRED_REASON in (cached.get("reason"), cached.get("liveErrorReason")):
-            return mark_codex_cli_login_expired(cached)
-        return cached
     tokens = oauth_tokens(auth)
     access_token = tokens.get("access_token")
     account_id = tokens.get("account_id") or auth.get("account_id") or ""
+    fingerprint = codex_token_fingerprint(access_token) if isinstance(access_token, str) and access_token else None
+    now = int(time.time())
+    cached = None if force else cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS)
+    previous = cached or cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+    same_login = bool(fingerprint) and isinstance(previous, dict) and previous.get("_tokenFingerprint") == fingerprint
+    if _codex_limits_login_expired(previous):
+        retry_at = int_limit(previous.get("_loginRetryAt"))
+        window_open = retry_at > now if retry_at is not None else cached is not None
+        # The same expired token inside its backoff: no request, even when
+        # forced. A new token (re-login) skips the wait.
+        if window_open and (same_login or fingerprint is None):
+            return _codex_public_limits(mark_codex_cli_login_expired(sanitize_codex_cached_limits(previous)))
+    elif cached:
+        return _codex_public_limits(sanitize_codex_cached_limits(cached))
     if not isinstance(access_token, str) or not access_token:
         return empty_limits()
 
@@ -4223,18 +4268,32 @@ def codex_live_limits_for_auth(
             last_error = exc
     error = last_error or RuntimeError("Codex usage API failed")
     reason = CODEX_CLI_LOGIN_EXPIRED_REASON if login_expired else None
+    login_state: Dict[str, Any] = {}
+    if login_expired:
+        streak = 1
+        if same_login and _codex_limits_login_expired(previous):
+            streak = (int_count(previous.get("_loginExpiredStreak")) or 0) + 1
+        login_state = {
+            "_tokenFingerprint": fingerprint,
+            "_loginExpiredStreak": streak,
+            "_loginRetryAt": now + codex_failure_backoff_seconds(streak),
+        }
     stale = cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
     if stale:
+        # Start from the last numbers without any older login bookkeeping.
+        stale = _codex_public_limits(stale)
         if not login_expired and stale.get("reason") == CODEX_CLI_LOGIN_EXPIRED_REASON:
             # The latest failure was not a 401; don't keep an older login label.
-            stale = {key: value for key, value in stale.items() if key != "reason"}
+            stale.pop("reason", None)
+        stale.update(login_state)
         served = serve_stale_live_limits(cache_key, stale, error, reason=reason)
-        return mark_codex_cli_login_expired(served) if login_expired else served
+        return _codex_public_limits(mark_codex_cli_login_expired(served) if login_expired else served)
     limits = live_limit_error(error, "codex-usage-api")
     if reason:
         limits["reason"] = reason
+    limits.update(login_state)
     write_live_limits_cache(cache_key, limits)
-    return limits
+    return _codex_public_limits(limits)
 
 
 def codex_live_limits(force: bool = False) -> Dict[str, Any]:
@@ -5139,6 +5198,8 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
             stale["reason"] = reason
         return stale
 
+    failure = cached.get("failure") if isinstance(cached, dict) and isinstance(cached.get("failure"), dict) else {}
+
     try:
         auth = read_codex_auth()
     except Exception:
@@ -5153,6 +5214,35 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
     account_id = tokens.get("account_id") or auth.get("account_id") or ""
     if not isinstance(access_token, str) or not access_token:
         return stale_or_unavailable()
+    now = int(time.time())
+    fingerprint = codex_token_fingerprint(access_token)
+    same_login = failure.get("tokenFingerprint") == fingerprint
+    failure_reason = failure.get("reason") if failure.get("reason") == CODEX_CLI_LOGIN_EXPIRED_REASON else None
+    retry_at = int_limit(failure.get("retryAt"))
+    if same_login and retry_at is not None and retry_at > now:
+        # Inside the backoff after a failure with this same token: serve the
+        # last breakdown, no request (rule R6).
+        return stale_or_unavailable(failure_reason)
+
+    def record_failure(reason: Optional[str] = None) -> Dict[str, Any]:
+        streak = ((int_count(failure.get("streak")) or 0) + 1) if same_login else 1
+        entry: Dict[str, Any] = {
+            "retryAt": now + codex_failure_backoff_seconds(streak),
+            "streak": streak,
+            "tokenFingerprint": fingerprint,
+        }
+        if reason:
+            entry["reason"] = reason
+        document: Dict[str, Any] = {"failure": entry}
+        if cached_data is not None and fetched_at is not None:
+            document["fetched_at"] = fetched_at
+            document["data"] = cached_data
+        try:
+            write_json_atomic(CODEX_USAGE_BREAKDOWN_CACHE, document)
+        except Exception:
+            pass
+        return stale_or_unavailable(reason)
+
     try:
         payload = codex_usage_breakdown_request(access_token, str(account_id), CODEX_USAGE_BREAKDOWN_URL)
         parsed = codex_usage_breakdown_from_response(payload)
@@ -5160,17 +5250,17 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
             # A 200 with an unknown schema is still a failed refresh. Keep
             # the last known-good cache rather than replacing it with an
             # empty section. A legitimate data: [] response parses as ok.
-            return stale_or_unavailable()
+            return record_failure()
         return cache_and_return(parsed)
     except urllib.error.HTTPError as exc:
         # This is the Codex CLI's own login: never refresh it (rule R1). The
         # CLI refreshes its token on its next run; until then keep the last
         # breakdown, marked stale.
         if exc.code == 401:
-            return stale_or_unavailable(CODEX_CLI_LOGIN_EXPIRED_REASON)
-        return stale_or_unavailable()
+            return record_failure(CODEX_CLI_LOGIN_EXPIRED_REASON)
+        return record_failure()
     except Exception:
-        return stale_or_unavailable()
+        return record_failure()
 
 
 def codex_usage_breakdown() -> Dict[str, Any]:

@@ -480,6 +480,52 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertTrue(again["stale"])
         self.assertEqual(again["quotas"][0]["remainingPercent"], 70.0)
 
+    def test_codex_401_backoff_holds_even_when_forced_until_relogin(self) -> None:
+        codex_home = agentcat.HOME / ".codex"
+        codex_home.mkdir(parents=True)
+        auth_path = codex_home / "auth.json"
+
+        def write_token(token: str) -> None:
+            auth_path.write_text(
+                json.dumps({"tokens": {"access_token": token, "refresh_token": "cli-owned", "account_id": "acct"}}),
+                encoding="utf-8",
+            )
+
+        write_token("expired")
+        start = 1_800_000_000
+        requests: list = []
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start):
+            first = agentcat.codex_live_limits()
+        self.assertEqual(first["reason"], "cli_login_expired")
+        self.assertFalse([key for key in first if key.startswith("_")])
+        sent = len(requests)
+        self.assertGreater(sent, 0)
+
+        # Inside the 5 min window the same expired token sends nothing, even
+        # through the forced /v1/usage path.
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 299):
+            held = agentcat.codex_live_limits(force=True)
+        self.assertEqual(len(requests), sent)
+        self.assertEqual(held["reason"], "cli_login_expired")
+        self.assertFalse([key for key in held if key.startswith("_")])
+
+        # After the window it retries once; the next window doubles.
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 301):
+            agentcat.codex_live_limits()
+        self.assertEqual(len(requests), 2 * sent)
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 301 + 599):
+            agentcat.codex_live_limits()
+        self.assertEqual(len(requests), 2 * sent)
+
+        # The CLI refreshed its own login: the new token is tried at once.
+        write_token("fresh-after-login")
+        with self._codex_unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 302):
+            agentcat.codex_live_limits()
+        self.assertEqual(len(requests), 3 * sent)
+        cache_text = agentcat.LIVE_LIMITS_CACHE.read_text(encoding="utf-8")
+        self.assertNotIn("fresh-after-login", cache_text)
+        self.assertNotIn('"expired"', cache_text)
+
     def test_codex_401_without_cache_reports_cli_login_expired(self) -> None:
         codex_home = agentcat.HOME / ".codex"
         codex_home.mkdir(parents=True)
