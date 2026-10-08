@@ -379,20 +379,30 @@ TOKEN_CLASS_KEYS = (
 #   cache_read   — tokens served from prompt cache (typically much cheaper)
 #   cache_write  — tokens written into prompt cache (≈ input or slightly more)
 #
-# Source: public provider pricing pages through 2026-07. Estimates only —
+# These rows are what users see whenever the LiteLLM cache is cold (first run,
+# offline, fetch failure), so they must match current list prices. Rows were
+# checked against the providers' own pricing pages on 2026-10-08:
+#   Anthropic  platform.claude.com/docs/en/about-claude/pricing
+#   OpenAI     developers.openai.com/api/docs/pricing (Standard tier)
+#   Google     ai.google.dev/gemini-api/docs/pricing (paid tier)
+# cache_write is the 5-minute write rate where the provider charges one
+# (Anthropic 1.25x input); OpenAI and Gemini bill no write premium, so it is
+# the input rate. tests/fixtures/pricing pins these rows. Estimates only —
 # never bill from these. Unknown models intentionally return None so the
 # caller emits a `pricing_missing` finding instead of silently guessing.
+# GPT-5.6 Sol: OpenAI's promotional rate, "available at least through
+# November 21, 2026". Re-check it then.
 _GPT_5_6_SOL_PRICING: Dict[str, Any] = {
-    "input": 5.0,
-    "output": 30.0,
-    "cache_read": 0.5,
-    "cache_write": 6.25,
+    "input": 4.0,
+    "output": 20.0,
+    "cache_read": 0.4,
+    "cache_write": 5.0,
     "tiers": [{
         "threshold": 272_001,
-        "input": 10.0,
-        "output": 45.0,
-        "cache_read": 1.0,
-        "cache_write": 12.5,
+        "input": 8.0,
+        "output": 30.0,
+        "cache_read": 0.8,
+        "cache_write": 10.0,
     }],
 }
 _GPT_5_6_TERRA_PRICING: Dict[str, Any] = {
@@ -436,28 +446,35 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # OpenAI / Codex
     "gpt-5":         {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": 1.25},
     "gpt-5-mini":    {"input": 0.25, "output": 2.0,  "cache_read": 0.025, "cache_write": 0.25},
-    "gpt-5.5":       {"input": 2.5,  "output": 15.0, "cache_read": 0.25,  "cache_write": 2.5},
+    "gpt-5.5":       {"input": 5.0,  "output": 30.0, "cache_read": 0.5,   "cache_write": 5.0,
+                      "tiers": [{"threshold": 272_001, "input": 10.0, "output": 45.0,
+                                 "cache_read": 1.0, "cache_write": 10.0}]},
+    # Not on OpenAI's current price list; unverified, left unchanged.
     "gpt-5.5-mini":  {"input": 0.3,  "output": 2.4,  "cache_read": 0.03,  "cache_write": 0.3},
     **OFFICIAL_PRICING_OVERRIDES,
-    "o3":            {"input": 4.0,  "output": 16.0, "cache_read": 0.4,   "cache_write": 4.0},
-    "o3-mini":       {"input": 0.55, "output": 2.2,  "cache_read": 0.055, "cache_write": 0.55},
-    "o4-mini":       {"input": 0.55, "output": 2.2,  "cache_read": 0.055, "cache_write": 0.55},
+    "o3":            {"input": 2.0,  "output": 8.0,  "cache_read": 0.5,   "cache_write": 2.0},
+    "o3-mini":       {"input": 1.1,  "output": 4.4,  "cache_read": 0.55,  "cache_write": 1.1},
+    "o4-mini":       {"input": 1.1,  "output": 4.4,  "cache_read": 0.275, "cache_write": 1.1},
     # Anthropic / Claude
-    "claude-opus-4-5":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
-    "claude-opus-4-6":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
-    "claude-opus-4-7":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    "claude-opus-4-5":   {"input": 5.0,  "output": 25.0, "cache_read": 0.5,  "cache_write": 6.25},
+    "claude-opus-4-6":   {"input": 5.0,  "output": 25.0, "cache_read": 0.5,  "cache_write": 6.25},
+    "claude-opus-4-7":   {"input": 5.0,  "output": 25.0, "cache_read": 0.5,  "cache_write": 6.25},
     # Claude Fable/Mythos 5: $10/M input, $50/M output, 90% cache-read
     # discount ($1/M). LiteLLM's combined cache-write fallback is $12.50/M.
     "claude-fable-5":    {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
     "claude-mythos-5":   {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
     "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
     "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
-    "claude-haiku-4-5":  {"input": 0.8,  "output": 4.0,  "cache_read": 0.08, "cache_write": 1.0},
+    "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0,  "cache_read": 0.1,  "cache_write": 1.25},
     # Google / Gemini
-    "gemini-2.5-pro":   {"input": 1.25, "output": 5.0,  "cache_read": 0.31, "cache_write": 1.25},
-    "gemini-2.5-flash": {"input": 0.15, "output": 0.6,  "cache_read": 0.04, "cache_write": 0.15},
+    "gemini-2.5-pro":   {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": 1.25,
+                         "tiers": [{"threshold": 200_001, "input": 2.5, "output": 15.0,
+                                    "cache_read": 0.25, "cache_write": 2.5}]},
+    "gemini-2.5-flash": {"input": 0.3,  "output": 2.5,  "cache_read": 0.03, "cache_write": 0.3},
+    # gemini-3-pro is no longer on Google's price list and not in the feed;
+    # left as it was until there is a source to check it against.
     "gemini-3-pro":     {"input": 2.5,  "output": 10.0, "cache_read": 0.62, "cache_write": 2.5},
-    "gemini-3-flash":   {"input": 0.2,  "output": 0.8,  "cache_read": 0.05, "cache_write": 0.2},
+    "gemini-3-flash":   {"input": 0.5,  "output": 3.0,  "cache_read": 0.05, "cache_write": 0.5},
 }
 
 

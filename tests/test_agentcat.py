@@ -5135,8 +5135,9 @@ class PricingTests(unittest.TestCase):
 
     def test_gpt_5_6_current_rates_aliases_and_long_context(self) -> None:
         expected = {
-            "gpt-5.6": (5.0, 30.0, 0.5, 6.25),
-            "gpt-5.6-sol": (5.0, 30.0, 0.5, 6.25),
+            # Sol: OpenAI's promotional rate through at least 2026-11-21.
+            "gpt-5.6": (4.0, 20.0, 0.4, 5.0),
+            "gpt-5.6-sol": (4.0, 20.0, 0.4, 5.0),
             "gpt-5.6-terra": (2.0, 12.0, 0.2, 2.5),
             "gpt-5.6-luna": (0.2, 1.2, 0.02, 0.25),
         }
@@ -5170,6 +5171,91 @@ class PricingTests(unittest.TestCase):
             (above["input"], above["output"], above["cache_read"], above["cache_write"]),
             (4.0, 18.0, 0.4, 5.0),
         )
+
+    # Official list prices per 1M tokens (input, output, cache read, cache
+    # write), checked on the providers' pricing pages on 2026-10-08. These are
+    # the rates a user sees whenever the LiteLLM cache is cold (issue #17).
+    OFFICIAL_LIST_PRICES = {
+        "claude-opus-4-5": (5.0, 25.0, 0.5, 6.25),
+        "claude-opus-4-6": (5.0, 25.0, 0.5, 6.25),
+        "claude-opus-4-7": (5.0, 25.0, 0.5, 6.25),
+        "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25),
+        "claude-sonnet-4-6": (3.0, 15.0, 0.3, 3.75),
+        "gpt-5.5": (5.0, 30.0, 0.5, 5.0),
+        "o3": (2.0, 8.0, 0.5, 2.0),
+        "o3-mini": (1.1, 4.4, 0.55, 1.1),
+        "o4-mini": (1.1, 4.4, 0.275, 1.1),
+        "gemini-2.5-pro": (1.25, 10.0, 0.125, 1.25),
+        "gemini-2.5-flash": (0.3, 2.5, 0.03, 0.3),
+        "gemini-3-flash-preview": (0.5, 3.0, 0.05, 0.5),
+    }
+
+    def test_cold_cache_uses_official_list_prices(self) -> None:
+        self.assertFalse(agentcat.pricing_cache_file().exists())
+        self.assertEqual(agentcat.merged_pricing_table()[1]["source"], "bundled")
+        for model, rates in self.OFFICIAL_LIST_PRICES.items():
+            with self.subTest(model=model):
+                cost = agentcat.estimate_cost(model, 1_000_000, 1_000_000, 1_000_000, 1_000_000)
+                self.assertEqual(
+                    tuple(round(cost[key], 6) for key in ("input", "output", "cache_read", "cache_write")),
+                    rates,
+                )
+        # Dated and suffixed ids resolve to the same rows.
+        self.assertEqual(agentcat.estimate_cost("claude-opus-4-7-20260415", 1_000_000, 0, 0, 0)["input"], 5.0)
+        self.assertEqual(agentcat.estimate_cost("claude-haiku-4-5-20251001", 0, 1_000_000, 0, 0)["output"], 5.0)
+        self.assertEqual(agentcat.estimate_cost("gpt-5.5-codex", 0, 1_000_000, 0, 0)["output"], 30.0)
+
+    def test_cold_cache_long_context_tiers(self) -> None:
+        def rates(model, context):
+            cost = agentcat.estimate_cost(model, 1_000_000, 1_000_000, 1_000_000, 1_000_000, context_tokens=context)
+            return tuple(round(cost[key], 6) for key in ("input", "output", "cache_read", "cache_write"))
+
+        self.assertEqual(rates("gpt-5.5", 272_000), (5.0, 30.0, 0.5, 5.0))
+        self.assertEqual(rates("gpt-5.5", 272_001), (10.0, 45.0, 1.0, 10.0))
+        self.assertEqual(rates("gemini-2.5-pro", 200_000), (1.25, 10.0, 0.125, 1.25))
+        self.assertEqual(rates("gemini-2.5-pro", 200_001), (2.5, 15.0, 0.25, 2.5))
+
+    def test_bundled_rows_match_checked_in_feed_snapshot(self) -> None:
+        """Fail when a bundled row drifts from the dated feed snapshot.
+
+        The fixture is a subset of the public LiteLLM feed whose rows were
+        checked against the providers' pricing pages. When prices change,
+        refresh the fixture and the bundled row together.
+        """
+        fixture = REPO_ROOT / "tests" / "fixtures" / "pricing" / "litellm-subset-2026-10-08.json"
+        feed = agentcat.litellm_price_table(json.loads(fixture.read_text(encoding="utf-8")))
+        feed_key = {"gemini-3-flash": "gemini-3-flash-preview"}
+        unchecked = {"gpt-5.5-mini", "gemini-3-pro"}  # not on any current price list
+        self.assertEqual(
+            set(agentcat.MODEL_PRICING) - unchecked,
+            {key for key in agentcat.MODEL_PRICING if feed_key.get(key, key) in feed},
+        )
+        for model, bundled in agentcat.MODEL_PRICING.items():
+            if model in unchecked:
+                continue
+            with self.subTest(model=model):
+                expected = feed[feed_key.get(model, model)]
+                for bucket in ("input", "output", "cache_read"):
+                    self.assertAlmostEqual(bundled[bucket], expected[bucket], places=6, msg=bucket)
+                self.assertAlmostEqual(
+                    bundled["cache_write"], expected.get("cache_write", expected["input"]), places=6,
+                )
+                for bundled_tier in bundled.get("tiers") or []:
+                    # The feed's "above_272k" threshold is 272_000; the bundled
+                    # rows use the first token past it.
+                    matches = [
+                        tier for tier in expected.get("tiers") or []
+                        if abs(tier["threshold"] - bundled_tier["threshold"]) <= 1
+                    ]
+                    self.assertEqual(len(matches), 1, bundled_tier)
+                    for bucket, value in matches[0].items():
+                        if bucket == "threshold":
+                            continue
+                        if bucket == "cache_write" and "cache_write" not in expected:
+                            # No write premium (Gemini): the bundled tier uses
+                            # its input rate, as the base row does.
+                            continue
+                        self.assertAlmostEqual(bundled_tier[bucket], value, places=6, msg=bucket)
 
     def test_cache_read_is_cheaper_than_input(self) -> None:
         cost = agentcat.estimate_cost(
