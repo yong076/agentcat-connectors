@@ -18316,6 +18316,25 @@ def _reopen_stderr(path: Path) -> None:
         os.close(fd)
 
 
+def ensure_daemon_stderr_appends(path: Optional[Path] = None) -> bool:
+    """Reopen fd 2 in append mode when it is the daemon log.
+
+    On Windows the installer hands the daemon an inherited handle with no
+    append semantics, so after the copy-truncate rotation the next write
+    lands at the old offset and the file fills with NUL bytes up to it.
+    An O_APPEND descriptor always writes at the current end. Harmless where
+    launchd already opened the file for appending.
+    """
+    log_path = path or daemon_err_log_path()
+    if not _fd_refers_to(2, log_path):
+        return False
+    try:
+        _reopen_stderr(log_path)
+    except OSError:
+        return False
+    return True
+
+
 def rotate_daemon_log(path: Optional[Path] = None, max_bytes: Optional[int] = None) -> bool:
     """Cap the daemon log at ``max_bytes`` plus one ``.1`` backup of the same size.
 
@@ -18378,6 +18397,7 @@ def run_daemon(args: argparse.Namespace) -> int:
     initialize_loopback_control()
     # Bound the launchd/installer stderr file before writing to it (#121).
     try:
+        ensure_daemon_stderr_appends()
         rotate_daemon_log()
     except Exception:
         pass

@@ -149,6 +149,52 @@ class DaemonLogHygieneTests(unittest.TestCase):
         self.assertIn("before 001999", backup)
         self.assertLessEqual(len(backup.encode()), 4096)
 
+    def _run_inherited_handle_child(self, reopen: bool) -> bytes:
+        # The Windows installer passes the daemon a handle opened without
+        # append semantics. After copy-truncate, a write through such a handle
+        # lands at the old offset and NUL-fills the gap.
+        script = textwrap.dedent(
+            f"""
+            import importlib.util, sys
+            from importlib.machinery import SourceFileLoader
+            from pathlib import Path
+            sys.path.insert(0, {str(REPO / "tests")!r})
+            from sandbox import redirect_module_paths
+            loader = SourceFileLoader("child_agentcat", {str(REPO / "bin" / "agentcat")!r})
+            spec = importlib.util.spec_from_loader("child_agentcat", loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            redirect_module_paths(module, Path({str(self.home)!r}), Path({str(self.state)!r}))
+            if {reopen!r}:
+                assert module.ensure_daemon_stderr_appends()
+            sys.stderr.write("x" * 4000 + "\\n")
+            sys.stderr.flush()
+            with module.daemon_err_log_path().open("r+b") as fh:
+                fh.truncate(0)
+            sys.stderr.write("after\\n")
+            sys.stderr.flush()
+            """
+        )
+        env = {key: value for key, value in os.environ.items() if not key.startswith(("AGENTCAT_", "CLAUDE_", "CODEX_"))}
+        env.update(HOME=str(self.home), AGENTCAT_HOME=str(self.state), USERPROFILE=str(self.home))
+        with self.log.open("wb") as stderr:  # no append mode, like the inherited handle
+            result = subprocess.run(
+                [sys.executable, "-c", script], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=stderr, env=env, timeout=60,
+            )
+        self.assertEqual(result.returncode, 0)
+        return self.log.read_bytes()
+
+    def test_stderr_reopened_for_append_survives_copy_truncate(self):
+        data = self._run_inherited_handle_child(reopen=True)
+        self.assertNotIn(b"\x00", data)
+        self.assertEqual(data.strip(), b"after")
+
+    @unittest.skipIf(os.name == "nt", "control case only; the fix is asserted above on every OS")
+    def test_without_reopen_the_truncated_log_fills_with_nul(self):
+        data = self._run_inherited_handle_child(reopen=False)
+        self.assertIn(b"\x00" * 100, data)
+
     def test_unreadable_file_warning_is_logged_once_with_home_relative_path(self):
         path = self.home / ".codex" / "sessions" / "rollout-a.jsonl"
         error = PermissionError(13, "Permission denied", str(path))
