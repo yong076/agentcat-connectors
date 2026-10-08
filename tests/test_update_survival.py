@@ -154,11 +154,6 @@ elif command == 'print':
         self.update_and_assert_survival(version)
 
     @unittest.skipUnless(os.environ.get("AGENTCAT_TEST_PREVIOUS_ARCHIVE"), "N-1 release fixture supplied by rehearsal CI step")
-    # Releases up to 26.40.5 cannot install on Windows with Python 3.9
-    # (Path.write_text(newline=)); 26.40.6 fixes it. Drop this skip once the
-    # previous release is 26.40.6 or newer.
-    @unittest.skipIf(os.name == "nt" and sys.version_info < (3, 10),
-                     "previous release cannot install on Windows Python 3.9")
     def test_previous_release_updates_to_working_tree(self):
         source, version = self.build_current()
         archive = Path(os.environ["AGENTCAT_TEST_PREVIOUS_ARCHIVE"])
