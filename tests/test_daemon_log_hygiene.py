@@ -4,7 +4,7 @@ agentcatd.err.log is launchd's StandardErrorPath and was never rotated (one Mac
 reached 703 MB of per-tick "cannot read <absolute path>" warnings). These tests
 pin the cap + single backup, the stderr reopen, the Windows copy-truncate
 fallback, once-per-file ~-relative warnings, the one-line bind error, and the
-launchd ThrottleInterval.
+LaunchAgent plist (no ThrottleInterval: it delays `kickstart -k`).
 """
 
 from __future__ import annotations
@@ -264,10 +264,13 @@ class DaemonLogHygieneTests(unittest.TestCase):
 
 
 class LaunchAgentPlistTests(unittest.TestCase):
-    def test_plist_throttles_keepalive_restarts(self):
+    def test_plist_keeps_default_restart_throttle(self):
+        # A ThrottleInterval above launchd's 10 s default makes the installer's
+        # `launchctl kickstart -k` wait that long, which overran the
+        # auto-update installer's 30 s budget on a real Mac (26.41.0).
         plist = plistlib.loads(install.plist_text().encode("utf-8"))
         self.assertIs(plist["KeepAlive"], True)
-        self.assertEqual(plist["ThrottleInterval"], 30)
+        self.assertNotIn("ThrottleInterval", plist)
         self.assertTrue(plist["StandardErrorPath"].endswith("agentcatd.err.log"))
 
 

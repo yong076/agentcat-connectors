@@ -18461,8 +18461,8 @@ def run_daemon(args: argparse.Namespace) -> int:
     try:
         server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
     except OSError as exc:
-        # One line, not a traceback: launchd restarts us (ThrottleInterval
-        # spaces the retries) and the usual cause is another agentcatd.
+        # One line, not a traceback: launchd restarts us (its 10 s default
+        # throttle spaces the retries) and the usual cause is another agentcatd.
         print(
             f"agentcatd cannot listen on {args.host}:{args.port}: "
             f"{exc.strerror or type(exc).__name__} (is another agentcatd running?)",
