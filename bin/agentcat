@@ -17226,6 +17226,39 @@ def local_http_origin_allowed(origin: Optional[str]) -> bool:
     )
 
 
+# First-party WebView origins. Tauri serves its UI from http(s)://tauri.localhost
+# on Windows and tauri://localhost on macOS/Linux. Such a page is cross-site to
+# 127.0.0.1 (so it carries Sec-Fetch-Site: cross-site), yet it is the Agent Cat
+# app itself. A web page cannot claim these origins: browsers set Origin and
+# scripts cannot override it. The shipped Windows app posts through its native
+# Rust proxy (no Origin); these entries keep a WebView fallback working.
+TRUSTED_APP_ORIGINS = frozenset({"http://tauri.localhost", "https://tauri.localhost", "tauri://localhost"})
+SAFE_FETCH_SITES = frozenset({"same-origin", "same-site", "none"})
+
+
+def mutating_request_origin_error(headers: Any) -> Optional[Tuple[int, str]]:
+    """Reject cross-site browser writes on every mutating route (CSRF guard).
+
+    Browsers attach Origin to every cross-origin POST/PATCH/DELETE (forms
+    included) and Sec-Fetch-Site to every request, so a request with neither
+    comes from a native client on this machine: the macOS app's URLSession,
+    the Windows app's Rust proxy, the CLI or curl. Those stay allowed.
+
+    Unlike ``key_mutation_request_error`` this does not require a JSON
+    Content-Type: the macOS app sends body-less POSTs without one
+    (``/reflect/enable``, ``/reflect/analyze/<id>``).
+    """
+    origin = headers.get("Origin")
+    if str(origin or "").strip().lower() in TRUSTED_APP_ORIGINS:
+        return None
+    fetch_site = str(headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if fetch_site and fetch_site not in SAFE_FETCH_SITES:
+        return 403, "cross_site_request"
+    if not local_http_origin_allowed(origin):
+        return 403, "foreign_origin"
+    return None
+
+
 def key_mutation_request_error(headers: Any) -> Optional[Tuple[int, str]]:
     """Reject simple/cross-site browser writes while preserving native loopback JSON."""
     content_type = str(headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -17263,6 +17296,15 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if host_header_allowed(self.headers.get("Host")):
             return True
         self.send_json(403, {"error": "forbidden", "message": "host_not_allowed"})
+        return False
+
+    def mutation_origin_ok(self) -> bool:
+        """Run the CSRF guard before any POST/PATCH/DELETE route is dispatched."""
+        guard_error = mutating_request_origin_error(self.headers)
+        if guard_error is None:
+            return True
+        status, reason = guard_error
+        self.send_json(status, {"error": "forbidden", "message": reason})
         return False
 
     def write_response_body(self, body: bytes) -> bool:
@@ -17472,6 +17514,8 @@ class AgentCatHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if not self.host_header_ok():
+            return
+        if not self.mutation_origin_ok():
             return
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/v1/connections/"):
@@ -17736,6 +17780,8 @@ class AgentCatHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         if not self.host_header_ok():
             return
+        if not self.mutation_origin_ok():
+            return
         path = urllib.parse.urlparse(self.path).path
         match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})", path)
         if not match:
@@ -17765,6 +17811,8 @@ class AgentCatHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         if not self.host_header_ok():
+            return
+        if not self.mutation_origin_ok():
             return
         path = urllib.parse.urlparse(self.path).path
         managed_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/([0-9a-f]{32})", path)
