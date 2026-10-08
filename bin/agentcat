@@ -251,7 +251,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.41.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.41.1")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -17714,8 +17714,26 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         if guard_error is None:
             return True
         status, reason = guard_error
+        self.discard_request_body()
         self.send_json(status, {"error": "forbidden", "message": reason})
         return False
+
+    def discard_request_body(self, max_bytes: int = 256 * 1024) -> None:
+        """Read a rejected request's small body before answering.
+
+        Closing with unread bytes makes Windows reset the connection
+        (WinError 10053), so the client may never see the 403. Oversized or
+        malformed lengths are left unread; that response may still be reset.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            return
+        if 0 < length <= max_bytes:
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
 
     def write_response_body(self, body: bytes) -> bool:
         try:
@@ -18461,8 +18479,8 @@ def run_daemon(args: argparse.Namespace) -> int:
     try:
         server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
     except OSError as exc:
-        # One line, not a traceback: launchd restarts us (ThrottleInterval
-        # spaces the retries) and the usual cause is another agentcatd.
+        # One line, not a traceback: launchd restarts us (its 10 s default
+        # throttle spaces the retries) and the usual cause is another agentcatd.
         print(
             f"agentcatd cannot listen on {args.host}:{args.port}: "
             f"{exc.strerror or type(exc).__name__} (is another agentcatd running?)",

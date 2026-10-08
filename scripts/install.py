@@ -24,9 +24,11 @@ CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 BIN_PATH = LOCAL_BIN / ("agentcat.cmd" if IS_WINDOWS else "agentcat")
 PLIST_PATH = HOME / "Library" / "LaunchAgents" / "com.trappist.agentcatd.plist"
 LABEL = "com.trappist.agentcatd"
-# KeepAlive restarts a daemon that exits (e.g. port 8765 already taken). Space
-# those restarts out instead of launchd's 10 s default crash loop.
-LAUNCHD_THROTTLE_SECONDS = 30
+# No ThrottleInterval: `launchctl kickstart -k` blocks until launchd respawns
+# the job, and launchd delays that respawn by ThrottleInterval. With 30 s the
+# install step took ~29 s and the auto-update installer's 30 s budget expired,
+# rolling every Mac back (real-Mac 26.41.0 verification, 2026-10-08). launchd's
+# 10 s default already spaces KeepAlive restarts after a bind failure.
 WINDOWS_TASK_NAME = "AgentCatD"
 WINDOWS_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOWS_RUN_VALUE = "AgentCatD"
@@ -258,8 +260,6 @@ def plist_text() -> str:
   <true/>
   <key>KeepAlive</key>
   <true/>
-  <key>ThrottleInterval</key>
-  <integer>{LAUNCHD_THROTTLE_SECONDS}</integer>
   <key>StandardOutPath</key>
   <string>{AGENTCAT_HOME}/agentcatd.out.log</string>
   <key>StandardErrorPath</key>
