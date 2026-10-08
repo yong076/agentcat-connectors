@@ -39,6 +39,10 @@ WINDOWS_LEGACY_STARTUP_SCRIPT = (
     / "Startup"
     / "AgentCatD.vbs"
 )
+# Hidden sign-in launcher (agent-cat-releases#46). Same path and contents the
+# Windows app writes when it repairs a visible launch, so the app finds nothing
+# to repair and its uninstaller deletes this file by name.
+WINDOWS_HIDDEN_LAUNCHER_NAME = "AgentCatD.vbs"
 GEMINI_TELEMETRY = AGENTCAT_HOME / "gemini" / "telemetry.log"
 ANTIGRAVITY_TELEMETRY = AGENTCAT_HOME / "gemini" / "antigravity-telemetry.log"
 CODEX_BEGIN = "# agentcat-connectors:begin"
@@ -329,8 +333,47 @@ def remove_legacy_windows_startup_script() -> None:
         log(f"removed legacy Windows startup script {WINDOWS_LEGACY_STARTUP_SCRIPT}")
 
 
+def windows_hidden_launcher_path() -> Path:
+    return AGENTCAT_HOME / WINDOWS_HIDDEN_LAUNCHER_NAME
+
+
+def windows_hidden_launcher_script(bin_path: Path) -> str:
+    """VBScript that starts `<agentcat.cmd> daemon` with window style 0.
+
+    A logon task or Run value that launches `cmd.exe` directly opens a console
+    window at every sign-in that stays open for the daemon's lifetime. WSH runs
+    the shim hidden, and the shim's py/python child inherits the hidden console.
+    """
+    return (
+        'Set shell = CreateObject("WScript.Shell")\r\n'
+        f'shell.Run """{bin_path}"" daemon", 0, False\r\n'
+    )
+
+
+def write_windows_hidden_launcher() -> Path:
+    path = windows_hidden_launcher_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # UTF-16 LE with BOM: Windows Script Host decodes it reliably, including
+    # a profile path with non-ASCII characters.
+    path.write_bytes(b"\xff\xfe" + windows_hidden_launcher_script(BIN_PATH).encode("utf-16-le"))
+    return path
+
+
+def windows_startup_command(launcher: str) -> str:
+    # //B suppresses WSH error dialogs (e.g. a missing shim) at sign-in.
+    return f'wscript.exe //B //NoLogo "{launcher}"'
+
+
+def remove_windows_hidden_launcher() -> None:
+    path = windows_hidden_launcher_path()
+    if path.exists():
+        path.unlink()
+        log(f"removed Windows startup launcher {path}")
+
+
 def load_windows_daemon() -> None:
-    task_command = f'cmd.exe /d /c ""{BIN_PATH}" daemon"'
+    launcher = write_windows_hidden_launcher()
+    task_command = windows_startup_command(str(launcher))
     result = run(
         [
             "schtasks.exe",
@@ -350,7 +393,8 @@ def load_windows_daemon() -> None:
     else:
         task_error = result.stderr.strip() or f"exit code {result.returncode}"
         log(f"Windows startup task registration failed: {task_error}")
-        run_command = f'cmd.exe /d /c ""{_windows_shim_path(BIN_PATH)}" daemon"'
+        # REG_EXPAND_SZ + %USERPROFILE% keeps the value ASCII for any username.
+        run_command = windows_startup_command(_windows_shim_path(launcher))
         fallback = run(
             [
                 "reg.exe",
@@ -383,6 +427,7 @@ def unload_windows_daemon() -> None:
     remove_windows_run_entry()
     stop_windows_daemon()
     remove_legacy_windows_startup_script()
+    remove_windows_hidden_launcher()
 
 
 def unload_launch_agent() -> None:
