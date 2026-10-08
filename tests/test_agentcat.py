@@ -5309,6 +5309,10 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(cost["total"], 73.5)
 
     def test_gpt_5_6_current_rates_aliases_and_long_context(self) -> None:
+        promo_day = agentcat.active_pricing_overrides(agentcat.dt.date(2026, 10, 8))
+        patcher = patch.object(agentcat, "active_pricing_overrides", return_value=promo_day)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         expected = {
             # Sol: OpenAI's promotional rate through at least 2026-11-21.
             "gpt-5.6": (4.0, 20.0, 0.4, 5.0),
@@ -5363,7 +5367,43 @@ class PricingTests(unittest.TestCase):
         "gemini-2.5-pro": (1.25, 10.0, 0.125, 1.25),
         "gemini-2.5-flash": (0.3, 2.5, 0.03, 0.3),
         "gemini-3-flash-preview": (0.5, 3.0, 0.05, 0.5),
+        "gemini-2.5-flash-lite": (0.1, 0.4, 0.01, 0.1),
+        "gpt-5-nano": (0.05, 0.4, 0.005, 0.05),
+        "gpt-5.4": (2.5, 15.0, 0.25, 2.5),
+        "gpt-5.4-mini": (0.75, 4.5, 0.075, 0.75),
+        "gpt-5.5-pro": (30.0, 180.0, 0.0, 30.0),
+        "o3-pro": (20.0, 80.0, 0.0, 20.0),
+        "claude-fable-5-1": (10.0, 50.0, 0.25, 12.5),
+        "claude-mythos-5-1": (10.0, 50.0, 0.25, 12.5),
     }
+
+    def test_variant_ids_never_borrow_the_base_row(self) -> None:
+        table = agentcat.MODEL_PRICING
+        # A point release or -pro/-nano/-lite/-mini variant is never priced as
+        # its base model; with no row of its own it is unknown (None).
+        for model in ("gpt-5.3", "gpt-5.7-codex", "gpt-5-pro", "o4-mini-pro", "gemini-2.5-pro-lite", "claude-haiku-4-5-nano"):
+            with self.subTest(model=model):
+                self.assertIsNone(agentcat._lookup_pricing(model, table))
+        # Ordinary suffixes still resolve to the base row.
+        self.assertIs(agentcat._lookup_pricing("gpt-5.5-codex", table), table["gpt-5.5"])
+        self.assertIs(agentcat._lookup_pricing("claude-opus-4-7-1m", table), table["claude-opus-4-7"])
+        self.assertIs(agentcat._lookup_pricing("o4-mini-high", table), table["o4-mini"])
+        self.assertIs(agentcat._lookup_pricing("gpt-5.4-mini-codex", table), table["gpt-5.4-mini"])
+        self.assertIs(agentcat._lookup_pricing("gemini-2.5-flash-lite-preview", table), table["gemini-2.5-flash-lite"])
+
+    def test_sol_promotion_ends_after_its_last_day(self) -> None:
+        during = agentcat.active_pricing_overrides(agentcat.dt.date(2026, 11, 21))
+        after = agentcat.active_pricing_overrides(agentcat.dt.date(2026, 11, 22))
+        self.assertEqual(during["gpt-5.6-sol"]["input"], 4.0)
+        self.assertEqual(during["gpt-5.6"]["output"], 20.0)
+        self.assertNotIn("gpt-5.6-sol", after)
+        self.assertIn("gpt-5.6-terra", after)
+        # After the promotion a cold cache falls back to the bundled list rate,
+        # and a warm feed is no longer overridden.
+        with patch.object(agentcat, "active_pricing_overrides", return_value=after):
+            agentcat._PRICING_TABLE_MEMO = None
+            self.assertEqual(agentcat.estimate_cost("gpt-5.6-sol", 1_000_000, 0, 0, 0)["input"], 5.0)
+        agentcat._PRICING_TABLE_MEMO = None
 
     def test_cold_cache_uses_official_list_prices(self) -> None:
         self.assertFalse(agentcat.pricing_cache_file().exists())
@@ -5401,36 +5441,39 @@ class PricingTests(unittest.TestCase):
         feed = agentcat.litellm_price_table(json.loads(fixture.read_text(encoding="utf-8")))
         feed_key = {"gemini-3-flash": "gemini-3-flash-preview"}
         unchecked = {"gpt-5.5-mini", "gemini-3-pro"}  # not on any current price list
+        # Sol's bundled row is the list rate; on the fixture's date OpenAI bills
+        # the promotional rate, which is what the feed carries.
+        rows = dict(agentcat.MODEL_PRICING)
+        rows.update(agentcat.active_pricing_overrides(agentcat.dt.date(2026, 10, 8)))
         self.assertEqual(
-            set(agentcat.MODEL_PRICING) - unchecked,
-            {key for key in agentcat.MODEL_PRICING if feed_key.get(key, key) in feed},
+            set(rows) - unchecked,
+            {key for key in rows if feed_key.get(key, key) in feed},
         )
-        for model, bundled in agentcat.MODEL_PRICING.items():
+        buckets = ("input", "output", "cache_read", "cache_write")
+        for model, bundled in rows.items():
             if model in unchecked:
                 continue
             with self.subTest(model=model):
                 expected = feed[feed_key.get(model, model)]
-                for bucket in ("input", "output", "cache_read"):
-                    self.assertAlmostEqual(bundled[bucket], expected[bucket], places=6, msg=bucket)
-                self.assertAlmostEqual(
-                    bundled["cache_write"], expected.get("cache_write", expected["input"]), places=6,
-                )
+                base = agentcat._tier_rates(bundled, None)
+                feed_base = agentcat._tier_rates(expected, None)
+                for bucket in buckets:
+                    self.assertAlmostEqual(base[bucket], feed_base[bucket], places=6, msg=bucket)
                 for bundled_tier in bundled.get("tiers") or []:
                     # The feed's "above_272k" threshold is 272_000; the bundled
                     # rows use the first token past it.
-                    matches = [
-                        tier for tier in expected.get("tiers") or []
-                        if abs(tier["threshold"] - bundled_tier["threshold"]) <= 1
-                    ]
-                    self.assertEqual(len(matches), 1, bundled_tier)
-                    for bucket, value in matches[0].items():
-                        if bucket == "threshold":
-                            continue
+                    self.assertTrue(any(
+                        abs(tier["threshold"] - bundled_tier["threshold"]) <= 1
+                        for tier in expected.get("tiers") or []
+                    ), bundled_tier)
+                    ours = agentcat._tier_rates(bundled, bundled_tier["threshold"])
+                    theirs = agentcat._tier_rates(expected, bundled_tier["threshold"])
+                    for bucket in buckets:
                         if bucket == "cache_write" and "cache_write" not in expected:
-                            # No write premium (Gemini): the bundled tier uses
-                            # its input rate, as the base row does.
+                            # No write premium (Gemini, OpenAI): the bundled
+                            # tier uses its input rate, as the base row does.
                             continue
-                        self.assertAlmostEqual(bundled_tier[bucket], value, places=6, msg=bucket)
+                        self.assertAlmostEqual(ours[bucket], theirs[bucket], places=6, msg=bucket)
 
     def test_cache_read_is_cheaper_than_input(self) -> None:
         cost = agentcat.estimate_cost(

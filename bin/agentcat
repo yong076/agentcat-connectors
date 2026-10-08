@@ -396,9 +396,22 @@ TOKEN_CLASS_KEYS = (
 # the input rate. tests/fixtures/pricing pins these rows. Estimates only —
 # never bill from these. Unknown models intentionally return None so the
 # caller emits a `pricing_missing` finding instead of silently guessing.
-# GPT-5.6 Sol: OpenAI's promotional rate, "available at least through
-# November 21, 2026". Re-check it then.
+# GPT-5.6 Sol: the list rate bundled since 26.31.0. OpenAI currently bills a
+# promotional rate (below), "available at least through November 21, 2026".
 _GPT_5_6_SOL_PRICING: Dict[str, Any] = {
+    "input": 5.0,
+    "output": 30.0,
+    "cache_read": 0.5,
+    "cache_write": 6.25,
+    "tiers": [{
+        "threshold": 272_001,
+        "input": 10.0,
+        "output": 45.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5,
+    }],
+}
+_GPT_5_6_SOL_PROMO_PRICING: Dict[str, Any] = {
     "input": 4.0,
     "output": 20.0,
     "cache_read": 0.4,
@@ -411,6 +424,7 @@ _GPT_5_6_SOL_PRICING: Dict[str, Any] = {
         "cache_write": 10.0,
     }],
 }
+GPT_5_6_SOL_PROMO_LAST_DAY = dt.date(2026, 11, 21)
 _GPT_5_6_TERRA_PRICING: Dict[str, Any] = {
     "input": 2.0,
     "output": 12.0,
@@ -442,23 +456,50 @@ _GPT_5_6_LUNA_PRICING: Dict[str, Any] = {
 # with a newer verified provider rate here and apply them after the feed.
 # `gpt-5.6` is OpenAI's alias for GPT-5.6 Sol.
 OFFICIAL_PRICING_OVERRIDES: Dict[str, Dict[str, Any]] = {
-    "gpt-5.6": _GPT_5_6_SOL_PRICING,
-    "gpt-5.6-sol": _GPT_5_6_SOL_PRICING,
     "gpt-5.6-terra": _GPT_5_6_TERRA_PRICING,
     "gpt-5.6-luna": _GPT_5_6_LUNA_PRICING,
 }
+# Time-boxed provider promotions: (last day, inclusive, UTC; rows). They win
+# over the feed only until that day; afterwards the feed, or the bundled list
+# rate when the feed is cold, applies again.
+PROMOTIONAL_PRICING_OVERRIDES: Tuple[Tuple[dt.date, Dict[str, Dict[str, Any]]], ...] = (
+    (GPT_5_6_SOL_PROMO_LAST_DAY, {
+        "gpt-5.6": _GPT_5_6_SOL_PROMO_PRICING,
+        "gpt-5.6-sol": _GPT_5_6_SOL_PROMO_PRICING,
+    }),
+)
+
+
+def active_pricing_overrides(today: Optional[dt.date] = None) -> Dict[str, Dict[str, Any]]:
+    day = today or dt.datetime.now(dt.timezone.utc).date()
+    overrides = dict(OFFICIAL_PRICING_OVERRIDES)
+    for last_day, rows in PROMOTIONAL_PRICING_OVERRIDES:
+        if day <= last_day:
+            overrides.update(rows)
+    return overrides
 
 MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # OpenAI / Codex
     "gpt-5":         {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": 1.25},
     "gpt-5-mini":    {"input": 0.25, "output": 2.0,  "cache_read": 0.025, "cache_write": 0.25},
+    "gpt-5-nano":    {"input": 0.05, "output": 0.4,  "cache_read": 0.005, "cache_write": 0.05},
+    "gpt-5.4":       {"input": 2.5,  "output": 15.0, "cache_read": 0.25,  "cache_write": 2.5,
+                      "tiers": [{"threshold": 272_001, "input": 5.0, "output": 22.5,
+                                 "cache_read": 0.5, "cache_write": 5.0}]},
+    "gpt-5.4-mini":  {"input": 0.75, "output": 4.5,  "cache_read": 0.075, "cache_write": 0.75},
     "gpt-5.5":       {"input": 5.0,  "output": 30.0, "cache_read": 0.5,   "cache_write": 5.0,
                       "tiers": [{"threshold": 272_001, "input": 10.0, "output": 45.0,
                                  "cache_read": 1.0, "cache_write": 10.0}]},
+    # Pro models offer no cached-input rate (cache_read 0, writes at input).
+    "gpt-5.5-pro":   {"input": 30.0, "output": 180.0,
+                      "tiers": [{"threshold": 272_001, "input": 60.0, "output": 270.0}]},
     # Not on OpenAI's current price list; unverified, left unchanged.
     "gpt-5.5-mini":  {"input": 0.3,  "output": 2.4,  "cache_read": 0.03,  "cache_write": 0.3},
+    "gpt-5.6":       _GPT_5_6_SOL_PRICING,
+    "gpt-5.6-sol":   _GPT_5_6_SOL_PRICING,
     **OFFICIAL_PRICING_OVERRIDES,
     "o3":            {"input": 2.0,  "output": 8.0,  "cache_read": 0.5,   "cache_write": 2.0},
+    "o3-pro":        {"input": 20.0, "output": 80.0},
     "o3-mini":       {"input": 1.1,  "output": 4.4,  "cache_read": 0.55,  "cache_write": 1.1},
     "o4-mini":       {"input": 1.1,  "output": 4.4,  "cache_read": 0.275, "cache_write": 1.1},
     # Anthropic / Claude
@@ -469,6 +510,9 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # discount ($1/M). LiteLLM's combined cache-write fallback is $12.50/M.
     "claude-fable-5":    {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
     "claude-mythos-5":   {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
+    # 5.1 reads its cache at 0.025x input.
+    "claude-fable-5-1":  {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
+    "claude-mythos-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
     "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
     "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
     "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0,  "cache_read": 0.1,  "cache_write": 1.25},
@@ -477,11 +521,15 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
                          "tiers": [{"threshold": 200_001, "input": 2.5, "output": 15.0,
                                     "cache_read": 0.25, "cache_write": 2.5}]},
     "gemini-2.5-flash": {"input": 0.3,  "output": 2.5,  "cache_read": 0.03, "cache_write": 0.3},
+    "gemini-2.5-flash-lite": {"input": 0.1, "output": 0.4, "cache_read": 0.01, "cache_write": 0.1},
     # gemini-3-pro is no longer on Google's price list and not in the feed;
     # left as it was until there is a source to check it against.
     "gemini-3-pro":     {"input": 2.5,  "output": 10.0, "cache_read": 0.62, "cache_write": 2.5},
     "gemini-3-flash":   {"input": 0.5,  "output": 3.0,  "cache_read": 0.05, "cache_write": 0.5},
 }
+
+
+_PRICING_VARIANT_SUFFIX_RE = re.compile(r"^(?:\.\d|-(?:pro|nano|lite|mini)(?:$|[-.]))")
 
 
 def _lookup_pricing(
@@ -518,6 +566,10 @@ def _lookup_pricing(
         # end of the string (audit #13).
         rest = trimmed[len(key):]
         if rest and rest[0] not in "-.":
+            continue
+        # A point release or a tier variant is a different price, never the
+        # base row: gpt-5 must not price gpt-5.4, gpt-5-nano or o3-pro.
+        if _PRICING_VARIANT_SUFFIX_RE.match(rest):
             continue
         if best_key is None or len(key) > len(best_key):
             best_key = key
@@ -625,7 +677,7 @@ _LITELLM_TIER_KEY_RE = re.compile(
     r"cache_creation_input_token_cost)_above_(\d+)k_tokens$"
 )
 _PRICING_TABLE_LOCK = threading.Lock()
-_PRICING_TABLE_MEMO: Optional[Tuple[Tuple[str, Optional[int], Optional[int]], Dict[str, Dict[str, Any]], Dict[str, Any]]] = None
+_PRICING_TABLE_MEMO: Optional[Tuple[Tuple[Any, ...], Dict[str, Dict[str, Any]], Dict[str, Any]]] = None
 
 
 def pricing_cache_file() -> Path:
@@ -755,11 +807,14 @@ def merged_pricing_table() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """
     global _PRICING_TABLE_MEMO
     path = pricing_cache_file()
+    overrides = active_pricing_overrides()
+    # The active override set changes when a promotion ends.
+    override_key = tuple(sorted((name, id(row)) for name, row in overrides.items()))
     try:
         stat = path.stat()
-        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        key = (str(path), stat.st_mtime_ns, stat.st_size, override_key)
     except OSError:
-        key = (str(path), None, None)
+        key = (str(path), None, None, override_key)
     with _PRICING_TABLE_LOCK:
         memo = _PRICING_TABLE_MEMO
     if memo is not None and memo[0] == key:
@@ -771,7 +826,7 @@ def merged_pricing_table() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
         meta = {"source": "litellm", "fetchedAt": cache.get("fetchedAt")}
     else:
         meta = {"source": "bundled", "fetchedAt": None}
-    table.update(OFFICIAL_PRICING_OVERRIDES)
+    table.update(overrides)
     with _PRICING_TABLE_LOCK:
         _PRICING_TABLE_MEMO = (key, table, meta)
     return table, meta
