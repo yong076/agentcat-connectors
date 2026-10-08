@@ -24,6 +24,9 @@ CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 BIN_PATH = LOCAL_BIN / ("agentcat.cmd" if IS_WINDOWS else "agentcat")
 PLIST_PATH = HOME / "Library" / "LaunchAgents" / "com.trappist.agentcatd.plist"
 LABEL = "com.trappist.agentcatd"
+# KeepAlive restarts a daemon that exits (e.g. port 8765 already taken). Space
+# those restarts out instead of launchd's 10 s default crash loop.
+LAUNCHD_THROTTLE_SECONDS = 30
 WINDOWS_TASK_NAME = "AgentCatD"
 WINDOWS_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOWS_RUN_VALUE = "AgentCatD"
@@ -251,6 +254,8 @@ def plist_text() -> str:
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>{LAUNCHD_THROTTLE_SECONDS}</integer>
   <key>StandardOutPath</key>
   <string>{AGENTCAT_HOME}/agentcatd.out.log</string>
   <key>StandardErrorPath</key>

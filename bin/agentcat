@@ -782,9 +782,9 @@ def pricing_refresh_loop(interval_seconds: float, initial_delay_seconds: float) 
         try:
             state = refresh_litellm_pricing()
             if state.get("status") == "error":
-                print(f"agentcatd pricing refresh failed: {state.get('error')}", file=sys.stderr, flush=True)
+                print(f"agentcatd pricing refresh failed: {_tilde_text(str(state.get('error')))}", file=sys.stderr, flush=True)
         except Exception as exc:
-            print(f"agentcatd pricing loop failed: {exc}", file=sys.stderr, flush=True)
+            print(f"agentcatd pricing loop failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
         time.sleep(max(60.0, interval_seconds))
 
 
@@ -8972,7 +8972,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
                                 if last_dt is None or when > last_dt:
                                     proj["last_active"] = when.isoformat().replace("+00:00", "Z")
         except OSError as exc:
-            logging.warning("codex_sessions_snapshot: cannot read %s: %s", path_str, exc)
+            warn_unreadable_path("codex_sessions_snapshot", path, exc)
             continue
 
         changed = True
@@ -10263,7 +10263,7 @@ def rebuild_claude_journal_projects(now: "dt.datetime") -> Dict[str, Dict[str, A
                         if rec:
                             _apply_record_to_totals(scratch_totals, rec, now, projects)
             except OSError as exc:
-                logging.warning("rebuild_claude_journal_projects: cannot read %s: %s", str(path), exc)
+                warn_unreadable_path("rebuild_claude_journal_projects", path, exc)
                 continue
     return projects
 
@@ -10368,7 +10368,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                             )
                             lines_parsed += 1
             except OSError as exc:
-                logging.warning("scan_claude_journal: cannot read %s: %s", path_str, exc)
+                warn_unreadable_path("scan_claude_journal", path, exc)
                 continue
             if offsets.get(path_str) != new_offset:
                 changed = True
@@ -10653,7 +10653,7 @@ def _claude_journal_file_tokens(path: Path) -> Optional[int]:
         added, new_offset, tail = _read_claude_journal_tokens(path, offset)
     except OSError as exc:
         _CLAUDE_SOURCE_FILE_MEMO.pop(key, None)
-        logging.warning("claude_usage_by_source: cannot read %s: %s", str(path), exc)
+        warn_unreadable_path("claude_usage_by_source", path, exc)
         return None
     committed += added
     _CLAUDE_SOURCE_FILE_MEMO[key] = (stat.st_size, stat.st_mtime_ns, new_offset, committed, tail)
@@ -12888,9 +12888,9 @@ def auto_update_loop(interval_seconds: float, initial_delay_seconds: float) -> N
             if state.get("status") == "update_started":
                 print(state.get("message", "agentcatd update started"), file=sys.stderr, flush=True)
             elif state.get("status") == "error":
-                print(f"agentcatd update check failed: {state.get('error')}", file=sys.stderr, flush=True)
+                print(f"agentcatd update check failed: {_tilde_text(str(state.get('error')))}", file=sys.stderr, flush=True)
         except Exception as exc:
-            print(f"agentcatd update loop failed: {exc}", file=sys.stderr, flush=True)
+            print(f"agentcatd update loop failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
         time.sleep(max(60.0, interval_seconds))
 
 
@@ -13595,7 +13595,7 @@ def snapshot_refresh_loop(interval_seconds: float) -> None:
         try:
             build_snapshot()
         except Exception as exc:
-            print(f"agentcatd snapshot refresh failed: {exc}", file=sys.stderr, flush=True)
+            print(f"agentcatd snapshot refresh failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
 
 
 # Managed Codex quota is only as fresh as its last app-server probe. It used
@@ -17951,12 +17951,150 @@ def resolve_bind_host(host: Optional[str]) -> str:
     return "127.0.0.1"
 
 
+# --- Daemon log hygiene -------------------------------------------------------
+# launchd's StandardErrorPath (and the Windows installer) points the daemon's
+# stderr at ~/.agentcat/agentcatd.err.log and nothing rotated it: one Mac had
+# 703 MB, almost all per-tick "cannot read <absolute path>" warnings. The log is
+# now capped at DAEMON_LOG_MAX_BYTES plus one ".1" backup of the same size, and
+# repeated per-file warnings are logged once with ~-relative paths.
+DAEMON_ERR_LOG_NAME = "agentcatd.err.log"
+DAEMON_LOG_MAX_BYTES = int(os.environ.get("AGENTCAT_DAEMON_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+DAEMON_LOG_ROTATE_INTERVAL_SECONDS = 300.0
+_UNREADABLE_WARNED: Set[Tuple[str, str, str]] = set()
+_UNREADABLE_WARNED_LOCK = threading.Lock()
+_UNREADABLE_WARNED_MAX = 2048
+
+
+def daemon_err_log_path() -> Path:
+    return AGENTCAT_HOME / DAEMON_ERR_LOG_NAME
+
+
+def _tilde_text(text: str) -> str:
+    """Collapse $HOME to ~ inside free text such as an exception message."""
+    home = str(HOME)
+    if not home or home == "/":
+        return text
+    return re.sub(re.escape(home) + r"(?=[/\\\s'\":]|$)", "~", text)
+
+
+def log_safe_error(exc: BaseException) -> str:
+    return _tilde_text(str(exc))
+
+
+def warn_unreadable_path(context: str, path: Any, exc: BaseException) -> None:
+    """Log that a usage file could not be read, once per file and reason.
+
+    These readers run on every 60 s tick for every file, so an unreadable
+    file used to add a line per tick forever. The path is ~-relative and the
+    reason is the OS error text without the filename.
+    """
+    reason = getattr(exc, "strerror", None) or type(exc).__name__
+    key = (context, str(path), str(reason))
+    with _UNREADABLE_WARNED_LOCK:
+        if key in _UNREADABLE_WARNED or len(_UNREADABLE_WARNED) >= _UNREADABLE_WARNED_MAX:
+            return
+        _UNREADABLE_WARNED.add(key)
+    logging.warning("%s: cannot read %s: %s", context, _tilde(path), reason)
+
+
+def _fd_refers_to(fd: int, path: Path) -> bool:
+    try:
+        fd_stat = os.fstat(fd)
+        path_stat = path.stat()
+    except OSError:
+        return False
+    return bool(path_stat.st_ino) and (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino)
+
+
+def _copy_log_tail(source: Path, target: Path, max_bytes: int) -> None:
+    """Write the last ``max_bytes`` of ``source`` (from a line start) to ``target``."""
+    size = source.stat().st_size
+    tmp = unique_atomic_tmp_path(target)
+    with source.open("rb") as src, tmp.open("wb") as dst:
+        if size > max_bytes:
+            src.seek(size - max_bytes)
+            src.readline()  # drop the partial first line
+        shutil.copyfileobj(src, dst)
+    os.replace(tmp, target)
+
+
+def _reopen_stderr(path: Path) -> None:
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.dup2(fd, 2)
+    finally:
+        os.close(fd)
+
+
+def rotate_daemon_log(path: Optional[Path] = None, max_bytes: Optional[int] = None) -> bool:
+    """Cap the daemon log at ``max_bytes`` plus one ``.1`` backup of the same size.
+
+    When the daemon's own stderr is this file (launchd), the file is renamed
+    to ``.1`` and stderr is reopened onto a fresh file, so no line is lost or
+    written into a hole. Where the rename fails (Windows locks open files),
+    the tail is copied to ``.1`` and the file is truncated in place.
+    """
+    path = path or daemon_err_log_path()
+    limit = DAEMON_LOG_MAX_BYTES if max_bytes is None else int(max_bytes)
+    if limit <= 0:
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= limit:
+        return False
+    backup = path.with_name(path.name + ".1")
+    stderr_is_log = _fd_refers_to(2, path)
+    try:
+        os.replace(path, backup)
+    except OSError:
+        try:
+            _copy_log_tail(path, backup, limit)
+            with path.open("r+b") as fh:
+                fh.truncate(0)
+        except OSError as exc:
+            logging.warning("agentcatd: could not rotate %s: %s", _tilde(path), type(exc).__name__)
+            return False
+    else:
+        if stderr_is_log:
+            try:
+                _reopen_stderr(path)
+            except OSError:
+                pass
+        try:
+            # The first rotation of an old, unbounded log keeps only its tail.
+            _copy_log_tail(backup, backup, limit)
+        except OSError:
+            pass
+    logging.info("agentcatd: rotated %s at %d MB", _tilde(path), size // (1024 * 1024))
+    return True
+
+
+def daemon_log_rotation_loop(interval_seconds: float = DAEMON_LOG_ROTATE_INTERVAL_SECONDS) -> None:
+    while True:
+        time.sleep(max(1.0, interval_seconds))
+        try:
+            rotate_daemon_log()
+        except Exception as exc:  # noqa: BLE001 — log hygiene must never stop the daemon
+            print(f"agentcatd log rotation failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+
+
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
     # Connection clients read this file before their first authenticated request.
     # Creating it only inside the request guard makes a fresh install unable to
     # issue that request at all.
     initialize_loopback_control()
+    # Bound the launchd/installer stderr file before writing to it (#121).
+    try:
+        rotate_daemon_log()
+    except Exception:
+        pass
     # Give the long-running daemon a real, leveled log so failures (keychain
     # denials, provider parse errors) leave a diagnosable trail in the launchd
     # stderr file instead of vanishing. Reason codes + ~-relative paths only —
@@ -17975,14 +18113,25 @@ def run_daemon(args: argparse.Namespace) -> int:
     # snapshot_for_http() already serves the cached latest-snapshot.json, we bind first
     # and move the initial build into the background: returning users see their last
     # snapshot instantly while it refreshes underneath them.
-    server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
+    except OSError as exc:
+        # One line, not a traceback: launchd restarts us (ThrottleInterval
+        # spaces the retries) and the usual cause is another agentcatd.
+        print(
+            f"agentcatd cannot listen on {args.host}:{args.port}: "
+            f"{exc.strerror or type(exc).__name__} (is another agentcatd running?)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
 
     def _initial_build_then_refresh() -> None:
         try:
             build_snapshot()
         except Exception as exc:
-            print(f"agentcatd initial snapshot build failed: {exc}", file=sys.stderr, flush=True)
+            print(f"agentcatd initial snapshot build failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
         snapshot_refresh_loop(60.0)
 
     threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
@@ -18013,6 +18162,7 @@ def run_daemon(args: argparse.Namespace) -> int:
     # loop re-reads it every tick, so flipping the file to true needs no restart.
     reflect_write_default_config()
     threading.Thread(target=reflect_scheduler_loop, args=(60.0,), daemon=True).start()
+    threading.Thread(target=daemon_log_rotation_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
