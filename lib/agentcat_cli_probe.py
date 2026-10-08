@@ -153,6 +153,31 @@ def _result(provider: str, home: Path, **fields: Any) -> Dict[str, Any]:
     return row
 
 
+def claude_api_billing_mode(home: Path) -> Optional[str]:
+    """Detect API billing from the daemon environment or this home's settings.
+
+    Return only the billing mode; credential values never enter probe results.
+    """
+    def from_env(source: Dict[str, Any]) -> Optional[str]:
+        if str(source.get("CLAUDE_CODE_USE_BEDROCK") or "").strip() not in ("", "0", "false"):
+            return "bedrock"
+        if str(source.get("CLAUDE_CODE_USE_VERTEX") or "").strip() not in ("", "0", "false"):
+            return "vertex"
+        if source.get("ANTHROPIC_API_KEY") or source.get("ANTHROPIC_AUTH_TOKEN"):
+            return "api_key"
+        return None
+
+    mode = from_env(dict(os.environ))
+    if mode:
+        return mode
+    try:
+        settings = json.loads((home / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    env_block = settings.get("env") if isinstance(settings, dict) else None
+    return from_env(env_block) if isinstance(env_block, dict) else None
+
+
 def probe_claude_home(
     home: Path,
     default_home: Path,
@@ -162,6 +187,10 @@ def probe_claude_home(
     token_reader: Optional[Callable[[Path, Path], Optional[str]]] = None,
 ) -> Dict[str, Any]:
     identity = claude_identity(home, default_home)
+    billing_mode = claude_api_billing_mode(home)
+    if billing_mode:
+        return _result("claude", home, status="not_configured", reason="api_billing",
+                       billingMode=billing_mode, **identity)
     if not executable:
         return _result("claude", home, status="error", reason="cli_not_found", **identity)
     env = dict(os.environ)

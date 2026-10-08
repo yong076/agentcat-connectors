@@ -3539,9 +3539,9 @@ def configured_limits() -> Dict[str, Dict[str, Any]]:
     return base
 
 
-def latest_event_payload(provider: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def latest_event_record(provider: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
     init_db()
-    query = "select payload_json from events where provider = ?"
+    query = "select payload_json, ts from events where provider = ?"
     params: List[Any] = [provider]
     if source:
         query += " and source = ?"
@@ -3558,7 +3558,7 @@ def latest_event_payload(provider: str, source: Optional[str] = None) -> Optiona
         payload = json.loads(str(row[0]))
     except json.JSONDecodeError:
         return None
-    return payload if isinstance(payload, dict) else None
+    return {"payload": payload, "timestamp": row[1]} if isinstance(payload, dict) else None
 
 
 def codex_runtime_limits() -> Dict[str, Any]:
@@ -3640,12 +3640,21 @@ def codex_runtime_limits() -> Dict[str, Any]:
 
 
 def claude_runtime_limits() -> Dict[str, Any]:
-    payload = latest_event_payload("claude", "claude-statusline")
-    if not payload:
+    record = latest_event_record("claude", "claude-statusline")
+    if not record:
         return empty_limits()
+    payload = record["payload"]
 
     limits = empty_limits(status="auto")
     limits["source"] = "claude-statusline"
+    # Use the collector's event timestamp, never a timestamp supplied by the
+    # statusline payload. Keep old values visible only with honest freshness.
+    observed = parse_timestamp(record["timestamp"])
+    age = time.time() - observed.timestamp() if observed is not None else None
+    limits["updatedAt"] = iso_from_timestamp(observed.timestamp()) if observed is not None else None
+    limits["stale"] = age is None or not 0 <= age <= LIVE_LIMITS_MAX_AGE_SECONDS
+    if limits["stale"]:
+        limits["reason"] = "statusline_stale"
     quotas: List[Dict[str, Any]] = []
 
     context_window = payload.get("context_window")
@@ -5394,23 +5403,7 @@ def claude_api_billing_mode() -> Optional[str]:
     invisible to it. Claude Code's own ``settings.json`` env block is checked
     too, which is where a persistent setup actually lives.
     """
-    def _from_env(source: Dict[str, Any]) -> Optional[str]:
-        if str(source.get("CLAUDE_CODE_USE_BEDROCK") or "").strip() not in ("", "0", "false"):
-            return "bedrock"
-        if str(source.get("CLAUDE_CODE_USE_VERTEX") or "").strip() not in ("", "0", "false"):
-            return "vertex"
-        if source.get("ANTHROPIC_API_KEY") or source.get("ANTHROPIC_AUTH_TOKEN"):
-            return "api_key"
-        return None
-
-    mode = _from_env(dict(os.environ))
-    if mode:
-        return mode
-    settings = read_json(claude_config_dir() / "settings.json")
-    env_block = settings.get("env") if isinstance(settings, dict) else None
-    if isinstance(env_block, dict):
-        return _from_env(env_block)
-    return None
+    return cli_probe.claude_api_billing_mode(claude_config_dir())
 
 
 def read_claude_oauth_credentials() -> Dict[str, Any]:

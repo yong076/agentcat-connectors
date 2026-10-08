@@ -107,6 +107,44 @@ class ClaudeProbeTests(unittest.TestCase):
         self.assertEqual(row["status"], "ok")
         self.assertNotIn(str(other), json.dumps(row))
 
+    def test_api_billing_rows_skip_cli_and_token_reads(self):
+        cases = (("ANTHROPIC_API_KEY", "fixture-key", "api_key"),
+                 ("ANTHROPIC_AUTH_TOKEN", "fixture-token", "api_key"),
+                 ("CLAUDE_CODE_USE_BEDROCK", "1", "bedrock"),
+                 ("CLAUDE_CODE_USE_VERTEX", "1", "vertex"))
+        for setting, value, mode in cases:
+            for source in ("environment", "settings"):
+                with self.subTest(setting=setting, source=source), tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    env = {setting: value} if source == "environment" else {}
+                    if source == "settings":
+                        (home / "settings.json").write_text(json.dumps({"env": {setting: value}}))
+                    with patch.dict(cli_probe.os.environ, env, clear=True), \
+                         patch.object(cli_probe, "claude_access_token", side_effect=AssertionError("no token read")), \
+                         patch.object(cli_probe, "fetch_claude_passes", side_effect=AssertionError("no network")):
+                        row = cli_probe.probe_claude_home(home, home, "/bin/claude",
+                            run=lambda *a, **kw: self.fail("API billing must not launch Claude"))
+                    self.assertEqual((row["status"], row["reason"]), ("not_configured", "api_billing"))
+                    self.assertEqual(row["billingMode"], mode)
+                    self.assertEqual(row["windows"], [])
+                    self.assertNotIn("fixture-key", json.dumps(row))
+                    self.assertNotIn("fixture-token", json.dumps(row))
+
+    def test_subscription_probe_does_not_borrow_default_home_billing_settings(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(cli_probe.os.environ, {}, clear=True):
+            default, other = Path(tmp) / "default", Path(tmp) / "other"
+            default.mkdir()
+            other.mkdir()
+            (default / "settings.json").write_text(json.dumps({"env": {"ANTHROPIC_API_KEY": "fixture-key"}}))
+            (other / "settings.json").write_text(json.dumps({"env": {
+                "CLAUDE_CODE_USE_BEDROCK": "0", "CLAUDE_CODE_USE_VERTEX": "false"}}))
+            row = cli_probe.probe_claude_home(other, default, "/bin/claude",
+                run=lambda args, **kw: subprocess.CompletedProcess(args, 0, stdout=USAGE_TEXT),
+                token_reader=lambda *_: None)
+        self.assertEqual(row["status"], "ok")
+        self.assertIsNone(row["reason"])
+        self.assertTrue(row["windows"])
+
     def test_timeout_is_an_error_row_not_an_exception(self):
         def run(args, **kwargs):
             raise subprocess.TimeoutExpired(args, 60)

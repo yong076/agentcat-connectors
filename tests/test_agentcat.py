@@ -4710,10 +4710,50 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["shortWindowMinutes"], 300)
         self.assertEqual(limits["weeklyUsedPercent"], 10.0)
         self.assertEqual(limits["weeklyResetAt"], 1770000400)
+        self.assertFalse(limits["stale"])
+        self.assertIsNotNone(limits["updatedAt"])
         self.assertEqual([quota["id"] for quota in limits["quotas"]], ["claude:five_hour", "claude:seven_day", "claude:session"])
         self.assertEqual(limits["quotas"][0]["remainingPercent"], 96.0)
         self.assertEqual(limits["quotas"][1]["remainingPercent"], 90.0)
         self.assertEqual(limits["quotas"][2]["limit"], 1000000.0)
+
+    def test_claude_statusline_freshness_uses_event_age_at_cutoff(self) -> None:
+        captured = 1791400000
+        with patch.object(agentcat.time, "time", return_value=captured):
+            agentcat.store_event("claude", "claude-statusline", "statusline", {
+                "timestamp": captured + 86400,
+                "rate_limits": {"five_hour": {"used_percentage": 42}},
+            })
+        for age, stale in ((0, False), (agentcat.LIVE_LIMITS_MAX_AGE_SECONDS, False),
+                           (agentcat.LIVE_LIMITS_MAX_AGE_SECONDS + 1, True),
+                           (90 * 86400, True), (-60, True)):
+            with self.subTest(age=age), patch.object(agentcat.time, "time", return_value=captured + age):
+                limits = agentcat.claude_runtime_limits()
+                self.assertEqual(limits["updatedAt"], agentcat.iso_from_timestamp(captured))
+                self.assertEqual(limits["stale"], stale)
+                self.assertEqual(limits["shortUsedPercent"], 42)
+                if stale:
+                    self.assertEqual(limits["reason"], "statusline_stale")
+                else:
+                    self.assertNotIn("reason", limits)
+                fallback = agentcat.prefer_live_limits(agentcat.empty_limits("error", "offline"), limits)
+                self.assertEqual(fallback["stale"], stale)
+                self.assertEqual(fallback["updatedAt"], limits["updatedAt"])
+        live = agentcat.empty_limits("auto")
+        live.update(shortUsedPercent=5, stale=False)
+        self.assertEqual(agentcat.prefer_live_limits(live, limits)["shortUsedPercent"], 5)
+        self.assertFalse(agentcat.prefer_live_limits(live, limits)["stale"])
+
+    def test_claude_statusline_invalid_event_timestamp_is_stale(self) -> None:
+        agentcat.store_event("claude", "claude-statusline", "statusline", {
+            "rate_limits": {"five_hour": {"used_percentage": 42}},
+        })
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as connection:
+            connection.execute("update events set ts = 'invalid' where source = 'claude-statusline'")
+            connection.commit()
+        limits = agentcat.claude_runtime_limits()
+        self.assertTrue(limits["stale"])
+        self.assertIsNone(limits["updatedAt"])
 
     def test_sanitize_payload_redacts_content_but_keeps_limit_metadata(self) -> None:
         sanitized = agentcat.sanitize_payload(
