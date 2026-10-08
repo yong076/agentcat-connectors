@@ -10508,6 +10508,25 @@ def _classify_claude_journal_root(root: Path) -> str:
     return "cli"
 
 
+# Desktop session index memo: path -> (size, mtime_ns, cliSessionId or None).
+# Only index files whose size or mtime changed are re-parsed on a tick.
+_CLAUDE_DESKTOP_SESSION_LOCK = threading.Lock()
+_CLAUDE_DESKTOP_SESSION_MEMO: Dict[str, Tuple[int, int, Optional[str]]] = {}
+
+
+def _claude_desktop_session_id_from_file(path: Path) -> Optional[str]:
+    """Read one desktop ``claude-code-sessions`` index file's ``cliSessionId``."""
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(obj, dict):
+        sid = obj.get("cliSessionId")
+        if isinstance(sid, str) and sid:
+            return sid
+    return None
+
+
 def _desktop_originated_claude_session_ids() -> Set[str]:
     """Session ids of Claude Code runs launched from the Claude desktop app.
 
@@ -10517,110 +10536,155 @@ def _desktop_originated_claude_session_ids() -> Set[str]:
     ``<app-support>/claude-code-sessions/**/*.json`` with a ``cliSessionId`` that
     equals the journal filename stem, letting us reattribute those journals to
     the desktop ("app") surface. Defensive against unreadable/partial indexes.
+
+    The index grows with every desktop session and this runs on each snapshot
+    tick, so files are memoized on (size, mtime_ns): a tick only stats them and
+    re-parses the ones that changed.
     """
     ids: Set[str] = set()
-    for data_root in desktop_app_data_roots("claude"):
-        sessions_dir = data_root / "claude-code-sessions"
-        try:
-            paths = sessions_dir.rglob("*.json")
-        except OSError:
-            continue
-        for path in paths:
+    seen: Set[str] = set()
+    with _CLAUDE_DESKTOP_SESSION_LOCK:
+        for data_root in desktop_app_data_roots("claude"):
+            sessions_dir = data_root / "claude-code-sessions"
             try:
-                obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-            except (OSError, json.JSONDecodeError, ValueError):
+                paths = list(sessions_dir.rglob("*.json"))
+            except OSError:
                 continue
-            if isinstance(obj, dict):
-                sid = obj.get("cliSessionId")
-                if isinstance(sid, str) and sid:
+            for path in paths:
+                key = str(path)
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                seen.add(key)
+                memo = _CLAUDE_DESKTOP_SESSION_MEMO.get(key)
+                if memo is not None and memo[0] == stat.st_size and memo[1] == stat.st_mtime_ns:
+                    sid = memo[2]
+                else:
+                    sid = _claude_desktop_session_id_from_file(path)
+                    _CLAUDE_DESKTOP_SESSION_MEMO[key] = (stat.st_size, stat.st_mtime_ns, sid)
+                if sid:
                     ids.add(sid)
+        for key in [key for key in _CLAUDE_DESKTOP_SESSION_MEMO if key not in seen]:
+            del _CLAUDE_DESKTOP_SESSION_MEMO[key]
     return ids
 
 
+# Per-journal memo for the CLI/desktop split:
+# path -> (size, mtime_ns, offset, committed_tokens, tail_tokens).
+# ``offset`` is the byte just past the last newline-terminated line folded into
+# ``committed_tokens``; ``tail_tokens`` counts an unterminated final line, which
+# is re-read (not double counted) once the writer finishes it.
 _CLAUDE_USAGE_BY_SOURCE_LOCK = threading.Lock()
-_CLAUDE_USAGE_BY_SOURCE_KEY: Optional[Tuple] = None
-_CLAUDE_USAGE_BY_SOURCE_VALUE: Optional[Dict[str, Any]] = None
+_CLAUDE_SOURCE_FILE_MEMO: Dict[str, Tuple[int, int, int, int, int]] = {}
 
 
-def _claude_journal_signature() -> Tuple:
-    """Cheap fingerprint of every Claude journal file: (path, mtime_ns, size).
+def _claude_journal_line_tokens(raw_line: bytes) -> int:
+    line = raw_line.decode("utf-8", errors="replace").strip()
+    if not line:
+        return 0
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return 0
+    if not isinstance(obj, dict):
+        return 0
+    rec = parse_claude_usage_line(obj)
+    return claude_record_total(rec) if rec else 0
 
-    Walking + stat'ing is orders of magnitude cheaper than reading and
-    JSON-parsing the whole corpus, so it lets ``claude_usage_by_source`` skip
-    the full re-scan on the 60s snapshot tick unless a file actually changed.
+
+def _read_claude_journal_tokens(path: Path, offset: int) -> Tuple[int, int, int]:
+    """Sum usage tokens from ``offset``: (committed tokens, new offset, tail tokens)."""
+    committed = 0
+    tail = 0
+    new_offset = offset
+    with path.open("rb") as fh:
+        fh.seek(offset)
+        for raw_line in fh:
+            if not raw_line.endswith(b"\n"):
+                # Writer mid-append (or a final line without a newline). Count
+                # it for now, but resume before it so it is never added twice.
+                tail = _claude_journal_line_tokens(raw_line)
+                break
+            new_offset += len(raw_line)
+            committed += _claude_journal_line_tokens(raw_line)
+    return committed, new_offset, tail
+
+
+def _claude_journal_file_tokens(path: Path) -> Optional[int]:
+    """Usage tokens in one journal, reading only bytes appended since last tick.
+
+    Claude Code journals are append-only JSONL. An unchanged file (same size and
+    mtime) is not opened at all; a grown file is read from the stored offset; a
+    file that shrank or was rewritten in place is re-read from the start.
+    Callers hold ``_CLAUDE_USAGE_BY_SOURCE_LOCK``.
     """
-    entries = []
-    for root, paths in claude_journal_files_by_root():
-        surface = _classify_claude_journal_root(root)
-        for path in paths:
-            try:
-                stat = path.stat()
-                entries.append((str(path), surface, stat.st_mtime_ns, stat.st_size))
-            except OSError:
-                continue
-    return tuple(entries)
+    key = str(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        _CLAUDE_SOURCE_FILE_MEMO.pop(key, None)
+        return None
+    memo = _CLAUDE_SOURCE_FILE_MEMO.get(key)
+    if memo is not None and memo[0] == stat.st_size and memo[1] == stat.st_mtime_ns:
+        return memo[3] + memo[4]
+    if memo is not None and stat.st_size > memo[0] and memo[2] <= stat.st_size:
+        offset, committed = memo[2], memo[3]
+    else:
+        offset, committed = 0, 0
+    try:
+        added, new_offset, tail = _read_claude_journal_tokens(path, offset)
+    except OSError as exc:
+        _CLAUDE_SOURCE_FILE_MEMO.pop(key, None)
+        logging.warning("claude_usage_by_source: cannot read %s: %s", str(path), exc)
+        return None
+    committed += added
+    _CLAUDE_SOURCE_FILE_MEMO[key] = (stat.st_size, stat.st_mtime_ns, new_offset, committed, tail)
+    return committed + tail
 
 
 def claude_usage_by_source() -> Dict[str, Any]:
     """Sum Claude journal tokens split by surface (CLI vs Desktop app).
 
-    Standalone scan over the same journal roots used by the merged totals;
-    deliberately independent of the incremental cursor so this stays purely
-    additive and cannot perturb existing offsets/totals. Defensive against
-    unreadable files and malformed lines.
+    Separate from the dedupe cursor in ``scan_claude_journal`` so it stays
+    purely additive and cannot perturb existing offsets/totals. Defensive
+    against unreadable files and malformed lines.
 
-    Memoized on the journal file signature so the daemon's 60s snapshot tick
-    only re-reads the (potentially hundreds of MB) corpus when a file changed,
-    instead of every cycle.
+    Incremental: each journal's total is memoized on (size, mtime_ns) and grown
+    from its last byte offset, so the 60s snapshot tick during an active Claude
+    session reads only the newly appended lines instead of the whole corpus
+    (which can be hundreds of MB).
     """
-    global _CLAUDE_USAGE_BY_SOURCE_KEY, _CLAUDE_USAGE_BY_SOURCE_VALUE
-    # Desktop-launched Claude Code journals live in the shared CLI dir; reattribute
-    # them to "app" by session id. Fold the id set into the cache key so the split
-    # recomputes when the desktop session index changes.
-    desktop_ids = _desktop_originated_claude_session_ids()
-    signature = (_claude_journal_signature(), tuple(sorted(desktop_ids)))
     with _CLAUDE_USAGE_BY_SOURCE_LOCK:
-        if _CLAUDE_USAGE_BY_SOURCE_VALUE is not None and _CLAUDE_USAGE_BY_SOURCE_KEY == signature:
-            return dict(_CLAUDE_USAGE_BY_SOURCE_VALUE)
-
-    per_source: Dict[str, int] = {"cli": 0, "app": 0}
-    for root, paths in claude_journal_files_by_root():
-        surface = _classify_claude_journal_root(root)
-        for path in paths:
-            # A CLI-root journal whose session id was launched from the desktop
-            # app is really desktop usage.
-            file_surface = "app" if (surface == "cli" and path.stem in desktop_ids) else surface
-            try:
-                with path.open("rb") as fh:
-                    for raw_line in fh:
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-                        if not isinstance(obj, dict):
-                            continue
-                        rec = parse_claude_usage_line(obj)
-                        if rec:
-                            per_source[file_surface] += claude_record_total(rec)
-            except OSError as exc:
-                logging.warning("claude_usage_by_source: cannot read %s: %s", str(path), exc)
-                continue
+        # Desktop-launched Claude Code journals live in the shared CLI dir;
+        # reattribute them to "app" by session id. Totals are memoized per file
+        # and classified at sum time, so a new desktop index entry moves an
+        # existing journal to "app" without re-reading it.
+        desktop_ids = _desktop_originated_claude_session_ids()
+        per_source: Dict[str, int] = {"cli": 0, "app": 0}
+        seen: Set[str] = set()
+        for root, paths in claude_journal_files_by_root():
+            surface = _classify_claude_journal_root(root)
+            for path in paths:
+                tokens = _claude_journal_file_tokens(path)
+                if tokens is None:
+                    continue
+                seen.add(str(path))
+                # A CLI-root journal whose session id was launched from the
+                # desktop app is really desktop usage.
+                file_surface = "app" if (surface == "cli" and path.stem in desktop_ids) else surface
+                per_source[file_surface] += tokens
+        for key in [key for key in _CLAUDE_SOURCE_FILE_MEMO if key not in seen]:
+            del _CLAUDE_SOURCE_FILE_MEMO[key]
     cli_tokens = per_source["cli"]
     app_tokens = per_source["app"]
     by_surface = {k: v for k, v in {"cli": cli_tokens, "app": app_tokens}.items() if v > 0}
-    value = {
+    return {
         "status": "ok" if (cli_tokens > 0 or app_tokens > 0) else "not_available",
         "units": "tokens",
         "bySurface": by_surface,
         "source": "claude-journal-split",
     }
-    with _CLAUDE_USAGE_BY_SOURCE_LOCK:
-        _CLAUDE_USAGE_BY_SOURCE_KEY = signature
-        _CLAUDE_USAGE_BY_SOURCE_VALUE = value
-    return dict(value)
 
 
 def claude_snapshot() -> Dict[str, Any]:

@@ -2537,6 +2537,122 @@ class AgentCatConnectorTests(unittest.TestCase):
             fh.write(self._claude_usage_event(now, "cache_req_2", "cache_msg_2", 30))
         self.assertEqual(agentcat.claude_usage_by_source()["bySurface"], {"cli": 80})
 
+    def test_claude_usage_by_source_reads_only_appended_lines(self) -> None:
+        # Issue #15: during an active Claude session one journal changes every
+        # tick. Only that journal's new bytes may be read, never the corpus.
+        now = dt.datetime.now(dt.timezone.utc)
+        project = agentcat.CLAUDE_PROJECTS_DIR / "busy-project"
+        project.mkdir(parents=True)
+        active = project / "active.jsonl"
+        idle = project / "idle.jsonl"
+        active.write_text(
+            self._claude_usage_event(now, "a1", "a1", 10) + self._claude_usage_event(now, "a2", "a2", 20),
+            encoding="utf-8",
+        )
+        idle.write_text(self._claude_usage_event(now, "i1", "i1", 5), encoding="utf-8")
+
+        parsed: List[int] = []
+        opened: List[str] = []
+        real_parse = agentcat.parse_claude_usage_line
+        real_read = agentcat._read_claude_journal_tokens
+
+        def counting_parse(obj):
+            parsed.append(1)
+            return real_parse(obj)
+
+        def counting_read(path, offset):
+            opened.append(path.name)
+            return real_read(path, offset)
+
+        def tick():
+            parsed.clear()
+            opened.clear()
+            with patch.object(agentcat, "parse_claude_usage_line", side_effect=counting_parse), \
+                patch.object(agentcat, "_read_claude_journal_tokens", side_effect=counting_read):
+                return agentcat.claude_usage_by_source()["bySurface"]
+
+        self.assertEqual(tick(), {"cli": 35})
+        self.assertEqual(len(parsed), 3)
+        self.assertEqual(sorted(opened), ["active.jsonl", "idle.jsonl"])
+
+        # Nothing changed: no journal is opened or parsed.
+        self.assertEqual(tick(), {"cli": 35})
+        self.assertEqual((len(parsed), opened), (0, []))
+
+        # One append: only that file is opened, and only the new line parsed.
+        with active.open("a", encoding="utf-8") as fh:
+            fh.write(self._claude_usage_event(now, "a3", "a3", 7))
+        self.assertEqual(tick(), {"cli": 42})
+        self.assertEqual((len(parsed), opened), (1, ["active.jsonl"]))
+
+        # A half-written line is not counted twice once the writer finishes it.
+        line = self._claude_usage_event(now, "a4", "a4", 100)
+        with active.open("a", encoding="utf-8") as fh:
+            fh.write(line[:20])
+        self.assertEqual(tick(), {"cli": 42})
+        with active.open("a", encoding="utf-8") as fh:
+            fh.write(line[20:])
+        self.assertEqual(tick(), {"cli": 142})
+        self.assertEqual(opened, ["active.jsonl"])
+        self.assertEqual(tick(), {"cli": 142})
+        self.assertEqual((len(parsed), opened), (0, []))
+
+        # A rewritten (shrunk) journal is re-read from the start.
+        active.write_text(self._claude_usage_event(now, "b1", "b1", 1), encoding="utf-8")
+        self.assertEqual(tick(), {"cli": 6})
+
+        # A deleted journal drops out of the total and the memo.
+        idle.unlink()
+        self.assertEqual(tick(), {"cli": 1})
+        self.assertNotIn(str(idle), agentcat._CLAUDE_SOURCE_FILE_MEMO)
+
+    def test_desktop_session_index_is_parsed_only_when_it_changes(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        desktop_sid = "5f0c2a8e-1111-4222-8333-944455556666"
+        project = agentcat.CLAUDE_PROJECTS_DIR / "shared"
+        project.mkdir(parents=True)
+        (project / f"{desktop_sid}.jsonl").write_text(
+            self._claude_usage_event(now, "d1", "d1", 30), encoding="utf-8",
+        )
+        (project / "cli-only.jsonl").write_text(
+            self._claude_usage_event(now, "c1", "c1", 70), encoding="utf-8",
+        )
+        sessions = agentcat.HOME / "Library" / "Application Support" / "Claude" / "claude-code-sessions" / "acct"
+        sessions.mkdir(parents=True)
+        (sessions / "other.json").write_text(json.dumps({"cliSessionId": "not-a-journal"}), encoding="utf-8")
+
+        index_reads: List[str] = []
+        journal_reads: List[str] = []
+        real_index = agentcat._claude_desktop_session_id_from_file
+        real_read = agentcat._read_claude_journal_tokens
+
+        def counting_index(path):
+            index_reads.append(path.name)
+            return real_index(path)
+
+        def counting_read(path, offset):
+            journal_reads.append(path.name)
+            return real_read(path, offset)
+
+        def tick():
+            index_reads.clear()
+            journal_reads.clear()
+            with patch.object(agentcat, "_claude_desktop_session_id_from_file", side_effect=counting_index), \
+                patch.object(agentcat, "_read_claude_journal_tokens", side_effect=counting_read):
+                return agentcat.claude_usage_by_source()["bySurface"]
+
+        self.assertEqual(tick(), {"cli": 100})
+        self.assertEqual(index_reads, ["other.json"])
+
+        self.assertEqual(tick(), {"cli": 100})
+        self.assertEqual((index_reads, journal_reads), ([], []))
+
+        # A new desktop index entry re-parses only that file and moves the
+        # matching journal to "app" without re-reading the journal itself.
+        (sessions / "local_new.json").write_text(json.dumps({"cliSessionId": desktop_sid}), encoding="utf-8")
+        self.assertEqual(tick(), {"cli": 70, "app": 30})
+        self.assertEqual((index_reads, journal_reads), (["local_new.json"], []))
+
     def test_codexbar_cost_cache_floors_claude_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()
         cache_dir = agentcat.HOME / "Library" / "Caches" / "CodexBar" / "cost-usage"
