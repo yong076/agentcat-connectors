@@ -188,6 +188,37 @@ class MutationOriginGuardHTTPTests(unittest.TestCase):
                 self.assertEqual(payload["eventType"], "tauri")
         self.assertEqual(self.event_count(), len(TAURI_ORIGINS))
 
+    def test_forced_usage_fetch_rejects_cross_site_get(self):
+        # GET /v1/usage forces a live fetch from every provider and skips their
+        # backoffs. An <img src> on any page sends Sec-Fetch-Site: cross-site
+        # (and no Origin) and must not reach it.
+        with self.server_url() as url, \
+            patch.object(agentcat, "fetch_llm_usage_fresh", side_effect=AssertionError("must not fetch")):
+            for headers in (
+                {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "image"},
+                {"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
+                {"Origin": "null"},
+            ):
+                status, payload = self.send(url + "/v1/usage", "GET", headers=headers)
+                self.assertEqual(status, 403, headers)
+                self.assertEqual(payload["error"], "forbidden")
+        with self.server_url() as url, \
+            patch.object(agentcat, "fetch_llm_usage_fresh", return_value={"providers": {}}) as fetch:
+            # The native apps (URLSession, the Windows Rust proxy) send neither header.
+            status, payload = self.send(url + "/v1/usage", "GET")
+            self.assertEqual((status, payload), (200, {"providers": {}}))
+            status, _payload = self.send(
+                url + "/v1/usage", "GET",
+                headers={"Origin": "http://127.0.0.1:8765", "Sec-Fetch-Site": "same-origin"},
+            )
+            self.assertEqual(status, 200)
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_read_only_gets_stay_open_to_native_and_widgets(self):
+        with self.server_url() as url:
+            status, _payload = self.send(url + "/v1/version", "GET", headers={"Sec-Fetch-Site": "cross-site"})
+            self.assertEqual(status, 200)
+
     def test_credential_routes_keep_their_stricter_guard(self):
         # The general guard admits a Tauri origin; /v1/connections/* still
         # requires a loopback-or-no Origin plus the control bearer token.

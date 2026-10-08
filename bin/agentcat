@@ -17602,8 +17602,12 @@ class AgentCatHandler(BaseHTTPRequestHandler):
         self.send_json(403, {"error": "forbidden", "message": "host_not_allowed"})
         return False
 
-    def mutation_origin_ok(self) -> bool:
-        """Run the CSRF guard before any POST/PATCH/DELETE route is dispatched."""
+    def origin_guard_ok(self) -> bool:
+        """CSRF guard: every POST/PATCH/DELETE, plus GETs that spend network.
+
+        A cross-site page can also fire a GET (``<img src=…>``); browsers send
+        ``Sec-Fetch-Site: cross-site`` on it, which this rejects.
+        """
         guard_error = mutating_request_origin_error(self.headers)
         if guard_error is None:
             return True
@@ -17696,6 +17700,10 @@ class AgentCatHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return
         if path == "/v1/usage":
+            # Forces a live fetch from every provider; a web page must not be
+            # able to trigger that (and skip their backoffs) with an <img>.
+            if not self.origin_guard_ok():
+                return
             try:
                 self.send_json(200, fetch_llm_usage_fresh())
             except Exception as exc:
@@ -17819,7 +17827,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self.host_header_ok():
             return
-        if not self.mutation_origin_ok():
+        if not self.origin_guard_ok():
             return
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/v1/connections/"):
@@ -18084,7 +18092,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         if not self.host_header_ok():
             return
-        if not self.mutation_origin_ok():
+        if not self.origin_guard_ok():
             return
         path = urllib.parse.urlparse(self.path).path
         match = re.fullmatch(r"/v1/connections/([0-9a-f]{32})", path)
@@ -18116,7 +18124,7 @@ class AgentCatHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         if not self.host_header_ok():
             return
-        if not self.mutation_origin_ok():
+        if not self.origin_guard_ok():
             return
         path = urllib.parse.urlparse(self.path).path
         managed_match = re.fullmatch(r"/v1/connections/(kimi|grok|gemini|antigravity|claude)/([0-9a-f]{32})", path)
