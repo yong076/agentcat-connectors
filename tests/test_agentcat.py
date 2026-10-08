@@ -400,7 +400,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIsNone(sanitized["shortUsedPercent"])
         self.assertEqual(sanitized["weeklyUsedPercent"], 24.0)
 
-    def test_codex_live_limits_tries_wham_before_refresh_after_codex_403(self) -> None:
+    def test_codex_live_limits_tries_wham_after_codex_403(self) -> None:
         (agentcat.HOME / ".codex").mkdir(parents=True)
         (agentcat.HOME / ".codex" / "auth.json").write_text(
             json.dumps({"tokens": {"access_token": "access", "refresh_token": "refresh", "account_id": "acct"}}),
@@ -419,14 +419,101 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         with patch.object(agentcat, "CODEX_USAGE_URLS", ("https://chatgpt.com/backend-api/codex/usage", "https://chatgpt.com/backend-api/wham/usage")), \
             patch.object(agentcat, "codex_usage_request", side_effect=usage_side_effect), \
-            patch.object(agentcat, "codex_reset_credits_request", return_value={"available_count": 2, "credits": []}), \
-            patch.object(agentcat, "refresh_codex_access_token", side_effect=AssertionError("refresh should wait until all usage URLs fail")):
+            patch.object(agentcat, "codex_reset_credits_request", return_value={"available_count": 2, "credits": []}):
             limits = agentcat.codex_live_limits()
 
         self.assertEqual(limits["source"], "https://chatgpt.com/backend-api/wham/usage")
         self.assertEqual(limits["resetCreditsAvailable"], 2)
         self.assertEqual(limits["codexCredits"]["approxCloudMessages"], 0)
         self.assertEqual(limits["quotas"][0]["remainingPercent"], 80.0)
+        self.assertNotIn("reason", limits)
+
+    def _codex_unauthorized_network(self, requests: list):
+        """urlopen stand-in: record every request and answer each with 401."""
+
+        def fake_urlopen(request, *args, **kwargs):
+            url = request.full_url if hasattr(request, "full_url") else str(request)
+            method = request.get_method() if hasattr(request, "get_method") else "GET"
+            requests.append((method, url))
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, io.BytesIO(b""))
+
+        return patch.object(agentcat.urllib.request, "urlopen", side_effect=fake_urlopen)
+
+    def test_codex_401_never_refreshes_cli_grant_and_serves_stale_limits(self) -> None:
+        # Rule R1: Codex rotates refresh tokens, so spending the CLI's refresh
+        # token here would log the CLI out. A 401 must only read, never POST.
+        self.assertFalse(hasattr(agentcat, "refresh_codex_access_token"))
+        codex_home = agentcat.HOME / ".codex"
+        codex_home.mkdir(parents=True)
+        auth_path = codex_home / "auth.json"
+        auth_path.write_text(
+            json.dumps({"tokens": {"access_token": "expired", "refresh_token": "cli-owned", "account_id": "acct"}}),
+            encoding="utf-8",
+        )
+        auth_before = auth_path.read_bytes()
+        good = agentcat.codex_limits_from_usage_response(
+            {"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 30, "reset_at": 1770000000}}},
+            source="https://chatgpt.com/backend-api/wham/usage",
+        )
+        agentcat.write_live_limits_cache("codex", good)
+
+        requests: list = []
+        with self._codex_unauthorized_network(requests):
+            limits = agentcat.codex_live_limits(force=True)
+
+        self.assertEqual([method for method, _url in requests], ["GET"] * len(agentcat.CODEX_USAGE_URLS))
+        self.assertEqual([url for _method, url in requests], list(agentcat.CODEX_USAGE_URLS))
+        self.assertFalse(any("oauth" in url or "auth.openai.com" in url for _method, url in requests))
+        self.assertEqual(auth_path.read_bytes(), auth_before)
+        self.assertEqual(limits["reason"], "cli_login_expired")
+        self.assertEqual(limits["liveErrorReason"], "cli_login_expired")
+        self.assertTrue(limits["stale"])
+        self.assertEqual(limits["quotas"][0]["remainingPercent"], 70.0)
+
+        # The next tick sits inside the error backoff: no network at all, and
+        # the row is still labelled stale + cli_login_expired.
+        requests.clear()
+        with self._codex_unauthorized_network(requests):
+            again = agentcat.codex_live_limits()
+        self.assertEqual(requests, [])
+        self.assertEqual(again["reason"], "cli_login_expired")
+        self.assertTrue(again["stale"])
+        self.assertEqual(again["quotas"][0]["remainingPercent"], 70.0)
+
+    def test_codex_401_without_cache_reports_cli_login_expired(self) -> None:
+        codex_home = agentcat.HOME / ".codex"
+        codex_home.mkdir(parents=True)
+        (codex_home / "auth.json").write_text(
+            json.dumps({"tokens": {"access_token": "expired", "refresh_token": "cli-owned", "account_id": "acct"}}),
+            encoding="utf-8",
+        )
+        requests: list = []
+        with self._codex_unauthorized_network(requests):
+            limits = agentcat.codex_live_limits()
+        self.assertTrue(all(method == "GET" for method, _url in requests))
+        self.assertFalse(any("oauth" in url for _method, url in requests))
+        self.assertEqual(limits["status"], "error")
+        self.assertEqual(limits["reason"], "cli_login_expired")
+        self.assertEqual(limits["quotas"], [])
+
+    def test_codex_provider_instances_never_refresh_cli_homes_on_401(self) -> None:
+        for name in (".codex", ".codex-work"):
+            home = agentcat.HOME / name
+            home.mkdir(parents=True)
+            (home / "sessions").mkdir()
+            (home / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": f"expired-{name}", "refresh_token": "cli-owned", "account_id": f"acct{name}"}}),
+                encoding="utf-8",
+            )
+        requests: list = []
+        with self._codex_unauthorized_network(requests), \
+            patch.object(agentcat, "_codex_connections", return_value=[]):
+            instances = agentcat.codex_provider_instances()
+        self.assertEqual(len(instances), 2)
+        self.assertTrue(requests)
+        self.assertTrue(all(method == "GET" for method, _url in requests))
+        self.assertFalse(any("oauth" in url for _method, url in requests))
+        self.assertEqual({row["limits"].get("reason") for row in instances}, {"cli_login_expired"})
 
     def test_claude_usage_api_payload_builds_weekly_and_monthly_remaining(self) -> None:
         limits = agentcat.claude_limits_from_usage_response(

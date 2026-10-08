@@ -162,8 +162,12 @@ CODEX_USAGE_BREAKDOWN_CACHE = AGENTCAT_HOME / "codex-usage-breakdown-cache.json"
 CODEX_USAGE_BREAKDOWN_TTL_SECONDS = int(os.environ.get("AGENTCAT_CODEX_USAGE_TTL_SECONDS", "900"))
 # Codex's seven-day window in minutes; upstream values may drift by one minute.
 CODEX_WEEKLY_WINDOW_MINUTES = 10080
-CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+# Reason code for a Codex CLI login whose access token the usage API rejects.
+# The connector never refreshes a CLI-owned grant (OAuth rule R1: Codex rotates
+# refresh tokens, so refreshing here would log the CLI out). The CLI refreshes
+# its own token the next time it runs; until then the last numbers are served
+# as stale with this reason.
+CODEX_CLI_LOGIN_EXPIRED_REASON = "cli_login_expired"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
 OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
@@ -3326,6 +3330,7 @@ def serve_stale_live_limits(
     stale: Dict[str, Any],
     exc: Exception,
     project_id: Optional[str] = None,
+    reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return the last-good live limits during a probe failure, re-stamping the
     cache so the daemon does not re-probe (and re-refresh the OAuth token) on every
@@ -3333,11 +3338,16 @@ def serve_stale_live_limits(
     never advances once the good entry goes stale, so one revoked/expired token
     turns into a full refresh POST — and for Antigravity a ~140MB binary re-scan —
     every tick. Re-stamping throttles re-probing to one attempt per max-age window.
+
+    ``reason`` overrides the generic HTTP-derived reason code when the caller
+    knows more (e.g. a CLI-owned login that expired).
     """
     stale = dict(stale)
     stale["liveError"] = str(exc)
     error_limits = live_limit_error(exc, str(stale.get("source") or provider), project_id=project_id)
-    stale["liveErrorReason"] = error_limits.get("reason")
+    stale["liveErrorReason"] = reason or error_limits.get("reason")
+    if reason:
+        stale["reason"] = reason
     stale.pop("retryAt", None)
     if error_limits.get("retryAt") is not None:
         stale["retryAt"] = error_limits["retryAt"]
@@ -3720,28 +3730,22 @@ def provider_sync_identity(provider: str, native_account_id: str) -> str:
     ).hexdigest()
 
 
-def refresh_codex_access_token(auth: Dict[str, Any]) -> Optional[str]:
-    tokens = oauth_tokens(auth)
-    refresh_token = tokens.get("refresh_token")
-    if not isinstance(refresh_token, str) or not refresh_token:
-        return None
+def mark_codex_cli_login_expired(limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Label Codex limits whose CLI access token the usage API rejected.
 
-    body = urllib.parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CODEX_OAUTH_CLIENT_ID,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        CODEX_OAUTH_TOKEN_URL,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    token = payload.get("access_token")
-    return token if isinstance(token, str) and token else None
+    Every auth document that reaches the HTTP usage path is read from a Codex
+    CLI home (``~/.codex*``, an adopted or Orca runtime home). Agent Cat's own
+    managed Codex logins never come through here: they are delegated to
+    ``codex app-server`` in a private CODEX_HOME, which refreshes its own grant.
+    So there is no grant on this path the connector may refresh. The numbers
+    stay visible but are never presented as live.
+    """
+    out = dict(limits)
+    if out.get("quotas"):
+        out["stale"] = True
+    out["reason"] = CODEX_CLI_LOGIN_EXPIRED_REASON
+    out["liveErrorReason"] = CODEX_CLI_LOGIN_EXPIRED_REASON
+    return out
 
 
 def codex_request_headers(access_token: str, account_id: str) -> Dict[str, str]:
@@ -4151,10 +4155,19 @@ def codex_live_limits_for_auth(
     cache_key: str,
     force: bool = False,
 ) -> Dict[str, Any]:
-    """Fetch one Codex identity's quota without sharing another identity's cache."""
+    """Fetch one Codex identity's quota without sharing another identity's cache.
+
+    ``auth`` is a Codex CLI home's own ``auth.json``: it is read, never
+    refreshed or written back (rule R1). A 401 means the CLI's access token
+    lapsed; the last numbers are served as stale with ``cli_login_expired``
+    until the CLI refreshes its own token on its next run.
+    """
     cached = None if force else cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS)
     if cached:
-        return sanitize_codex_cached_limits(cached)
+        cached = sanitize_codex_cached_limits(cached)
+        if CODEX_CLI_LOGIN_EXPIRED_REASON in (cached.get("reason"), cached.get("liveErrorReason")):
+            return mark_codex_cli_login_expired(cached)
+        return cached
     tokens = oauth_tokens(auth)
     access_token = tokens.get("access_token")
     account_id = tokens.get("account_id") or auth.get("account_id") or ""
@@ -4162,40 +4175,41 @@ def codex_live_limits_for_auth(
         return empty_limits()
 
     last_error: Optional[Exception] = None
-    for attempt in range(2):
-        for url in CODEX_USAGE_URLS:
+    login_expired = False
+    for url in CODEX_USAGE_URLS:
+        try:
+            payload = codex_usage_request(access_token, str(account_id), url)
+            limits = codex_limits_from_usage_response(payload, source=url)
             try:
-                payload = codex_usage_request(access_token, str(account_id), url)
-                limits = codex_limits_from_usage_response(payload, source=url)
-                try:
-                    reset_payload = codex_reset_credits_request(access_token, str(account_id))
-                    merge_codex_reset_credit_details(limits, reset_payload)
-                except Exception:
-                    pass
-                write_live_limits_cache(cache_key, limits)
-                return limits
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                # Codex currently exposes several adjacent usage endpoints.
-                # Some valid sessions receive 403 on /codex/usage while
-                # /wham/usage succeeds with the same access token, so exhaust
-                # the URL list before attempting token refresh.
-                continue
-            except Exception as exc:
-                last_error = exc
-        if attempt == 0:
-            try:
-                refreshed = refresh_codex_access_token(auth)
-            except Exception as exc:
-                last_error = exc
-                refreshed = None
-            if not refreshed:
-                break
-            access_token = refreshed
+                reset_payload = codex_reset_credits_request(access_token, str(account_id))
+                merge_codex_reset_credit_details(limits, reset_payload)
+            except Exception:
+                pass
+            write_live_limits_cache(cache_key, limits)
+            return limits
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 401:
+                login_expired = True
+            # Codex currently exposes several adjacent usage endpoints.
+            # Some valid sessions receive 403 on /codex/usage while
+            # /wham/usage succeeds with the same access token, so exhaust
+            # the URL list before reporting a failure.
+            continue
+        except Exception as exc:
+            last_error = exc
+    error = last_error or RuntimeError("Codex usage API failed")
+    reason = CODEX_CLI_LOGIN_EXPIRED_REASON if login_expired else None
     stale = cached_live_limits(cache_key, LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
     if stale:
-        return serve_stale_live_limits(cache_key, stale, last_error or RuntimeError("Codex usage API failed"))
-    limits = live_limit_error(last_error or RuntimeError("Codex usage API failed"), "codex-usage-api")
+        if not login_expired and stale.get("reason") == CODEX_CLI_LOGIN_EXPIRED_REASON:
+            # The latest failure was not a 401; don't keep an older login label.
+            stale = {key: value for key, value in stale.items() if key != "reason"}
+        served = serve_stale_live_limits(cache_key, stale, error, reason=reason)
+        return mark_codex_cli_login_expired(served) if login_expired else served
+    limits = live_limit_error(error, "codex-usage-api")
+    if reason:
+        limits["reason"] = reason
     write_live_limits_cache(cache_key, limits)
     return limits
 
@@ -5092,12 +5106,15 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
             pass
         return validated
 
-    def stale_or_unavailable() -> Dict[str, Any]:
+    def stale_or_unavailable(reason: Optional[str] = None) -> Dict[str, Any]:
         if cached_data is not None:
             stale = dict(cached_data)
             stale["stale"] = True
-            return stale
-        return not_available
+        else:
+            stale = dict(not_available)
+        if reason:
+            stale["reason"] = reason
+        return stale
 
     try:
         auth = read_codex_auth()
@@ -5113,29 +5130,24 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
     account_id = tokens.get("account_id") or auth.get("account_id") or ""
     if not isinstance(access_token, str) or not access_token:
         return stale_or_unavailable()
-    for attempt in range(2):
-        try:
-            payload = codex_usage_breakdown_request(access_token, str(account_id), CODEX_USAGE_BREAKDOWN_URL)
-            parsed = codex_usage_breakdown_from_response(payload)
-            if parsed.get("status") != "ok":
-                # A 200 with an unknown schema is still a failed refresh. Keep
-                # the last known-good cache rather than replacing it with an
-                # empty section. A legitimate data: [] response parses as ok.
-                return stale_or_unavailable()
-            return cache_and_return(parsed)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401 and attempt == 0:
-                try:
-                    refreshed = refresh_codex_access_token(auth)
-                except Exception:
-                    refreshed = None
-                if refreshed:
-                    access_token = refreshed
-                    continue
+    try:
+        payload = codex_usage_breakdown_request(access_token, str(account_id), CODEX_USAGE_BREAKDOWN_URL)
+        parsed = codex_usage_breakdown_from_response(payload)
+        if parsed.get("status") != "ok":
+            # A 200 with an unknown schema is still a failed refresh. Keep
+            # the last known-good cache rather than replacing it with an
+            # empty section. A legitimate data: [] response parses as ok.
             return stale_or_unavailable()
-        except Exception:
-            return stale_or_unavailable()
-    return stale_or_unavailable()
+        return cache_and_return(parsed)
+    except urllib.error.HTTPError as exc:
+        # This is the Codex CLI's own login: never refresh it (rule R1). The
+        # CLI refreshes its token on its next run; until then keep the last
+        # breakdown, marked stale.
+        if exc.code == 401:
+            return stale_or_unavailable(CODEX_CLI_LOGIN_EXPIRED_REASON)
+        return stale_or_unavailable()
+    except Exception:
+        return stale_or_unavailable()
 
 
 def codex_usage_breakdown() -> Dict[str, Any]:
