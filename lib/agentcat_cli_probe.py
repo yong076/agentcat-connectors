@@ -25,6 +25,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+HOME = Path((os.environ.get("USERPROFILE") if os.name == "nt" else None)
+            or os.environ.get("HOME") or os.path.expanduser("~"))
 CLAUDE_USAGE_TIMEOUT_SECONDS = 60
 _EMAIL_RE = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,253}$")
 _CLAUDE_LINE_RE = re.compile(
@@ -121,8 +123,16 @@ def parse_claude_usage(text: str, now: Optional[dt.datetime] = None) -> List[Dic
     return windows
 
 
+def _claude_account_config(home: Path, default_home: Path) -> Path:
+    # The default .claude home keeps account metadata beside it; alternate
+    # config homes keep it inside. Resolve both from the selected home, without
+    # consulting the daemon user's HOME/USERPROFILE or platform account database.
+    home = Path(home)
+    return (home.parent if home == Path(default_home) else home) / ".claude.json"
+
+
 def claude_identity(home: Path, default_home: Path) -> Dict[str, Optional[str]]:
-    config = Path.home() / ".claude.json" if Path(home) == Path(default_home) else Path(home) / ".claude.json"
+    config = _claude_account_config(home, default_home)
     try:
         raw = json.loads(config.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -153,6 +163,32 @@ def _result(provider: str, home: Path, **fields: Any) -> Dict[str, Any]:
     return row
 
 
+def claude_api_billing_mode(home: Path) -> Optional[str]:
+    """Detect API billing from this home's settings or explicit cloud flags.
+
+    Return only the billing mode; credential values never enter probe results.
+    """
+    def from_env(source: Dict[str, Any], *, allow_keys: bool = True) -> Optional[str]:
+        if str(source.get("CLAUDE_CODE_USE_BEDROCK") or "").strip() not in ("", "0", "false"):
+            return "bedrock"
+        if str(source.get("CLAUDE_CODE_USE_VERTEX") or "").strip() not in ("", "0", "false"):
+            return "vertex"
+        if allow_keys and (source.get("ANTHROPIC_API_KEY") or source.get("ANTHROPIC_AUTH_TOKEN")):
+            return "api_key"
+        return None
+
+    # SDK credentials inherited by the daemon do not select this home's billing.
+    mode = from_env(dict(os.environ), allow_keys=False)
+    if mode:
+        return mode
+    try:
+        settings = json.loads((home / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    env_block = settings.get("env") if isinstance(settings, dict) else None
+    return from_env(env_block) if isinstance(env_block, dict) else None
+
+
 def probe_claude_home(
     home: Path,
     default_home: Path,
@@ -162,6 +198,10 @@ def probe_claude_home(
     token_reader: Optional[Callable[[Path, Path], Optional[str]]] = None,
 ) -> Dict[str, Any]:
     identity = claude_identity(home, default_home)
+    billing_mode = claude_api_billing_mode(home)
+    if billing_mode:
+        return _result("claude", home, status="not_configured", reason="api_billing",
+                       billingMode=billing_mode, **identity)
     if not executable:
         return _result("claude", home, status="error", reason="cli_not_found", **identity)
     env = dict(os.environ)
@@ -516,7 +556,7 @@ _CLAUDE_TIERS = {"max_5x": "Max 5x", "max_20x": "Max 20x", "pro": "Pro", "team":
 
 
 def claude_account_details(home: Path, default_home: Path, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
-    config = Path.home() / ".claude.json" if Path(home) == Path(default_home) else Path(home) / ".claude.json"
+    config = _claude_account_config(home, default_home)
     try:
         raw = json.loads(config.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -748,7 +788,7 @@ def parse_auggie_status(raw: Any, now: Optional[float] = None) -> Dict[str, Any]
 
 
 def probe_auggie(executable: str, run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
-    home = Path.home() / ".augment"
+    home = HOME / ".augment"
     try:
         proc = run([executable, "account", "status", "--json"], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
         raw = json.loads(proc.stdout) if proc.returncode == 0 else None
@@ -774,7 +814,7 @@ def parse_amp_usage(text: str) -> Dict[str, Any]:
 
 
 def probe_amp(executable: str, run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
-    home = Path.home() / ".amp"
+    home = HOME / ".amp"
     try:
         proc = run([executable, "usage"], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
         text = proc.stdout if proc.returncode == 0 else ""

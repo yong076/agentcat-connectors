@@ -3317,7 +3317,7 @@ class AgentCatConnectorTests(unittest.TestCase):
                 side.unlink()
         before = {path.name: path.read_bytes() for path in conversations.iterdir()}
 
-        with patch.object(agentcat, "_antigravity_rows_from_copy", side_effect=AssertionError("no copy needed")):
+        with patch.object(agentcat.shutil, "copyfile", side_effect=AssertionError("no copy needed")):
             usage = agentcat.antigravity_sqlite_usage()
 
         self.assertEqual(usage["tokens"]["totalTokens"], 142)
@@ -4022,6 +4022,275 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(agentcat.classify_process("grok --prompt hello"), "grok")
         self.assertEqual(agentcat.classify_process("grock --prompt hello"), "grok")
 
+    def test_foreign_sqlite_readers_preserve_source_files_and_read_wal_rows(self) -> None:
+        def files(folder):
+            return {p.name: (p.stat().st_size, p.stat().st_mtime_ns, p.read_bytes())
+                    for p in folder.iterdir()}
+
+        for reader in ("hermes", "opencode", "codex", "cursor"):
+            for wal_only in (False, True):
+                with self.subTest(reader=reader, wal_only=wal_only):
+                    # Spaces, percent signs and fragments must be URI-escaped.
+                    folder = self.root / f"{reader} # % {wal_only}"
+                    folder.mkdir()
+                    database = folder / "state.db"
+                    staging = self.root / f"staging-{reader}-{wal_only}.db"
+                    writer = sqlite3.connect(staging if wal_only else database)
+                    try:
+                        writer.execute("pragma journal_mode=wal")
+                        writer.execute("pragma wal_autocheckpoint=0")
+                        if reader == "hermes":
+                            writer.execute("create table sessions (model text, input_tokens integer)")
+                            writer.execute("insert into sessions values ('test-model', 123)")
+                        elif reader == "opencode":
+                            writer.execute("create table session (id text, time_archived integer, parent_id text)")
+                            writer.execute("create table message (session_id text, time_created integer, data text)")
+                            writer.execute("insert into message values (null, ?, ?)", (
+                                int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000),
+                                json.dumps({"role": "assistant", "modelID": "test-model", "tokens": {"input": 123}}),
+                            ))
+                        elif reader == "codex":
+                            writer.execute("create table threads (tokens_used integer, model text)")
+                            writer.execute("insert into threads values (123, 'test-model')")
+                        else:
+                            writer.execute("create table blobs (data text)")
+                            writer.execute("insert into blobs values (?)", (
+                                json.dumps({"role": "assistant", "content": "fixture response"}),
+                            ))
+                        writer.commit()
+                        if wal_only:
+                            database.write_bytes(staging.read_bytes())
+                            database.with_name(database.name + "-wal").write_bytes(
+                                staging.with_name(staging.name + "-wal").read_bytes())
+                    finally:
+                        writer.close()
+                    self.assertFalse(database.with_name(database.name + "-shm").exists())
+                    self.assertEqual(database.with_name(database.name + "-wal").exists(), wal_only)
+                    if reader == "opencode":
+                        database = database.rename(folder / "opencode.db")
+                        if wal_only:
+                            (folder / "state.db-wal").rename(folder / "opencode.db-wal")
+                    before = files(folder)
+                    if reader == "hermes":
+                        with patch.dict(os.environ, {"HERMES_HOME": str(folder)}):
+                            result = agentcat.hermes_snapshot()
+                    elif reader == "opencode":
+                        with patch.object(agentcat, "opencode_data_dir", return_value=folder):
+                            result = agentcat.opencode_snapshot()
+                    elif reader == "codex":
+                        with patch.object(agentcat, "codex_state_sqlite_paths", return_value=[database]):
+                            result = agentcat.codex_sqlite_snapshot()
+                    else:
+                        result = list(agentcat.reflect_read_cursor_turns(database))
+                    self.assertEqual(files(folder), before)
+                    if reader == "cursor":
+                        self.assertEqual(len(result), 1)
+                        self.assertEqual(result[0]["text"], "fixture response")
+                    else:
+                        self.assertEqual(result["status"], "ok")
+                        self.assertEqual(result["tokens"]["all"], 123)
+
+    def test_foreign_sqlite_discards_raced_immutable_read(self) -> None:
+        for checkpoint in (False, True):
+            with self.subTest(checkpoint=checkpoint):
+                database = self.root / f"race-{checkpoint}.db"
+                with closing(sqlite3.connect(database)) as writer:
+                    writer.execute("pragma journal_mode=wal")
+                    writer.execute("create table fixture (value integer)")
+                    writer.execute("insert into fixture values (1)")
+                    writer.commit()
+                writer = sqlite3.connect(database)
+                calls = []
+
+                def read(connection):
+                    rows = connection.execute("select value from fixture order by value").fetchall()
+                    calls.append(rows)
+                    if len(calls) == 1:
+                        writer.execute("insert into fixture values (2)")
+                        writer.commit()
+                        if checkpoint:
+                            writer.close()
+                    return rows
+
+                try:
+                    self.assertEqual(agentcat.read_foreign_sqlite(database, read), [(1,), (2,)])
+                    self.assertEqual(calls, [[(1,)], [(1,), (2,)]])
+                finally:
+                    writer.close()
+
+    def test_foreign_sqlite_retries_unstable_private_copies(self) -> None:
+        for checkpoint in (False, True):
+            for changes in (1, 3):
+                with self.subTest(checkpoint=checkpoint, changes=changes):
+                    database = self.root / f"copy-{checkpoint}-{changes}.db"
+                    with closing(sqlite3.connect(database)) as writer:
+                        writer.execute("pragma journal_mode=wal")
+                        writer.execute("create table fixture (value integer)")
+                        writer.execute("insert into fixture values (1)")
+                        writer.commit()
+                        copied_databases = []
+                        real_copy = agentcat.shutil.copyfile
+                        temp_roots = []
+
+                        def copy(source, target):
+                            self.assertFalse(str(source).endswith("-shm"))
+                            result = real_copy(source, target)
+                            temp_roots.append(Path(target).parent)
+                            if Path(source).resolve() == database.resolve():
+                                copied_databases.append(source)
+                                if len(copied_databases) <= changes:
+                                    writer.execute("insert into fixture values (?)", (len(copied_databases) + 1,))
+                                    writer.commit()
+                                    if checkpoint:
+                                        writer.execute("pragma wal_checkpoint(truncate)")
+                            return result
+
+                        def read(connection):
+                            location = connection.execute("pragma database_list").fetchone()[2]
+                            if Path(location).resolve() == database.resolve():
+                                raise sqlite3.OperationalError("unable to open database file")
+                            return connection.execute("select value from fixture order by value").fetchall()
+
+                        with patch.object(agentcat.shutil, "copyfile", side_effect=copy):
+                            if changes == 3:
+                                with self.assertRaisesRegex(sqlite3.OperationalError, "changed while copying"):
+                                    agentcat.read_foreign_sqlite(database, read)
+                            else:
+                                self.assertEqual(agentcat.read_foreign_sqlite(database, read), [(1,), (2,)])
+                        self.assertEqual(len(copied_databases), 3 if changes == 3 else 2)
+                        self.assertTrue(all(not folder.exists() for folder in temp_roots))
+
+    def test_foreign_sqlite_resolves_symlink_before_finding_wal(self) -> None:
+        database = self.root / "target # % 한글.db"
+        link = self.root / "linked.db"
+        with closing(sqlite3.connect(database)) as writer:
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+            try:
+                link.symlink_to(database)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            self.assertFalse(link.with_name(link.name + "-wal").exists())
+            self.assertEqual(agentcat.read_foreign_sqlite(link, lambda conn:
+                conn.execute("select value from fixture").fetchall()), [(123,)])
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended-length paths")
+    def test_foreign_sqlite_windows_extended_path(self) -> None:
+        database = self.root / "extended # % 한글.db"
+        with closing(sqlite3.connect(database)) as writer:
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+        extended = Path("\\\\?\\" + str(database.resolve()))
+        self.assertEqual(agentcat.read_foreign_sqlite(extended, lambda conn:
+            conn.execute("select value from fixture").fetchall()), [(123,)])
+
+    def test_foreign_sqlite_preserves_sidecars_after_owner_exits(self) -> None:
+        staging = self.root / "owner.db"
+        folder = self.root / "owner-gone"
+        folder.mkdir()
+        database = folder / "database.db"
+        with closing(sqlite3.connect(staging)) as writer:
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+            for suffix in ("", "-wal", "-shm"):
+                target = Path(str(database) + suffix)
+                target.write_bytes(Path(str(staging) + suffix).read_bytes())
+                os.utime(target, (1000000000, 1000000000))
+        before = {p.name: (p.stat().st_size, p.stat().st_mtime_ns, p.read_bytes())
+                  for p in folder.iterdir()}
+        for _ in range(2):
+            self.assertEqual(agentcat.read_foreign_sqlite(database, lambda conn:
+                conn.execute("select value from fixture").fetchall()), [(123,)])
+            self.assertEqual({p.name: (p.stat().st_size, p.stat().st_mtime_ns, p.read_bytes())
+                              for p in folder.iterdir()}, before)
+
+    def test_foreign_sqlite_schema_errors_never_copy(self) -> None:
+        for live_wal in (False, True):
+            database = self.root / f"schema-{live_wal}.db"
+            writer = sqlite3.connect(database)
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("create table fixture (value integer)")
+            writer.commit()
+            if not live_wal:
+                writer.close()
+            try:
+                for sql, message in (("select missing from fixture", "no such column"),
+                                     ("select * from missing", "no such table"),
+                                     ("select from fixture", "syntax error")):
+                    with self.subTest(live_wal=live_wal, sql=sql), patch.object(
+                            agentcat.shutil, "copyfile", side_effect=AssertionError("must not copy")):
+                        with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                            agentcat.read_foreign_sqlite(database, lambda conn: conn.execute(sql).fetchall())
+            finally:
+                writer.close()
+
+    def test_foreign_sqlite_copy_fallback_is_limited_to_recoverable_errors(self) -> None:
+        database = self.root / "errors.db"
+        with closing(sqlite3.connect(database)) as writer:
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+        for message in ("database is locked", "disk I/O error", "database disk image is malformed",
+                        "file is not a database", "attempt to write a readonly database", "interrupted"):
+            with self.subTest(message=message):
+                calls = []
+
+                def read(connection):
+                    calls.append(connection)
+                    if len(calls) == 1:
+                        raise sqlite3.OperationalError(message)
+                    return connection.execute("select value from fixture").fetchall()
+
+                if message == "interrupted":
+                    with patch.object(agentcat.shutil, "copyfile", side_effect=AssertionError("must not copy")):
+                        with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                            agentcat.read_foreign_sqlite(database, read)
+                    self.assertEqual(len(calls), 1)
+                else:
+                    self.assertEqual(agentcat.read_foreign_sqlite(database, read), [(123,)])
+                    self.assertEqual(len(calls), 2)
+
+    def test_foreign_sqlite_sweep_removes_only_old_private_copies(self) -> None:
+        temp_root = self.root / "temp-copies"
+        temp_root.mkdir()
+        for name in ("agentcat-sqlite-old", "agentcat-sqlite-fresh", "agentcat-sqlite-unknown", "unrelated"):
+            folder = temp_root / name
+            folder.mkdir()
+            (folder / "database.db").write_bytes(b"fixture")
+            if name.endswith("unknown"):
+                (folder / "keep.txt").write_text("not a database copy")
+            os.utime(folder, (1000, 1000) if not name.endswith("fresh") else (5000, 5000))
+        with patch.object(agentcat.tempfile, "gettempdir", return_value=str(temp_root)), patch.object(
+                agentcat.time, "time", return_value=5000):
+            agentcat.sweep_foreign_sqlite_copies()
+        self.assertEqual({p.name for p in temp_root.iterdir()},
+                         {"agentcat-sqlite-fresh", "agentcat-sqlite-unknown", "unrelated"})
+
+    def test_foreign_sqlite_retries_failed_read_on_private_copy(self) -> None:
+        database = self.root / "retry.db"
+        with closing(sqlite3.connect(database)) as writer:
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+        calls = []
+
+        def read(connection):
+            calls.append(connection)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("unable to open database file")
+            return connection.execute("select value from fixture").fetchall()
+
+        self.assertEqual(agentcat.read_foreign_sqlite(database, read), [(123,)])
+        self.assertEqual(len(calls), 2)
+        for connection in calls:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("select 1")
+
     def test_hermes_snapshot_reads_sqlite_sessions_and_preserves_unknown_cost(self) -> None:
         hermes_home = self.root / "hermes-home"
         hermes_home.mkdir(parents=True)
@@ -4622,10 +4891,71 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["shortWindowMinutes"], 300)
         self.assertEqual(limits["weeklyUsedPercent"], 10.0)
         self.assertEqual(limits["weeklyResetAt"], 1770000400)
+        self.assertTrue(limits["stale"])
+        self.assertEqual(limits["reason"], "statusline_window_reset")
+        self.assertIsNotNone(limits["updatedAt"])
         self.assertEqual([quota["id"] for quota in limits["quotas"]], ["claude:five_hour", "claude:seven_day", "claude:session"])
         self.assertEqual(limits["quotas"][0]["remainingPercent"], 96.0)
         self.assertEqual(limits["quotas"][1]["remainingPercent"], 90.0)
         self.assertEqual(limits["quotas"][2]["limit"], 1000000.0)
+
+    def test_claude_statusline_freshness_uses_event_age_at_cutoff(self) -> None:
+        captured = 1791400000
+        with patch.object(agentcat.time, "time", return_value=captured):
+            agentcat.store_event("claude", "claude-statusline", "statusline", {
+                "timestamp": captured + 86400,
+                "rate_limits": {"five_hour": {"used_percentage": 42}},
+            })
+        for age, stale in ((0, False), (agentcat.LIVE_LIMITS_MAX_AGE_SECONDS, False),
+                           (agentcat.LIVE_LIMITS_MAX_AGE_SECONDS + 1, True),
+                           (90 * 86400, True), (-60, True)):
+            with self.subTest(age=age), patch.object(agentcat.time, "time", return_value=captured + age):
+                limits = agentcat.claude_runtime_limits()
+                self.assertEqual(limits["updatedAt"], agentcat.iso_from_timestamp(captured))
+                self.assertEqual(limits["stale"], stale)
+                self.assertEqual(limits["shortUsedPercent"], 42)
+                if stale:
+                    self.assertEqual(limits["reason"], "statusline_stale")
+                else:
+                    self.assertNotIn("reason", limits)
+                fallback = agentcat.prefer_live_limits(agentcat.empty_limits("error", "offline"), limits)
+                self.assertEqual(fallback["stale"], stale)
+                self.assertEqual(fallback["updatedAt"], limits["updatedAt"])
+        live = agentcat.empty_limits("auto")
+        live.update(shortUsedPercent=5, stale=False)
+        self.assertEqual(agentcat.prefer_live_limits(live, limits)["shortUsedPercent"], 5)
+        self.assertFalse(agentcat.prefer_live_limits(live, limits)["stale"])
+
+    def test_claude_statusline_reset_boundary_marks_any_window_stale(self) -> None:
+        captured = 1791400000
+        for window in ("five_hour", "seven_day", "seven_day_sonnet"):
+            for offset in (-1, 0, 1):
+                with self.subTest(window=window, offset=offset), patch.object(
+                        agentcat.time, "time", return_value=captured):
+                    agentcat.store_event("claude", "claude-statusline", "statusline", {
+                        "rate_limits": {
+                            "five_hour": {"used_percentage": 42, "resets_at": captured + 300},
+                            window: {"used_percentage": 50, "resets_at": captured + offset},
+                        },
+                    })
+                    limits = agentcat.claude_runtime_limits()
+                    self.assertEqual(limits["stale"], offset <= 0)
+                    self.assertEqual(limits["updatedAt"], agentcat.iso_from_timestamp(captured))
+                    if offset <= 0:
+                        self.assertEqual(limits["reason"], "statusline_window_reset")
+                    else:
+                        self.assertNotIn("reason", limits)
+
+    def test_claude_statusline_invalid_event_timestamp_is_stale(self) -> None:
+        agentcat.store_event("claude", "claude-statusline", "statusline", {
+            "rate_limits": {"five_hour": {"used_percentage": 42}},
+        })
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as connection:
+            connection.execute("update events set ts = 'invalid' where source = 'claude-statusline'")
+            connection.commit()
+        limits = agentcat.claude_runtime_limits()
+        self.assertTrue(limits["stale"])
+        self.assertIsNone(limits["updatedAt"])
 
     def test_sanitize_payload_redacts_content_but_keeps_limit_metadata(self) -> None:
         sanitized = agentcat.sanitize_payload(

@@ -187,9 +187,9 @@ class ClaudeApiBillingTests(AuditFixTestCase):
             json.dumps({"env": env}), encoding="utf-8"
         )
 
-    def test_api_key_in_environment_is_detected(self) -> None:
+    def test_api_key_in_daemon_environment_does_not_select_billing(self) -> None:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-xxx"}):
-            self.assertEqual(agentcat.claude_api_billing_mode(), "api_key")
+            self.assertIsNone(agentcat.claude_api_billing_mode())
 
     def test_bedrock_and_vertex_are_distinguished(self) -> None:
         with patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "1"}):
@@ -213,9 +213,8 @@ class ClaudeApiBillingTests(AuditFixTestCase):
         self.assertIsNone(agentcat.claude_api_billing_mode())
 
     def test_credentials_report_api_billing_instead_of_token_missing(self) -> None:
-        with patch.object(agentcat.sys, "platform", "linux"), patch.dict(
-            os.environ, {"ANTHROPIC_API_KEY": "sk-ant-xxx"}
-        ):
+        self._settings({"ANTHROPIC_API_KEY": "fixture-key"})
+        with patch.object(agentcat.sys, "platform", "linux"):
             result = agentcat.read_claude_oauth_credentials()
 
         self.assertIsNone(result["oauth"])

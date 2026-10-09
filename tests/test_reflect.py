@@ -521,12 +521,11 @@ class IndexerTests(ReflectTestCase):
         self.assertEqual((digest["tool_call_counts"], digest["tokens"]), ({"read_file": 1}, 105))
         self.assertFalse(digest["counts_only"])
 
-    def test_cursor_reader_copies_sqlite_and_yields_shared_turns(self):
+    def test_cursor_reader_preserves_sqlite_and_yields_shared_turns(self):
         path = self.write_cursor_session()
-        with patch.object(agentcat.shutil, "copy2", wraps=shutil.copy2) as copied:
-            turns = list(agentcat.reflect_read_cursor_turns(path))
-        self.assertEqual(copied.call_count, 1)
-        self.assertNotEqual(Path(copied.call_args.args[1]), path)
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        turns = list(agentcat.reflect_read_cursor_turns(path))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         self.assertTrue(all(set(turn) == {"role", "text", "tool", "ts"} for turn in turns))
         digest = agentcat.reflect_parse_cursor_session(path)
         self.assertEqual((digest["project"], digest["user_turns"]), ("cursor-repo", 1))
@@ -1066,6 +1065,25 @@ class StoreTests(ReflectTestCase):
         with closing(sqlite3.connect(agentcat.REFLECT_DB)) as conn:
             columns = {row[1] for row in conn.execute("pragma table_info(analyses)")}
         self.assertIn("lang", columns)
+
+    def test_cursor_sync_reindexes_wal_changes_without_double_counting(self):
+        path = self.home / "cursor.db"
+        with closing(sqlite3.connect(path)) as writer:
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("pragma wal_autocheckpoint=0")
+            writer.execute("create table blobs (data text)")
+            writer.execute("insert into blobs values (?)", (json.dumps({"role": "user", "content": "first"}),))
+            writer.commit()
+            source_stat = (path.stat().st_size, path.stat().st_mtime_ns)
+            self.assertEqual(agentcat.reflect_sync(files=[("cursor", path)])["indexed"], 1)
+            self.assertEqual(agentcat.reflect_sync(files=[("cursor", path)])["skipped"], 1)
+            writer.execute("insert into blobs values (?)", (json.dumps({"role": "user", "content": "second"}),))
+            writer.commit()
+            self.assertEqual((path.stat().st_size, path.stat().st_mtime_ns), source_stat)
+            self.assertEqual(agentcat.reflect_sync(files=[("cursor", path)])["indexed"], 1)
+            session_id = agentcat.reflect_session_id("cursor", path)
+            self.assertEqual(agentcat.reflect_get_session(session_id)["user_turns"], 2)
+            self.assertEqual(agentcat.reflect_sync(files=[("cursor", path)])["skipped"], 1)
 
     def test_sync_indexes_and_skips_unchanged(self):
         self.write_claude_session()

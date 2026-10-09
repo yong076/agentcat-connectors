@@ -842,6 +842,7 @@ class AntigravityMtimeTests(SandboxedCase):
         embedded = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
         database = self._database(self._blob(int(embedded.timestamp())), embedded)
         original_stat = Path.stat
+        rows = agentcat.antigravity_read_gen_rows(database)
 
         def stat_with_failed_database_mtime(path, *args, **kwargs):
             if path == database:
@@ -852,7 +853,10 @@ class AntigravityMtimeTests(SandboxedCase):
             Path,
             "is_file",
             side_effect=AssertionError("database discovery must not require stat"),
-        ), patch.object(Path, "stat", stat_with_failed_database_mtime):
+        ), patch.object(Path, "stat", stat_with_failed_database_mtime), patch.object(
+            agentcat, "antigravity_read_gen_rows", return_value=rows,
+        ):
+            # Isolate timestamp fallback from the reader's mandatory safety stat.
             usage = agentcat.antigravity_sqlite_usage()
 
         self.assertIsNotNone(usage)

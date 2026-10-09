@@ -107,6 +107,94 @@ class ClaudeProbeTests(unittest.TestCase):
         self.assertEqual(row["status"], "ok")
         self.assertNotIn(str(other), json.dumps(row))
 
+    def test_subscription_ignores_daemon_api_credentials(self):
+        for default_home in (True, False):
+            with self.subTest(default_home=default_home), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / ".claude"
+                home.mkdir()
+                default = home if default_home else Path(tmp) / "default"
+                config = home.parent if default_home else home
+                (config / ".claude.json").write_text(json.dumps({"oauthAccount": {
+                    "emailAddress": "subscriber@example.com", "accountUuid": "fixture"}}))
+                calls = []
+
+                def run(args, **kwargs):
+                    calls.append(args)
+                    self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
+                    return subprocess.CompletedProcess(args, 0, stdout=USAGE_TEXT)
+
+                with patch.dict(cli_probe.os.environ, {"ANTHROPIC_API_KEY": "fixture-key"}, clear=True):
+                    row = cli_probe.probe_claude_home(home, default, "claude", run=run,
+                                                     token_reader=lambda *_: None)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(row["status"], "ok")
+                self.assertEqual(row["windows"], cli_probe.parse_claude_usage(USAGE_TEXT))
+
+    def test_api_billing_rows_skip_cli_and_token_reads(self):
+        cases = (("ANTHROPIC_API_KEY", "fixture-key", "api_key"),
+                 ("ANTHROPIC_AUTH_TOKEN", "fixture-token", "api_key"),
+                 ("CLAUDE_CODE_USE_BEDROCK", "1", "bedrock"),
+                 ("CLAUDE_CODE_USE_VERTEX", "1", "vertex"))
+        for setting, value, mode in cases:
+            for source in (("settings",) if mode == "api_key" else ("environment", "settings")):
+                with self.subTest(setting=setting, source=source), tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    env = {"HOME": str(home), "USERPROFILE": str(home)}
+                    if source == "environment":
+                        env[setting] = value
+                    if source == "settings":
+                        (home / "settings.json").write_text(json.dumps({"env": {setting: value}}))
+                    with patch.dict(cli_probe.os.environ, env, clear=True), \
+                         patch.object(cli_probe, "claude_access_token", side_effect=AssertionError("no token read")), \
+                         patch.object(cli_probe, "fetch_claude_passes", side_effect=AssertionError("no network")):
+                        row = cli_probe.probe_claude_home(home, home, "/bin/claude",
+                            run=lambda *a, **kw: self.fail("API billing must not launch Claude"))
+                    self.assertEqual((row["status"], row["reason"]), ("not_configured", "api_billing"))
+                    self.assertEqual(row["billingMode"], mode)
+                    self.assertEqual(row["windows"], [])
+                    self.assertNotIn("fixture-key", json.dumps(row))
+                    self.assertNotIn("fixture-token", json.dumps(row))
+
+    def test_subscription_probe_does_not_borrow_default_home_billing_settings(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(cli_probe.os.environ,
+                {"HOME": tmp, "USERPROFILE": tmp}, clear=True):
+            default, other = Path(tmp) / "default", Path(tmp) / "other"
+            default.mkdir()
+            other.mkdir()
+            (default / "settings.json").write_text(json.dumps({"env": {"ANTHROPIC_API_KEY": "fixture-key"}}))
+            (other / "settings.json").write_text(json.dumps({"env": {
+                "CLAUDE_CODE_USE_BEDROCK": "0", "CLAUDE_CODE_USE_VERTEX": "false"}}))
+            row = cli_probe.probe_claude_home(other, default, "/bin/claude",
+                run=lambda args, **kw: subprocess.CompletedProcess(args, 0, stdout=USAGE_TEXT),
+                token_reader=lambda *_: None)
+        self.assertEqual(row["status"], "ok")
+        self.assertIsNone(row["reason"])
+        self.assertTrue(row["windows"])
+
+    def test_selected_home_supplies_identity_and_details_without_global_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default = Path(tmp) / "selected-user" / ".claude"
+            other = Path(tmp) / "alternate-config"
+            for home, config in ((default, default.parent / ".claude.json"),
+                                 (other, other / ".claude.json")):
+                with self.subTest(default_home=home == default):
+                    home.mkdir(parents=True)
+                    config.write_text(json.dumps({"oauthAccount": {
+                        "emailAddress": "selected@example.com", "accountUuid": "selected-account",
+                        "organizationRateLimitTier": "max_5x", "hasExtraUsageEnabled": False,
+                    }}))
+                    with patch.dict(cli_probe.os.environ,
+                            {"HOME": tmp, "USERPROFILE": tmp}, clear=True), \
+                         patch.object(Path, "home", side_effect=RuntimeError("Could not determine home directory")):
+                        row = cli_probe.probe_claude_home(home, default, "/bin/claude",
+                            run=lambda args, **kw: subprocess.CompletedProcess(args, 0, stdout=USAGE_TEXT),
+                            token_reader=lambda *_: None)
+                    self.assertEqual(row["status"], "ok")
+                    self.assertEqual(row["email"], "selected@example.com")
+                    self.assertEqual(row["accountID"], "selected-account")
+                    self.assertEqual(row["plan"], "Max 5x")
+                    self.assertFalse(row["extraUsageEnabled"])
+
     def test_timeout_is_an_error_row_not_an_exception(self):
         def run(args, **kwargs):
             raise subprocess.TimeoutExpired(args, 60)
@@ -384,6 +472,13 @@ class CreditProbeTests(unittest.TestCase):
         self.assertEqual(row["balances"], {"remainingUsd": 12.5})
         self.assertEqual(row["email"], "someone@example.com")
         self.assertEqual(cli_probe.parse_amp_usage("Not signed in")["reason"], "usage_unavailable")
+
+    def test_credit_probes_use_module_home_when_platform_home_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(cli_probe, "HOME", Path(tmp)), patch.object(
+                Path, "home", side_effect=RuntimeError("home unavailable")):
+            for probe, relative in ((cli_probe.probe_auggie, ".augment"), (cli_probe.probe_amp, ".amp")):
+                row = probe("fixture", lambda args, **kw: subprocess.CompletedProcess(args, 1, stdout=""))
+                self.assertEqual(row["homeKey"], cli_probe.home_key(Path(tmp) / relative))
 
     def test_probe_runs_only_the_read_only_account_command(self):
         calls = []

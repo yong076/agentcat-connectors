@@ -27,7 +27,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -3539,9 +3539,9 @@ def configured_limits() -> Dict[str, Dict[str, Any]]:
     return base
 
 
-def latest_event_payload(provider: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def latest_event_record(provider: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
     init_db()
-    query = "select payload_json from events where provider = ?"
+    query = "select payload_json, ts from events where provider = ?"
     params: List[Any] = [provider]
     if source:
         query += " and source = ?"
@@ -3558,7 +3558,7 @@ def latest_event_payload(provider: str, source: Optional[str] = None) -> Optiona
         payload = json.loads(str(row[0]))
     except json.JSONDecodeError:
         return None
-    return payload if isinstance(payload, dict) else None
+    return {"payload": payload, "timestamp": row[1]} if isinstance(payload, dict) else None
 
 
 def codex_runtime_limits() -> Dict[str, Any]:
@@ -3640,12 +3640,22 @@ def codex_runtime_limits() -> Dict[str, Any]:
 
 
 def claude_runtime_limits() -> Dict[str, Any]:
-    payload = latest_event_payload("claude", "claude-statusline")
-    if not payload:
+    record = latest_event_record("claude", "claude-statusline")
+    if not record:
         return empty_limits()
+    payload = record["payload"]
 
     limits = empty_limits(status="auto")
     limits["source"] = "claude-statusline"
+    # Use the collector's event timestamp, never a timestamp supplied by the
+    # statusline payload. Keep old values visible only with honest freshness.
+    observed = parse_timestamp(record["timestamp"])
+    now = time.time()
+    age = now - observed.timestamp() if observed is not None else None
+    limits["updatedAt"] = iso_from_timestamp(observed.timestamp()) if observed is not None else None
+    limits["stale"] = age is None or not 0 <= age <= LIVE_LIMITS_MAX_AGE_SECONDS
+    if limits["stale"]:
+        limits["reason"] = "statusline_stale"
     quotas: List[Dict[str, Any]] = []
 
     context_window = payload.get("context_window")
@@ -3665,6 +3675,12 @@ def claude_runtime_limits() -> Dict[str, Any]:
 
     rate_limits = payload.get("rate_limits")
     if isinstance(rate_limits, dict):
+        for window in rate_limits.values():
+            reset = int_limit(window.get("resets_at")) if isinstance(window, dict) else None
+            if reset is not None and reset <= now:
+                limits["stale"] = True
+                limits["reason"] = "statusline_window_reset"
+                break
         seven_day = rate_limits.get("seven_day")
         if isinstance(seven_day, dict):
             limits["weeklyUsedPercent"] = float_percent(seven_day.get("used_percentage"))
@@ -5389,28 +5405,11 @@ def claude_api_billing_mode() -> Optional[str]:
     failed to detect Claude" and is a known share of the "detection works for
     some users, not others" reports.
 
-    The daemon's own environment is not enough: it inherits whatever the launch
-    job froze, so an ``ANTHROPIC_API_KEY`` exported in the user's shell is
-    invisible to it. Claude Code's own ``settings.json`` env block is checked
-    too, which is where a persistent setup actually lives.
+    API keys must come from the selected home's settings, since a daemon
+    environment key may belong to unrelated SDK work. Explicit Bedrock and
+    Vertex environment flags still select those billing modes.
     """
-    def _from_env(source: Dict[str, Any]) -> Optional[str]:
-        if str(source.get("CLAUDE_CODE_USE_BEDROCK") or "").strip() not in ("", "0", "false"):
-            return "bedrock"
-        if str(source.get("CLAUDE_CODE_USE_VERTEX") or "").strip() not in ("", "0", "false"):
-            return "vertex"
-        if source.get("ANTHROPIC_API_KEY") or source.get("ANTHROPIC_AUTH_TOKEN"):
-            return "api_key"
-        return None
-
-    mode = _from_env(dict(os.environ))
-    if mode:
-        return mode
-    settings = read_json(claude_config_dir() / "settings.json")
-    env_block = settings.get("env") if isinstance(settings, dict) else None
-    if isinstance(env_block, dict):
-        return _from_env(env_block)
-    return None
+    return cli_probe.claude_api_billing_mode(claude_config_dir())
 
 
 def read_claude_oauth_credentials() -> Dict[str, Any]:
@@ -7695,9 +7694,7 @@ def hermes_snapshot() -> Dict[str, Any]:
     errors: List[str] = []
     total_cost = actual_cost = estimated_cost = 0.0
     for db_path in existing_paths:
-        conn: Optional[sqlite3.Connection] = None
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        def read_rows(conn: sqlite3.Connection) -> List[Any]:
             available = {
                 str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
             }
@@ -7713,13 +7710,13 @@ def hermes_snapshot() -> Dict[str, Any]:
                 f"SELECT {', '.join(select_fields)} FROM sessions "
                 "WHERE model IS NOT NULL AND TRIM(model) != ''"
             )
-            rows = conn.execute(query).fetchall()
+            return conn.execute(query).fetchall()
+
+        try:
+            rows = read_foreign_sqlite(db_path, read_rows)
         except Exception as exc:
             errors.append(f"{db_path.name}: {exc}")
             continue
-        finally:
-            if conn is not None:
-                conn.close()
 
         for (_session_id, model_raw, started_at, input_raw, output_raw,
              cache_read_raw, cache_write_raw, reasoning_raw, estimated_raw,
@@ -8246,9 +8243,7 @@ def opencode_snapshot() -> Dict[str, Any]:
     project_tokens: Dict[str, int] = {}
     project_last: Dict[str, dt.datetime] = {}
     for db_path in db_paths:
-        conn: Optional[sqlite3.Connection] = None
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        def read_rows(conn: sqlite3.Connection) -> List[Any]:
             session_columns = {row[1] for row in conn.execute("pragma table_info(session)").fetchall()}
             # Session schemas across opencode releases have used `path`,
             # `cwd`, and `working_directory`. Try each — first hit wins.
@@ -8258,7 +8253,7 @@ def opencode_snapshot() -> Dict[str, Any]:
                     path_col = candidate
                     break
             select_path = f"session.{path_col}" if path_col else "''"
-            rows = conn.execute(
+            return conn.execute(
                 f"""
                 select message.time_created, message.data, {select_path}
                 from message
@@ -8268,15 +8263,12 @@ def opencode_snapshot() -> Dict[str, Any]:
                 order by message.time_created asc
                 """
             ).fetchall()
+
+        try:
+            rows = read_foreign_sqlite(db_path, read_rows)
         except Exception as exc:
             errors.append(f"{db_path.name}: {exc}")
             continue
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
 
         for created_raw, data_raw, project_raw in rows:
             try:
@@ -9317,13 +9309,13 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
 
     db_path = paths[-1]
     result["source"] = snapshot_source_label(db_path)
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+    def read_rows(conn: sqlite3.Connection) -> Tuple[List[str], Optional[List[Any]]]:
         columns = [row[1] for row in conn.execute("pragma table_info(threads)").fetchall()]
         if "tokens_used" not in columns:
             result["status"] = "unsupported_schema"
             result["columns"] = columns
-            return result
+            return columns, None
         model_col = "model" if "model" in columns else "null"
         updated_col = "updated_at" if "updated_at" in columns else ("created_at" if "created_at" in columns else "null")
         rollout_col = "rollout_path" if "rollout_path" in columns else "null"
@@ -9334,15 +9326,16 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
         if cwd_col == "null":
             # Codex schemas without cwd cannot attribute thread token totals to projects.
             result["projects"] = {"status": "not_available", "items": []}
+        return columns, rows
+
+    try:
+        columns, rows = read_foreign_sqlite(db_path, read_rows)
+        if rows is None:
+            return result
     except Exception as exc:
         result["status"] = "error"
         result["error"] = str(exc)
         return result
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
     models: Dict[str, Dict[str, int]] = {}
     project_tokens: Dict[str, int] = {}
@@ -12122,57 +12115,132 @@ def _antigravity_db_signature(database: Path) -> Optional[Tuple[int, int, int, i
     return (stat.st_size, stat.st_mtime_ns, wal_sig[0], wal_sig[1])
 
 
-def _antigravity_rows_from_copy(database: Path) -> List[Any]:
-    with tempfile.TemporaryDirectory(prefix="agentcat-antigravity-") as temp_dir:
-        copied = Path(temp_dir) / "conversation.db"
-        shutil.copyfile(database, copied)
-        for suffix in ("-wal", "-shm"):
-            try:
-                shutil.copyfile(
-                    database.with_name(database.name + suffix),
-                    copied.with_name(copied.name + suffix),
-                )
-            except FileNotFoundError:
+def _foreign_sqlite_signature(database: Path) -> Tuple[int, int, int, int]:
+    stat = database.stat()
+    try:
+        wal = database.with_name(database.name + "-wal").stat()
+        wal_sig = (wal.st_size, wal.st_mtime_ns)
+    except FileNotFoundError:
+        wal_sig = (-1, -1)
+    return (stat.st_size, stat.st_mtime_ns, *wal_sig)
+
+
+def _foreign_sqlite_copy_error(exc: sqlite3.Error) -> bool:
+    """Copy only for source access, locking, I/O or damaged database errors."""
+    message = str(exc).lower()
+    if any(text in message for text in ("no such column", "no such table", "syntax error")):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        # Mask extended codes (including READONLY_CANTINIT and IOERR_SHMOPEN).
+        return (code & 0xff) in (5, 6, 8, 10, 11, 14, 15, 26)
+    # Python 3.9/3.10 do not attach SQLite result codes to exceptions.
+    return any(text in message for text in (
+        "unable to open database", "database is locked", "database table is locked",
+        "database schema is locked", "disk i/o error", "database disk image is malformed",
+        "file is not a database", "readonly database", "read-only database", "locking protocol",
+    ))
+
+
+def sweep_foreign_sqlite_copies() -> None:
+    """Remove abandoned private database copies after one hour, best effort."""
+    cutoff = time.time() - 3600
+    try:
+        candidates = list(Path(tempfile.gettempdir()).glob("agentcat-sqlite-*"))
+    except OSError:
+        return
+    for folder in candidates:
+        try:
+            metadata = folder.lstat()
+            if folder.is_symlink() or not folder.is_dir() or metadata.st_mtime >= cutoff:
                 continue
-        with closing(sqlite3.connect(str(copied))) as connection:
-            return connection.execute(_ANTIGRAVITY_GEN_QUERY).fetchall()
+            if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+                continue
+            # Only our known disposable copy files, never another task's data.
+            if any(child.is_symlink() or not child.is_file() or child.name not in
+                   ("database.db", "database.db-wal", "database.db-shm", "database.db-journal")
+                   for child in folder.iterdir()):
+                continue
+            shutil.rmtree(folder)
+        except OSError:
+            continue
+
+
+def read_foreign_sqlite(
+    database: Path, read: Callable[[sqlite3.Connection], Any], *, timeout: float = 5.0,
+) -> Any:
+    """Read a foreign DB without creating side files in its owner's folder.
+
+    Cleanly closed WAL databases need immutable=1: mode=ro alone can create
+    -wal/-shm files. With both side files present, use a normal concurrent
+    reader (even for an empty WAL). Partial side files or a failed in-place
+    read require a private copy including WAL frames. The callback must fully
+    materialize its result before the connection closes and may be retried.
+    """
+    database = database.resolve()
+
+    def sidecars() -> Tuple[bool, bool]:
+        return (database.with_name(database.name + "-wal").exists(),
+                database.with_name(database.name + "-shm").exists())
+
+    # One immutable attempt, then a fresh mode decision without immutable.
+    # A writer may checkpoint and remove its WAL entirely during the callback.
+    for attempt in range(2):
+        wal_exists, shm_exists = sidecars()
+        immutable = attempt == 0 and not wal_exists and not shm_exists
+        if not immutable and not (wal_exists and shm_exists):
+            break
+        # pathname2url handles Windows extended-length paths without making
+        # the \? prefix a URI authority. Keep UNC shares in the URI path too.
+        uri_path = urllib.request.pathname2url(os.path.abspath(database))
+        if uri_path.startswith("//") and not uri_path.startswith("///"):
+            uri_path = "//" + uri_path
+        uri = "file:" + uri_path + "?mode=ro&readonly_shm=1"
+        if immutable:
+            uri += "&immutable=1"
+        try:
+            before = database.stat() if immutable else None
+            with closing(sqlite3.connect(uri, uri=True, timeout=timeout)) as connection:
+                result = read(connection)
+            if immutable:
+                after = database.stat()
+                if ((before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
+                        or any(sidecars())):
+                    continue
+            return result
+        except sqlite3.Error as exc:
+            if not _foreign_sqlite_copy_error(exc):
+                raise
+            break
+        except OSError:
+            break
+    # Retry two times if a writer changes the DB/WAL while they are copied.
+    # Each attempt gets a new directory so vanished WALs cannot leave old frames.
+    for attempt in range(3):
+        with tempfile.TemporaryDirectory(prefix="agentcat-sqlite-") as temp_dir:
+            copied = Path(temp_dir) / "database.db"
+            try:
+                before = _foreign_sqlite_signature(database)
+                shutil.copyfile(database, copied)
+                if before[2] != -1:
+                    shutil.copyfile(database.with_name(database.name + "-wal"),
+                                    copied.with_name(copied.name + "-wal"))
+                after = _foreign_sqlite_signature(database)
+            except FileNotFoundError:
+                # The owner may checkpoint and remove its WAL between stat/copy.
+                continue
+            if before != after:
+                continue
+            # Never copy the owner's shared-memory index; SQLite rebuilds it here.
+            with closing(sqlite3.connect(str(copied), timeout=timeout)) as connection:
+                return read(connection)
+    raise sqlite3.OperationalError("foreign database changed while copying")
 
 
 def antigravity_read_gen_rows(database: Path) -> List[Any]:
-    """Read gen_metadata blobs without creating or changing any file next to the DB.
-
-    Antigravity's trajectory DBs are in WAL mode. Opening one with plain
-    ``mode=ro`` needs the ``-shm`` index: depending on the SQLite build it
-    either fails once Antigravity has exited and removed it (releases#44 item
-    3) or creates ``-shm``/``-wal`` files in Antigravity's folder. So:
-
-    - ``-wal`` and ``-shm`` both present (Antigravity running, even with a
-      0-byte ``-wal``): ``mode=ro`` in place, a normal concurrent reader
-      that creates nothing and takes the writer's locks into account;
-    - neither present (cleanly closed, fully checkpointed): ``immutable=1``,
-      which reads the file without locks or side files;
-    - anything else, or if the in-place read fails: read a private temp copy
-      of the db with its ``-wal``/``-shm`` so recent WAL frames still count.
-    """
-    wal_exists = database.with_name(database.name + "-wal").exists()
-    shm_exists = database.with_name(database.name + "-shm").exists()
-    if wal_exists and shm_exists:
-        uri: Optional[str] = f"file:{database}?mode=ro"
-    elif not wal_exists and not shm_exists:
-        # immutable=1 skips locking, so it is only safe with no live writer.
-        uri = f"file:{database}?mode=ro&immutable=1"
-    else:
-        uri = None
-    if uri is not None:
-        try:
-            with closing(sqlite3.connect(uri, uri=True)) as connection:
-                return connection.execute(_ANTIGRAVITY_GEN_QUERY).fetchall()
-        except sqlite3.Error as exc:
-            if "no such table" in str(exc):
-                raise
-        except OSError:
-            pass
-    return _antigravity_rows_from_copy(database)
+    return read_foreign_sqlite(
+        database, lambda connection: connection.execute(_ANTIGRAVITY_GEN_QUERY).fetchall(),
+    )
 
 
 def antigravity_sqlite_usage() -> Optional[Dict[str, Any]]:
@@ -14018,12 +14086,12 @@ def run_cli_probes() -> Dict[str, Any]:
         if current is None or (current["status"] != "ok" and row["status"] == "ok"):
             seen[key] = row
     results.extend(r for r in seen.values() if r.get("email") or r["status"] == "ok")
-    claude = shutil.which("claude") or (str(Path.home() / ".local" / "bin" / "claude") if (Path.home() / ".local" / "bin" / "claude").exists() else None)
+    claude = shutil.which("claude") or (str(HOME / ".local" / "bin" / "claude") if (HOME / ".local" / "bin" / "claude").exists() else None)
     default_claude = default_provider_home("claude")
     for home in tracked_provider_homes("claude"):
         results.append(cli_probe.probe_claude_home(home, default_claude, claude, cwd=cwd))
     for provider, relative, token_key in (("grok", ".grok", "token"), ("kimi", ".kimi-code", "access")):
-        home = Path.home() / relative
+        home = HOME / relative
         if home.is_dir():
             try:
                 results.append(cli_probe.probe_token_home(provider, home, _cli_probe_token_module(provider), token_key))
@@ -14036,7 +14104,7 @@ def run_cli_probes() -> Dict[str, Any]:
             try:
                 results.append(probe(executable))
             except Exception:
-                results.append(cli_probe._result(provider, Path.home(), status="error", reason="cli_failed"))
+                results.append(cli_probe._result(provider, HOME, status="error", reason="cli_failed"))
     if shutil.which("gh"):
         try:
             # Copilot rides the GitHub login the gh CLI already holds.
@@ -15195,49 +15263,44 @@ def _reflect_cursor_json_messages(value: Any) -> Iterable[Dict[str, Any]]:
 
 
 def reflect_read_cursor_turns(path: Path) -> Iterable[Dict[str, Any]]:
-    """Copy Cursor SQLite, then yield JSON message blobs from the read-only copy."""
-    with tempfile.TemporaryDirectory(prefix="agentcat-reflect-cursor-") as temp_dir:
-        copied = Path(temp_dir) / path.name
+    """Read Cursor message blobs, including pending WAL frames, without source writes."""
+    def read_values(conn: sqlite3.Connection) -> List[Any]:
+        tables = {str(row[0]) for row in conn.execute("select name from sqlite_master where type='table'")}
+        raw_values: List[Any] = []
+        if "blobs" in tables:
+            raw_values.extend(row[0] for row in conn.execute("select data from blobs order by rowid"))
+        elif "ItemTable" in tables:
+            raw_values.extend(row[0] for row in conn.execute(
+                "select value from ItemTable where key like '%chat%' or key like '%composer%' order by key"
+            ))
+        return raw_values
+
+    try:
+        raw_values = read_foreign_sqlite(path, read_values, timeout=1.0)
+    except (OSError, sqlite3.Error):
+        return
+    for raw in raw_values:
+        if isinstance(raw, bytes):
+            text = raw.decode("utf-8", errors="ignore")
+        else:
+            text = str(raw or "")
+        if not text.lstrip().startswith(("{", "[")):
+            continue
         try:
-            shutil.copy2(path, copied)
-            conn = sqlite3.connect(f"file:{copied}?mode=ro", uri=True, timeout=1.0)
-        except (OSError, sqlite3.Error):
-            return
-        try:
-            tables = {str(row[0]) for row in conn.execute("select name from sqlite_master where type='table'")}
-            raw_values: List[Any] = []
-            if "blobs" in tables:
-                raw_values.extend(row[0] for row in conn.execute("select data from blobs order by rowid"))
-            elif "ItemTable" in tables:
-                raw_values.extend(row[0] for row in conn.execute(
-                    "select value from ItemTable where key like '%chat%' or key like '%composer%' order by key"
-                ))
-            for raw in raw_values:
-                if isinstance(raw, bytes):
-                    text = raw.decode("utf-8", errors="ignore")
-                else:
-                    text = str(raw or "")
-                if not text.lstrip().startswith(("{", "[")):
-                    continue
-                try:
-                    parsed = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                for message in _reflect_cursor_json_messages(parsed):
-                    role = str(message.get("role"))
-                    content = message.get("content") if "content" in message else message.get("text")
-                    message_text = _reflect_message_text(content)
-                    timestamp = message.get("timestamp") or message.get("createdAt") or message.get("created_at")
-                    if message_text:
-                        yield _reflect_shared_turn(role, text=message_text, ts=timestamp)
-                    blocks = content if isinstance(content, list) else []
-                    for block in blocks:
-                        if isinstance(block, dict) and block.get("type") in ("tool", "tool_call", "tool-call"):
-                            yield _reflect_shared_turn("assistant", tool=block.get("toolName") or block.get("name"), ts=timestamp)
-        except sqlite3.Error:
-            return
-        finally:
-            conn.close()
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        for message in _reflect_cursor_json_messages(parsed):
+            role = str(message.get("role"))
+            content = message.get("content") if "content" in message else message.get("text")
+            message_text = _reflect_message_text(content)
+            timestamp = message.get("timestamp") or message.get("createdAt") or message.get("created_at")
+            if message_text:
+                yield _reflect_shared_turn(role, text=message_text, ts=timestamp)
+            blocks = content if isinstance(content, list) else []
+            for block in blocks:
+                if isinstance(block, dict) and block.get("type") in ("tool", "tool_call", "tool-call"):
+                    yield _reflect_shared_turn("assistant", tool=block.get("toolName") or block.get("name"), ts=timestamp)
 
 
 def _reflect_add_usage(
@@ -16219,20 +16282,27 @@ def reflect_sync(files: Optional[List[Tuple[str, Path]]] = None) -> Dict[str, An
     """Index every session file; files whose (mtime, size) match the stored row are skipped."""
     candidates = files if files is not None else reflect_session_files()
     known: Dict[str, Tuple[float, int]] = {}
+    cursor_signatures: Dict[str, str] = {}
     with closing(_reflect_connect()) as conn:
         for row in conn.execute("select id, file_mtime, file_size from sessions"):
             known[row["id"]] = (float(row["file_mtime"] or 0.0), int(row["file_size"] or 0))
+        cursor_signatures = dict(conn.execute(
+            "select key, value from state where key like 'cursor_source_signature:%'"))
     indexed = 0
     skipped = 0
     empty = 0
     for tool, path in candidates:
         try:
             stat = path.stat()
+            cursor_signature = (json.dumps(_foreign_sqlite_signature(path.resolve()))
+                                if tool == "cursor" else None)
         except OSError:
             continue
         session_id = reflect_session_id(tool, path)
         previous = known.get(session_id)
-        if previous is not None and previous == (float(stat.st_mtime), int(stat.st_size)):
+        signature_key = "cursor_source_signature:" + session_id
+        if (previous is not None and previous == (float(stat.st_mtime), int(stat.st_size))
+                and (tool != "cursor" or cursor_signatures.get(signature_key) == cursor_signature)):
             skipped += 1
             continue
         digest = reflect_parse_session(tool, path)
@@ -16240,6 +16310,8 @@ def reflect_sync(files: Optional[List[Tuple[str, Path]]] = None) -> Dict[str, An
             empty += 1
             continue
         reflect_upsert_session(reflect_session_row(digest), float(stat.st_mtime), int(stat.st_size))
+        if cursor_signature is not None:
+            reflect_state_set(signature_key, cursor_signature)
         indexed += 1
     with closing(_reflect_connect()) as conn:
         total = int(conn.execute("select count(*) from sessions").fetchone()[0])
@@ -18497,6 +18569,7 @@ def run_daemon(args: argparse.Namespace) -> int:
         rotate_daemon_log()
     except Exception:
         pass
+    sweep_foreign_sqlite_copies()
     # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
     prune_events()
     print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
