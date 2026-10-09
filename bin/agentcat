@@ -13406,9 +13406,16 @@ def auto_update_status_snapshot() -> Dict[str, Any]:
             "rollout": {"percent": 0, "bucketAllowed": False, "halted": False, "reason": "not_checked"},
         }
     status = dict(state)
+    if state.get("currentVersion") != CONNECTOR_VERSION:
+        # Check results belong to the runtime that produced them. Leave the
+        # persisted format untouched; the background check will replace it.
+        for key in ("checkedAt", "latestVersion", "remoteVersion", "updateAvailable",
+                    "rollout", "installPid", "message", "error"):
+            status.pop(key, None)
+        status.update(status="idle" if enabled else "disabled", enabled=enabled, reason=reason)
     status.setdefault("enabled", enabled)
     status.setdefault("reason", reason)
-    status.setdefault("currentVersion", CONNECTOR_VERSION)
+    status["currentVersion"] = CONNECTOR_VERSION
     status["channel"] = update_channel_status_snapshot()
     status.setdefault("rollout", {"percent": 0, "bucketAllowed": False, "halted": False, "reason": "not_checked"})
     status["installDir"] = _safe_auto_update_path(status.get("installDir"))

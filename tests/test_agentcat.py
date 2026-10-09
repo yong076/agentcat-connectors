@@ -1148,6 +1148,65 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
         self.assertEqual(snapshot["update"]["channel"]["channel"], "public")
 
+    def test_snapshot_discards_update_results_from_previous_runtime(self) -> None:
+        for latest in ("26.37.0", "26.41.4", "26.42.0"):
+            for enabled in (True, False):
+                with self.subTest(latest=latest, enabled=enabled):
+                    state = {
+                        "currentVersion": "26.32.4",
+                        "checkedAt": "2026-08-17T00:00:00Z",
+                        "latestVersion": latest,
+                        "remoteVersion": latest,
+                        "updateAvailable": True,
+                        "status": "update_available",
+                        "enabled": True,
+                        "reason": "enabled",
+                        "rollout": {"bucketAllowed": True},
+                        "installPid": 12345,
+                        "message": "updating an older runtime",
+                        "error": "old error",
+                    }
+                    agentcat.write_auto_update_state(state)
+                    with patch.object(agentcat, "CONNECTOR_VERSION", "26.41.4"), \
+                            patch.object(agentcat, "auto_update_enabled_status", return_value=(enabled, "test")), \
+                            patch.object(agentcat, "check_auto_update_once") as check, \
+                            patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")):
+                        snapshot = agentcat.build_snapshot()
+                        agentcat.write_json_atomic(agentcat.LATEST_SNAPSHOT, snapshot)
+                        served = agentcat.snapshot_for_http()
+                    check.assert_not_called()
+                    for payload in (snapshot, served):
+                        update = payload["update"]
+                        self.assertEqual(update["currentVersion"], payload["connectorVersion"])
+                        self.assertEqual(update["currentVersion"], "26.41.4")
+                        self.assertEqual(update["channel"]["currentVersion"], "26.41.4")
+                        self.assertEqual(update["status"], "idle" if enabled else "disabled")
+                        self.assertEqual(update["enabled"], enabled)
+                        for key in ("checkedAt", "latestVersion", "remoteVersion", "updateAvailable",
+                                    "installPid", "message", "error"):
+                            self.assertNotIn(key, update)
+                        self.assertEqual(update["rollout"]["reason"], "not_checked")
+                    self.assertEqual(agentcat.read_auto_update_state(), state)
+
+    def test_auto_update_snapshot_preserves_fresh_check_results(self) -> None:
+        state = {
+            "currentVersion": agentcat.CONNECTOR_VERSION,
+            "checkedAt": agentcat.now_iso(),
+            "latestVersion": "99.0.0",
+            "remoteVersion": "99.0.0",
+            "updateAvailable": True,
+            "status": "update_available",
+            "enabled": True,
+            "reason": "enabled",
+            "rollout": {"percent": 100, "bucketAllowed": True},
+        }
+        agentcat.write_auto_update_state(state)
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")):
+            snapshot = agentcat.auto_update_status_snapshot()
+        for key, value in state.items():
+            self.assertEqual(snapshot[key], value)
+        self.assertEqual(agentcat.read_auto_update_state(), state)
+
     def test_connector_version_parser_and_comparison(self) -> None:
         text = 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.10")'
 
