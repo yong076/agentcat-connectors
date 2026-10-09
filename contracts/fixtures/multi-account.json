@@ -6,12 +6,96 @@
     "contractVersion": 1,
     "connectorVersion": "26.34.6",
     "generatedAt": "2026-08-22T00:00:00Z",
-    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1"],
+    "capabilities": ["connector.contract.v1", "connector.daemon.status.v1", "providerInstances.v1", "homes.discovery"],
     "providers": {"codex": {"status": "ok", "tokens": {"all": 3000}}},
     "providerInstances": [
-      {"id": "codex:account-a", "provider": "codex", "label": "Work", "status": "ok", "tokens": {"all": 1800}},
-      {"id": "codex:account-b", "provider": "codex", "label": "Personal", "status": "ok", "tokens": {"all": 1200}}
+      {"id": "codex:account-a", "provider": "codex", "label": "Work", "status": "ok", "tokens": {"all": 1800}, "usage": {"today": 1800, "week": 1800, "month": 1800}},
+      {"id": "codex:account-b", "provider": "codex", "label": "Codex \u00b7 codex-team", "status": "ok", "tokens": {"all": 1200}, "usage": {"today": 1200, "week": 1200, "month": 1200}}
     ],
+    "homes": {
+      "codex": {
+        "tracked": [
+          "~/.codex",
+          "~/team-home"
+        ],
+        "discovered": [
+          {
+            "id": "111111111111",
+            "path": "~/.codex",
+            "source": "default",
+            "sources": [
+              "default",
+              "auto"
+            ],
+            "launchers": [],
+            "state": "tracked",
+            "evidence": [
+              "provider.openai"
+            ],
+            "tracked": true,
+            "excluded": false,
+            "files": 1,
+            "newestAgeSeconds": 1,
+            "usage": {
+              "today": 1800,
+              "week": 1800,
+              "month": 1800,
+              "all": 1800
+            }
+          },
+          {
+            "id": "222222222222",
+            "path": "~/team-home",
+            "source": "launcher",
+            "sources": [
+              "launcher",
+              "auto"
+            ],
+            "launchers": [
+              "codex-team"
+            ],
+            "state": "tracked",
+            "evidence": [
+              "provider.openai"
+            ],
+            "tracked": true,
+            "excluded": false,
+            "files": 1,
+            "newestAgeSeconds": 1,
+            "usage": {
+              "today": 1200,
+              "week": 1200,
+              "month": 1200,
+              "all": 1200
+            }
+          },
+          {
+            "id": "333333333333",
+            "path": "~/runtime-mirror",
+            "source": "auto",
+            "sources": [
+              "known_runtime"
+            ],
+            "launchers": [],
+            "state": "mirror",
+            "evidence": [
+              "originator.codex",
+              "sessions.mirror"
+            ],
+            "tracked": false,
+            "excluded": false,
+            "files": 2,
+            "newestAgeSeconds": 2,
+            "usage": {
+              "today": 0,
+              "week": 0,
+              "month": 0,
+              "all": 0
+            }
+          }
+        ]
+      }
+    },
     "activity": {"status": "ok", "processes": [], "countsByProvider": {"codex": 2}},
     "daemon": {"platform": "macos", "status": "registered", "persistent": true, "registration": "launch_agent"}
   }

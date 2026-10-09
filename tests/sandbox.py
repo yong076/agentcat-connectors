@@ -13,12 +13,15 @@ being redirected here.
 """
 
 from pathlib import Path
+import os
+from unittest.mock import patch
 
 
 def _redirect(home: Path, agentcat_home: Path) -> dict:
     """Sandbox value for each module-level path constant."""
     return {
         "HOME": home,
+        "HOME_DISCOVERY_LAUNCHER_DIRS": (str(home / "system-bin"),),
         "AGENTCAT_HOME": agentcat_home,
         "EVENTS_DB": agentcat_home / "events.sqlite",
         "LATEST_SNAPSHOT": agentcat_home / "latest-snapshot.json",
@@ -64,6 +67,14 @@ def _redirect(home: Path, agentcat_home: Path) -> dict:
 def redirect_module_paths(module, home: Path, agentcat_home: Path) -> dict:
     """Point every path constant at the sandbox. Returns the originals."""
     originals = {}
+    # A fake HOME does not neutralize a launcher-inherited CODEX_HOME. Remove
+    # ambient CLI overrides before any discovery/probe runs; tests can inject
+    # their own overrides after redirecting, and restoration is paired below.
+    env_patch = patch.dict(os.environ, {}, clear=False)
+    env_patch.start()
+    originals["_sandbox_env_patch"] = env_patch
+    for key in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "GROK_HOME", "KIMI_HOME", "GEMINI_CLI_HOME"):
+        os.environ.pop(key, None)
     # Snapshot tests must never call the developer's running Orca account API.
     if hasattr(module, "ORCA_ACCOUNTS_ENABLED"):
         originals["ORCA_ACCOUNTS_ENABLED"] = module.ORCA_ACCOUNTS_ENABLED
@@ -73,13 +84,19 @@ def redirect_module_paths(module, home: Path, agentcat_home: Path) -> dict:
             continue  # constant renamed or removed upstream; nothing to redirect
         originals[name] = getattr(module, name)
         setattr(module, name, sandboxed)
+    if hasattr(module, "_HOME_CANDIDATES_KEY"):
+        module._HOME_CANDIDATES_KEY = None
+        module._HOME_USAGE_CURSORS.clear()
     assert_sandboxed(module, home, agentcat_home)
     return originals
 
 
 def restore_module_paths(module, originals: dict) -> None:
     for name, value in originals.items():
-        setattr(module, name, value)
+        if name == "_sandbox_env_patch":
+            value.stop()
+        else:
+            setattr(module, name, value)
 
 
 def block_network(module):
