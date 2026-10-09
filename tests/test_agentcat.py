@@ -4665,11 +4665,54 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(agentcat.motion_stage(0, 100, 10), "sleeping")
         self.assertEqual(agentcat.motion_stage(1, 0, 0), "walking")
         self.assertEqual(agentcat.motion_stage(1, 6.9, 0), "walking")
-        self.assertEqual(agentcat.motion_stage(1, 7, 0), "running")
-        self.assertEqual(agentcat.motion_stage(1, 21.9, 0), "running")
-        self.assertEqual(agentcat.motion_stage(1, 22, 0), "sprinting")
+        self.assertEqual(agentcat.motion_stage(1, 7, 0, recent_activity=True), "running")
+        self.assertEqual(agentcat.motion_stage(1, 21.9, 0, recent_activity=True), "running")
+        self.assertEqual(agentcat.motion_stage(1, 22, 0, recent_activity=True), "sprinting")
         self.assertEqual(agentcat.motion_stage(1, 0, 2), "running")
         self.assertEqual(agentcat.motion_stage(1, 0, 6), "sprinting")
+
+    def test_terminal_motion_requires_runnable_or_recent_hook_append(self) -> None:
+        now = 1_800_000_000
+        cases = [
+            (7, "S", None, "claude", "claude-hook", "walking"),
+            (40, "S", None, "claude", "claude-hook", "walking"),
+            (3, "R", None, "claude", "claude-hook", "running"),
+            (18, "R+", None, "claude", "claude-hook", "sprinting"),
+            (7, "S", 0, "claude", "claude-hook", "running"),
+            (22, "S", 60, "claude", "claude-hook", "sprinting"),
+            (22, "S", 61, "claude", "claude-hook", "walking"),
+            (22, "S", -1, "claude", "claude-hook", "walking"),
+            (22, "S", 0, "codex", "codex-notify", "walking"),
+            (22, "S", 0, "claude", "claude-statusline", "walking"),
+            (6.9, "S", 0, "claude", "claude-hook", "walking"),
+        ]
+        for cpu, state, age, provider, source, expected in cases:
+            with self.subTest(cpu=cpu, state=state, age=age, source=source):
+                agentcat.init_db()
+                with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
+                    conn.execute("delete from events")
+                    conn.commit()
+                if age is not None:
+                    with patch.object(agentcat.time, "time", return_value=now - age):
+                        agentcat.store_event(provider, source, "activity", {})
+                completed = agentcat.subprocess.CompletedProcess(
+                    args=["ps"], returncode=0,
+                    stdout=f"101 1 {cpu / 2} 1024 {state} claude\n"
+                           f"102 1 {cpu / 2} 1024 S claude\n", stderr="",
+                )
+                with patch.object(agentcat, "IS_WINDOWS", False), patch.object(
+                    agentcat.subprocess, "run", return_value=completed
+                ), patch.object(agentcat.time, "time", return_value=now), patch.object(
+                    agentcat, "safe_runtime_modes_snapshot", return_value=[]
+                ):
+                    snapshot = agentcat.terminal_activity_snapshot()
+                self.assertEqual(snapshot["motionStage"], expected)
+                self.assertEqual(snapshot["totalCPUPercent"], cpu)
+
+    def test_motion_activity_missing_or_invalid_database_is_idle(self) -> None:
+        self.assertFalse(agentcat.has_recent_motion_activity(["claude"]))
+        agentcat.EVENTS_DB.write_text("not a database", encoding="utf-8")
+        self.assertFalse(agentcat.has_recent_motion_activity(["claude"]))
 
     def test_terminal_activity_snapshot_reports_memory_usage(self) -> None:
         completed = agentcat.subprocess.CompletedProcess(
