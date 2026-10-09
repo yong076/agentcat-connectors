@@ -13,6 +13,7 @@ profile contract would risk mixing accounts.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import re
@@ -675,6 +676,7 @@ def _usage_from_profile(profile_dir: Path) -> Dict[str, Any]:
     return {
         "source": "gemini_code_assist",
         "freshness": "live",
+        "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "windows": normalized,
         "credits": None,
         "spendControl": None,

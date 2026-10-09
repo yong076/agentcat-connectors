@@ -6298,10 +6298,8 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         self.assertIn(limits["status"], {"not_configured", None})
         self.assertFalse(limits.get("quotas"))
 
-    def test_serve_stale_restamps_cache_to_throttle_reprobe(self) -> None:
-        # Audit H1: on probe failure we return the last-good numbers but MUST
-        # re-stamp the cache so the daemon does not re-probe (and re-refresh the
-        # OAuth token / re-scan the agy binary) on every 60s tick.
+    def test_serve_stale_preserves_fetch_time_and_throttles_reprobe(self) -> None:
+        # Retry timing must not advance the last successful fetch timestamp.
         good = agentcat.empty_limits(status="auto")
         good["quotas"] = [{"id": "gemini:pro", "label": "Pro", "remainingPercent": 90.0, "usedPercent": 10.0}]
         agentcat.write_live_limits_cache("antigravity", good)
@@ -6311,8 +6309,7 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         served = agentcat.serve_stale_live_limits("antigravity", before, RuntimeError("boom"))
         self.assertEqual(served["liveError"], "boom")
         self.assertTrue(served.get("quotas"))
-        # serve_stale re-wrote the cache entry (fresh cachedAt + liveError), so the
-        # next tick short-circuits on the cache instead of re-probing the token.
+        # The separate attempt timestamp throttles the next probe.
         after = agentcat.cached_live_limits("antigravity", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
         self.assertIsNotNone(after)
         self.assertEqual(after.get("liveError"), "boom")

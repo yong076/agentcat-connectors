@@ -46,7 +46,7 @@ from agentcat_codex_app_server import (
 )
 import agentcat_cli_probe as cli_probe
 import agentcat_home_signatures as home_signatures
-from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS
+from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS, USAGE_FRESH_SECONDS, age_usage
 from agentcat_openrouter_managed import OpenRouterManagedAuth, OpenRouterManagedError, build_adapter as build_openrouter_managed_adapter
 
 
@@ -3563,7 +3563,7 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     retry_at = int_limit(limits.get("retryAt"))
     if retry_at is not None:
         if retry_at > now:
-            effective_max_age = max(retry_at - cached_at, 0)
+            effective_max_age = max(retry_at - (int_limit(entry.get("lastAttemptAt")) or cached_at), 0)
         elif not allow_stale:
             return None
         else:
@@ -3580,7 +3580,8 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
         and retry_at is None
         and failure_streak == 0
     )
-    expired = age >= effective_max_age if adaptive_due else age > effective_max_age
+    poll_age = now - (int_limit(entry.get("lastAttemptAt")) or cached_at) if failure_streak else age
+    expired = poll_age >= effective_max_age if adaptive_due else poll_age > effective_max_age
     if expired and not allow_stale:
         return None
     out = dict(limits)
@@ -3588,6 +3589,9 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     out["cacheAgeSeconds"] = max(age, 0)
     if expired:
         out["stale"] = True
+    if provider in {"gemini", "antigravity"}:
+        out.setdefault("updatedAt", dt.datetime.fromtimestamp(cached_at, dt.timezone.utc).isoformat().replace("+00:00", "Z"))
+        out = normalize_gemini_limits(out)
     return out
 
 
@@ -3633,7 +3637,8 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
             reset_signal_at=reset_signal_at,
         )
         cache[provider] = {
-            "cachedAt": now,
+            "cachedAt": previous.get("cachedAt", limits.get("cachedAt", now)) if failed else now,
+            "lastAttemptAt": now,
             "failureStreak": previous_streak + 1 if failed else 0,
             "limits": limits,
             "pollPolicy": poll_policy,
@@ -3684,15 +3689,9 @@ def serve_stale_live_limits(
     project_id: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Return the last-good live limits during a probe failure, re-stamping the
-    cache so the daemon does not re-probe (and re-refresh the OAuth token) on every
-    60s tick while the provider keeps failing. Without the re-stamp, `cachedAt`
-    never advances once the good entry goes stale, so one revoked/expired token
-    turns into a full refresh POST — and for Antigravity a ~140MB binary re-scan —
-    every tick. Re-stamping throttles re-probing to one attempt per max-age window.
+    """Keep the last-good fetch time; lastAttemptAt independently throttles retries.
 
-    ``reason`` overrides the generic HTTP-derived reason code when the caller
-    knows more (e.g. a CLI-owned login that expired).
+    ``reason`` overrides the generic HTTP-derived reason code.
     """
     stale = dict(stale)
     stale["liveError"] = str(exc)
@@ -4833,7 +4832,7 @@ def codex_provider_instances_with_completeness(
     ), complete
 
 
-CODEX_MANAGED_USAGE_FRESH_SECONDS = 300
+CODEX_MANAGED_USAGE_FRESH_SECONDS = USAGE_FRESH_SECONDS
 
 
 def codex_managed_connection_limits(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -6563,6 +6562,8 @@ def gemini_limits_from_quota_response(
                 )
             )
 
+    limits["updatedAt"] = now_iso()
+    limits["stale"] = False
     limits["quotas"] = sorted_gemini_quotas(quotas)
     if not quotas:
         limits["status"] = "not_configured"
@@ -6579,7 +6580,7 @@ def normalize_gemini_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
     quotas = limits.get("quotas")
     if not isinstance(quotas, list):
         return limits
-    out = dict(limits)
+    out = age_usage({**limits, "freshness": "stale" if limits.get("stale") else "live"})
     out["quotas"] = sorted_gemini_quotas([q for q in quotas if isinstance(q, dict)])
     return out
 
@@ -10470,7 +10471,8 @@ def live_usage_provider_from_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
         "model": None,
         "tokens": {"total": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
         "cost_usd": None,
-        "updated_at": now_iso(),
+        "updated_at": limits.get("updatedAt") or now_iso(),
+        "stale": bool(limits.get("stale")),
     }
     if limits.get("reason"):
         provider["reason"] = limits["reason"]
