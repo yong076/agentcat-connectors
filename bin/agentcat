@@ -9200,7 +9200,34 @@ def _coerce_int_map(raw: Any) -> Dict[str, int]:
     return out
 
 
+# Single daemon-owned parsed cursor. The path is part of the key so temporary
+# homes and separate CLI invocations cannot reuse another home's state.
+_CODEX_CURSOR_CACHE = None
+CODEX_REBUILD_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+def _codex_cursor_stamp():
+    try:
+        stat = CODEX_SESSIONS_CURSOR_FILE.stat()
+        return (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
 def load_codex_sessions_cursor() -> Dict[str, Any]:
+    global _CODEX_CURSOR_CACHE
+    stamp = _codex_cursor_stamp()
+    key = str(CODEX_SESSIONS_CURSOR_FILE)
+    if _CODEX_CURSOR_CACHE is not None:
+        path, previous_stamp, cursor = _CODEX_CURSOR_CACHE
+        if path == key and previous_stamp == stamp:
+            return cursor
+    cursor = _read_codex_sessions_cursor()
+    _CODEX_CURSOR_CACHE = (key, stamp, cursor)
+    return cursor
+
+
+def _read_codex_sessions_cursor() -> Dict[str, Any]:
     raw = read_json(CODEX_SESSIONS_CURSOR_FILE)
     if not isinstance(raw, dict) or raw.get("version") != CODEX_SESSIONS_CURSOR_VERSION:
         return _empty_codex_cursor()
@@ -9245,20 +9272,24 @@ def load_codex_sessions_cursor() -> Dict[str, Any]:
             }
         cursor["projects"] = clean_projects
     cursor["turns"] = int(raw.get("turns") or 0)
-    for key in ("homeDaily", "usagePaths", "homeAccounts"):
+    for key in ("homeDaily", "usagePaths", "homeAccounts", "lastRebuildAt", "pendingReconcile"):
         if key in raw:
             cursor[key] = raw[key]
     return cursor
 
 
 def save_codex_sessions_cursor(cursor: Dict[str, Any]) -> bool:
+    global _CODEX_CURSOR_CACHE
     tmp = unique_atomic_tmp_path(CODEX_SESSIONS_CURSOR_FILE)
     try:
         AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
         with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(cursor, fh, ensure_ascii=False, separators=(",", ":"))
+            json.dump({k: v for k, v in cursor.items() if k != "_dirty"},
+                      fh, ensure_ascii=False, separators=(",", ":"))
             fh.write("\n")
         tmp.replace(CODEX_SESSIONS_CURSOR_FILE)
+        _CODEX_CURSOR_CACHE = (str(CODEX_SESSIONS_CURSOR_FILE), _codex_cursor_stamp(), cursor)
+        cursor.pop("_dirty", None)
         return True
     except Exception as exc:
         logging.debug("save_codex_sessions_cursor failed: %s", exc)
@@ -9269,7 +9300,7 @@ def save_codex_sessions_cursor(cursor: Dict[str, Any]) -> bool:
         return False
 
 
-def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
+def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False) -> Dict[str, Any]:
     """Per-class Codex token snapshot read from sessions/**/*.jsonl.
 
     Returns the SAME shape codex_snapshot produces (status/source/tokens/
@@ -9294,18 +9325,52 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
     roots = [root for root in codex_session_roots() if root.is_dir()]
     result["source"] = snapshot_source_label(" + ".join(f"{root}/**/*.jsonl" for root in roots))
 
-    cursor = _empty_codex_cursor() if force_rebuild else load_codex_sessions_cursor()
+    cursor = load_codex_sessions_cursor()
     account_changed = _prepare_home_accounts("codex", cursor)
     previous_accounts = cursor.get("homeAccounts", {})
     selected = {str(p): _usage_home_id("codex", p) for p in files}
-    old_paths = cursor.get("usagePaths")
-    # New paths can be read incrementally. Removed/reassigned paths require a
-    # rebuild so an excluded home or a longer mirror cannot leave counted history.
-    if (cursor.get("files") and "homeDaily" not in cursor) or (isinstance(old_paths, dict) and any(selected.get(p) != hid for p, hid in old_paths.items())):
+    old_paths = cursor.get("usagePaths", {})
+    topology_changed = (
+        bool(cursor.get("files")) and "homeDaily" not in cursor
+    ) or any(selected.get(p) != hid for p, hid in old_paths.items())
+    last_rebuild = cursor.get("lastRebuildAt", {})
+    # Rollups are shared across homes. A full scan is allowed only when EVERY
+    # participating home is due; adding a home must not reset another's budget.
+    home_ids = set(selected.values()) | set(old_paths.values())
+    now = time.time()
+    due = all(now - last_rebuild.get(hid, 0) >= CODEX_REBUILD_INTERVAL_SECONDS
+              for hid in home_ids)
+    requested = reconcile or topology_changed or bool(cursor.get("pendingReconcile"))
+    rebuild = force_rebuild or (due and (requested or not cursor.get("files")))
+    if rebuild:
+        last_rebuild = {**last_rebuild, **{hid: now for hid in home_ids}}
+        cursor["lastRebuildAt"] = last_rebuild
+        # Reserve the window before expensive I/O, preserving the old totals
+        # on disk in case the process stops during reconciliation.
+        save_codex_sessions_cursor(cursor)
         cursor = _empty_codex_cursor()
         cursor["homeAccounts"] = previous_accounts
-        force_rebuild = True
-    cursor["usagePaths"] = selected
+        cursor["lastRebuildAt"] = last_rebuild
+        cursor["usagePaths"] = selected
+    elif requested:
+        if not cursor.get("pendingReconcile"):
+            cursor["pendingReconcile"] = True
+            cursor["_dirty"] = True
+        if topology_changed:
+            # A moved archive / longer mirror keeps its offset. Retain cursors
+            # evicted by the cap until reconciliation so reappearance is not
+            # counted as a fresh session. Rollout names contain the session UUID.
+            missing = {_session_identity(Path(p)): p for p in old_paths
+                       if p not in selected and _session_identity(Path(p))}
+            for path in files:
+                old = missing.get(_session_identity(path))
+                if old and str(path) not in cursor["files"] and old in cursor["files"]:
+                    cursor["files"][str(path)] = cursor["files"].pop(old)
+                    old_paths.pop(old, None)
+                    cursor["_dirty"] = True
+        cursor["usagePaths"] = {**old_paths, **selected}
+    else:
+        cursor["usagePaths"] = selected
     home_daily = cursor.setdefault("homeDaily", {})
     file_cursors: Dict[str, Any] = cursor["files"]
     daily: Dict[str, int] = cursor["daily"]
@@ -9317,7 +9382,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
     new_turns = 0
     # Persist the multi-MB cursor only when a file actually advanced; the
     # unconditional 60s re-serialization was a steady daemon CPU cost.
-    changed = bool(force_rebuild or account_changed)
+    changed = bool(rebuild or account_changed or cursor.get("_dirty"))
 
     for path in files:
         path_str = str(path)
@@ -9361,8 +9426,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
                     if not raw_line.endswith(b"\n"):
                         # Incomplete trailing line: the writer is mid-append. Do NOT
                         # advance the cursor past it — committing this offset would
-                        # permanently skip the turn once the writer finishes it (codex
-                        # has no daily rebuild to recover, unlike claude — audit #8).
+                        # skip the turn until the next permitted reconciliation.
                         break
                     new_offset += len(raw_line)
                     line = raw_line.decode("utf-8", errors="replace").strip()
@@ -9452,16 +9516,21 @@ def codex_sessions_snapshot(force_rebuild: bool = False) -> Dict[str, Any]:
         }
 
     cursor["turns"] = int(cursor.get("turns") or 0) + new_turns
-    if changed and (force_rebuild or account_changed or not cursor_recently_saved(CODEX_SESSIONS_CURSOR_FILE)):
+    cursor["_dirty"] = changed
+    if changed and (rebuild or account_changed or not cursor_recently_saved(CODEX_SESSIONS_CURSOR_FILE)):
         saved = save_codex_sessions_cursor(cursor)
         if not saved:
             logging.debug("codex_sessions_snapshot: cursor save failed")
 
+    global _CODEX_CURSOR_CACHE
+    _CODEX_CURSOR_CACHE = (str(CODEX_SESSIONS_CURSOR_FILE), _codex_cursor_stamp(), cursor)
     _HOME_USAGE_CURSORS["codex"] = (str(CODEX_SESSIONS_CURSOR_FILE), cursor)
     return _build_codex_sessions_snapshot(result, cursor)
 
 
 def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any]) -> Dict[str, Any]:
+    if cursor.get("pendingReconcile"):
+        result["pendingReconcile"] = True
     daily: Dict[str, int] = cursor.get("daily") or {}
     hourly: Dict[str, int] = cursor.get("hourly") or {}
     model_daily: Dict[str, Dict[str, int]] = cursor.get("modelDaily") or {}
@@ -10050,44 +10119,6 @@ def attach_codex_usage_coverage(
     return snapshot
 
 
-def _codex_rebuild_state_file() -> Path:
-    return AGENTCAT_HOME / "codex-rebuild-state.json"
-
-
-def _codex_rebuild_key(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> List[int]:
-    return [_codex_tokens_all(sessions), _codex_tokens_all(sqlite)]
-
-
-def mark_codex_rebuild_ineffective(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> None:
-    """Record that a full rebuild did not close the sessions/sqlite gap.
-
-    The trigger below compares two numbers a rebuild cannot always reconcile: a
-    user who deleted old rollout JSONLs still has lifetime totals in
-    ``state_*.sqlite``, so the gap is permanent. Without this marker the daemon
-    re-parsed the entire sessions corpus (up to 10k files) every 60s forever.
-    """
-    try:
-        write_json_atomic(
-            _codex_rebuild_state_file(), {"ineffectiveKey": _codex_rebuild_key(sessions, sqlite)}
-        )
-    except Exception as exc:
-        logging.debug("could not persist codex rebuild marker: %s", exc)
-
-
-def _codex_rebuild_marked_ineffective(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> bool:
-    raw = read_json(_codex_rebuild_state_file())
-    if not isinstance(raw, dict):
-        return False
-    stored = raw.get("ineffectiveKey")
-    if not isinstance(stored, list):
-        return False
-    # Keyed on both totals: when either moves, the corpus changed and a rebuild
-    # is worth attempting again.
-    return [int(x) for x in stored if isinstance(x, (int, float))] == _codex_rebuild_key(
-        sessions, sqlite
-    )
-
-
 def _codex_sessions_need_rebuild(sessions: Dict[str, Any], sqlite: Dict[str, Any]) -> bool:
     if sessions.get("status") != "ok" or sqlite.get("status") != "ok":
         return False
@@ -10097,7 +10128,7 @@ def _codex_sessions_need_rebuild(sessions: Dict[str, Any], sqlite: Dict[str, Any
         return False
     if sqlite_all <= session_all * 5:
         return False
-    return not _codex_rebuild_marked_ineffective(sessions, sqlite)
+    return True
 
 
 def _merge_int_maps_by_max(primary: Dict[str, Any], fallback: Dict[str, Any]) -> bool:
@@ -10212,17 +10243,14 @@ def codex_snapshot() -> Dict[str, Any]:
     sqlite = codex_sqlite_snapshot()
 
     if _codex_sessions_need_rebuild(sessions, sqlite):
-        before = sessions
         try:
-            rebuilt = codex_sessions_snapshot(force_rebuild=True)
+            rebuilt = codex_sessions_snapshot(reconcile=True)
             if rebuilt.get("status") == "ok":
                 sessions = rebuilt
         except Exception as exc:
             logging.debug("codex_sessions_snapshot rebuild failed: %s", exc)
-        # If the expensive rebuild left the gap exactly as wide, repeating it
-        # every tick cannot help — the missing tokens are in deleted rollouts.
-        if _codex_tokens_all(sessions) <= _codex_tokens_all(before):
-            mark_codex_rebuild_ineffective(sessions, sqlite)
+        if _codex_sessions_need_rebuild(sessions, sqlite):
+            sessions["pendingReconcile"] = True
 
     codexbar_cache = codexbar_cost_cache_snapshot("codex")
     if sessions.get("status") == "ok":
