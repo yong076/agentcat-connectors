@@ -313,7 +313,9 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
             (home / "sessions/unrelated.jsonl").write_text("{}\n")
         collect = agentcat.home_signatures.collect_candidates
         for reverse in (False, True):
-            with self.subTest(reverse=reverse), patch.object(agentcat.home_signatures, "collect_candidates",
+            # Correctness, not speed: a slow runner must not turn this into a budget test.
+            with self.subTest(reverse=reverse), patch.object(agentcat, "HOME_DISCOVERY_TIME_BUDGET_SECONDS", 120.0), \
+                    patch.object(agentcat.home_signatures, "collect_candidates",
                     side_effect=lambda *a, **kw: list(reversed(collect(*a, **kw))) if reverse else collect(*a, **kw)):
                 self._reset_discovery_cache()
                 for provider in expected:

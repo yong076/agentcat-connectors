@@ -1525,7 +1525,10 @@ HOME_DISCOVERY_PROVIDER_IDS = tuple(PROVIDER_HOME_SPECS)
 HOME_DISCOVERY_MAX_CANDIDATES = 32
 HOME_DISCOVERY_FILE_CAP = 50000
 HOME_DISCOVERY_CACHE_TTL_SECONDS = 600
-HOME_DISCOVERY_TIME_BUDGET_SECONDS = 5.0
+# Runs at most once per 10-minute cache in the 60 s background refresh loop and
+# keeps the last good result when exceeded. 4.6 s on the owner's Mac (14 large
+# homes); slower machines and CI runners exceeded the earlier 5 s.
+HOME_DISCOVERY_TIME_BUDGET_SECONDS = 15.0
 HOME_DISCOVERY_LAUNCHER_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 _HOME_CANDIDATES_LOCK = threading.RLock()
 _HOME_CANDIDATES_VALUE: Dict[str, List[Dict[str, Any]]] = {}
