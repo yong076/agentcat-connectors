@@ -324,6 +324,21 @@ class HomeSignatureTests(unittest.TestCase):
                                              {"CODEX_HOME": str(remote)}, fs=RemoteFS())
         self.assertEqual([r["path"] for r in rows], [local])
 
+    def test_worker_session_inventory_matches_in_process_result(self):
+        # The daemon runs the whole inventory in the worker (one round trip);
+        # it must equal the in-process result, local-only guard included.
+        home = self.home("inventory")
+        for i in range(5):
+            day = home / f"sessions/2026/10/0{i + 1}"
+            day.mkdir(parents=True)
+            (day / f"rollout-2026-10-0{i + 1}T00-00-00-00000000-0000-4000-8000-00000000000{i}.jsonl").write_text("{}\n")
+        direct = signatures.session_inventory(home, signatures.CODEX_GLOBS, fs=signatures.LocalFS())
+        with signatures.BoundedFS(time.monotonic() + 10) as worker:
+            via_worker = signatures.bounded_session_inventory(
+                home, signatures.CODEX_GLOBS, fs=signatures.LocalOnlyFS(worker), deadline=time.monotonic() + 10)
+        self.assertEqual(via_worker["sessions"], direct["sessions"])
+        self.assertEqual(via_worker["stats"]["files"], direct["stats"]["files"])
+
     def test_stalled_filesystem_io_times_out_and_next_worker_recovers(self):
         home = self.home("slow")
         for operation in ("stat", "children"):

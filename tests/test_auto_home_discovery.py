@@ -74,6 +74,8 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
 
         rows = [{"path": agentcat.HOME / f"candidate-{i}", "sources": ["auto"], "launchers": []}
                 for i in range(100)]
+        for row in rows:
+            (row["path"] / "sessions").mkdir(parents=True)  # a layout, so each one is classified
         with patch.object(agentcat.time, "monotonic", side_effect=lambda: clock[0]), \
              patch.object(agentcat, "HOME_DISCOVERY_TIME_BUDGET_SECONDS", 0.35), \
              patch.object(signatures, "BoundedFS", InlineFS, create=True), \
@@ -92,7 +94,7 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         rows = []
         for i in range(100):
             path = agentcat.HOME / f"auto-{i:03d}"
-            path.mkdir()
+            (path / "sessions").mkdir(parents=True)  # a layout, so the cap applies
             rows.append({"path": path, "sources": ["auto"], "launchers": []})
         with patch.object(signatures, "collect_candidates", return_value=rows), \
              patch.object(signatures, "classify_home", return_value={"kind": "provider", "provider": "codex",
@@ -261,6 +263,10 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
 
     def test_owner_regression_table_and_candidate_order_independence(self):
         expected = {"claude": {}, "codex": {}}
+        # The owner's HOME has ~160 entries; unrelated ones sorted before the
+        # real homes must not use up the auto-candidate cap.
+        for i in range(agentcat.HOME_DISCOVERY_MAX_CANDIDATES * 3):
+            (agentcat.HOME / f".aaa-unrelated-{i:03d}" / "cache").mkdir(parents=True)
         for i in range(1, 6):
             home = agentcat.HOME / (".claude" if i == 1 else f".claude{i}")
             self._claude_journal(home, f"10000000-0000-4000-8000-{i:012d}")

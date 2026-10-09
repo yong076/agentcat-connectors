@@ -103,7 +103,13 @@ def _io_worker(connection, fs_type, deadline):
                 if time.monotonic() >= deadline:
                     connection.send(("timeout", None))
                     continue
-                if operation == "next":
+                if operation == "session_inventory":
+                    # One round trip for a whole home: per-stat IPC cost 30k
+                    # requests (~4.3 s) on the owner's Mac.
+                    from agentcat_home_signatures import LocalOnlyFS as _LocalOnly, session_inventory as _inventory
+                    inner = _LocalOnly(fs) if local_only else fs
+                    result = _inventory(args[0], args[1], fs=inner, deadline=deadline)
+                elif operation == "next":
                     iterator = iterators[args[0]]
                     batch = []
                     for _ in range(32):

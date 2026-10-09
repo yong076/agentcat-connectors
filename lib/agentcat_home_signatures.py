@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+import agentcat_discovery_io as _discovery_io
 from agentcat_discovery_io import BoundedFS, DiscoveryTimeout, LocalMounts, LocalOnlyFS
 
 
@@ -309,6 +310,33 @@ def sample_usage_files(path: Path, patterns: Sequence[str], *, fs=None, deadline
     return found
 
 
+def structure_matches(path: Path, registry=REGISTRY, *, fs=None) -> bool:
+    """A few stats: does any registry layout fit this directory?
+
+    HOME holds far more directories than CLI homes (160 on the owner's Mac).
+    Only directories that pass this check are classified and count against the
+    auto-candidate cap; otherwise unrelated folders sorted first hide real homes.
+    """
+    fs = fs or LocalFS()
+
+    def exists(name):
+        if "*" in name:
+            return any(fnmatch.fnmatchcase(child.name, name) and not fs.is_symlink(child) and fs.is_file(child)
+                       for child in fs.children(path))
+        target = path / name
+        return not fs.is_symlink(target) and (fs.is_dir(target) or fs.is_file(target))
+
+    for signature in registry:
+        if not (signature.structure_all or signature.structure_any):
+            continue
+        if not all(exists(m) for m in signature.structure_all):
+            continue
+        if signature.structure_any and not any(exists(m) for m in signature.structure_any):
+            continue
+        return True
+    return False
+
+
 def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits(), threshold=6, margin=3,
                   deadline=None) -> dict:
     fs = fs or LocalFS()
@@ -476,6 +504,19 @@ def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits()
 
 
 SESSION_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+
+
+def bounded_session_inventory(path: Path, patterns: Sequence[str], *, fs, deadline=None) -> dict:
+    """Run `session_inventory` inside the discovery worker in one round trip.
+
+    Falls back to an in-process call for plain filesystems (tests, tools).
+    """
+    local_only = isinstance(fs, LocalOnlyFS)
+    base = fs.fs if local_only else fs
+    # The real worker class (tests may rebind the module-level BoundedFS name).
+    if isinstance(base, _discovery_io.BoundedFS):
+        return base._request("session_inventory", path, tuple(patterns), local_only=local_only)
+    return session_inventory(path, patterns, fs=fs, deadline=deadline)
 
 
 def session_inventory(path: Path, patterns: Sequence[str], *, fs=None, deadline=None,

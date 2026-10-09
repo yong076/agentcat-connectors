@@ -1808,6 +1808,9 @@ def _scan_provider_homes(settings, deadline):
             if time.monotonic() >= deadline:
                 raise home_signatures.DiscoveryTimeout()
             if not row.get("providers"):
+                # Unrelated directories never consume the cap (see structure_matches).
+                if not home_signatures.structure_matches(row["path"], fs=local_fs):
+                    continue
                 if auto_examined >= HOME_DISCOVERY_MAX_CANDIDATES:
                     complete = False
                     break
@@ -1851,7 +1854,7 @@ def _scan_provider_homes(settings, deadline):
                 candidate["_explicit"] = trusted
                 candidate["_priority"] = source_priority(row)
                 if exists:
-                    inventory = home_signatures.session_inventory(path, spec["usageGlobs"], fs=candidate_fs, deadline=deadline)
+                    inventory = home_signatures.bounded_session_inventory(path, spec["usageGlobs"], fs=candidate_fs, deadline=deadline)
                     candidate["stats"] = inventory["stats"]
                     candidate["_sessionIds"] = inventory["sessions"]
                     candidate["_sessionPaths"] = inventory["paths"]
