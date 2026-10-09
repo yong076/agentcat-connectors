@@ -493,6 +493,7 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
         self.assertEqual(result["bySurface"], section["bySurface"])
 
         agentcat.CODEX_USAGE_BREAKDOWN_CACHE.unlink()
+        agentcat._QUOTA_URL_FAILURES.clear()
         requests.clear()
         with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), self._unauthorized_network(requests):
             result = agentcat.codex_usage_breakdown()
@@ -501,8 +502,7 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
         self.assertEqual(result["reason"], "cli_login_expired")
 
     def test_401_backoff_skips_requests_until_retry_or_relogin(self):
-        # Rule R6: an expired CLI token is retried after 5 min, doubling to
-        # 60 min, and a new token (re-login) lifts the backoff at once.
+        # Breakdown retains its 15 minute polling floor on failure, and a new token (re-login) lifts the backoff at once.
         requests = []
         start = 1_800_000_000
         auth = self.auth()
@@ -513,25 +513,25 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
         self.assertEqual(len(requests), 1)
         self.assertEqual((first["reason"], again["reason"]), ("cli_login_expired", "cli_login_expired"))
         stored = json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text())
-        self.assertEqual(stored["failure"]["retryAt"], start + 300)
+        self.assertEqual(stored["failure"]["retryAt"], start + 900)
         self.assertNotIn("access", json.dumps(stored))  # a fingerprint, never the token
 
         with patch.object(agentcat, "read_codex_auth", side_effect=lambda: auth), \
-            self._unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 301):
+            self._unauthorized_network(requests), patch.object(agentcat.time, "time", return_value=start + 901):
             agentcat.codex_usage_breakdown()
         self.assertEqual(len(requests), 2)
         stored = json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text())
-        self.assertEqual((stored["failure"]["streak"], stored["failure"]["retryAt"]), (2, start + 301 + 600))
+        self.assertEqual((stored["failure"]["streak"], stored["failure"]["retryAt"]), (2, start + 901 + 900))
 
         relogin = {"tokens": {"access_token": "fresh-after-login", "account_id": "acct"}}
         with patch.object(agentcat, "read_codex_auth", return_value=relogin), patch.object(
             agentcat, "codex_usage_breakdown_request", return_value=self.RAW
-        ) as request, patch.object(agentcat.time, "time", return_value=start + 302):
+        ) as request, patch.object(agentcat.time, "time", return_value=start + 902):
             result = agentcat.codex_usage_breakdown()
         request.assert_called_once()
         self.assertEqual(result["status"], "ok")
         self.assertNotIn("failure", json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text()))
-        self.assertEqual(agentcat.codex_failure_backoff_seconds(10), 3600)
+        self.assertEqual(agentcat.codex_failure_backoff_seconds(10), 900)
 
     def test_403_timeout_and_no_auth_fail_soft_without_unwanted_refresh(self):
         forbidden = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b""))

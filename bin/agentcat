@@ -6,7 +6,7 @@ import base64
 import copy
 import csv
 import importlib
-from contextlib import closing
+from contextlib import closing, contextmanager
 import logging
 import datetime as dt
 import email.utils
@@ -218,7 +218,8 @@ ADAPTIVE_LIVE_LIMITS_POLL_SECONDS = 120
 ADAPTIVE_LIVE_LIMITS_THRESHOLD_PERCENT = 10.0
 ADAPTIVE_LIVE_LIMITS_RESET_SIGNAL_SECONDS = 2 * 60 * 60
 ADAPTIVE_LIVE_LIMITS_RECOVERY_SECONDS = 30 * 60
-LIVE_LIMITS_ERROR_BACKOFF_BASE_SECONDS = 30
+LIVE_LIMITS_ERROR_BACKOFF_BASE_SECONDS = 300
+LIVE_LIMITS_REQUEST_TIMEOUT_SECONDS = 8
 LIVE_LIMITS_ERROR_BACKOFF_MAX_SECONDS = 900
 # A "no quota for this account" answer is cached to stop the per-tick reprobe loop, but on
 # a shorter horizon than a good result so a transient empty response or a later plan upgrade
@@ -3447,6 +3448,100 @@ def live_limit_error(
     return limits
 
 
+_LIVE_LIMITS_WRITE_LOCK = threading.RLock()
+_QUOTA_REFRESH_LOCK = threading.Lock()
+_QUOTA_REFRESHING: set = set()
+_QUOTA_REFRESH_PENDING: Dict[str, Dict[str, Any]] = {}
+
+
+def schedule_quota_refresh(provider: str, refresh: Any, key: Optional[str] = None) -> None:
+    """One worker per provider; coalesce queued account/endpoint refreshes."""
+    key = key or provider
+    with _QUOTA_REFRESH_LOCK:
+        pending = _QUOTA_REFRESH_PENDING.setdefault(provider, {})
+        pending[key] = refresh
+        if provider in _QUOTA_REFRESHING:
+            return
+        _QUOTA_REFRESHING.add(provider)
+
+    def run() -> None:
+        while True:
+            with _QUOTA_REFRESH_LOCK:
+                pending = _QUOTA_REFRESH_PENDING[provider]
+                if not pending:
+                    _QUOTA_REFRESHING.discard(provider)
+                    return
+                job_key = next(iter(pending))
+                job = pending.pop(job_key)
+            try:
+                job()
+            except Exception:
+                logging.debug("background quota refresh failed for %s", provider)
+
+    try:
+        threading.Thread(target=run, name="quota-" + provider, daemon=True).start()
+    except Exception:
+        with _QUOTA_REFRESH_LOCK:
+            _QUOTA_REFRESHING.discard(provider)
+        raise
+
+
+_QUOTA_URL_FAILURES: Dict[Any, Any] = {}
+_QUOTA_URL_LOCK = threading.Lock()
+
+
+@contextmanager
+def quota_urlopen(request: Any, timeout: float = LIVE_LIMITS_REQUEST_TIMEOUT_SECONDS) -> Any:
+    """Back off each failed URL, including optional/fallback endpoints.
+
+    Only a digest of the authorization header is retained in process memory;
+    a new login can recover immediately. Never persist credentials.
+    """
+    identity = hashlib.sha256(str(request.get_header("Authorization", "")).encode()).digest()
+    key = (str(LIVE_LIMITS_CACHE), request.full_url, identity)
+    with _QUOTA_URL_LOCK:
+        previous = _QUOTA_URL_FAILURES.get(key)
+    if previous is not None and time.time() < previous[0]:
+        code = previous[2]
+        if code is not None:
+            raise urllib.error.HTTPError(request.full_url, code, "quota retry backoff", {}, None)
+        raise urllib.error.URLError("quota retry backoff")
+    try:
+        with urllib.request.urlopen(request, timeout=min(timeout, LIVE_LIMITS_REQUEST_TIMEOUT_SECONDS)) as response:
+            yield response
+    except Exception as exc:
+        streak = previous[1] + 1 if previous else 1
+        with _QUOTA_URL_LOCK:
+            _QUOTA_URL_FAILURES[key] = (
+                time.time() + live_limits_error_backoff_seconds(streak), streak,
+                exc.code if isinstance(exc, urllib.error.HTTPError) else None,
+            )
+        raise
+    else:
+        with _QUOTA_URL_LOCK:
+            _QUOTA_URL_FAILURES.pop(key, None)
+
+
+def background_live_limits(provider: str, refresh: Any) -> Dict[str, Any]:
+    if provider == "codex":
+        home = active_codex_home()
+        auth = read_codex_auth(home)
+        if not auth:
+            return empty_limits()
+        provider = codex_home_limits_cache_key(home, auth)
+    cached = cached_live_limits(provider, LIVE_LIMITS_MAX_AGE_SECONDS)
+    if cached is None:
+        schedule_quota_refresh(provider.split("-instance:")[0], refresh, key=provider)
+        cached = cached_live_limits(provider, LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
+    limits = cached or empty_limits()
+    if provider.startswith("codex-instance:"):
+        limits = sanitize_codex_cached_limits(limits)
+        if _codex_limits_login_expired(limits):
+            limits = mark_codex_cli_login_expired(limits)
+        return _codex_public_limits(limits)
+    return limits
+
+
 def live_limits_error_backoff_seconds(failure_streak: int) -> int:
     exponent = min(max(int(failure_streak) - 1, 0), 5)
     return min(
@@ -3599,90 +3694,92 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
 
 
 def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
-    status = limits.get("status")
-    if status == "error":
-        pass
-    elif status == "not_configured" and limits.get("reason") == "not_applicable":
-        # A definitive "this account has no quota API data" answer from the live
-        # API — cache it (throttled to the normal max-age) so the daemon stops
-        # re-probing api.anthropic.com every tick.
-        pass
-    elif status not in {"auto", "ok"} or not limits.get("quotas"):
-        return
-    try:
-        ensure_dirs()
-        raw = read_json(LIVE_LIMITS_CACHE)
-        cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
-        previous = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
-        previous_limits = previous.get("limits") if isinstance(previous.get("limits"), dict) else {}
-        if (
-            status == "error"
-            and previous_limits.get("status") in {"auto", "ok"}
-            and previous_limits.get("quotas")
-        ):
-            # Keep last-good quotas. An error-only payload would blank the tile
-            # even though the token is still valid (e.g. project_required 403).
-            merged = dict(previous_limits)
-            merged["liveError"] = limits.get("error")
-            merged["liveErrorReason"] = limits.get("reason")
-            if limits.get("retryAt") is not None:
-                merged["retryAt"] = limits.get("retryAt")
-            limits = merged
-        previous_streak = int_count(previous.get("failureStreak")) or 0
-        failed = status == "error" or bool(limits.get("liveError"))
-        now = int(time.time())
-        reset_signal_at = int_limit(previous.get("resetSignalAt"))
-        poll_policy = adaptive_limit_poll_policy(
-            limits,
-            now=now,
-            normal_interval_seconds=LIVE_LIMITS_MAX_AGE_SECONDS,
-            previous_state=previous.get("pollPolicy"),
-            reset_signal_at=reset_signal_at,
-        )
-        cache[provider] = {
-            "cachedAt": previous.get("cachedAt", limits.get("cachedAt", now)) if failed else now,
-            "lastAttemptAt": now,
-            "failureStreak": previous_streak + 1 if failed else 0,
-            "limits": limits,
-            "pollPolicy": poll_policy,
-        }
-        if reset_signal_at is not None:
-            cache[provider]["resetSignalAt"] = reset_signal_at
-        tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
-        with tmp_path.open("w", encoding="utf-8") as fh:
-            json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
-            fh.write("\n")
-        tmp_path.replace(LIVE_LIMITS_CACHE)
-    except Exception:
-        pass
+    with _LIVE_LIMITS_WRITE_LOCK:
+        status = limits.get("status")
+        if status == "error":
+            pass
+        elif status == "not_configured" and limits.get("reason") == "not_applicable":
+            # A definitive "this account has no quota API data" answer from the live
+            # API — cache it (throttled to the normal max-age) so the daemon stops
+            # re-probing api.anthropic.com every tick.
+            pass
+        elif status not in {"auto", "ok"} or not limits.get("quotas"):
+            return
+        try:
+            ensure_dirs()
+            raw = read_json(LIVE_LIMITS_CACHE)
+            cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+            previous = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
+            previous_limits = previous.get("limits") if isinstance(previous.get("limits"), dict) else {}
+            if (
+                status == "error"
+                and previous_limits.get("status") in {"auto", "ok"}
+                and previous_limits.get("quotas")
+            ):
+                # Keep last-good quotas. An error-only payload would blank the tile
+                # even though the token is still valid (e.g. project_required 403).
+                merged = dict(previous_limits)
+                merged["liveError"] = limits.get("error")
+                merged["liveErrorReason"] = limits.get("reason")
+                if limits.get("retryAt") is not None:
+                    merged["retryAt"] = limits.get("retryAt")
+                limits = merged
+            previous_streak = int_count(previous.get("failureStreak")) or 0
+            failed = status == "error" or bool(limits.get("liveError"))
+            now = int(time.time())
+            reset_signal_at = int_limit(previous.get("resetSignalAt"))
+            poll_policy = adaptive_limit_poll_policy(
+                limits,
+                now=now,
+                normal_interval_seconds=LIVE_LIMITS_MAX_AGE_SECONDS,
+                previous_state=previous.get("pollPolicy"),
+                reset_signal_at=reset_signal_at,
+            )
+            cache[provider] = {
+                "cachedAt": previous.get("cachedAt", limits.get("cachedAt", now)) if failed else now,
+                "lastAttemptAt": now,
+                "failureStreak": previous_streak + 1 if failed else 0,
+                "limits": limits,
+                "pollPolicy": poll_policy,
+            }
+            if reset_signal_at is not None:
+                cache[provider]["resetSignalAt"] = reset_signal_at
+            tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                fh.write("\n")
+            tmp_path.replace(LIVE_LIMITS_CACHE)
+        except Exception:
+            pass
 
 
 def record_live_limit_reset_signal(provider: str, observed_at: Optional[int] = None) -> None:
     """Mark a provider reset without storing a signal id, source, or identity."""
-    try:
-        ensure_dirs()
-        raw = read_json(LIVE_LIMITS_CACHE)
-        cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
-        entry = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
-        entry = dict(entry)
-        signal_at = int(observed_at if observed_at is not None else time.time())
-        limits = entry.get("limits") if isinstance(entry.get("limits"), dict) else {}
-        entry["resetSignalAt"] = signal_at
-        entry["pollPolicy"] = adaptive_limit_poll_policy(
-            limits,
-            now=signal_at,
-            normal_interval_seconds=LIVE_LIMITS_MAX_AGE_SECONDS,
-            previous_state=entry.get("pollPolicy"),
-            reset_signal_at=signal_at,
-        )
-        cache[provider] = entry
-        tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
-        with tmp_path.open("w", encoding="utf-8") as fh:
-            json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
-            fh.write("\n")
-        tmp_path.replace(LIVE_LIMITS_CACHE)
-    except Exception:
-        logging.debug("failed to record live-limit reset signal for %s", provider)
+    with _LIVE_LIMITS_WRITE_LOCK:
+        try:
+            ensure_dirs()
+            raw = read_json(LIVE_LIMITS_CACHE)
+            cache = raw if isinstance(raw, dict) and not raw.get("_agentcat_error") else {}
+            entry = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
+            entry = dict(entry)
+            signal_at = int(observed_at if observed_at is not None else time.time())
+            limits = entry.get("limits") if isinstance(entry.get("limits"), dict) else {}
+            entry["resetSignalAt"] = signal_at
+            entry["pollPolicy"] = adaptive_limit_poll_policy(
+                limits,
+                now=signal_at,
+                normal_interval_seconds=LIVE_LIMITS_MAX_AGE_SECONDS,
+                previous_state=entry.get("pollPolicy"),
+                reset_signal_at=signal_at,
+            )
+            cache[provider] = entry
+            tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                fh.write("\n")
+            tmp_path.replace(LIVE_LIMITS_CACHE)
+        except Exception:
+            logging.debug("failed to record live-limit reset signal for %s", provider)
 
 
 def serve_stale_live_limits(
@@ -4100,11 +4197,11 @@ def provider_sync_identity(provider: str, native_account_id: str) -> str:
     ).hexdigest()
 
 
-# A failed Codex usage probe waits 5 min, doubling to 60 min, before the next
+# A failed Codex usage probe waits 5 min, doubling to 15 min, before the next
 # request (rule R6). A 401 with the same token cannot succeed until the CLI
 # refreshes its own login, so polling it every tick only burns requests.
 CODEX_FAILURE_BACKOFF_SECONDS = 300
-CODEX_FAILURE_BACKOFF_MAX_SECONDS = 3600
+CODEX_FAILURE_BACKOFF_MAX_SECONDS = 900
 
 
 def codex_failure_backoff_seconds(streak: int) -> int:
@@ -4169,7 +4266,7 @@ def codex_request_headers(access_token: str, account_id: str) -> Dict[str, str]:
 
 def codex_usage_request(access_token: str, account_id: str, url: str) -> Dict[str, Any]:
     req = urllib.request.Request(url, headers=codex_request_headers(access_token, account_id))
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with quota_urlopen(req) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload if isinstance(payload, dict) else {}
 
@@ -4179,7 +4276,7 @@ def codex_reset_credits_request(access_token: str, account_id: str) -> Dict[str,
         CODEX_RESET_CREDITS_URL,
         headers=codex_request_headers(access_token, account_id),
     )
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with quota_urlopen(req) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload if isinstance(payload, dict) else {}
 
@@ -4797,7 +4894,10 @@ def codex_provider_instances_with_completeness(
         else:
             cache_key = f"codex-instance:{entry['id'].rsplit(':', 1)[-1]}"
             try:
-                limits = codex_live_limits_for_auth(auth, cache_key)
+                limits = background_live_limits(
+                    cache_key, lambda auth=auth, cache_key=cache_key: codex_live_limits_for_auth(auth, cache_key)
+                )
+                limits = _codex_public_limits(limits)
             except Exception as exc:
                 limits = empty_limits(status="error", error=str(exc))
         entry["limits"] = limits
@@ -5403,7 +5503,7 @@ def codex_usage_breakdown_request(access_token: str, account_id: str, url: str) 
     if account_id:
         headers["chatgpt-account-id"] = account_id
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with quota_urlopen(req) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload if isinstance(payload, dict) else {}
 
@@ -5586,7 +5686,7 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
     def record_failure(reason: Optional[str] = None) -> Dict[str, Any]:
         streak = ((int_count(failure.get("streak")) or 0) + 1) if same_login else 1
         entry: Dict[str, Any] = {
-            "retryAt": now + codex_failure_backoff_seconds(streak),
+            "retryAt": now + max(CODEX_USAGE_BREAKDOWN_TTL_SECONDS, live_limits_error_backoff_seconds(streak)),
             "streak": streak,
             "tokenFingerprint": fingerprint,
         }
@@ -5631,12 +5731,31 @@ def codex_usage_breakdown() -> Dict[str, Any]:
         return empty_codex_usage_breakdown()
 
 
+def cached_codex_usage_breakdown() -> Dict[str, Any]:
+    """Snapshot-only reader. The worker owns authentication and HTTP."""
+    raw = read_json(CODEX_USAGE_BREAKDOWN_CACHE)
+    raw = raw if isinstance(raw, dict) else {}
+    data = validated_codex_usage_breakdown(raw.get("data"))
+    fetched = int_limit(raw.get("fetched_at"))
+    fresh = data is not None and fetched is not None and 0 <= time.time() - fetched < CODEX_USAGE_BREAKDOWN_TTL_SECONDS
+    failure = raw.get("failure") if isinstance(raw.get("failure"), dict) else {}
+    if not fresh and (int_limit(failure.get("retryAt")) or 0) <= time.time():
+        schedule_quota_refresh("codex", codex_usage_breakdown, key="breakdown")
+    if data is None:
+        data = empty_codex_usage_breakdown()
+    elif not fresh:
+        data["stale"] = True
+    if failure.get("reason") == CODEX_CLI_LOGIN_EXPIRED_REASON:
+        data["reason"] = CODEX_CLI_LOGIN_EXPIRED_REASON
+    return data
+
+
 def attach_codex_usage_breakdown(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """Attach the optional section fail-soft while preserving existing fields."""
     if "codexUsageBreakdown" in snapshot:
         return snapshot
     try:
-        breakdown = codex_usage_breakdown()
+        breakdown = cached_codex_usage_breakdown()
     except Exception as exc:
         logging.debug("codex usage breakdown attachment failed: %s", exc)
         breakdown = empty_codex_usage_breakdown()
@@ -5766,7 +5885,7 @@ def claude_usage_request(access_token: str) -> Dict[str, Any]:
             "User-Agent": "claude-code/2.1.69",
         },
     )
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with quota_urlopen(req) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload if isinstance(payload, dict) else {}
 
@@ -6297,7 +6416,7 @@ def refresh_gemini_access_token(creds: Dict[str, Any]) -> Dict[str, Any]:
         data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=LIVE_LIMITS_REQUEST_TIMEOUT_SECONDS) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     updated = dict(creds)
     updated["access_token"] = payload.get("access_token") or updated.get("access_token")
@@ -6402,7 +6521,7 @@ def refresh_antigravity_access_token(creds: Dict[str, Any]) -> Dict[str, Any]:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
             try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, timeout=LIVE_LIMITS_REQUEST_TIMEOUT_SECONDS) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 last_error = exc
@@ -6512,7 +6631,7 @@ def gemini_code_assist_post(method: str, payload: Dict[str, Any], access_token: 
             "User-Agent": "AgentCat/1.0",
         },
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with quota_urlopen(req) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data if isinstance(data, dict) else {}
 
@@ -6945,7 +7064,7 @@ def grok_live_limits(force: bool = False) -> Dict[str, Any]:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with quota_urlopen(req) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             limits = grok_limits_from_billing_response(
                 payload if isinstance(payload, dict) else {},
@@ -7259,7 +7378,7 @@ def kimi_usage_request(access_token: str) -> Dict[str, Any]:
             "User-Agent": "kimi-code/1.0",
         },
     )
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with quota_urlopen(req) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload if isinstance(payload, dict) else {}
 
@@ -7362,7 +7481,7 @@ def copilot_usage_request(token: str) -> Dict[str, Any]:
             "X-Github-Api-Version": "2025-04-01",
         },
     )
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with quota_urlopen(req) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload if isinstance(payload, dict) else {}
 
@@ -7485,7 +7604,8 @@ def runtime_limits(*, remote_quota: bool = False) -> Dict[str, Dict[str, Any]]:
     only local runtime/statusline evidence and configured limits.  The legacy
     on-demand usage endpoint continues to call the provider-specific live
     helpers directly; callers that must retain the old aggregate probing
-    behavior can opt in explicitly with ``remote_quota=True``.
+    behavior can opt in explicitly with ``remote_quota=True``. Remote overlays
+    read caches immediately and schedule background refreshes when due.
     """
     def _safe(fn: Any) -> Dict[str, Any]:
         # Per-provider isolation: one provider raising (e.g. a stat race on a deleted
@@ -7512,20 +7632,17 @@ def runtime_limits(*, remote_quota: bool = False) -> Dict[str, Dict[str, Any]]:
             "kimi": empty_limits(),
             "copilot": empty_limits(),
         }
-    gemini_limits = _safe(gemini_live_limits)
-    return {
-        "codex": prefer_live_limits(_safe(codex_live_limits), codex_fallback),
-        "claude": prefer_live_limits(_safe(claude_live_limits), claude_fallback),
-        "gemini": gemini_limits,
-        # Antigravity probes its own Code Assist quota (26.28.0). Return it directly
-        # like gemini — do NOT fall back to a copy of the gemini limits, which would
-        # relabel Gemini's quota as Antigravity's (the exact #45 mirroring bug this
-        # provider was split out to fix).
-        "antigravity": _safe(antigravity_live_limits),
-        "grok": _safe(grok_live_limits),
-        "kimi": _safe(kimi_live_limits),
-        "copilot": _safe(copilot_live_limits),
-    }
+    result = {}
+    for provider, refresh in (
+        ("codex", codex_live_limits), ("claude", claude_live_limits),
+        ("gemini", gemini_live_limits), ("antigravity", antigravity_live_limits),
+        ("grok", grok_live_limits), ("kimi", kimi_live_limits),
+        ("copilot", copilot_live_limits),
+    ):
+        result[provider] = background_live_limits(provider, refresh)
+    result["codex"] = prefer_live_limits(result["codex"], codex_fallback)
+    result["claude"] = prefer_live_limits(result["claude"], claude_fallback)
+    return result
 
 
 def parse_timestamp(raw: Any) -> Optional[dt.datetime]:

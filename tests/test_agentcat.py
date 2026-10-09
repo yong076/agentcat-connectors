@@ -556,7 +556,8 @@ class AgentCatConnectorTests(unittest.TestCase):
             )
         requests: list = []
         with self._codex_unauthorized_network(requests), \
-            patch.object(agentcat, "_codex_connections", return_value=[]):
+            patch.object(agentcat, "_codex_connections", return_value=[]), \
+            patch.object(agentcat, "schedule_quota_refresh", side_effect=lambda provider, refresh, **kwargs: refresh()):
             instances = agentcat.codex_provider_instances()
         self.assertEqual(len(instances), 2)
         self.assertTrue(requests)
@@ -6321,6 +6322,7 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         gem = agentcat.empty_limits(status="auto")
         gem["quotas"] = [{"id": "gemini:pro", "label": "Pro", "remainingPercent": 55.0, "usedPercent": 45.0}]
         empty = agentcat.empty_limits()
+        agentcat.write_live_limits_cache("gemini", gem)
         with _patch.object(agentcat, "gemini_live_limits", return_value=gem), \
              _patch.object(agentcat, "antigravity_live_limits", return_value=agentcat.empty_limits()), \
              _patch.object(agentcat, "codex_live_limits", return_value=empty), \
@@ -6371,6 +6373,8 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         good = agentcat.empty_limits(status="auto")
         good["quotas"] = [{"id": "g", "label": "7d", "remainingPercent": 80.0, "usedPercent": 20.0}]
         empty = agentcat.empty_limits()
+
+        agentcat.write_live_limits_cache("gemini", good)
 
         def boom() -> dict:
             raise RuntimeError("stat race on a deleted session file")

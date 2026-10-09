@@ -606,8 +606,14 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
             },
         )
         self.limits_mock = self.limits_patch.start()
+        # Identity tests supply already-refreshed fixture limits; worker timing
+        # is covered separately in test_async_quota.
+        self.background_patch = patch.object(
+            agentcat, "background_live_limits", side_effect=lambda provider, refresh: refresh())
+        self.background_patch.start()
 
     def tearDown(self) -> None:
+        self.background_patch.stop()
         self.limits_patch.stop()
         super().tearDown()
 
