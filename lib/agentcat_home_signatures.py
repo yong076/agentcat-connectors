@@ -515,7 +515,16 @@ def session_inventory(path: Path, patterns: Sequence[str], *, fs=None, deadline=
             "partial": bool(status["capped"] or index_partial)}
 
 
+# `${OVERRIDE:-$HOME/.claude3}`: launchers commonly let an env var override
+# the home. The daemon cannot see the user's interactive overrides, so the
+# default is the launcher's home; the default still passes the checks below.
+_DEFAULTED = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=](?P<default>.*)\}$")
+
+
 def _expand(value: str, home: Path) -> Path | None:
+    defaulted = _DEFAULTED.match(value)
+    if defaulted:
+        value = defaulted.group("default")
     value = re.sub(r"\$(?:\{HOME\}|HOME(?![A-Za-z0-9_]))", lambda _: str(home), value)
     if value == "~" or value.startswith("~/"):
         value = str(home) + value[1:]
