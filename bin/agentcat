@@ -12147,7 +12147,7 @@ def read_foreign_sqlite(
         uri_path = urllib.request.pathname2url(os.path.abspath(database))
         if uri_path.startswith("//") and not uri_path.startswith("///"):
             uri_path = "//" + uri_path
-        uri = "file:" + uri_path + "?mode=ro"
+        uri = "file:" + uri_path + "?mode=ro&readonly_shm=1"
         if immutable:
             uri += "&immutable=1"
         try:

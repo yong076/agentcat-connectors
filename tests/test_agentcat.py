@@ -4187,6 +4187,28 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(agentcat.read_foreign_sqlite(extended, lambda conn:
             conn.execute("select value from fixture").fetchall()), [(123,)])
 
+    def test_foreign_sqlite_preserves_sidecars_after_owner_exits(self) -> None:
+        staging = self.root / "owner.db"
+        folder = self.root / "owner-gone"
+        folder.mkdir()
+        database = folder / "database.db"
+        with closing(sqlite3.connect(staging)) as writer:
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+            for suffix in ("", "-wal", "-shm"):
+                target = Path(str(database) + suffix)
+                target.write_bytes(Path(str(staging) + suffix).read_bytes())
+                os.utime(target, (1000000000, 1000000000))
+        before = {p.name: (p.stat().st_size, p.stat().st_mtime_ns, p.read_bytes())
+                  for p in folder.iterdir()}
+        for _ in range(2):
+            self.assertEqual(agentcat.read_foreign_sqlite(database, lambda conn:
+                conn.execute("select value from fixture").fetchall()), [(123,)])
+            self.assertEqual({p.name: (p.stat().st_size, p.stat().st_mtime_ns, p.read_bytes())
+                              for p in folder.iterdir()}, before)
+
     def test_foreign_sqlite_retries_failed_read_on_private_copy(self) -> None:
         database = self.root / "retry.db"
         with closing(sqlite3.connect(database)) as writer:
