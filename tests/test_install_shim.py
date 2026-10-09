@@ -45,7 +45,7 @@ class WindowsShimPathTests(unittest.TestCase):
 
 
 class WindowsShimGenerationTests(unittest.TestCase):
-    def test_install_pins_interpreter_and_forwards_arguments(self) -> None:
+    def test_install_prefers_pinned_interpreter_with_legacy_fallback(self) -> None:
         for username in ("Alice Smith", "아트 심", "田中"):
             for outside_home in (False, True):
                 with self.subTest(username=username, outside_home=outside_home), tempfile.TemporaryDirectory() as tmp:
@@ -71,7 +71,16 @@ class WindowsShimGenerationTests(unittest.TestCase):
                     expected = (
                         '@echo off\r\n'
                         'set "AGENTCAT_HOME=%USERPROFILE%\\.agentcat"\r\n'
-                        f'"{python_ref}" "%USERPROFILE%\\.agentcat\\connectors\\bin\\agentcat" %*\r\n'
+                        f'if exist "{python_ref}" (\r\n'
+                        f'  "{python_ref}" "%USERPROFILE%\\.agentcat\\connectors\\bin\\agentcat" %*\r\n'
+                        '  goto :eof\r\n'
+                        ')\r\n'
+                        'where py >nul 2>nul\r\n'
+                        'if %ERRORLEVEL% EQU 0 (\r\n'
+                        '  py -3 "%USERPROFILE%\\.agentcat\\connectors\\bin\\agentcat" %*\r\n'
+                        ') else (\r\n'
+                        '  python "%USERPROFILE%\\.agentcat\\connectors\\bin\\agentcat" %*\r\n'
+                        ')\r\n'
                     )
                     self.assertEqual(shim.read_bytes(), expected.encode("ascii"))
 
