@@ -3448,14 +3448,17 @@ def live_limit_error(
     return limits
 
 
+_RUNNING_DAEMON = False
 _LIVE_LIMITS_WRITE_LOCK = threading.RLock()
 _QUOTA_REFRESH_LOCK = threading.Lock()
 _QUOTA_REFRESHING: set = set()
 _QUOTA_REFRESH_PENDING: Dict[str, Dict[str, Any]] = {}
 
 
-def schedule_quota_refresh(provider: str, refresh: Any, key: Optional[str] = None) -> None:
-    """One worker per provider; coalesce queued account/endpoint refreshes."""
+def schedule_quota_refresh(provider: str, refresh: Any, key: Optional[str] = None) -> Any:
+    """CLI jobs finish inline; daemon jobs coalesce in one worker per provider."""
+    if not _RUNNING_DAEMON:
+        return refresh()
     key = key or provider
     with _QUOTA_REFRESH_LOCK:
         pending = _QUOTA_REFRESH_PENDING.setdefault(provider, {})
@@ -3530,8 +3533,10 @@ def background_live_limits(provider: str, refresh: Any) -> Dict[str, Any]:
             return empty_limits()
         provider = codex_home_limits_cache_key(home, auth)
     cached = cached_live_limits(provider, LIVE_LIMITS_MAX_AGE_SECONDS)
-    if cached is None:
-        schedule_quota_refresh(provider.split("-instance:")[0], refresh, key=provider)
+    if cached is None or not _RUNNING_DAEMON:
+        refreshed = schedule_quota_refresh(provider.split("-instance:")[0], refresh, key=provider)
+        if isinstance(refreshed, dict):
+            return refreshed
         cached = cached_live_limits(provider, LIVE_LIMITS_MAX_AGE_SECONDS, allow_stale=True)
     limits = cached or empty_limits()
     if provider.startswith("codex-instance:"):
@@ -4197,11 +4202,11 @@ def provider_sync_identity(provider: str, native_account_id: str) -> str:
     ).hexdigest()
 
 
-# A failed Codex usage probe waits 5 min, doubling to 15 min, before the next
+# A failed Codex usage probe waits 5 min, doubling to 60 min, before the next
 # request (rule R6). A 401 with the same token cannot succeed until the CLI
 # refreshes its own login, so polling it every tick only burns requests.
 CODEX_FAILURE_BACKOFF_SECONDS = 300
-CODEX_FAILURE_BACKOFF_MAX_SECONDS = 900
+CODEX_FAILURE_BACKOFF_MAX_SECONDS = 3600
 
 
 def codex_failure_backoff_seconds(streak: int) -> int:
@@ -5686,7 +5691,7 @@ def _codex_usage_breakdown_impl() -> Dict[str, Any]:
     def record_failure(reason: Optional[str] = None) -> Dict[str, Any]:
         streak = ((int_count(failure.get("streak")) or 0) + 1) if same_login else 1
         entry: Dict[str, Any] = {
-            "retryAt": now + max(CODEX_USAGE_BREAKDOWN_TTL_SECONDS, live_limits_error_backoff_seconds(streak)),
+            "retryAt": now + max(900, codex_failure_backoff_seconds(streak)),
             "streak": streak,
             "tokenFingerprint": fingerprint,
         }
@@ -5739,8 +5744,12 @@ def cached_codex_usage_breakdown() -> Dict[str, Any]:
     fetched = int_limit(raw.get("fetched_at"))
     fresh = data is not None and fetched is not None and 0 <= time.time() - fetched < CODEX_USAGE_BREAKDOWN_TTL_SECONDS
     failure = raw.get("failure") if isinstance(raw.get("failure"), dict) else {}
-    if not fresh and (int_limit(failure.get("retryAt")) or 0) <= time.time():
-        schedule_quota_refresh("codex", codex_usage_breakdown, key="breakdown")
+    if not _RUNNING_DAEMON or (not fresh and (int_limit(failure.get("retryAt")) or 0) <= time.time()):
+        refreshed = schedule_quota_refresh("codex", codex_usage_breakdown, key="breakdown")
+        if isinstance(refreshed, dict):
+            # One-shot callers must see the inline result on this invocation,
+            # even when the cache could not be persisted.
+            return refreshed
     if data is None:
         data = empty_codex_usage_breakdown()
     elif not fresh:
@@ -19233,6 +19242,16 @@ def healthy_daemon_on_port(host: str, port: int) -> bool:
 
 
 def run_daemon(args: argparse.Namespace) -> int:
+    global _RUNNING_DAEMON
+    previous = _RUNNING_DAEMON
+    _RUNNING_DAEMON = True
+    try:
+        return _run_daemon_impl(args)
+    finally:
+        _RUNNING_DAEMON = previous
+
+
+def _run_daemon_impl(args: argparse.Namespace) -> int:
     ensure_dirs()
     # Connection clients read this file before their first authenticated request.
     # Creating it only inside the request guard makes a fresh install unable to

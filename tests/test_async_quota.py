@@ -27,12 +27,15 @@ class AsyncQuotaTests(unittest.TestCase):
         a._QUOTA_REFRESHING.clear()
         a._QUOTA_REFRESH_PENDING.clear()
         a._QUOTA_URL_FAILURES.clear()
+        self.daemon_patch = patch.object(a, "_RUNNING_DAEMON", True)
+        self.daemon_patch.start()
         self.jobs = []
         self.thread_patch = patch.object(a.threading, 'Thread', side_effect=self.thread)
         self.thread_patch.start()
 
     def tearDown(self):
         self.thread_patch.stop()
+        self.daemon_patch.stop()
         restore_module_paths(a, self.originals)
         self.tmp.cleanup()
 
@@ -166,3 +169,37 @@ class AsyncQuotaTests(unittest.TestCase):
         self.assertEqual(result['updatedAt'], 'original')
         self.assertEqual(result['reason'], 'cli_login_expired')
         self.assertEqual(self.jobs, [])
+
+    def test_one_shot_limits_fill_cold_cache_inline(self):
+        good = {'status': 'auto', 'updatedAt': 'fetch-time', 'quotas': [{'usedPercent': 10}]}
+        def refresh():
+            a.write_live_limits_cache('claude', good)
+            return good
+        with patch.object(a, '_RUNNING_DAEMON', False):
+            result = a.background_live_limits('claude', refresh)
+            unavailable = a.empty_limits(reason='fixture_no_login')
+            self.assertEqual(a.background_live_limits('grok', lambda: unavailable), unavailable)
+        self.assertEqual(result['updatedAt'], 'fetch-time')
+        self.assertEqual(result['quotas'], good['quotas'])
+        self.assertTrue(a.LIVE_LIMITS_CACHE.exists())
+        self.assertEqual(self.jobs, [])
+
+    def test_one_shot_breakdown_returns_and_persists_first_response(self):
+        with patch.object(a, '_RUNNING_DAEMON', False), \
+             patch.object(a, 'read_codex_auth', return_value={'tokens': {'access_token': 'fixture'}}), \
+             patch.object(a, 'codex_usage_breakdown_request', return_value={'data': []}) as request:
+            result = a.attach_codex_usage_breakdown({})['codexUsageBreakdown']
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(json.loads(a.CODEX_USAGE_BREAKDOWN_CACHE.read_text())['data'], result)
+        request.assert_called_once()
+        self.assertEqual(self.jobs, [])
+
+    def test_daemon_mode_is_scoped_to_run_daemon_even_on_failure(self):
+        def fail(args):
+            self.assertTrue(a._RUNNING_DAEMON)
+            raise OSError('fixture bind failure')
+        with patch.object(a, '_RUNNING_DAEMON', False), \
+             patch.object(a, '_run_daemon_impl', side_effect=fail):
+            with self.assertRaises(OSError):
+                a.run_daemon(a.argparse.Namespace())
+            self.assertFalse(a._RUNNING_DAEMON)

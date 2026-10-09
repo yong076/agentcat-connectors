@@ -531,7 +531,26 @@ class WP10CodexBreakdownHardeningTests(SandboxedCase):
         request.assert_called_once()
         self.assertEqual(result["status"], "ok")
         self.assertNotIn("failure", json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text()))
-        self.assertEqual(agentcat.codex_failure_backoff_seconds(10), 900)
+        self.assertEqual(agentcat.codex_failure_backoff_seconds(10), 3600)
+
+    def test_breakdown_failure_floor_preserves_expired_token_curve(self):
+        now = 1_800_000_000
+        with patch.object(agentcat, "read_codex_auth", return_value=self.auth()), \
+             patch.object(agentcat, "codex_usage_breakdown_request", side_effect=TimeoutError("offline")) as request:
+            for streak, delay in enumerate((900, 900, 1200, 2400, 3600, 3600), 1):
+                with patch.object(agentcat.time, "time", return_value=now):
+                    agentcat.codex_usage_breakdown()
+                stored = json.loads(agentcat.CODEX_USAGE_BREAKDOWN_CACHE.read_text())
+                self.assertEqual(stored["failure"]["streak"], streak)
+                self.assertEqual(stored["failure"]["retryAt"], now + delay)
+                with patch.object(agentcat.time, "time", return_value=now + delay - 1):
+                    agentcat.codex_usage_breakdown()
+                self.assertEqual(request.call_count, streak)
+                now += delay
+        self.assertEqual(
+            [agentcat.codex_failure_backoff_seconds(streak) for streak in range(1, 7)],
+            [300, 600, 1200, 2400, 3600, 3600],
+        )
 
     def test_403_timeout_and_no_auth_fail_soft_without_unwanted_refresh(self):
         forbidden = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b""))
