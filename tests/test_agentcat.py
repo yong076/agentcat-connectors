@@ -1202,13 +1202,13 @@ class AgentCatConnectorTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
-            snapshot = agentcat.snapshot_for_http()
+        with patch.object(agentcat, "refresh_activity_if_stale"):
+            agentcat.initialize_http_snapshot_cache()
+            snapshot = json.loads(b"".join(agentcat.snapshot_for_http()))
 
         self.assertEqual(snapshot["generatedAt"], "2026-05-01T00:00:00Z")
         self.assertIn("servedAt", snapshot)
-        self.assertIn("update", snapshot)
-        self.assertEqual(snapshot["activity"], {"status": "ok"})
+        self.assertEqual(snapshot["activity"], {"status": "old"})
 
     def test_version_json_matches_snapshot_schema_version(self) -> None:
         buf = io.StringIO()
@@ -1936,27 +1936,6 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(agentcat.filter_snapshot_sections(payload, "   "), payload)
         self.assertEqual(agentcat.filter_snapshot_sections(payload, "nonexistent"), payload)
 
-    def test_http_live_overlay_is_cached_within_ttl(self) -> None:
-        # Audit #6: /v1/snapshot GET must not spawn ps + walk the desktop tree on every
-        # poll (~2-5s). The live overlay is cached for a couple of seconds.
-        from unittest.mock import patch as _p
-        agentcat._HTTP_LIVE_CACHE = None
-        calls = {"n": 0}
-
-        def act():
-            calls["n"] += 1
-            return {"status": "ok", "n": calls["n"]}
-
-        try:
-            with _p.object(agentcat, "terminal_activity_snapshot", side_effect=act), \
-                 _p.object(agentcat, "desktop_app_sources_snapshot", side_effect=lambda *a, **k: {}):
-                a1, _ = agentcat._live_activity_and_desktop()
-                a2, _ = agentcat._live_activity_and_desktop()
-            self.assertEqual(calls["n"], 1)  # computed once, second call served from cache
-            self.assertIs(a1, a2)
-        finally:
-            agentcat._HTTP_LIVE_CACHE = None
-
     def test_terminal_activity_error_path_populates_runtime_modes(self) -> None:
         # Audit #6: the wasted eager runtimeModes query was removed from the initializer;
         # the ps-error path must still populate it (it's the only place it's needed there).
@@ -2000,16 +1979,13 @@ class AgentCatConnectorTests(unittest.TestCase):
             agentcat.LATEST_SNAPSHOT,
             {"schemaVersion": 1, "providers": {"codex": {"status": "ok"}}},
         )
-        agentcat._HTTP_LIVE_CACHE = None
-        try:
-            with patch.object(agentcat, "_build_snapshot_impl", side_effect=AssertionError("must not rebuild")), \
-                 patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}), \
-                 patch.object(agentcat, "desktop_app_sources_snapshot", return_value={}):
-                snap = agentcat.snapshot_for_http()
-            self.assertIn("servedAt", snap)
-            self.assertEqual(snap["providers"]["codex"]["status"], "ok")
-        finally:
-            agentcat._HTTP_LIVE_CACHE = None
+        agentcat.initialize_http_snapshot_cache()
+        with patch.object(agentcat, "_build_snapshot_impl", side_effect=AssertionError("must not rebuild")), \
+             patch.object(agentcat, "refresh_activity_if_stale"), \
+             patch.object(agentcat, "read_json", side_effect=AssertionError("must not read")):
+            snap = json.loads(b"".join(agentcat.snapshot_for_http()))
+        self.assertIn("servedAt", snap)
+        self.assertEqual(snap["providers"]["codex"]["status"], "ok")
 
     def test_codexbar_cost_cache_floors_codex_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()

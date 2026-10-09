@@ -14209,7 +14209,9 @@ def build_snapshot() -> Dict[str, Any]:
     # interleaved builds re-book the same growth into today's projectsDaily (audit #4).
     # An RLock keeps it safe even if a future caller nests a build.
     with _BUILD_SNAPSHOT_LOCK:
-        return _build_snapshot_impl()
+        snapshot = _build_snapshot_impl()
+        publish_http_snapshot(snapshot)
+        return snapshot
 
 
 def _build_snapshot_impl() -> Dict[str, Any]:
@@ -14370,27 +14372,72 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     return snapshot
 
 
-_HTTP_LIVE_CACHE_LOCK = threading.Lock()
-_HTTP_LIVE_CACHE: Optional[Tuple[float, Dict[str, Any], Dict[str, Any]]] = None
-HTTP_LIVE_CACHE_TTL = float(os.environ.get("AGENTCAT_HTTP_LIVE_CACHE_SECONDS", "2.0"))
+# Published as one immutable generation; readers never acquire the build lock.
+_HTTP_SNAPSHOT_CACHE: Optional[Tuple[bytes, Dict[str, bytes]]] = None
+_HTTP_ACTIVITY_CACHE: Optional[Tuple[float, bytes]] = None
+_HTTP_ACTIVITY_REFRESH_LOCK = threading.Lock()
+# TerminalAgentMonitor polls every 2s while active (20s while idle).
+ACTIVITY_CACHE_TTL_SECONDS = 2.0
+_activity_monotonic = time.monotonic
 
 
-def _live_activity_and_desktop() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """The per-request live overlay (process scan + desktop-app walk), cached for a
-    couple of seconds. The app polls /v1/snapshot every ~2-5s, and each call otherwise
-    spawned `/bin/ps` (or WMI) and walked the desktop tree — 10-13% of a core steady
-    state (audit #6). The 60s background loop keeps the snapshot body fresh; this only
-    throttles the live overlay."""
-    global _HTTP_LIVE_CACHE
-    now = time.monotonic()
-    with _HTTP_LIVE_CACHE_LOCK:
-        if _HTTP_LIVE_CACHE is not None and (now - _HTTP_LIVE_CACHE[0]) < HTTP_LIVE_CACHE_TTL:
-            return _HTTP_LIVE_CACHE[1], _HTTP_LIVE_CACHE[2]
-    activity = terminal_activity_snapshot()
-    desktop_apps = desktop_app_sources_snapshot(agentcat_settings())
-    with _HTTP_LIVE_CACHE_LOCK:
-        _HTTP_LIVE_CACHE = (time.monotonic(), activity, desktop_apps)
-    return activity, desktop_apps
+def _refresh_http_activity() -> None:
+    """One background scan. The caller reserves the single-flight lock first."""
+    global _HTTP_ACTIVITY_CACHE
+    started = _activity_monotonic()
+    try:
+        try:
+            activity = terminal_activity_snapshot()
+        except Exception as exc:
+            activity = {"status": "error", "updatedAt": now_iso(),
+                        "error": log_safe_error(exc)}
+        encoded = json.dumps(activity, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        # Age starts at scan start, so scan duration does not hide stale data.
+        _HTTP_ACTIVITY_CACHE = (started, b'"activity":' + encoded)
+    finally:
+        _HTTP_ACTIVITY_REFRESH_LOCK.release()
+
+
+def refresh_activity_if_stale() -> None:
+    """Schedule at most one scan; requests never wait for a scan or a lock."""
+    cached = _HTTP_ACTIVITY_CACHE
+    if cached is not None and _activity_monotonic() - cached[0] < ACTIVITY_CACHE_TTL_SECONDS:
+        return
+    if not _HTTP_ACTIVITY_REFRESH_LOCK.acquire(blocking=False):
+        return
+    try:
+        # Another worker may have published between the first check and acquire.
+        cached = _HTTP_ACTIVITY_CACHE
+        if cached is not None and _activity_monotonic() - cached[0] < ACTIVITY_CACHE_TTL_SECONDS:
+            _HTTP_ACTIVITY_REFRESH_LOCK.release()
+            return
+        threading.Thread(target=_refresh_http_activity, daemon=True).start()
+    except Exception:
+        _HTTP_ACTIVITY_REFRESH_LOCK.release()
+        logging.debug("activity refresh could not start", exc_info=True)
+
+
+def publish_http_snapshot(snapshot: Dict[str, Any]) -> None:
+    global _HTTP_SNAPSHOT_CACHE
+    # Encode each section once. Full and filtered replies reuse these bytes;
+    # subsequent mutations of the builder's dictionaries cannot alter a reply.
+    sections = {
+        key: json.dumps(key).encode("utf-8") + b":" +
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        for key, value in snapshot.items() if key != "servedAt"
+    }
+    body = b",".join(value for key, value in sections.items() if key != "activity")
+    _HTTP_SNAPSHOT_CACHE = (body, sections)
+
+
+def initialize_http_snapshot_cache() -> None:
+    """Read the previous generation once, before accepting HTTP requests."""
+    global _HTTP_SNAPSHOT_CACHE, _HTTP_ACTIVITY_CACHE
+    _HTTP_SNAPSHOT_CACHE = None
+    _HTTP_ACTIVITY_CACHE = None
+    cached = read_json(LATEST_SNAPSHOT)
+    if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
+        publish_http_snapshot(cached)
 
 
 # Cheap envelope keys that always ride along: a caller filtering for one
@@ -14434,20 +14481,29 @@ def filter_snapshot_sections(payload: Dict[str, Any], requested: str) -> Dict[st
     return filtered
 
 
-def snapshot_for_http() -> Dict[str, Any]:
-    cached = read_json(LATEST_SNAPSHOT)
-    if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
-        snapshot = copy.deepcopy(cached)
-        snapshot["servedAt"] = now_iso()
-        snapshot["update"] = auto_update_status_snapshot()
-        activity, desktop_apps = _live_activity_and_desktop()
-        snapshot["activity"] = activity
-        snapshot["desktopApps"] = desktop_apps
-        providers = snapshot.get("providers")
-        if isinstance(providers, dict):
-            attach_desktop_app_sources(providers, desktop_apps)
-        return snapshot
-    return build_snapshot()
+def snapshot_for_http(requested: str = "") -> Optional[Tuple[bytes, ...]]:
+    cache = _HTTP_SNAPSHOT_CACHE
+    if cache is None:
+        return None
+    body, sections = cache
+    # A completed slow build must never overwrite a newer on-demand sample.
+    activity_cache = _HTTP_ACTIVITY_CACHE
+    activity = activity_cache[1] if activity_cache is not None else sections.get("activity")
+    keep = {name.strip() for name in requested.split(",") if name.strip()}
+    if keep and ("servedAt" in keep or ("activity" in keep and activity is not None)
+                 or any(key in keep for key in sections)):
+        body = b",".join(value for key, value in sections.items()
+                         if key != "activity" and (key in keep or key in _SNAPSHOT_ENVELOPE_KEYS))
+        if "activity" not in keep:
+            activity = None
+    if activity is not None:
+        refresh_activity_if_stale()
+    # servedAt is transport time. Activity has its own updatedAt; provider
+    # generatedAt and quota freshness still refer to the last full build.
+    served = b'"servedAt":' + json.dumps(now_iso()).encode("utf-8")
+    # Keep the large full-body buffer intact, including on the socket write.
+    return (b"{" + served, b"," if body else b"", body,
+            b"," if activity else b"", activity or b"", b"}")
 
 
 def snapshot_refresh_loop(interval_seconds: float) -> None:
@@ -18294,14 +18350,22 @@ class AgentCatHandler(BaseHTTPRequestHandler):
 
     def send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        self.send_json_bytes(status, body)
+
+    def send_json_bytes(self, status: int, body: bytes) -> None:
+        self.send_json_chunks(status, (body,))
+
+    def send_json_chunks(self, status: int, chunks: Tuple[bytes, ...]) -> None:
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(sum(len(chunk) for chunk in chunks)))
             self.end_headers()
         except (BrokenPipeError, ConnectionResetError):
             return
-        self.write_response_body(body)
+        for chunk in chunks:
+            if not self.write_response_body(chunk):
+                break
 
     def send_html(self, status: int, document: str) -> None:
         body = document.encode("utf-8")
@@ -18361,11 +18425,14 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/snapshot":
             try:
-                payload = snapshot_for_http()
                 requested = urllib.parse.parse_qs(
                     urllib.parse.urlparse(self.path).query
                 ).get("sections", [""])[0]
-                self.send_json(200, filter_snapshot_sections(payload, requested))
+                body = snapshot_for_http(requested)
+                if body is None:
+                    self.send_json(503, {"error": "snapshot_not_ready"})
+                else:
+                    self.send_json_chunks(200, body)
             except Exception as exc:
                 self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return
@@ -19022,8 +19089,8 @@ def run_daemon(args: argparse.Namespace) -> int:
     # Bind and start accepting connections BEFORE the initial snapshot build (audit #3).
     # The first build_snapshot() streams the full local history — gigabytes, minutes, for
     # the heaviest users — and previously ran before the port bind, so the app got
-    # connection-refused the whole time and reported the user "not detected". Since
-    # snapshot_for_http() already serves the cached latest-snapshot.json, we bind first
+    # connection-refused the whole time and reported the user "not detected".
+    # The previous snapshot is loaded once into memory after binding; we bind first
     # and move the initial build into the background: returning users see their last
     # snapshot instantly while it refreshes underneath them.
     try:
@@ -19038,6 +19105,7 @@ def run_daemon(args: argparse.Namespace) -> int:
             flush=True,
         )
         return 1
+    initialize_http_snapshot_cache()
     # Only the instance that owns the port maintains shared state: a second
     # agentcatd that loses the bind must not rotate the live daemon's log or
     # vacuum its database.
