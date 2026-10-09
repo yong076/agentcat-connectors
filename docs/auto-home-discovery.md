@@ -127,3 +127,11 @@ login does not suppress a working login in another home of the same account.
 
 Run the repository's copy + fake HOME + closed stdin test command. Discovery
 tests never inspect real homes, Keychain, or provider endpoints.
+
+## Checking a real machine
+
+`python3 scripts/discovery_dry_run.py` classifies the machine's homes read-only
+(throwaway AGENTCAT_HOME, no probes, no settings writes) and prints state,
+sources, launchers, evidence and timing. Run it after any discovery change and
+compare against the expected outcome; fake-HOME tests alone missed real-scale
+budget, candidate-order and IPC problems.
