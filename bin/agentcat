@@ -10,6 +10,7 @@ from contextlib import closing
 import logging
 import datetime as dt
 import email.utils
+import errno
 import hashlib
 import hmac
 import html
@@ -19,12 +20,14 @@ import os
 import re
 import shutil
 import shlex
+import signal
 import subprocess
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -19097,6 +19100,21 @@ def daemon_log_rotation_loop(interval_seconds: float = DAEMON_LOG_ROTATE_INTERVA
             print(f"agentcatd log rotation failed: {type(exc).__name__}", file=sys.stderr, flush=True)
 
 
+def healthy_daemon_on_port(host: str, port: int) -> bool:
+    """Probe only the conflicting local listener, without proxies or redirects."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    probe_host = host
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(f"http://{probe_host}:{port}/healthz", timeout=1.0) as response:
+            return response.status == 200 and response.read(16) == b"ok\n"
+    except (OSError, ValueError, HTTPException):
+        return False
+
+
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
     # Connection clients read this file before their first authenticated request.
@@ -19122,73 +19140,92 @@ def run_daemon(args: argparse.Namespace) -> int:
     try:
         server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
     except OSError as exc:
-        # One line, not a traceback: launchd restarts us (its 10 s default
-        # throttle spaces the retries) and the usual cause is another agentcatd.
+        if exc.errno == errno.EADDRINUSE and healthy_daemon_on_port(args.host, args.port):
+            return 0
+        # EX_TEMPFAIL remains nonzero for service-manager retries, spaced by
+        # launchd's default throttle. A healthy duplicate exits successfully.
         print(
             f"agentcatd cannot listen on {args.host}:{args.port}: "
             f"{exc.strerror or type(exc).__name__} (is another agentcatd running?)",
             file=sys.stderr,
             flush=True,
         )
-        return 1
-    initialize_http_snapshot_cache()
-    # Only the instance that owns the port maintains shared state: a second
-    # agentcatd that loses the bind must not rotate the live daemon's log or
-    # vacuum its database.
-    try:
-        # Bound the launchd/installer stderr file (#121).
-        ensure_daemon_stderr_appends()
-        rotate_daemon_log()
-    except Exception:
-        pass
-    sweep_foreign_sqlite_copies()
-    # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
-    prune_events()
-    print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
+        return 75
+    previous_handlers = {}
 
-    def _initial_build_then_refresh() -> None:
+    def request_stop(signum, frame):
+        # Raising on the main thread unwinds serve_forever without the deadlock
+        # caused by calling server.shutdown() from its own serving thread.
+        raise KeyboardInterrupt
+
+    try:
+        for signum in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+            if signum is not None:
+                previous_handlers[signum] = signal.signal(signum, request_stop)
+        initialize_http_snapshot_cache()
+        # Only the instance that owns the port maintains shared state: a second
+        # agentcatd that loses the bind must not rotate the live daemon's log or
+        # vacuum its database.
         try:
-            build_snapshot()
-        except Exception as exc:
-            print(f"agentcatd initial snapshot build failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
-        snapshot_refresh_loop(60.0)
+            # Bound the launchd/installer stderr file (#121).
+            ensure_daemon_stderr_appends()
+            rotate_daemon_log()
+        except Exception:
+            pass
+        sweep_foreign_sqlite_copies()
+        # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
+        prune_events()
+        print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
 
-    threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
-    threading.Thread(
-        target=cli_probe_loop,
-        args=(CLI_PROBE_INTERVAL_SECONDS,),
-        daemon=True,
-    ).start()
-    threading.Thread(
-        target=managed_quota_refresh_loop,
-        args=(MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS,),
-        daemon=True,
-    ).start()
-    update_enabled, _update_reason = auto_update_enabled_status()
-    if update_enabled and AUTO_UPDATE_INTERVAL_SECONDS > 0:
+        def _initial_build_then_refresh() -> None:
+            try:
+                build_snapshot()
+            except Exception as exc:
+                print(f"agentcatd initial snapshot build failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
+            snapshot_refresh_loop(60.0)
+
+        threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
         threading.Thread(
-            target=auto_update_loop,
-            args=(float(AUTO_UPDATE_INTERVAL_SECONDS), float(AUTO_UPDATE_INITIAL_DELAY_SECONDS)),
+            target=cli_probe_loop,
+            args=(CLI_PROBE_INTERVAL_SECONDS,),
             daemon=True,
         ).start()
-    if PRICING_FETCH_INTERVAL_SECONDS > 0:
         threading.Thread(
-            target=pricing_refresh_loop,
-            args=(float(PRICING_FETCH_INTERVAL_SECONDS), float(PRICING_FETCH_INITIAL_DELAY_SECONDS)),
+            target=managed_quota_refresh_loop,
+            args=(MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS,),
             daemon=True,
         ).start()
-    # Reflect: the default config is written once (enabled=false); the scheduler
-    # loop re-reads it every tick, so flipping the file to true needs no restart.
-    reflect_write_default_config()
-    threading.Thread(target=reflect_scheduler_loop, args=(60.0,), daemon=True).start()
-    threading.Thread(target=daemon_log_rotation_loop, daemon=True).start()
-    try:
+        update_enabled, _update_reason = auto_update_enabled_status()
+        if update_enabled and AUTO_UPDATE_INTERVAL_SECONDS > 0:
+            threading.Thread(
+                target=auto_update_loop,
+                args=(float(AUTO_UPDATE_INTERVAL_SECONDS), float(AUTO_UPDATE_INITIAL_DELAY_SECONDS)),
+                daemon=True,
+            ).start()
+        if PRICING_FETCH_INTERVAL_SECONDS > 0:
+            threading.Thread(
+                target=pricing_refresh_loop,
+                args=(float(PRICING_FETCH_INTERVAL_SECONDS), float(PRICING_FETCH_INITIAL_DELAY_SECONDS)),
+                daemon=True,
+            ).start()
+        # Reflect: the default config is written once (enabled=false); the scheduler
+        # loop re-reads it every tick, so flipping the file to true needs no restart.
+        reflect_write_default_config()
+        threading.Thread(target=reflect_scheduler_loop, args=(60.0,), daemon=True).start()
+        threading.Thread(target=daemon_log_rotation_loop, daemon=True).start()
         server.serve_forever()
     except KeyboardInterrupt:
         return 0
     finally:
-        shutdown_codex_app_servers()
-        server.server_close()
+        # Repeated stop signals must not interrupt child-process cleanup.
+        for signum in previous_handlers:
+            signal.signal(signum, signal.SIG_IGN)
+        try:
+            shutdown_codex_app_servers()
+        finally:
+            server.server_close()
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
     return 0
 
 
