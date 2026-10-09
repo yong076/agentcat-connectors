@@ -4090,6 +4090,34 @@ class AgentCatConnectorTests(unittest.TestCase):
                         self.assertEqual(result["status"], "ok")
                         self.assertEqual(result["tokens"]["all"], 123)
 
+    def test_foreign_sqlite_discards_raced_immutable_read(self) -> None:
+        for checkpoint in (False, True):
+            with self.subTest(checkpoint=checkpoint):
+                database = self.root / f"race-{checkpoint}.db"
+                with closing(sqlite3.connect(database)) as writer:
+                    writer.execute("pragma journal_mode=wal")
+                    writer.execute("create table fixture (value integer)")
+                    writer.execute("insert into fixture values (1)")
+                    writer.commit()
+                writer = sqlite3.connect(database)
+                calls = []
+
+                def read(connection):
+                    rows = connection.execute("select value from fixture order by value").fetchall()
+                    calls.append(rows)
+                    if len(calls) == 1:
+                        writer.execute("insert into fixture values (2)")
+                        writer.commit()
+                        if checkpoint:
+                            writer.close()
+                    return rows
+
+                try:
+                    self.assertEqual(agentcat.read_foreign_sqlite(database, read), [(1,), (2,)])
+                    self.assertEqual(calls, [[(1,)], [(1,), (2,)]])
+                finally:
+                    writer.close()
+
     def test_foreign_sqlite_retries_failed_read_on_private_copy(self) -> None:
         database = self.root / "retry.db"
         with closing(sqlite3.connect(database)) as writer:

@@ -12119,20 +12119,36 @@ def read_foreign_sqlite(
     read require a private copy including WAL frames. The callback must fully
     materialize its result before the connection closes and may be retried.
     """
-    wal_exists = database.with_name(database.name + "-wal").exists()
-    shm_exists = database.with_name(database.name + "-shm").exists()
-    uri = database.resolve().as_uri() + "?mode=ro"
-    if not wal_exists and not shm_exists:
-        uri += "&immutable=1"
-    if wal_exists == shm_exists:
+    def sidecars() -> Tuple[bool, bool]:
+        return (database.with_name(database.name + "-wal").exists(),
+                database.with_name(database.name + "-shm").exists())
+
+    # One immutable attempt, then a fresh mode decision without immutable.
+    # A writer may checkpoint and remove its WAL entirely during the callback.
+    for attempt in range(2):
+        wal_exists, shm_exists = sidecars()
+        immutable = attempt == 0 and not wal_exists and not shm_exists
+        if not immutable and not (wal_exists and shm_exists):
+            break
+        uri = database.resolve().as_uri() + "?mode=ro"
+        if immutable:
+            uri += "&immutable=1"
         try:
+            before = database.stat() if immutable else None
             with closing(sqlite3.connect(uri, uri=True, timeout=timeout)) as connection:
-                return read(connection)
+                result = read(connection)
+            if immutable:
+                after = database.stat()
+                if ((before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
+                        or any(sidecars())):
+                    continue
+            return result
         except sqlite3.Error as exc:
             if "no such table" in str(exc):
                 raise
+            break
         except OSError:
-            pass
+            break
     with tempfile.TemporaryDirectory(prefix="agentcat-sqlite-") as temp_dir:
         copied = Path(temp_dir) / "database.db"
         shutil.copyfile(database, copied)
