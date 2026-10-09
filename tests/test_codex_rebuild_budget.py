@@ -162,7 +162,7 @@ class CodexRebuildBudgetTests(HomeDiscoveryTestCase):
         unnamed = self.path.with_name('unnamed.jsonl')
         self.path.rename(unnamed)
         alias = unnamed.with_name('alias.jsonl')
-        alias.hardlink_to(unnamed)
+        os.link(unnamed, alias)
         with patch.object(agentcat, 'codex_session_files', return_value=[unnamed, alias]):
             self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 200)
             self.assertEqual(len(agentcat.load_codex_sessions_cursor()['files']), 1)

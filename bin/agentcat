@@ -14440,7 +14440,7 @@ def refresh_activity_if_stale() -> None:
         if cached is not None and _activity_monotonic() - cached[0] < ACTIVITY_CACHE_TTL_SECONDS:
             _HTTP_ACTIVITY_REFRESH_LOCK.release()
             return
-        threading.Thread(target=_refresh_http_activity, daemon=True).start()
+        threading.Thread(target=_refresh_http_activity, name="agentcat_refresh_http_activity", daemon=True).start()
     except Exception:
         _HTTP_ACTIVITY_REFRESH_LOCK.release()
         logging.debug("activity refresh could not start", exc_info=True)
