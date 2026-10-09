@@ -13,11 +13,29 @@ if ([string]::IsNullOrWhiteSpace($BackupRoot)) {
   $BackupRoot = Join-Path $HOME ".agentcat\backups\connector-source"
 }
 
+function Test-Python3([string[]]$Prefix) {
+  $command = $Prefix[0]
+  $probeArguments = @()
+  if ($Prefix.Length -gt 1) { $probeArguments += $Prefix[1..($Prefix.Length - 1)] }
+  $probeArguments += @("-c", "import sys; sys.exit(0 if sys.version_info.major == 3 else 1)")
+  try {
+    & $command @probeArguments *> $null
+    return $LASTEXITCODE -eq 0
+  } catch {
+    return $false
+  }
+}
+
 function Resolve-Python {
+  # Self-updates must keep the daemon's interpreter, even when it is not on PATH.
+  if (-not [string]::IsNullOrWhiteSpace($env:AGENTCAT_PYTHON)) {
+    if (Test-Python3 @($env:AGENTCAT_PYTHON)) { return @($env:AGENTCAT_PYTHON) }
+  }
+  # Get-Command alone also accepts the nonfunctional Microsoft Store alias.
   $python = Get-Command python -ErrorAction SilentlyContinue
-  if ($python) { return @($python.Source) }
+  if ($python -and (Test-Python3 @($python.Source))) { return @($python.Source) }
   $py = Get-Command py -ErrorAction SilentlyContinue
-  if ($py) { return @($py.Source, "-3") }
+  if ($py -and (Test-Python3 @($py.Source, "-3"))) { return @($py.Source, "-3") }
   throw "Python 3 is required to install Agent Cat Connectors."
 }
 

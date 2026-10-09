@@ -1,5 +1,6 @@
 import importlib.util
 import unittest
+import tempfile
 import unittest.mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path, PureWindowsPath
@@ -41,6 +42,38 @@ class WindowsShimPathTests(unittest.TestCase):
         with unittest.mock.patch.object(install, "HOME", home):
             result = install._windows_shim_path(target)
         self.assertEqual(result, "D:\\custom\\install\\bin\\agentcat")
+
+
+class WindowsShimGenerationTests(unittest.TestCase):
+    def test_install_pins_interpreter_and_forwards_arguments(self) -> None:
+        for username in ("Alice Smith", "아트 심", "田中"):
+            for outside_home in (False, True):
+                with self.subTest(username=username, outside_home=outside_home), tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / username
+                    repo = home / ".agentcat" / "connectors"
+                    src = repo / "bin" / "agentcat"
+                    src.parent.mkdir(parents=True)
+                    src.write_text("# fixture", encoding="ascii")
+                    shim = home / ".local" / "bin" / "agentcat.cmd"
+                    shim.parent.mkdir(parents=True)
+                    executable = (
+                        Path(tmp) / "Program Files" / "Python" / "python.exe"
+                        if outside_home else home / ".agentcat" / "python" / "3.13.16" / "python.exe"
+                    )
+                    with unittest.mock.patch.multiple(
+                        install, HOME=home, AGENTCAT_HOME=home / ".agentcat",
+                        BIN_PATH=shim, IS_WINDOWS=True,
+                    ), unittest.mock.patch.object(install.sys, "executable", str(executable)), \
+                            unittest.mock.patch.object(install, "ensure_windows_user_path"), \
+                            unittest.mock.patch.object(install, "log"):
+                        install.install_binary(repo, home / "backups")
+                        python_ref = install._windows_shim_path(executable)
+                    expected = (
+                        '@echo off\r\n'
+                        'set "AGENTCAT_HOME=%USERPROFILE%\\.agentcat"\r\n'
+                        f'"{python_ref}" "%USERPROFILE%\\.agentcat\\connectors\\bin\\agentcat" %*\r\n'
+                    )
+                    self.assertEqual(shim.read_bytes(), expected.encode("ascii"))
 
 
 if __name__ == "__main__":
