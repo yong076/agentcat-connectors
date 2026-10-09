@@ -170,10 +170,10 @@ class LiveLimitBackoffTests(LancelotWP8TestCase):
     def cache_entry(self, provider="claude"):
         return json.loads(agentcat.LIVE_LIMITS_CACHE.read_text(encoding="utf-8"))[provider]
 
-    def test_backoff_curve_starts_at_thirty_seconds_and_caps_at_nine_hundred(self):
+    def test_backoff_curve_starts_at_five_minutes_and_caps_at_nine_hundred(self):
         self.assertEqual(
             [agentcat.live_limits_error_backoff_seconds(streak) for streak in range(1, 8)],
-            [30, 60, 120, 240, 480, 900, 900],
+            [300, 600, 900, 900, 900, 900, 900],
         )
 
     def test_consecutive_failures_increment_provider_streak_and_extend_backoff(self):
@@ -182,16 +182,16 @@ class LiveLimitBackoffTests(LancelotWP8TestCase):
             agentcat.write_live_limits_cache("claude", failure)
         self.assertEqual(self.cache_entry()["failureStreak"], 1)
 
-        with patch.object(agentcat.time, "time", return_value=1_029):
+        with patch.object(agentcat.time, "time", return_value=1_299):
             self.assertIsNotNone(agentcat.cached_live_limits("claude", -1))
-        with patch.object(agentcat.time, "time", return_value=1_031):
+        with patch.object(agentcat.time, "time", return_value=1_301):
             self.assertIsNone(agentcat.cached_live_limits("claude", 10_000))
             agentcat.write_live_limits_cache("claude", failure)
         self.assertEqual(self.cache_entry()["failureStreak"], 2)
 
-        with patch.object(agentcat.time, "time", return_value=1_090):
+        with patch.object(agentcat.time, "time", return_value=1_900):
             self.assertIsNotNone(agentcat.cached_live_limits("claude", -1))
-        with patch.object(agentcat.time, "time", return_value=1_092):
+        with patch.object(agentcat.time, "time", return_value=1_902):
             self.assertIsNone(agentcat.cached_live_limits("claude", 10_000))
 
     def test_success_resets_failure_streak(self):
@@ -355,7 +355,7 @@ class CodexWindowClassificationTests(LancelotWP8TestCase):
             self.assertEqual(headers["user-agent"], "codex-cli")
             self.assertEqual(headers["openai-beta"], "codex-1")
             self.assertEqual(headers["chatgpt-account-id"], "account")
-            self.assertEqual(timeout, 12)
+            self.assertEqual(timeout, 8)
 
 
 class ClaudeCredentialSourceTests(LancelotWP8TestCase):

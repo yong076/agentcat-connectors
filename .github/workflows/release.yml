@@ -29,7 +29,7 @@ jobs:
           test "${GITHUB_REF_NAME}" = "v${version}"
 
       - name: Run release tests
-        run: python scripts/run_sandboxed_tests.py --previous-version 26.41.4
+        run: python scripts/run_sandboxed_tests.py --previous-version 26.41.5
 
       - name: Build checksum-bound release assets
         run: python scripts/build_public_release.py --output dist --source-ref "${GITHUB_REF_NAME}"

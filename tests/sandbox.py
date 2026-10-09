@@ -79,6 +79,11 @@ def redirect_module_paths(module, home: Path, agentcat_home: Path) -> dict:
     if hasattr(module, "ORCA_ACCOUNTS_ENABLED"):
         originals["ORCA_ACCOUNTS_ENABLED"] = module.ORCA_ACCOUNTS_ENABLED
         module.ORCA_ACCOUNTS_ENABLED = False
+    # Async work must not outlive fixture paths/network patches. Dedicated
+    # worker tests opt in with a controlled scheduler and drain it explicitly.
+    if hasattr(module, "schedule_quota_refresh"):
+        originals["schedule_quota_refresh"] = module.schedule_quota_refresh
+        module.schedule_quota_refresh = lambda provider, refresh, **kwargs: None
     for name, sandboxed in _redirect(home, agentcat_home).items():
         if not hasattr(module, name):
             continue  # constant renamed or removed upstream; nothing to redirect

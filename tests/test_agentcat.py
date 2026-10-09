@@ -556,7 +556,8 @@ class AgentCatConnectorTests(unittest.TestCase):
             )
         requests: list = []
         with self._codex_unauthorized_network(requests), \
-            patch.object(agentcat, "_codex_connections", return_value=[]):
+            patch.object(agentcat, "_codex_connections", return_value=[]), \
+            patch.object(agentcat, "schedule_quota_refresh", side_effect=lambda provider, refresh, **kwargs: refresh()):
             instances = agentcat.codex_provider_instances()
         self.assertEqual(len(instances), 2)
         self.assertTrue(requests)
@@ -1149,6 +1150,65 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertIn("limits.claude.statuslineQuotas", snapshot["capabilities"])
         self.assertIn("usage.hourlyTokens", snapshot["capabilities"])
         self.assertEqual(snapshot["update"]["channel"]["channel"], "public")
+
+    def test_snapshot_discards_update_results_from_previous_runtime(self) -> None:
+        for latest in ("26.37.0", "26.41.4", "26.42.0"):
+            for enabled in (True, False):
+                with self.subTest(latest=latest, enabled=enabled):
+                    state = {
+                        "currentVersion": "26.32.4",
+                        "checkedAt": "2026-08-17T00:00:00Z",
+                        "latestVersion": latest,
+                        "remoteVersion": latest,
+                        "updateAvailable": True,
+                        "status": "update_available",
+                        "enabled": True,
+                        "reason": "enabled",
+                        "rollout": {"bucketAllowed": True},
+                        "installPid": 12345,
+                        "message": "updating an older runtime",
+                        "error": "old error",
+                    }
+                    agentcat.write_auto_update_state(state)
+                    with patch.object(agentcat, "CONNECTOR_VERSION", "26.41.4"), \
+                            patch.object(agentcat, "auto_update_enabled_status", return_value=(enabled, "test")), \
+                            patch.object(agentcat, "check_auto_update_once") as check, \
+                            patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")):
+                        snapshot = agentcat.build_snapshot()
+                        agentcat.write_json_atomic(agentcat.LATEST_SNAPSHOT, snapshot)
+                        served = json.loads(b"".join(agentcat.snapshot_for_http()))
+                    check.assert_not_called()
+                    for payload in (snapshot, served):
+                        update = payload["update"]
+                        self.assertEqual(update["currentVersion"], payload["connectorVersion"])
+                        self.assertEqual(update["currentVersion"], "26.41.4")
+                        self.assertEqual(update["channel"]["currentVersion"], "26.41.4")
+                        self.assertEqual(update["status"], "idle" if enabled else "disabled")
+                        self.assertEqual(update["enabled"], enabled)
+                        for key in ("checkedAt", "latestVersion", "remoteVersion", "updateAvailable",
+                                    "installPid", "message", "error"):
+                            self.assertNotIn(key, update)
+                        self.assertEqual(update["rollout"]["reason"], "not_checked")
+                    self.assertEqual(agentcat.read_auto_update_state(), state)
+
+    def test_auto_update_snapshot_preserves_fresh_check_results(self) -> None:
+        state = {
+            "currentVersion": agentcat.CONNECTOR_VERSION,
+            "checkedAt": agentcat.now_iso(),
+            "latestVersion": "99.0.0",
+            "remoteVersion": "99.0.0",
+            "updateAvailable": True,
+            "status": "update_available",
+            "enabled": True,
+            "reason": "enabled",
+            "rollout": {"percent": 100, "bucketAllowed": True},
+        }
+        agentcat.write_auto_update_state(state)
+        with patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")):
+            snapshot = agentcat.auto_update_status_snapshot()
+        for key, value in state.items():
+            self.assertEqual(snapshot[key], value)
+        self.assertEqual(agentcat.read_auto_update_state(), state)
 
     def test_connector_version_parser_and_comparison(self) -> None:
         text = 'CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.22.10")'
@@ -4482,6 +4542,103 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual((snapshot.get("projects") or {}).get("items") or [], [])
         self.assertEqual(snapshot["sources"]["workspaceFolders"], 1)
 
+    def test_process_scan_agent_entrypoint_fixtures(self) -> None:
+        fixtures = (
+            ("/opt/bin/codex --prompt hello", "codex"),
+            ("node /opt/node_modules/@openai/codex/bin/codex.js", "codex"),
+            ("node /opt/node_modules/@openai/codex/bin/codex.mjs", "codex"),
+            ("node /opt/node_modules/@openai/codex/bin/codex.cjs", "codex"),
+            ("/opt/bin/claude --prompt hello", "claude"),
+            ("node /opt/node_modules/@anthropic-ai/claude-code/cli.js", "claude"),
+            ("node /opt/node_modules/@anthropic-ai/claude-code/cli.mjs", "claude"),
+            ("node /opt/node_modules/@anthropic-ai/claude-code/cli.cjs", "claude"),
+            ("node /opt/node_modules/@google/gemini-cli/dist/index.js", "gemini"),
+            ("node /opt/node_modules/@google/gemini-cli/dist/index.mjs", "gemini"),
+            ("node /opt/node_modules/@google/gemini-cli/dist/index.cjs", "gemini"),
+            ("/opt/bin/gemini", "gemini"),
+            ("/opt/bin/agy", "antigravity"),
+            ("/opt/bin/antigravity-cli", "antigravity"),
+            ("/opt/bin/kimi-code", "kimi"),
+            ("/opt/bin/grok-code", "grok"),
+            ("/opt/bin/grock", "grok"),
+            ("/opt/bin/hermes", "hermes"),
+            ("python3.9 /opt/venv/bin/hermes", "hermes"),
+            ("/opt/bin/opencode", "opencode"),
+            ("node /opt/node_modules/opencode-ai/bin/opencode", "opencode"),
+            ("/opt/bin/copilot", "copilot"),
+            ("node /opt/node_modules/@github/copilot/index.js", "copilot"),
+            ("node /opt/node_modules/@github/copilot/index.mjs", "copilot"),
+            ("node /opt/node_modules/@github/copilot/index.cjs", "copilot"),
+            ("bun run /opt/node_modules/@github/copilot/index.js", "copilot"),
+            ("deno run /opt/node_modules/@anthropic-ai/claude-code/cli.js", "claude"),
+        )
+        for command, provider in fixtures:
+            with self.subTest(command=command):
+                self.assertEqual(agentcat.classify_process(command, windows=False), provider)
+        for provider in ("opencode", "copilot", "hermes"):
+            with self.subTest(provider=provider):
+                self.assertEqual(agentcat.classify_process(
+                    '"C:\\Program Files\\Agents\\' + provider + '.exe"', windows=True
+                ), provider)
+
+    def test_process_scan_rejects_report_scripts_and_argument_mentions(self) -> None:
+        for interpreter in ("python", "python3", "python3.9", "node", "bun", "deno"):
+            for script in (
+                "~/scripts/claude_report.py",
+                "/home/example/codex/report.js",
+                "/home/example/claude-code/report.js",
+                "/opt/@anthropic-ai/claude-code-backup/cli.js",
+                "/opt/@openai/codex-report/bin/codex.js",
+                "/opt/@github/copilot-backup/index.js",
+                "/opt/@google/gemini-cli-report/dist/index.js",
+                "worker.js --prompt claude",
+                "worker.js /opt/@anthropic-ai/claude-code/cli.js",
+                "-e claude",
+            ):
+                command = interpreter + " " + script
+                with self.subTest(command=command):
+                    self.assertIsNone(agentcat.classify_process(command, windows=False))
+        for command in ("python3 -c claude", "python3 -m claude", "python3 -cpass claude", "python3 -mhttp.server codex", "echo claude", "node --require claude worker.js"):
+            with self.subTest(command=command):
+                self.assertIsNone(agentcat.classify_process(command, windows=False))
+
+    def test_process_scan_new_providers_use_existing_motion_logic(self) -> None:
+        for provider in ("opencode", "copilot"):
+            for cpu, state, stage in ((0.0, "S", "walking"), (4.0, "R", "running")):
+                completed = agentcat.subprocess.CompletedProcess(
+                    args=["ps"], returncode=0, stderr="",
+                    stdout=f"101 1 {cpu} 1024 {state} /opt/bin/{provider}\n"
+                           "102 1 30.0 1024 R python3 ~/scripts/claude_report.py\n",
+                )
+                with self.subTest(provider=provider, stage=stage), \
+                     patch.object(agentcat, "IS_WINDOWS", False), \
+                     patch.object(agentcat.subprocess, "run", return_value=completed), \
+                     patch.object(agentcat, "safe_runtime_modes_snapshot", return_value=[]):
+                    snapshot = agentcat.terminal_activity_snapshot()
+                self.assertEqual(snapshot["processCount"], 1)
+                self.assertEqual(snapshot["countsByProvider"][provider], 1)
+                self.assertEqual(snapshot["countsByProvider"]["claude"], 0)
+                self.assertEqual(snapshot["motionStage"], stage)
+                self.assertEqual(snapshot["processes"][0]["kind"], provider)
+
+    def test_windows_process_scan_opencode_and_copilot_running(self) -> None:
+        for provider, command in (
+            ("opencode", r'C:\Tools\opencode.exe'),
+            ("copilot", r'node.exe C:\Tools\node_modules\@github\copilot\index.js'),
+        ):
+            completed = agentcat.subprocess.CompletedProcess(
+                ["powershell.exe"], 0,
+                json.dumps([{"ProcessId": 101, "CommandLine": command,
+                             "CpuPercent": 4, "WorkingSetSize": 1024}]), "",
+            )
+            with self.subTest(provider=provider), \
+                 patch.object(agentcat.subprocess, "run", return_value=completed), \
+                 patch.object(agentcat, "safe_runtime_modes_snapshot", return_value=[]):
+                snapshot = agentcat.terminal_activity_snapshot_windows()
+            self.assertEqual(snapshot["countsByProvider"][provider], 1)
+            self.assertEqual(snapshot["motionStage"], "running")
+            self.assertEqual(snapshot["processes"][0]["state"], "running")
+
     def test_classify_gemini_node_wrapper_processes(self) -> None:
         self.assertEqual(
             agentcat.classify_process("node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"),
@@ -4790,7 +4947,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             agentcat.terminal_activity_snapshot_windows()
         script = run.call_args.args[0][-1]
         pattern = agentcat.re.search(r"\$candidatePattern = '([^']+)'", script).group(1)
-        for name in ("kimi", "kimi-code", "grok", "grok-code", "node"):
+        for name in ("kimi", "kimi-code", "grok", "grok-code", "hermes", "opencode", "copilot", "node", "bun", "deno", "python", "python3", "python3.9"):
             for suffix in ("", ".exe", ".cmd"):
                 with self.subTest(name=name, suffix=suffix):
                     self.assertRegex(name + suffix, pattern)
@@ -6321,6 +6478,7 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         gem = agentcat.empty_limits(status="auto")
         gem["quotas"] = [{"id": "gemini:pro", "label": "Pro", "remainingPercent": 55.0, "usedPercent": 45.0}]
         empty = agentcat.empty_limits()
+        agentcat.write_live_limits_cache("gemini", gem)
         with _patch.object(agentcat, "gemini_live_limits", return_value=gem), \
              _patch.object(agentcat, "antigravity_live_limits", return_value=agentcat.empty_limits()), \
              _patch.object(agentcat, "codex_live_limits", return_value=empty), \
@@ -6371,6 +6529,8 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         good = agentcat.empty_limits(status="auto")
         good["quotas"] = [{"id": "g", "label": "7d", "remainingPercent": 80.0, "usedPercent": 20.0}]
         empty = agentcat.empty_limits()
+
+        agentcat.write_live_limits_cache("gemini", good)
 
         def boom() -> dict:
             raise RuntimeError("stat race on a deleted session file")
