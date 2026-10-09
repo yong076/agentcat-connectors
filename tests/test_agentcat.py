@@ -455,7 +455,9 @@ class AgentCatConnectorTests(unittest.TestCase):
             {"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 30, "reset_at": 1770000000}}},
             source="https://chatgpt.com/backend-api/wham/usage",
         )
-        agentcat.write_live_limits_cache("codex", good)
+        agentcat.write_live_limits_cache(
+            agentcat.codex_home_limits_cache_key(codex_home, agentcat.read_codex_auth(codex_home)), good
+        )
 
         requests: list = []
         with self._codex_unauthorized_network(requests):

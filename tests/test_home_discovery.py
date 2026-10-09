@@ -572,6 +572,27 @@ class SnapshotBlockTests(HomeDiscoveryTestCase):
         self.assertIn("homes.discovery", agentcat.CONNECTOR_CAPABILITIES)
 
 
+class ActiveCodexCacheTests(HomeDiscoveryTestCase):
+    def test_switch_does_not_reuse_other_accounts_cached_limits(self) -> None:
+        homes = [agentcat.HOME / ".codex", agentcat.HOME / ".codex-work"]
+        for index, home in enumerate(homes):
+            self._codex_auth(home, f"acct-{index}")
+            session = self._codex_session(home, [UUID_A, UUID_B][index])
+            os.utime(session, (100 + index, 100 + index))
+            key = agentcat.codex_home_limits_cache_key(home, agentcat.read_codex_auth(home))
+            limits = agentcat.codex_limits_from_usage_response({
+                "rate_limit": {"primary_window": {
+                    "used_percent": [98, 4][index], "limit_window_seconds": 604800}}})
+            agentcat.write_live_limits_cache(key, limits)
+        # Legacy global cache could belong to any install-time account.
+        agentcat.write_live_limits_cache("codex", {
+            "status": "auto", "weeklyUsedPercent": 77, "quotas": []})
+        with patch.object(agentcat, "codex_usage_request", side_effect=AssertionError("cache hit required")):
+            self.assertEqual(agentcat.codex_live_limits()["weeklyUsedPercent"], 4)
+            with patch.dict(os.environ, {"CODEX_HOME": str(homes[0])}):
+                self.assertEqual(agentcat.codex_live_limits()["weeklyUsedPercent"], 98)
+
+
 class ProviderInstanceTests(HomeDiscoveryTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -589,6 +610,55 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
     def tearDown(self) -> None:
         self.limits_patch.stop()
         super().tearDown()
+
+    def test_active_home_and_main_limits_follow_newest_session(self) -> None:
+        homes = [agentcat.HOME / ".codex", agentcat.HOME / ".codex-work"]
+        sessions = []
+        for index, home in enumerate(homes):
+            self._codex_auth(home, f"acct-{index}")
+            session = self._codex_session(home, [UUID_A, UUID_B][index])
+            event = json.loads(session.read_text())
+            event["payload"]["rate_limits"] = {
+                "primary": {"used_percent": [98, 4][index], "window_minutes": 10080}
+            }
+            session.write_text(json.dumps(event) + "\n")
+            os.utime(session, (100 + index, 100 + index))
+            sessions.append(session)
+        self.limits_mock.side_effect = lambda auth, cache_key, force=False: {
+            "status": "auto", "weeklyUsedPercent":
+                98 if auth["tokens"]["account_id"] == "acct-0" else 4,
+            "quotas": [],
+        }
+
+        def check(expected, percent):
+            self.assertEqual(agentcat.active_codex_home(), homes[expected])
+            rows = agentcat.codex_provider_instances()
+            self.assertTrue(rows[0]["active"])
+            self.assertEqual(sum(row["active"] for row in rows), 1)
+            self.assertEqual(rows[0]["limits"]["weeklyUsedPercent"], percent)
+            self.assertEqual(agentcat.runtime_limits()["codex"]["weeklyUsedPercent"], percent)
+            self.assertEqual(agentcat.codex_live_limits()["weeklyUsedPercent"], percent)
+            self.assertEqual(self.limits_mock.call_args.args[1],
+                             agentcat.codex_home_limits_cache_key(
+                                 homes[expected], agentcat.read_codex_auth(homes[expected])))
+
+        check(1, 4)
+        with patch.dict(os.environ, {"CODEX_HOME": str(homes[0])}):
+            check(0, 98)
+        # A later scan observes activity moving back, without reinstalling.
+        os.utime(sessions[0], (200, 200))
+        self._reset_discovery_cache()
+        check(0, 98)
+
+    def test_active_home_falls_back_and_ignores_excluded_activity(self) -> None:
+        default = agentcat.HOME / ".codex"
+        self._codex_auth(default, "acct-default")
+        self.assertEqual(agentcat.active_codex_home(), default)
+        other = agentcat.HOME / ".codex-other"
+        self.assertEqual(agentcat.active_codex_home([
+            {"path": other, "exists": True, "state": "excluded",
+             "stats": {"newestMtime": 200}}
+        ]), default)
 
     def test_two_accounts_collapse_same_account_runtime_mirror(self) -> None:
         account_a = "acct-native-a"

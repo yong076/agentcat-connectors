@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import plistlib
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -141,6 +142,28 @@ class AgentCatInstallTests(unittest.TestCase):
         self.assertEqual(calls[0], ["launchctl", "bootout", service])
         self.assertEqual(calls[1], ["launchctl", "print", service])
         self.assertFalse(any(command[1] == "unload" for command in calls))
+
+    def test_plist_does_not_capture_install_time_codex_home(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "codex"),
+                                          "CLAUDE_CONFIG_DIR": str(self.root / "claude")}):
+            env = plistlib.loads(install.plist_text().encode())["EnvironmentVariables"]
+        self.assertNotIn("CODEX_HOME", env)
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.root / "claude"))
+
+    def test_update_rewrites_legacy_codex_home_plist(self) -> None:
+        plist = self.root / "agentcatd.plist"
+        plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {
+            "CODEX_HOME": str(self.root / "old-codex")}}))
+        with (
+            mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "installer-codex")}),
+            mock.patch.object(install, "IS_WINDOWS", False),
+            mock.patch.object(install.os, "getuid", return_value=501, create=True),
+            mock.patch.object(install, "PLIST_PATH", plist),
+            mock.patch.object(install, "unload_launch_agent"),
+            mock.patch.object(install, "run", return_value=mock.Mock(returncode=0, stderr="")),
+        ):
+            install.load_launch_agent()
+        self.assertNotIn("CODEX_HOME", plistlib.loads(plist.read_bytes())["EnvironmentVariables"])
 
     def test_load_launch_agent_force_restarts_registered_service(self) -> None:
         calls: list[list[str]] = []
