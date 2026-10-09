@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from agentcat_discovery_io import BoundedFS, DiscoveryTimeout, LocalMounts, LocalOnlyFS
 
 
 @dataclass(frozen=True)
@@ -66,14 +67,9 @@ CODEBUDDY = Fingerprint("brand.codebuddy", "exists", ".codebuddy.json", weight=1
 CODEBUDDY_CONFIG = Fingerprint("config.codebuddy", "exists", "codebuddy.json", weight=12)
 GROK = Fingerprint("originator.grok", "jsonl_prefix", key="payload.originator", value="grok", weight=12)
 KIMI = Fingerprint("originator.kimi", "jsonl_prefix", key="payload.originator", value="kimi", weight=12)
-GROK_PROVIDER = Fingerprint("provider.grok", "toml_key", "config.toml", "model_provider", "grok", 12)
-KIMI_PROVIDER = Fingerprint("provider.kimi", "toml_key", "config.toml", "model_provider", "kimi", 12)
-GROK_XAI = Fingerprint("provider.xai", "toml_key", "config.toml", "model_provider", "xai", 12)
 CODEBUDDY_NAME = Fingerprint("home.codebuddy", "filename", ".", value=r"^\.codebuddy$", weight=12)
 GROK_NAME = Fingerprint("home.grok", "filename", ".", value=r"^\.(?:trappist-)?grok(?:-.*)?$", weight=12)
 KIMI_NAME = Fingerprint("home.kimi_code", "filename", ".", value=r"^\.kimi-code$", weight=12)
-GROK_MODEL = Fingerprint("model.grok", "jsonl_prefix", key="payload.model", value="grok", weight=12)
-KIMI_MODEL = Fingerprint("model.kimi", "jsonl_prefix", key="payload.model", value="kimi", weight=12)
 KIMI_CONFIG = Fingerprint("config.kimi", "exists", "kimi.json", weight=12)
 
 REGISTRY = (
@@ -97,7 +93,7 @@ REGISTRY = (
          Fingerprint("index.codex", "exists", "session_index.jsonl"),
          Fingerprint("state.codex", "exists", "state_*.sqlite"),
          Fingerprint("filename.codex_rollout", "filename", value=r"^rollout-.*[0-9a-f-]{36}\.jsonl$", weight=2)),
-        (GROK, KIMI, GROK_PROVIDER, KIMI_PROVIDER, GROK_XAI, GROK_NAME, KIMI_NAME, GROK_MODEL, KIMI_MODEL, KIMI_CONFIG), CODEX_GLOBS,
+        (GROK, KIMI, GROK_NAME, KIMI_NAME, KIMI_CONFIG), CODEX_GLOBS,
         IdentityExtractor("auth.json", ("tokens.account_id",)),
         ("Library/Application Support/orca/codex-runtime-home/home",
          "Library/Application Support/orca/codex-accounts/*/home"),
@@ -108,11 +104,11 @@ REGISTRY = (
                   usage_globs=CLAUDE_GLOBS),
     HomeSignature("grok", "foreign", "codex", default_names=(".grok",),
                   structure_any=("sessions", "archived_sessions", "config.toml", "auth.json", "session_index.jsonl", "state_*.sqlite"),
-                  fingerprints=(GROK, GROK_PROVIDER, GROK_XAI, GROK_NAME, GROK_MODEL),
+                  fingerprints=(GROK, GROK_NAME),
                   usage_globs=CODEX_GLOBS),
     HomeSignature("kimi-code", "foreign", "codex", default_names=(".kimi-code",),
                   structure_any=("sessions", "archived_sessions", "config.toml", "auth.json", "session_index.jsonl", "state_*.sqlite", "kimi.json"),
-                  fingerprints=(KIMI, KIMI_PROVIDER, KIMI_NAME, KIMI_CONFIG, KIMI_MODEL),
+                  fingerprints=(KIMI, KIMI_NAME, KIMI_CONFIG),
                   usage_globs=CODEX_GLOBS),
 )
 
@@ -161,6 +157,50 @@ class LocalFS:
     def read(self, path: Path, limit: int) -> bytes:
         with path.open("rb") as handle:
             return handle.read(limit)
+
+    def is_local(self, path: Path) -> bool:
+        if not hasattr(self, "_mounts"):
+            self._mounts = LocalMounts()
+        return self._mounts.is_local(path)
+
+    def glob(self, path: Path, pattern: str, limit: int, deadline: float):
+        # Runtime patterns contain single-level wildcards. Check each ancestor
+        # against the mount table before any directory operation.
+        safe = LocalOnlyFS(self)
+        paths = [path]
+        for part in Path(pattern).parts:
+            selected = []
+            for parent in paths:
+                if self.now() >= deadline:
+                    raise DiscoveryTimeout()
+                children = safe.children(parent) if any(c in part for c in "*?[") else (parent / part,)
+                for child in children:
+                    if self.now() >= deadline:
+                        raise DiscoveryTimeout()
+                    if fnmatch.fnmatchcase(child.name, part) and safe.is_dir(child):
+                        selected.append(child)
+                        if len(selected) >= limit:
+                            break
+                if len(selected) >= limit:
+                    break
+            paths = selected
+        return paths
+
+    def sqlite_ids(self, database: Path, limit: int, deadline: float):
+        indexed = set()
+        partial = False
+        try:
+            with closing(sqlite3.connect(database.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=0)) as conn:
+                conn.set_progress_handler(lambda: int(self.now() >= deadline), 1000)
+                for (value,) in conn.execute("SELECT id FROM threads LIMIT ?", (limit + 1,)):
+                    if self.now() >= deadline or len(indexed) >= limit:
+                        partial = True
+                        break
+                    if isinstance(value, str) and SESSION_UUID.fullmatch(value):
+                        indexed.add(value.lower())
+        except (OSError, sqlite3.Error):
+            partial = True
+        return indexed, partial
 
 
 def _key(obj: Any, key: str) -> Any:
@@ -499,14 +539,9 @@ def session_inventory(path: Path, patterns: Sequence[str], *, fs=None, deadline=
         try:
             # Immutable mode avoids creating WAL/SHM sidecars in a CLI home.
             # Filename samples cover live IDs not yet checkpointed in the DB.
-            with closing(sqlite3.connect(database.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=0)) as conn:
-                conn.set_progress_handler(lambda: int(fs.now() >= deadline), 1000)
-                for (value,) in conn.execute("SELECT id FROM threads LIMIT ?", (index_limit + 1,)):
-                    if fs.now() >= deadline or len(indexed) >= index_limit:
-                        index_partial = True
-                        break
-                    if isinstance(value, str) and SESSION_UUID.fullmatch(value):
-                        indexed.add(value.lower())
+            ids, incomplete = fs.sqlite_ids(database, index_limit - len(indexed), deadline)
+            indexed.update(ids)
+            index_partial |= incomplete
         except (OSError, sqlite3.Error):
             index_partial = True
     return {"sessions": set(sessions) | indexed, "paths": sessions,
@@ -535,16 +570,29 @@ def _expand(value: str, home: Path) -> Path | None:
 
 
 def collect_candidates(home: Path, launcher_dirs, runtime_homes, env: Mapping[str, str], *, registry=REGISTRY,
-                       fs=None, seconds=2.0) -> list[dict]:
-    fs = fs or LocalFS()
-    deadline = fs.now() + seconds
+                       fs=None, seconds=2.0, deadline=None, status=None) -> list[dict]:
+    fs = LocalOnlyFS(fs or LocalFS())
+    deadline = min(deadline, fs.now() + seconds) if deadline is not None else fs.now() + seconds
+    status = {} if status is None else status
+    status["partial"] = False
     candidates: dict[str, dict] = {}
     variables = {var for sig in registry if sig.kind == "provider" for var in sig.env_vars}
 
     def add(path, source, launcher=None):
-        if path is None or fs.is_symlink(path):
+        if path is None:
             return
-        key = str(fs.realpath(path))
+        if fs.now() >= deadline:
+            status["partial"] = True
+            return
+        if not fs.is_local(path) or fs.is_symlink(path):
+            return
+        try:
+            resolved = fs.realpath(path)
+        except OSError:
+            return
+        if not fs.is_local(resolved):
+            return
+        key = str(resolved)
         row = candidates.setdefault(key, {"path": path, "sources": [], "launchers": []})
         if source not in row["sources"]:
             row["sources"].append(source)
@@ -557,8 +605,12 @@ def collect_candidates(home: Path, launcher_dirs, runtime_homes, env: Mapping[st
     for path in runtime_homes:
         add(Path(path), "known_runtime")
     for directory in launcher_dirs:
+        if fs.now() >= deadline:
+            status["partial"] = True
+            break
         for index, script in enumerate(fs.children(Path(directory))):
             if index >= 4096 or fs.now() >= deadline:
+                status["partial"] = True
                 break
             try:
                 if fs.is_symlink(script) or not fs.is_file(script) or fs.stat(script).st_size > 65536:
@@ -600,7 +652,8 @@ def collect_candidates(home: Path, launcher_dirs, runtime_homes, env: Mapping[st
                 continue
     for index, path in enumerate(fs.children(home)):
         if index >= 4096 or fs.now() >= deadline:
+            status["partial"] = True
             break
-        if path.name not in DENYLIST and not fs.is_symlink(path) and fs.is_dir(path):
+        if path.name not in DENYLIST and fs.is_local(path) and not fs.is_symlink(path) and fs.is_dir(path):
             add(path, "auto")
     return list(candidates.values())

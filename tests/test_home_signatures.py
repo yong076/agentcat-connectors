@@ -3,9 +3,11 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from contextlib import nullcontext
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import agentcat_home_signatures as signatures
@@ -24,6 +26,18 @@ class RecordingFS(signatures.LocalFS):
     def read(self, path, limit):
         self.reads.append((path, limit))
         return super().read(path, limit)
+
+
+class SlowFS(signatures.LocalFS):
+    def stat(self, path):
+        (path / "stat-entered" if path.is_dir() else path.parent / "stat-entered").touch()
+        time.sleep(0.5)
+        return super().stat(path)
+
+    def children(self, path):
+        (path / "children-entered").touch()
+        time.sleep(0.5)
+        yield from super().children(path)
 
 
 class HomeSignatureTests(unittest.TestCase):
@@ -148,6 +162,24 @@ class HomeSignatureTests(unittest.TestCase):
                 self.assertEqual(result["provider"], "grok" if brand == "grok" else "kimi-code")
                 self.assertNotIn("private-token", json.dumps(result))
 
+    def test_model_provider_does_not_override_codex_cli_ownership(self):
+        for provider in ("grok", "kimi", "xai"):
+            with self.subTest(provider=provider):
+                home = self.home("codex-" + provider)
+                (home / "auth.json").write_text('{"tokens":{"id_token":"fixture","account_id":"native"}}')
+                (home / "session_index.jsonl").write_text("")
+                (home / "config.toml").write_text(f'model_provider = "{provider}"\n')
+                with (home / "sessions/session.jsonl").open("a") as handle:
+                    handle.write(json.dumps({"payload": {"model": provider + "-fixture"}}) + "\n")
+                result = signatures.classify_home(home)
+                self.assertEqual((result["kind"], result["provider"]), ("provider", "codex"))
+                self.assertIn("originator.codex", result["evidence"])
+
+    def test_foreign_model_provider_alone_is_not_cli_evidence(self):
+        home = self.home("unidentified", originator="unknown")
+        (home / "config.toml").write_text('model_provider = "grok"\n')
+        self.assertIsNone(signatures.classify_home(home)["provider"])
+
     def test_structure_and_filename_without_fingerprint_is_ambiguous(self):
         home = self.home("unknown", originator="unknown_cli")
         (home / "sessions/session.jsonl").rename(home / "sessions/rollout-2026-01-01-11111111-1111-4111-8111-111111111111.jsonl")
@@ -270,6 +302,73 @@ class HomeSignatureTests(unittest.TestCase):
         rows = signatures.collect_candidates(self.root, (), (valid,), {"CODEX_HOME": str(valid)})
         self.assertEqual(len(rows), 1)
         self.assertEqual(set(rows[0]["sources"]), {"env", "known_runtime", "auto"})
+
+    def test_remote_homes_and_launcher_targets_are_skipped_before_stat(self):
+        remote = self.home("remote")
+        local = self.home("local")
+        launcher_dir = self.root / "bin"
+        launcher_dir.mkdir()
+        (launcher_dir / "remote-launcher").write_text(f'#!/bin/sh\nCODEX_HOME="{remote}" exec codex\n')
+        class RemoteFS(RecordingFS):
+            def is_local(self, path):
+                return remote != path and remote not in path.parents
+            def is_dir(self, path):
+                if not self.is_local(path):
+                    raise AssertionError("remote stat attempted")
+                return super().is_dir(path)
+            def is_symlink(self, path):
+                if not self.is_local(path):
+                    raise AssertionError("remote lstat attempted")
+                return super().is_symlink(path)
+        rows = signatures.collect_candidates(self.root, (launcher_dir, remote), (remote,),
+                                             {"CODEX_HOME": str(remote)}, fs=RemoteFS())
+        self.assertEqual([r["path"] for r in rows], [local])
+
+    def test_stalled_filesystem_io_times_out_and_next_worker_recovers(self):
+        home = self.home("slow")
+        for operation in ("stat", "children"):
+            with self.subTest(operation=operation):
+                worker = (signatures.BoundedFS(time.monotonic() + 2, fs_type=SlowFS)
+                          if hasattr(signatures, "BoundedFS") else nullcontext(SlowFS()))
+                try:
+                    with worker as fs:
+                        self.assertTrue(fs.is_dir(home))  # Warm startup before timing the blocked IO.
+                        start = time.monotonic()
+                        fs.deadline = start + 0.1
+                        result = getattr(fs, operation)(home)
+                        if operation == "children":
+                            list(result)
+                except TimeoutError:
+                    pass
+                self.assertLess(time.monotonic() - start, 0.4)
+                self.assertTrue((home / f"{operation}-entered").exists())
+                if hasattr(signatures, "BoundedFS"):
+                    self.assertFalse(fs.alive)
+                    with signatures.BoundedFS(time.monotonic() + 2) as recovered:
+                        self.assertTrue(recovered.is_dir(home))
+
+    @unittest.skipIf(os.name == "nt", "POSIX mount prefixes; Windows uses drive types")
+    def test_mount_policy_uses_longest_lexical_prefix_and_fails_closed(self):
+        mounts = signatures.LocalMounts([(Path("/"), True), (Path("/remote"), False),
+                                         (Path("/remote/local"), True)])
+        self.assertFalse(mounts.is_local(Path("/remote/team")))
+        self.assertTrue(mounts.is_local(Path("/remote/local/team")))
+        self.assertTrue(mounts.is_local(Path("/remote-other/team")))
+        self.assertTrue(mounts.is_local(Path("/remote/../local")))
+        self.assertFalse(signatures.LocalMounts([]).is_local(self.root))
+
+    def test_nested_remote_sqlite_index_is_skipped_without_losing_local_sessions(self):
+        home = self.home("nested-remote")
+        (home / "state_remote.sqlite").write_text("not a local database")
+        class RemoteIndexFS(RecordingFS):
+            def is_local(self, path):
+                return path.name != "state_remote.sqlite"
+            def sqlite_ids(self, *args):
+                raise AssertionError("remote SQLite read attempted")
+        inventory = signatures.session_inventory(home, signatures.CODEX_GLOBS,
+                                                  fs=signatures.LocalOnlyFS(RemoteIndexFS()))
+        self.assertEqual(inventory["stats"]["files"], 1)
+        self.assertTrue(inventory["partial"])
 
     def test_home_id_uses_realpath_and_twelve_hex_digits(self):
         home = self.home("id")

@@ -1532,6 +1532,7 @@ _HOME_CANDIDATES_VALUE: Dict[str, List[Dict[str, Any]]] = {}
 _HOME_CANDIDATES_KEY: Any = None
 _HOME_CANDIDATES_AT = 0.0
 _HOME_CANDIDATES_COMPLETE = True
+_HOME_CANDIDATES_SCOPE: Any = None
 _HOME_USAGE_CURSORS: Dict[str, Tuple[str, Dict[str, Any]]] = {}
 
 
@@ -1701,39 +1702,94 @@ def default_provider_home(provider: str) -> Path:
     return HOME / str(spec.get("defaultName") or f".{provider}")
 
 
+def _explicit_home_rows(settings):
+    for provider in PROVIDER_HOME_SPECS:
+        yield provider, default_provider_home(provider), "default"
+        for path in _home_path_list(_home_settings(provider, settings), "adopted"):
+            yield provider, path, "adopted"
+
+
+def _home_lexical_key(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _home_discovery_fallback(settings, previous):
+    """Keep the last good scan, applying explicit choices without candidate IO."""
+    grouped = copy.deepcopy(previous)
+    for provider in HOME_DISCOVERY_PROVIDER_IDS:
+        explicit = {_home_lexical_key(path): (path, source)
+                    for p, path, source in _explicit_home_rows(settings) if p == provider}
+        excluded = {_home_lexical_key(path) for path in _home_path_list(_home_settings(provider, settings), "excluded")}
+        candidates = grouped.setdefault(provider, [])
+        candidates[:] = [c for c in candidates if not c.get("_explicit") or _home_lexical_key(c["path"]) in explicit]
+        by_path = {_home_lexical_key(c["path"]): c for c in candidates}
+        for key, (path, source) in explicit.items():
+            candidate = by_path.get(key)
+            if candidate is None:
+                candidate = {"path": path, "id": hashlib.sha256(key.encode()).hexdigest()[:12],
+                             "source": source, "sources": [source], "launchers": [], "exists": False,
+                             "state": "tracked", "tracked": True, "excluded": False,
+                             "evidence": ["scan.budget"], "identity": {},
+                             "stats": {"files": 0, "newestMtime": None, "capped": True},
+                             "_explicit": True, "_priority": 0 if source == "default" else 1}
+                candidates.append(candidate)
+            candidate.update(_explicit=True, state="tracked", tracked=True, excluded=False)
+        for candidate in candidates:
+            if _home_lexical_key(candidate["path"]) in excluded:
+                candidate.update(state="excluded", tracked=False, excluded=True)
+    return grouped
+
+
 def _discover_provider_homes(force: bool = False) -> Dict[str, List[Dict[str, Any]]]:
-    global _HOME_CANDIDATES_VALUE, _HOME_CANDIDATES_KEY, _HOME_CANDIDATES_AT, _HOME_CANDIDATES_COMPLETE
+    global _HOME_CANDIDATES_VALUE, _HOME_CANDIDATES_KEY, _HOME_CANDIDATES_AT, _HOME_CANDIDATES_COMPLETE, _HOME_CANDIDATES_SCOPE
     settings = agentcat_settings()
+    scope = (str(HOME), str(AGENTCAT_HOME))
     cache_key = (str(HOME), str(AGENTCAT_HOME), repr(settings.get("homes")),
                  tuple(os.environ.get(spec["envVar"]) for spec in PROVIDER_HOME_SPECS.values()))
+    deadline = time.monotonic() + HOME_DISCOVERY_TIME_BUDGET_SECONDS
     with _HOME_CANDIDATES_LOCK:
         if not force and cache_key == _HOME_CANDIDATES_KEY and time.monotonic() - _HOME_CANDIDATES_AT < HOME_DISCOVERY_CACHE_TTL_SECONDS:
             return _HOME_CANDIDATES_VALUE
-        deadline = time.monotonic() + HOME_DISCOVERY_TIME_BUDGET_SECONDS
+        try:
+            grouped, complete = _scan_provider_homes(settings, deadline)
+            if time.monotonic() >= deadline:
+                raise home_signatures.DiscoveryTimeout()
+        except (home_signatures.DiscoveryTimeout, OSError):
+            previous = _HOME_CANDIDATES_VALUE if scope == _HOME_CANDIDATES_SCOPE else {}
+            grouped = _home_discovery_fallback(settings, previous)
+            complete = False
+        _HOME_CANDIDATES_VALUE, _HOME_CANDIDATES_KEY = grouped, cache_key
+        _HOME_CANDIDATES_AT = time.monotonic()
+        _HOME_CANDIDATES_COMPLETE, _HOME_CANDIDATES_SCOPE = complete, scope
+        return grouped
+
+
+def _scan_provider_homes(settings, deadline):
+    with home_signatures.BoundedFS(deadline) as fs:
+        local_fs = home_signatures.LocalOnlyFS(fs)
         complete = True
         grouped: Dict[str, List[Dict[str, Any]]] = {p: [] for p in HOME_DISCOVERY_PROVIDER_IDS}
         explicit: Dict[str, Dict[str, Any]] = {}
-        for provider, spec in PROVIDER_HOME_SPECS.items():
-            entry = _home_settings(provider, settings)
-            for path, source in [(default_provider_home(provider), "default")] + [(h, "adopted") for h in _home_path_list(entry, "adopted")]:
-                key = _resolved_path_key(path)
-                row = explicit.setdefault(key, {"path": path, "sources": [], "launchers": [], "providers": []})
-                row["sources"].append(source)
-                row["providers"].append(provider)
+        for provider, path, source in _explicit_home_rows(settings):
+            key = str(fs.realpath(path))
+            row = explicit.setdefault(key, {"path": path, "sources": [], "launchers": [], "providers": []})
+            row["sources"].append(source)
+            row["providers"].append(provider)
         runtime = []
         for spec in PROVIDER_HOME_SPECS.values():
             for pattern in spec["knownRuntimeHomes"]:
-                for index, path in enumerate(HOME.glob(pattern)):
-                    if index >= HOME_DISCOVERY_MAX_CANDIDATES or time.monotonic() >= deadline:
-                        complete = False
-                        break
-                    runtime.append(path)
+                paths = local_fs.glob(HOME, pattern, HOME_DISCOVERY_MAX_CANDIDATES + 1, deadline)
+                complete &= len(paths) <= HOME_DISCOVERY_MAX_CANDIDATES
+                runtime.extend(paths[:HOME_DISCOVERY_MAX_CANDIDATES])
+        collection_status = {}
         rows = home_signatures.collect_candidates(
             HOME, (HOME / ".local/bin", HOME / "bin", *HOME_DISCOVERY_LAUNCHER_DIRS), runtime, os.environ,
             seconds=min(2.0, HOME_DISCOVERY_TIME_BUDGET_SECONDS),
+            fs=fs, deadline=deadline, status=collection_status,
         )
+        complete &= not collection_status.get("partial", False)
         for row in rows:
-            key = _resolved_path_key(row["path"])
+            key = str(local_fs.realpath(row["path"]))
             if key in explicit:
                 target = explicit[key]
                 target["sources"] = list(dict.fromkeys(target["sources"] + row["sources"]))
@@ -1744,23 +1800,31 @@ def _discover_provider_homes(force: bool = False) -> Dict[str, List[Dict[str, An
             sources = row["sources"]
             return 0 if "default" in sources else 1 if "adopted" in sources else 2 if "launcher" in sources or "env" in sources else 3 if "auto" in sources else 4
         ordered = sorted(explicit.values(), key=lambda row: (source_priority(row), str(row["path"])))
+        auto_counts = {p: 0 for p in grouped}
+        auto_examined = 0
+        exclusions = {provider: {str(fs.realpath(path)) for path in _home_path_list(_home_settings(provider, settings), "excluded")}
+                      for provider in grouped}
         for row in ordered:
+            if time.monotonic() >= deadline:
+                raise home_signatures.DiscoveryTimeout()
+            if not row.get("providers"):
+                if auto_examined >= HOME_DISCOVERY_MAX_CANDIDATES:
+                    complete = False
+                    break
+                auto_examined += 1
             path = row["path"]
-            # Every home gets its own budget. Large homes cannot starve the next
-            # account, and stats/mirror discovery cannot consume identity IO.
-            home_deadline = time.monotonic() + home_signatures.ScanLimits().seconds
-            classification = home_signatures.classify_home(path, deadline=home_deadline)
+            candidate_fs = fs if row.get("providers") else local_fs
+            classification = home_signatures.classify_home(path, fs=candidate_fs, deadline=deadline)
             providers = set(classification["layouts"]) | set(row.get("providers", []))
             for provider in providers:
                 if provider not in grouped:
                     continue
-                if len(grouped[provider]) >= HOME_DISCOVERY_MAX_CANDIDATES:
+                trusted = provider in row.get("providers", [])
+                if not trusted and auto_counts[provider] >= HOME_DISCOVERY_MAX_CANDIDATES:
                     complete = False
                     continue
                 spec = PROVIDER_HOME_SPECS[provider]
-                entry = _home_settings(provider, settings)
-                excluded = any(_same_path(path, h) for h in _home_path_list(entry, "excluded"))
-                trusted = provider in row.get("providers", [])
+                excluded = str(candidate_fs.realpath(path)) in exclusions[provider]
                 # Generic projects/sessions/config directories are not CLI
                 # evidence. Keep ambiguous rows only for actual conflicts.
                 if not trusted and classification["kind"] in ("unknown", "ambiguous") and classification["score"] < 6:
@@ -1769,7 +1833,8 @@ def _discover_provider_homes(force: bool = False) -> Dict[str, List[Dict[str, An
                 classified = classification["kind"] == "provider" and classification["provider"] == provider
                 if "scan.budget" in classification["evidence"]:
                     complete = False
-                if not trusted and not path.is_dir():
+                exists = candidate_fs.is_dir(path)
+                if not trusted and not exists:
                     continue
                 state = "tracked" if trusted or classified else "foreign" if classification["kind"] == "foreign" else "ambiguous"
                 if excluded:
@@ -1777,22 +1842,24 @@ def _discover_provider_homes(force: bool = False) -> Dict[str, List[Dict[str, An
                 sources = list(row["sources"])
                 source = "default" if "default" in sources else "adopted" if "adopted" in sources else "launcher" if row["launchers"] else "auto"
                 candidate = {
-                    "path": path, "id": home_signatures.home_id(path), "source": source,
+                    "path": path, "id": home_signatures.home_id(path, fs=candidate_fs), "source": source,
                     "sources": sources, "launchers": sorted(row["launchers"]),
-                    "exists": path.is_dir(), "state": state, "tracked": state == "tracked", "excluded": excluded,
+                    "exists": exists, "state": state, "tracked": state == "tracked", "excluded": excluded,
                     "evidence": classification["evidence"], "identity": classification["identity"] if classified else {},
                     "stats": {"files": 0, "newestMtime": None, "capped": False},
                 }
                 candidate["_explicit"] = trusted
                 candidate["_priority"] = source_priority(row)
-                if path.is_dir():
-                    inventory = home_signatures.session_inventory(path, spec["usageGlobs"], deadline=home_deadline)
+                if exists:
+                    inventory = home_signatures.session_inventory(path, spec["usageGlobs"], fs=candidate_fs, deadline=deadline)
                     candidate["stats"] = inventory["stats"]
                     candidate["_sessionIds"] = inventory["sessions"]
                     candidate["_sessionPaths"] = inventory["paths"]
                     if inventory["partial"] and "scan.partial" not in candidate["evidence"]:
                         candidate["evidence"] = candidate["evidence"] + ["scan.partial"]
                 grouped[provider].append(candidate)
+                if not trusted:
+                    auto_counts[provider] += 1
         for candidates in grouped.values():
             owners: List[Dict[str, Any]] = []
             # Stable precedence, independent of scandir/launcher enumeration.
@@ -1803,13 +1870,15 @@ def _discover_provider_homes(force: bool = False) -> Dict[str, List[Dict[str, An
                 -len(c.get("_sessionIds", ())), str(c["path"]),
             ))
             for candidate in ranked:
+                if time.monotonic() >= deadline:
+                    raise home_signatures.DiscoveryTimeout()
                 if not candidate["tracked"]:
                     continue
                 sessions = candidate.get("_sessionIds", set())
                 shared = {}
                 for sid in sessions:
                     relative = candidate.get("_sessionPaths", {}).get(sid)
-                    owner = _session_owner_in_homes(sid, relative, owners)
+                    owner = _session_owner_in_homes(sid, relative, owners, fs=fs)
                     if owner:
                         shared[sid] = owner
                 if not candidate["_explicit"] and sessions and len(shared) / len(sessions) >= 0.9:
@@ -1819,10 +1888,7 @@ def _discover_provider_homes(force: bool = False) -> Dict[str, List[Dict[str, An
                     candidate["_mirrorSourceIds"] = [owner["id"] for owner in owners]
                 else:
                     owners.append(candidate)
-        _HOME_CANDIDATES_VALUE, _HOME_CANDIDATES_KEY = grouped, cache_key
-        _HOME_CANDIDATES_AT = time.monotonic()
-        _HOME_CANDIDATES_COMPLETE = complete
-        return grouped
+        return grouped, complete
 
 
 def provider_home_candidates(provider: str) -> List[Dict[str, Any]]:
@@ -1838,7 +1904,7 @@ def tracked_provider_homes(provider: str) -> List[Path]:
 
 def _usage_provider_homes(provider: str) -> List[Path]:
     # Mirrors participate in the existing longer-file/inode/session dedup,
-    # but never contribute unique sessions or acquire a probe of their own.
+    # including unique sessions created after the home was copied.
     return [c["path"] for c in _discover_provider_homes().get(provider, []) if c["state"] in ("tracked", "mirror")]
 
 
@@ -1853,24 +1919,27 @@ def _usage_home_id(provider: str, path: Path) -> Optional[str]:
         if candidate["state"] == "mirror":
             sid = _session_identity(path)
             if not sid:
-                return None
+                return candidate["id"]
             owners = candidate["_mirrorOwners"]
             if sid not in owners:
                 sources = [c for c in _HOME_CANDIDATES_VALUE.get(provider, [])
                            if c["id"] in candidate["_mirrorSourceIds"]]
                 owners[sid] = _session_owner_in_homes(sid, path.relative_to(candidate["path"]), sources)
-            return owners[sid]
+            return owners[sid] or candidate["id"]
     return None
 
 
-def _session_owner_in_homes(session: str, relative: Optional[Path], homes: List[Dict[str, Any]]) -> Optional[str]:
+def _session_owner_in_homes(session: str, relative: Optional[Path], homes: List[Dict[str, Any]], fs=None) -> Optional[str]:
     """Indexes cover moved files; direct path checks cover unsampled copies."""
     for home in homes:
+        if fs is not None and fs.now() >= fs.deadline:
+            raise home_signatures.DiscoveryTimeout()
         if session in home.get("_sessionIds", ()):
             return home["id"]
         if relative is not None:
             original = home["path"] / relative
-            if original.is_file() and not original.is_symlink():
+            reader = fs or home_signatures.LocalFS()
+            if reader.is_file(original) and not reader.is_symlink(original):
                 return home["id"]
     return None
 
@@ -1903,7 +1972,7 @@ def _prepare_home_accounts(provider: str, cursor: Dict[str, Any]) -> bool:
     accounts = cursor.setdefault("homeAccounts", {})
     changed = False
     for candidate in _discover_provider_homes().get(provider, []):
-        if candidate["state"] != "tracked":
+        if candidate["state"] not in ("tracked", "mirror"):
             continue
         hid = candidate["id"]
         key = _home_account_key(provider, candidate)
@@ -1939,7 +2008,7 @@ def _cli_home_metadata(provider: str, row: Dict[str, Any]) -> Dict[str, Any]:
     key = home_signatures.account_key(provider, row.get("accountID") or row.get("email"))
     homes = []
     for candidate in _discover_provider_homes().get(provider, []):
-        if candidate["state"] != "tracked":
+        if candidate["state"] not in ("tracked", "mirror"):
             continue
         current = _home_account_key(provider, candidate)
         if key and current:
@@ -4605,7 +4674,7 @@ def codex_provider_instances_with_completeness(
     candidates = provider_home_candidates("codex")
     # Hitting the bounded discovery limit means there may be another home we
     # did not inspect. Treat that snapshot as advisory.
-    complete = _HOME_CANDIDATES_COMPLETE and len(candidates) < HOME_DISCOVERY_MAX_CANDIDATES
+    complete = _HOME_CANDIDATES_COMPLETE and sum(not c.get("_explicit") for c in candidates) < HOME_DISCOVERY_MAX_CANDIDATES
     active_path = _resolved_path_key(default_provider_home("codex"))
     grouped: Dict[str, Dict[str, Any]] = {}
 
@@ -14291,7 +14360,7 @@ def run_cli_probes() -> Dict[str, Any]:
     except OSError:
         cwd = None
     codex_rows: List[Dict[str, Any]] = []
-    def probe_homes(provider):
+    def probe_homes(provider, probe):
         seen_accounts = set()
         for candidate in provider_home_candidates(provider):
             if candidate["state"] != "tracked":
@@ -14299,11 +14368,15 @@ def run_cli_probes() -> Dict[str, Any]:
             key = candidate["identity"].get("accountKey")
             if key and key in seen_accounts:
                 continue
-            if key:
-                seen_accounts.add(key)
-            yield candidate["path"]
-    for home in probe_homes("codex"):
-        codex_rows.append(cli_probe.probe_codex_home(home, CodexAppServer))
+            row = probe(candidate["path"])
+            if row.get("status") == "ok":
+                if key:
+                    seen_accounts.add(key)
+                verified = home_signatures.account_key(provider, row.get("accountID") or row.get("email"))
+                if verified:
+                    seen_accounts.add(verified)
+            yield row
+    codex_rows.extend(probe_homes("codex", lambda home: cli_probe.probe_codex_home(home, CodexAppServer)))
     # Orca keeps its own copy of a local login; one account is one row.
     seen: Dict[str, Dict[str, Any]] = {}
     for row in codex_rows:
@@ -14316,8 +14389,7 @@ def run_cli_probes() -> Dict[str, Any]:
     # The CLI's default credential service/config location is canonical even
     # when the daemon inherited an alternate CLAUDE_CONFIG_DIR from a launcher.
     default_claude = HOME / PROVIDER_HOME_SPECS["claude"]["defaultName"]
-    for home in probe_homes("claude"):
-        results.append(cli_probe.probe_claude_home(home, default_claude, claude, cwd=cwd))
+    results.extend(probe_homes("claude", lambda home: cli_probe.probe_claude_home(home, default_claude, claude, cwd=cwd)))
     for provider, relative, token_key in (("grok", ".grok", "token"), ("kimi", ".kimi-code", "access")):
         home = HOME / relative
         if home.is_dir():
@@ -19105,7 +19177,7 @@ def home_discovery_snapshot(force: bool = False) -> Dict[str, Any]:
                     "id": c["id"], "path": _home_snapshot_path(c), "source": c["source"],
                     "sources": c["sources"], "launchers": c["launchers"], "state": c["state"],
                     "evidence": c["evidence"], "tracked": c["tracked"], "excluded": c["excluded"],
-                    "usage": usage.get(c["id"], empty_periods()) if c["state"] == "tracked" else empty_periods(),
+                    "usage": usage.get(c["id"], empty_periods()) if c["state"] in ("tracked", "mirror") else empty_periods(),
                     "files": c["stats"]["files"],
                     "newestAgeSeconds": int(max(0.0, now - c["stats"]["newestMtime"])) if c["stats"]["newestMtime"] else None,
                 }

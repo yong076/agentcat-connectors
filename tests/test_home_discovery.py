@@ -641,7 +641,7 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
 
     def test_capped_codex_home_scan_is_non_authoritative(self) -> None:
         self._codex_auth(agentcat.HOME / ".codex", "acct-0", "pro")
-        for index in range(1, agentcat.HOME_DISCOVERY_MAX_CANDIDATES):
+        for index in range(1, agentcat.HOME_DISCOVERY_MAX_CANDIDATES + 1):
             self._codex_auth(agentcat.HOME / f".codex-{index}", f"acct-{index}", "pro")
 
         _, complete = agentcat.codex_provider_instances_with_completeness({"status": "auto", "quotas": []})

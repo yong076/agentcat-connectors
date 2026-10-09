@@ -33,6 +33,151 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         path.write_text(f'#!/bin/sh\nexport {var}="{home}"\nexec {provider} "$@"\n')
         path.chmod(0o700)
 
+    def test_auto_candidate_cap_never_limits_explicit_homes(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                homes = [agentcat.HOME / f"{provider}-adopted-{i:02d}" for i in range(33)]
+                for i, home in enumerate(homes):
+                    sid = f"00000000-0000-4000-8000-{i:012d}"
+                    if provider == "codex":
+                        self._codex_session(home, sid)
+                    else:
+                        self._claude_journal(home, sid)
+                agentcat.write_agentcat_settings({"homes": {provider: {"adopted": [str(h) for h in homes]}}})
+                self.assertTrue(set(homes).issubset(agentcat.tracked_provider_homes(provider)))
+                result = (agentcat.codex_sessions_snapshot(force_rebuild=True) if provider == "codex"
+                          else agentcat.claude_snapshot())
+                self.assertEqual(result["tokens"]["all"], 33 * (200 if provider == "codex" else 30))
+
+    def test_global_deadline_preserves_last_good_discovery(self):
+        home = agentcat.HOME / "last-good"
+        self._codex_session(home, UUID_A)
+        previous = agentcat._discover_provider_homes(force=True)
+        clock = [100.0]
+        deadlines = []
+        signatures = agentcat.home_signatures
+
+        class InlineFS(signatures.LocalFS):
+            now = staticmethod(lambda: clock[0])
+            def __init__(self, *args, **kwargs):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        def classify(path, **kwargs):
+            deadlines.append(kwargs["deadline"])
+            clock[0] += 0.1
+            return {"kind": "provider", "provider": "codex", "layouts": ["codex"],
+                    "score": 6, "evidence": [], "identity": {}}
+
+        rows = [{"path": agentcat.HOME / f"candidate-{i}", "sources": ["auto"], "launchers": []}
+                for i in range(100)]
+        with patch.object(agentcat.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(agentcat, "HOME_DISCOVERY_TIME_BUDGET_SECONDS", 0.35), \
+             patch.object(signatures, "BoundedFS", InlineFS, create=True), \
+             patch.object(signatures, "collect_candidates", return_value=rows), \
+             patch.object(signatures, "classify_home", side_effect=classify), \
+             patch.object(signatures, "session_inventory", return_value={"sessions": set(), "paths": {}, "partial": False,
+                          "stats": {"files": 0, "newestMtime": None, "capped": False}}):
+            result = agentcat._discover_provider_homes(force=True)
+        self.assertLessEqual(len(deadlines), 4)
+        self.assertTrue(all(d == 100.35 for d in deadlines), deadlines)
+        self.assertEqual(result, previous)
+        self.assertFalse(agentcat._HOME_CANDIDATES_COMPLETE)
+
+    def test_auto_candidate_cap_is_checked_before_classification(self):
+        signatures = agentcat.home_signatures
+        rows = []
+        for i in range(100):
+            path = agentcat.HOME / f"auto-{i:03d}"
+            path.mkdir()
+            rows.append({"path": path, "sources": ["auto"], "launchers": []})
+        with patch.object(signatures, "collect_candidates", return_value=rows), \
+             patch.object(signatures, "classify_home", return_value={"kind": "provider", "provider": "codex",
+                          "layouts": ["codex"], "score": 6, "evidence": [], "identity": {}}) as classify:
+            agentcat._discover_provider_homes(force=True)
+        self.assertLessEqual(classify.call_count, agentcat.HOME_DISCOVERY_MAX_CANDIDATES + 2)
+
+    def test_timeout_keeps_last_good_homes_and_applies_new_explicit_choices(self):
+        auto = agentcat.HOME / "last-good"
+        self._codex_session(auto, UUID_A)
+        agentcat._discover_provider_homes(force=True)
+        adopted = agentcat.HOME / "new-explicit"
+        self._codex_session(adopted, UUID_B)
+        agentcat.write_agentcat_settings({"homes": {"codex": {
+            "adopted": [str(adopted)], "excluded": [str(auto)]}}})
+        with patch.object(agentcat, "HOME_DISCOVERY_TIME_BUDGET_SECONDS", 0):
+            candidates = agentcat._discover_provider_homes(force=True)["codex"]
+        states = {c["path"]: c["state"] for c in candidates}
+        self.assertEqual(states[auto], "excluded")
+        self.assertEqual(states[adopted], "tracked")
+        self.assertEqual(states[agentcat.HOME / ".codex"], "tracked")
+        self.assertFalse(agentcat._HOME_CANDIDATES_COMPLETE)
+
+    def test_explicit_remote_homes_still_read_while_auto_homes_are_skipped(self):
+        signatures = agentcat.home_signatures
+        default = agentcat.HOME / ".codex"
+        adopted = agentcat.HOME / "adopted"
+        auto = agentcat.HOME / "automatic"
+        for i, home in enumerate((default, adopted, auto)):
+            self._codex_session(home, f"00000000-0000-4000-8000-{i:012d}")
+        self._adopt("codex", adopted)
+        class RemoteFS(signatures.LocalFS):
+            def __init__(self, deadline):
+                self.deadline = deadline
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def is_local(self, path):
+                return not any(path == h or h in path.parents for h in (default, adopted, auto))
+        with patch.object(signatures, "BoundedFS", RemoteFS):
+            self.assertEqual(set(agentcat.tracked_provider_homes("codex")), {default, adopted})
+            self.assertEqual(agentcat.codex_sessions_snapshot(force_rebuild=True)["tokens"]["all"], 400)
+
+    def test_mirror_unique_usage_reaches_its_account_and_keeps_files_without_uuid(self):
+        primary = agentcat.HOME / ".codex"
+        for i in range(9):
+            self._codex_session(primary, f"00000000-0000-4000-8000-{i:012d}")
+        self._codex_auth(primary, "same-account")
+        mirror = agentcat.HOME / "mirror"
+        shutil.copytree(primary, mirror)
+        self._codex_session(mirror, UUID_B, tokens=999)
+        anonymous = self._codex_session(mirror, UUID_C, tokens=50)
+        anonymous = anonymous.rename(anonymous.parent / "new-session.jsonl")
+        self.assertIn(anonymous, agentcat.codex_session_files())
+        result = agentcat.codex_sessions_snapshot(force_rebuild=True)
+        self.assertEqual(result["tokens"]["all"], 3898)
+        agentcat.write_json_atomic(agentcat.CLI_PROBE_CACHE, {"results": [self.probe_row("codex", primary, "same-account")]})
+        self.assertEqual(agentcat.cli_probe_provider_instances()[0]["usage"]["today"], 3898)
+
+    def test_failed_probe_tries_next_home_of_same_account(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                default = agentcat.HOME / f".{provider}"
+                adopted = agentcat.HOME / f"{provider}-work"
+                third = agentcat.HOME / f"{provider}-other"
+                for home in (default, adopted, third):
+                    if provider == "codex":
+                        self._codex_auth(home, "same-account")
+                    else:
+                        self._claude_journal(home, UUID_A)
+                        self.account(home, "same-account")
+                self._adopt(provider, adopted)
+                success = self.probe_row(provider, adopted, "same-account")
+                expired = dict(self.probe_row(provider, default, "same-account"),
+                               status="error", reason="cli_login_expired", windows=[])
+                other = "claude" if provider == "codex" else "codex"
+                with patch.object(agentcat.cli_probe, f"probe_{provider}_home", side_effect=[expired, success]) as probe, \
+                     patch.object(agentcat.cli_probe, f"probe_{other}_home", return_value={"status": "error", "homeKey": "unknown"}), \
+                     patch.object(agentcat.shutil, "which", return_value=None), \
+                     patch.object(agentcat, "probe_antigravity", return_value=None):
+                    rows = agentcat.run_cli_probes()["results"]
+                self.assertEqual([c.args[0] for c in probe.call_args_list], [default, adopted])
+                self.assertIn(success, rows)
+
     def test_five_claude_homes_distinct_accounts_auto_tracked_with_usage(self):
         homes = [agentcat.HOME / (".claude" if i == 1 else f".claude{i}") for i in range(1, 6)]
         rows = []
@@ -120,6 +265,8 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
             home = agentcat.HOME / (".claude" if i == 1 else f".claude{i}")
             self._claude_journal(home, f"10000000-0000-4000-8000-{i:012d}")
             self.account(home, f"claude-{i}")
+            if i > 1:
+                self.launcher(f"claude{i}", "claude", home)
             # A generic foreign layout marker must not add a Codex row.
             (home / "sessions").mkdir()
             expected["claude"][home] = "tracked"
@@ -146,7 +293,9 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
             expected["codex"][home] = "mirror"
         for name, brand in ((".grok", "openai"), (".trappist-grok-lean", "grok"), (".kimi-code", "kimi"), (".progrok", "grok")):
             home = agentcat.HOME / name
-            self._codex_session(home, UUID_A)
+            rollout = self._codex_session(home, UUID_A)
+            with rollout.open("a") as handle:
+                handle.write(json.dumps({"payload": {"originator": "kimi_cli" if brand == "kimi" else "grok_cli"}}) + "\n")
             (home / "config.toml").write_text(f'model_provider = "{brand}"\n')
             expected["codex"][home] = "foreign"
         for name in (".cursor", ".gstack", ".factory", ".maestro", ".paperclip", ".paperclip-ko", "jeomjip-agent"):
@@ -189,8 +338,8 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         self.assertEqual(candidates[mirror]["state"], "mirror")
         self.assertEqual(len(candidates[primary]["_sessionIds"]), 1000)
         files = agentcat.codex_session_files()
-        self.assertEqual(len(files), 1000)
-        self.assertNotIn(unique, files)
+        self.assertEqual(len(files), 1001)
+        self.assertIn(unique, files)
         self.assertTrue(all(mirror in p.parents for p in files))
         self.assertEqual(database.read_bytes(), before_db)
         self.assertEqual(index.read_bytes(), before_index)
@@ -207,8 +356,8 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         self.assertEqual(candidates[mirror]["state"], "mirror")
         self.assertGreaterEqual(len(candidates[mirror]["_mirrorOwners"]), 255)
         files = agentcat.codex_session_files()
-        self.assertEqual(len(files), 300)
-        self.assertNotIn(unique, files)
+        self.assertEqual(len(files), 301)
+        self.assertIn(unique, files)
 
     def test_orca_mirror_has_zero_usage_and_no_probe(self):
         primary = agentcat.HOME / ".codex"
@@ -230,7 +379,7 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         self.assertEqual([c.args[0] for c in probe.call_args_list], [primary])
         self.assertEqual(agentcat.codex_session_files(), [first])
 
-    def test_ninety_percent_mirror_unique_tail_is_not_added_and_longer_copy_wins(self):
+    def test_ninety_percent_mirror_keeps_unique_tail_and_longer_copy_wins(self):
         primary = agentcat.HOME / ".codex"
         for i in range(9):
             self._codex_session(primary, f"00000000-0000-4000-8000-{i:012d}")
@@ -244,9 +393,13 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         candidates = agentcat.provider_home_candidates("codex")
         self.assertEqual(next(c["state"] for c in candidates if c["path"] == mirror), "mirror")
         files = agentcat.codex_session_files()
-        self.assertEqual(len(files), 9)
-        self.assertNotIn(extra, files)
-        self.assertEqual(agentcat.codex_sessions_snapshot(force_rebuild=True)["tokens"]["all"], 1800)
+        self.assertEqual(len(files), 10)
+        self.assertIn(extra, files)
+        self.assertIn(first, files)
+        self.assertEqual(agentcat.codex_sessions_snapshot(force_rebuild=True)["tokens"]["all"], 3798)
+        block = agentcat.home_discovery_snapshot()["codex"]["discovered"]
+        self.assertEqual(next(c["usage"]["all"] for c in block if c["state"] == "mirror"), 1998)
+        self.assertEqual(sum(c["usage"]["all"] for c in block), 3798)
 
     def test_launcher_outside_home_named_label_and_private_path(self):
         home = self.root / "outside/team"
