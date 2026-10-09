@@ -107,13 +107,36 @@ class ClaudeProbeTests(unittest.TestCase):
         self.assertEqual(row["status"], "ok")
         self.assertNotIn(str(other), json.dumps(row))
 
+    def test_subscription_ignores_daemon_api_credentials(self):
+        for default_home in (True, False):
+            with self.subTest(default_home=default_home), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / ".claude"
+                home.mkdir()
+                default = home if default_home else Path(tmp) / "default"
+                config = home.parent if default_home else home
+                (config / ".claude.json").write_text(json.dumps({"oauthAccount": {
+                    "emailAddress": "subscriber@example.com", "accountUuid": "fixture"}}))
+                calls = []
+
+                def run(args, **kwargs):
+                    calls.append(args)
+                    self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
+                    return subprocess.CompletedProcess(args, 0, stdout=USAGE_TEXT)
+
+                with patch.dict(cli_probe.os.environ, {"ANTHROPIC_API_KEY": "fixture-key"}, clear=True):
+                    row = cli_probe.probe_claude_home(home, default, "claude", run=run,
+                                                     token_reader=lambda *_: None)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(row["status"], "ok")
+                self.assertEqual(row["windows"], cli_probe.parse_claude_usage(USAGE_TEXT))
+
     def test_api_billing_rows_skip_cli_and_token_reads(self):
         cases = (("ANTHROPIC_API_KEY", "fixture-key", "api_key"),
                  ("ANTHROPIC_AUTH_TOKEN", "fixture-token", "api_key"),
                  ("CLAUDE_CODE_USE_BEDROCK", "1", "bedrock"),
                  ("CLAUDE_CODE_USE_VERTEX", "1", "vertex"))
         for setting, value, mode in cases:
-            for source in ("environment", "settings"):
+            for source in (("settings",) if mode == "api_key" else ("environment", "settings")):
                 with self.subTest(setting=setting, source=source), tempfile.TemporaryDirectory() as tmp:
                     home = Path(tmp)
                     env = {"HOME": str(home), "USERPROFILE": str(home)}

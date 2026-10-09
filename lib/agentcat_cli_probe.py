@@ -162,20 +162,21 @@ def _result(provider: str, home: Path, **fields: Any) -> Dict[str, Any]:
 
 
 def claude_api_billing_mode(home: Path) -> Optional[str]:
-    """Detect API billing from the daemon environment or this home's settings.
+    """Detect API billing from this home's settings or explicit cloud flags.
 
     Return only the billing mode; credential values never enter probe results.
     """
-    def from_env(source: Dict[str, Any]) -> Optional[str]:
+    def from_env(source: Dict[str, Any], *, allow_keys: bool = True) -> Optional[str]:
         if str(source.get("CLAUDE_CODE_USE_BEDROCK") or "").strip() not in ("", "0", "false"):
             return "bedrock"
         if str(source.get("CLAUDE_CODE_USE_VERTEX") or "").strip() not in ("", "0", "false"):
             return "vertex"
-        if source.get("ANTHROPIC_API_KEY") or source.get("ANTHROPIC_AUTH_TOKEN"):
+        if allow_keys and (source.get("ANTHROPIC_API_KEY") or source.get("ANTHROPIC_AUTH_TOKEN")):
             return "api_key"
         return None
 
-    mode = from_env(dict(os.environ))
+    # SDK credentials inherited by the daemon do not select this home's billing.
+    mode = from_env(dict(os.environ), allow_keys=False)
     if mode:
         return mode
     try:

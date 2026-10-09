@@ -5398,10 +5398,9 @@ def claude_api_billing_mode() -> Optional[str]:
     failed to detect Claude" and is a known share of the "detection works for
     some users, not others" reports.
 
-    The daemon's own environment is not enough: it inherits whatever the launch
-    job froze, so an ``ANTHROPIC_API_KEY`` exported in the user's shell is
-    invisible to it. Claude Code's own ``settings.json`` env block is checked
-    too, which is where a persistent setup actually lives.
+    API keys must come from the selected home's settings, since a daemon
+    environment key may belong to unrelated SDK work. Explicit Bedrock and
+    Vertex environment flags still select those billing modes.
     """
     return cli_probe.claude_api_billing_mode(claude_config_dir())
 
