@@ -451,10 +451,7 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         self.assertEqual(rows[0]["profileCount"], 2)
         agentcat.write_agentcat_settings({"homes": {"codex": {"excluded": [str(homes[1])]}}})
         self.assertNotIn(homes[1], agentcat.tracked_provider_homes("codex"))
-        pending = agentcat.codex_sessions_snapshot()
-        self.assertTrue(pending["pendingReconcile"])
-        # Exclusion reconciles on the daily budget; explicit rebuild stays immediate.
-        after = agentcat.codex_sessions_snapshot(force_rebuild=True)
+        after = agentcat.codex_sessions_snapshot()
         self.assertEqual(after["tokens"]["all"], 200)
         self.assertEqual(agentcat.cli_probe_provider_instances()[0]["usage"]["today"], 200)
 

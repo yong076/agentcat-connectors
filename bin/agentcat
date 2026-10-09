@@ -9272,7 +9272,7 @@ def _read_codex_sessions_cursor() -> Dict[str, Any]:
             }
         cursor["projects"] = clean_projects
     cursor["turns"] = int(raw.get("turns") or 0)
-    for key in ("homeDaily", "usagePaths", "homeAccounts", "lastRebuildAt", "pendingReconcile"):
+    for key in ("homeDaily", "usagePaths", "homeAccounts", "lastRebuildAt", "pendingReconcile", "homeConfiguration"):
         if key in raw:
             cursor[key] = raw[key]
     return cursor
@@ -9300,6 +9300,22 @@ def save_codex_sessions_cursor(cursor: Dict[str, Any]) -> bool:
         return False
 
 
+def _codex_home_configuration() -> Dict[str, Any]:
+    """Separate home membership/choices from ordinary session-file churn.
+
+    Compare semantic Codex settings, not settings.json's mtime: changing a UI
+    preference or another provider must not spend a full-store scan.
+    """
+    candidates = _discover_provider_homes().get("codex", [])
+    settings = _home_settings("codex")
+    return {
+        "homes": sorted([c["id"], c["state"], bool(c.get("exists"))]
+                        for c in candidates if c["state"] in ("tracked", "mirror")),
+        "settings": {key: sorted({_home_lexical_key(p) for p in _home_path_list(settings, key)})
+                     for key in ("adopted", "excluded")},
+    }
+
+
 def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False) -> Dict[str, Any]:
     """Per-class Codex token snapshot read from sessions/**/*.jsonl.
 
@@ -9319,13 +9335,15 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
         "projects": empty_projects(),
     }
     files = codex_session_files()
-    if not files:
+    cursor = load_codex_sessions_cursor()
+    home_configuration = _codex_home_configuration()
+    configuration_changed = cursor.get("homeConfiguration") != home_configuration
+    if not files and not configuration_changed and not force_rebuild:
         return result
 
     roots = [root for root in codex_session_roots() if root.is_dir()]
     result["source"] = snapshot_source_label(" + ".join(f"{root}/**/*.jsonl" for root in roots))
 
-    cursor = load_codex_sessions_cursor()
     account_changed = _prepare_home_accounts("codex", cursor)
     previous_accounts = cursor.get("homeAccounts", {})
     selected = {str(p): _usage_home_id("codex", p) for p in files}
@@ -9334,14 +9352,15 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
         bool(cursor.get("files")) and "homeDaily" not in cursor
     ) or any(selected.get(p) != hid for p, hid in old_paths.items())
     last_rebuild = cursor.get("lastRebuildAt", {})
-    # Rollups are shared across homes. A full scan is allowed only when EVERY
-    # participating home is due; adding a home must not reset another's budget.
+    # Rollups are shared across homes. Routine scans require EVERY home to be
+    # due. A changed home configuration is a one-shot exception, then the new
+    # configuration and fresh budget are persisted together.
     home_ids = set(selected.values()) | set(old_paths.values())
     now = time.time()
     due = all(now - last_rebuild.get(hid, 0) >= CODEX_REBUILD_INTERVAL_SECONDS
               for hid in home_ids)
     requested = reconcile or topology_changed or bool(cursor.get("pendingReconcile"))
-    rebuild = force_rebuild or (due and (requested or not cursor.get("files")))
+    rebuild = force_rebuild or configuration_changed or (due and (requested or not cursor.get("files")))
     if rebuild:
         last_rebuild = {**last_rebuild, **{hid: now for hid in home_ids}}
         cursor["lastRebuildAt"] = last_rebuild
@@ -9371,6 +9390,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
         cursor["usagePaths"] = {**old_paths, **selected}
     else:
         cursor["usagePaths"] = selected
+    cursor["homeConfiguration"] = home_configuration
     home_daily = cursor.setdefault("homeDaily", {})
     file_cursors: Dict[str, Any] = cursor["files"]
     daily: Dict[str, int] = cursor["daily"]
@@ -9525,7 +9545,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
     global _CODEX_CURSOR_CACHE
     _CODEX_CURSOR_CACHE = (str(CODEX_SESSIONS_CURSOR_FILE), _codex_cursor_stamp(), cursor)
     _HOME_USAGE_CURSORS["codex"] = (str(CODEX_SESSIONS_CURSOR_FILE), cursor)
-    return _build_codex_sessions_snapshot(result, cursor)
+    return _build_codex_sessions_snapshot(result, cursor) if files else result
 
 
 def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any]) -> Dict[str, Any]:

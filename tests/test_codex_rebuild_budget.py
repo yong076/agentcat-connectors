@@ -103,13 +103,72 @@ class CodexRebuildBudgetTests(HomeDiscoveryTestCase):
             self.assertEqual(agentcat.codex_sessions_snapshot(force_rebuild=True)['tokens']['all'], 400)
             rebuild.assert_called_once()
 
-    def test_new_home_does_not_reset_existing_home_budget(self):
+    def test_discovered_home_add_remove_rebuilds_once_then_returns_to_budget(self):
         agentcat.codex_sessions_snapshot()
-        self._codex_session(agentcat.HOME / '.codex-2', UUID_B)
+        other = agentcat.HOME / '.codex-2'
+        self._codex_session(other, UUID_B)
         self._reset_discovery_cache()
         with patch.object(agentcat, '_empty_codex_cursor', wraps=agentcat._empty_codex_cursor) as rebuild:
-            self.assertEqual(agentcat.codex_sessions_snapshot(reconcile=True)['tokens']['all'], 400)
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 400)
+            self.assertEqual(rebuild.call_count, 1)
+            for _ in range(3):
+                agentcat.codex_sessions_snapshot(reconcile=True)
+            self.assertEqual(rebuild.call_count, 1)
+            other.rename(self.root / 'retired-fixture')
+            self._reset_discovery_cache()
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 200)
+            self.assertEqual(rebuild.call_count, 2)
+            for _ in range(3):
+                agentcat.codex_sessions_snapshot(reconcile=True)
+            self.assertEqual(rebuild.call_count, 2)
+
+    def test_codex_settings_change_rebuilds_even_with_same_home_membership(self):
+        agentcat.codex_sessions_snapshot()
+        # External settings edits must work without write_agentcat_settings's
+        # in-process invalidation. Adopting the default keeps membership equal.
+        settings = {'homes': {'codex': {'adopted': [str(self.home)]}}}
+        (agentcat.AGENTCAT_HOME / 'settings.json').write_text(json.dumps(settings))
+        with patch.object(agentcat, '_empty_codex_cursor', wraps=agentcat._empty_codex_cursor) as rebuild:
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 200)
+            self.assertEqual(rebuild.call_count, 1)
+            agentcat.codex_sessions_snapshot(reconcile=True)
+            self.assertEqual(rebuild.call_count, 1)
+        agentcat._CODEX_CURSOR_CACHE = None
+        # Loading the persisted configuration does not trigger another scan.
+        agentcat.load_codex_sessions_cursor()
+        with patch.object(agentcat, '_empty_codex_cursor', wraps=agentcat._empty_codex_cursor) as rebuild:
+            agentcat.codex_sessions_snapshot(reconcile=True)
             rebuild.assert_not_called()
+
+    def test_unrelated_settings_and_equivalent_rewrite_do_not_rebuild(self):
+        settings = {'homes': {'codex': {'adopted': [str(self.home)]}}}
+        agentcat.write_agentcat_settings(settings)
+        agentcat.codex_sessions_snapshot()
+        settings.update(theme='dark')
+        settings['homes']['claude'] = {'excluded': [str(agentcat.HOME / '.claude')]}
+        agentcat.write_agentcat_settings(settings)
+        with patch.object(agentcat, '_empty_codex_cursor', wraps=agentcat._empty_codex_cursor) as rebuild:
+            agentcat.codex_sessions_snapshot(reconcile=True)
+            # An equivalent list with duplicates/ordering changes is not a new choice.
+            settings['homes']['codex']['adopted'].append(str(self.home))
+            agentcat.write_agentcat_settings(settings)
+            agentcat.codex_sessions_snapshot(reconcile=True)
+            rebuild.assert_not_called()
+
+    def test_exclude_all_then_include_clears_old_usage_and_rebuilds_once(self):
+        agentcat.codex_sessions_snapshot()
+        agentcat.write_agentcat_settings({'homes': {'codex': {'excluded': [str(self.home)]}}})
+        with patch.object(agentcat, '_empty_codex_cursor', wraps=agentcat._empty_codex_cursor) as rebuild:
+            self.assertEqual(agentcat.codex_sessions_snapshot()['status'], 'not_found')
+            self.assertEqual(agentcat.load_codex_sessions_cursor()['daily'], {})
+            self.assertEqual(agentcat._home_usage_periods('codex'), {})
+            agentcat.codex_sessions_snapshot()
+            self.assertEqual(rebuild.call_count, 1)
+            agentcat.write_agentcat_settings({'homes': {'codex': {'excluded': []}}})
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 200)
+            self.assertEqual(rebuild.call_count, 2)
+            agentcat.codex_sessions_snapshot(reconcile=True)
+            self.assertEqual(rebuild.call_count, 2)
 
     def test_dirty_tail_is_saved_on_later_idle_tick(self):
         # Use the real wall clock for the mtime-based write debounce.

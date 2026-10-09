@@ -63,6 +63,8 @@ def run(source, root, size_mib, count, ticks):
                 ('codex_session_files', lambda: files),
                 ('codex_session_roots', lambda: [store]),
                 ('_usage_home_id', lambda *args: 'fixture-home'),
+                ('_discover_provider_homes', lambda: {'codex': [
+                    {'id': 'fixture-home', 'path': store.parent, 'state': 'tracked', 'exists': True}]}),
                 ('_prepare_home_accounts', lambda *args: False),
                 ('codex_sqlite_snapshot', lambda: sqlite),
                 ('codexbar_cost_cache_snapshot', lambda *args: {}),
