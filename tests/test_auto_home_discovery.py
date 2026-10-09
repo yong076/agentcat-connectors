@@ -1,9 +1,12 @@
 """Automatic tracking, dedup attribution, and probe/label integration."""
 import datetime as dt
+from contextlib import closing
 import json
 import os
 import shutil
+import sqlite3
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -49,7 +52,7 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         self.assertEqual(sum(item["usage"]["all"] for item in block), 150)
         self.assertNotIn("account-", json.dumps(block))
 
-    def test_foreign_and_ambiguous_homes_are_never_counted_even_when_adopted(self):
+    def test_automatic_foreign_and_unidentified_homes_are_not_counted(self):
         buddy = agentcat.HOME / ".codebuddy"
         self._claude_journal(buddy, UUID_A)
         (buddy / ".codebuddy.json").write_text("{}")
@@ -62,15 +65,150 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         ambiguous = agentcat.HOME / "lookalike"
         (ambiguous / "sessions").mkdir(parents=True)
         (ambiguous / "sessions/session.jsonl").write_text('{}\n')
-        self._adopt("claude", buddy)
-        agentcat.write_agentcat_settings({"homes": {"codex": {"adopted": [str(h) for h in homes]}}})
         candidates = {c["path"]: c for c in agentcat.provider_home_candidates("codex")}
-        self.assertEqual(candidates[ambiguous]["state"], "ambiguous")
+        self.assertNotIn(ambiguous, candidates)
         for home in homes:
             self.assertEqual(candidates[home]["state"], "foreign")
             self.assertNotIn(home, agentcat.tracked_provider_homes("codex"))
         self.assertNotIn(buddy, agentcat.tracked_provider_homes("claude"))
         self.assertEqual(agentcat.codex_session_files(), [])
+
+    def test_explicit_homes_remain_tracked_despite_conflicts_or_budget(self):
+        default = agentcat.HOME / ".codex"
+        self._codex_session(default, UUID_A)
+        (default / "config.toml").write_text('model_provider = "grok"\n')
+        adopted = agentcat.HOME / ".codebuddy"
+        self._claude_journal(adopted, UUID_B)
+        (adopted / ".codebuddy.json").write_text("{}")
+        self._adopt("claude", adopted)
+        for limits in (agentcat.home_signatures.ScanLimits(), agentcat.home_signatures.ScanLimits(seconds=0)):
+            with self.subTest(seconds=limits.seconds), patch.object(agentcat.home_signatures, "ScanLimits", return_value=limits):
+                self._reset_discovery_cache()
+                self.assertIn(default, agentcat.tracked_provider_homes("codex"))
+                self.assertIn(adopted, agentcat.tracked_provider_homes("claude"))
+
+    def test_real_size_homes_are_tracked_within_each_home_budget(self):
+        codex = agentcat.HOME / ".codex"
+        self._codex_auth(codex, "large-codex")
+        for day in range(1, 31):
+            directory = codex / "sessions/2026/09" / f"{day:02d}"
+            directory.mkdir(parents=True)
+            for item in range(500):
+                sid = f"00000000-0000-4000-8000-{day * 500 + item:012d}"
+                (directory / f"rollout-2026-09-{day:02d}-{sid}.jsonl").write_text('{"payload":{"originator":"codex_cli_rs"}}\n')
+        claude = agentcat.HOME / ".claude2"
+        for project in range(30):
+            for item in range(20):
+                self._claude_journal(claude, f"10000000-0000-4000-8000-{project * 20 + item:012d}", project=f"project-{project:02d}")
+        self.account(claude, "large-claude")
+        signatures = agentcat.home_signatures
+        for home, provider in ((codex, "codex"), (claude, "claude")):
+            with self.subTest(provider=provider):
+                start = time.monotonic()
+                result = signatures.classify_home(home)
+                self.assertLess(time.monotonic() - start, signatures.ScanLimits().seconds)
+                self.assertEqual((result["provider"], result["kind"]), (provider, "provider"))
+        start = time.monotonic()
+        block = agentcat.home_discovery_snapshot(force=True)
+        self.assertLess(time.monotonic() - start, agentcat.HOME_DISCOVERY_TIME_BUDGET_SECONDS)
+        self.assertIn("~/.codex", block["codex"]["tracked"])
+        self.assertIn("~/.claude2", block["claude"]["tracked"])
+
+    def test_owner_regression_table_and_candidate_order_independence(self):
+        expected = {"claude": {}, "codex": {}}
+        for i in range(1, 6):
+            home = agentcat.HOME / (".claude" if i == 1 else f".claude{i}")
+            self._claude_journal(home, f"10000000-0000-4000-8000-{i:012d}")
+            self.account(home, f"claude-{i}")
+            # A generic foreign layout marker must not add a Codex row.
+            (home / "sessions").mkdir()
+            expected["claude"][home] = "tracked"
+        buddy = agentcat.HOME / ".codebuddy"
+        self._claude_journal(buddy, UUID_C)
+        (buddy / ".codebuddy.json").write_text("{}")
+        expected["claude"][buddy] = "foreign"
+        primary = agentcat.HOME / ".codex"
+        second = agentcat.HOME / ".codex-2"
+        self._codex_session(primary, UUID_A)
+        self._codex_session(second, UUID_B)
+        orca = agentcat.HOME / "Library/Application Support/orca"
+        own = orca / "codex-accounts/34c5/home"
+        self._codex_session(own, UUID_C)
+        # An index identifies archived/moved sessions independently of paths.
+        (own / "session_index.jsonl").write_text(json.dumps({"id": UUID_C}) + "\n")
+        mirror = orca / "codex-accounts/305c/home"
+        shutil.copytree(primary, mirror)
+        runtime = orca / "codex-runtime-home/home"
+        shutil.copytree(own, runtime)
+        for home in (primary, second, own):
+            expected["codex"][home] = "tracked"
+        for home in (mirror, runtime):
+            expected["codex"][home] = "mirror"
+        for name, brand in ((".grok", "openai"), (".trappist-grok-lean", "grok"), (".kimi-code", "kimi"), (".progrok", "grok")):
+            home = agentcat.HOME / name
+            self._codex_session(home, UUID_A)
+            (home / "config.toml").write_text(f'model_provider = "{brand}"\n')
+            expected["codex"][home] = "foreign"
+        for name in (".cursor", ".gstack", ".factory", ".maestro", ".paperclip", ".paperclip-ko", "jeomjip-agent"):
+            home = agentcat.HOME / name
+            (home / "projects").mkdir(parents=True)
+            (home / "settings.json").write_text("{}")
+            (home / "config.toml").write_text('theme = "dark"\n')
+            (home / "sessions").mkdir()
+            (home / "sessions/unrelated.jsonl").write_text("{}\n")
+        collect = agentcat.home_signatures.collect_candidates
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse), patch.object(agentcat.home_signatures, "collect_candidates",
+                    side_effect=lambda *a, **kw: list(reversed(collect(*a, **kw))) if reverse else collect(*a, **kw)):
+                self._reset_discovery_cache()
+                for provider in expected:
+                    actual = {c["path"]: c["state"] for c in agentcat.provider_home_candidates(provider)}
+                    self.assertEqual(actual, expected[provider])
+
+    def test_indexed_mirrors_cover_moved_and_unsampled_sessions_read_only(self):
+        primary = agentcat.HOME / ".codex"
+        primary.mkdir()
+        self._codex_auth(primary, "indexed")
+        ids = [f"00000000-0000-4000-8000-{i:012d}" for i in range(1000)]
+        # The state index covers sessions outside the owner's filename sample.
+        database = primary / "state_5.sqlite"
+        with closing(sqlite3.connect(database)) as conn, conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+            conn.executemany("INSERT INTO threads VALUES (?)", [(sid,) for sid in ids])
+        mirror = agentcat.HOME / "Library/Application Support/orca/codex-runtime-home/home"
+        for i, sid in enumerate(ids):
+            self._codex_session(primary, sid)
+            copied = self._codex_session(mirror, sid, day="07", tokens=200)
+            with copied.open("a") as handle:
+                handle.write("{}\n")
+        index = mirror / "session_index.jsonl"
+        index.write_text("".join(json.dumps({"id": sid}) + "\n" for sid in ids))
+        unique = self._codex_session(mirror, UUID_C, day="07", tokens=999)
+        before_db, before_index = database.read_bytes(), index.read_bytes()
+        candidates = {c["path"]: c for c in agentcat.provider_home_candidates("codex")}
+        self.assertEqual(candidates[mirror]["state"], "mirror")
+        self.assertEqual(len(candidates[primary]["_sessionIds"]), 1000)
+        files = agentcat.codex_session_files()
+        self.assertEqual(len(files), 1000)
+        self.assertNotIn(unique, files)
+        self.assertTrue(all(mirror in p.parents for p in files))
+        self.assertEqual(database.read_bytes(), before_db)
+        self.assertEqual(index.read_bytes(), before_index)
+        self.assertFalse((primary / "state_5.sqlite-journal").exists())
+
+    def test_unindexed_mirror_checks_unsampled_ids_against_owner_paths(self):
+        primary = agentcat.HOME / ".codex"
+        for i in range(300):
+            self._codex_session(primary, f"00000000-0000-4000-8000-{i:012d}")
+        mirror = agentcat.HOME / "mirror"
+        shutil.copytree(primary, mirror)
+        unique = self._codex_session(mirror, UUID_C, tokens=999)
+        candidates = {c["path"]: c for c in agentcat.provider_home_candidates("codex")}
+        self.assertEqual(candidates[mirror]["state"], "mirror")
+        self.assertGreaterEqual(len(candidates[mirror]["_mirrorOwners"]), 255)
+        files = agentcat.codex_session_files()
+        self.assertEqual(len(files), 300)
+        self.assertNotIn(unique, files)
 
     def test_orca_mirror_has_zero_usage_and_no_probe(self):
         primary = agentcat.HOME / ".codex"

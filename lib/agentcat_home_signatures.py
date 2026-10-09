@@ -11,12 +11,14 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import time
 try:
     import tomllib
 except ImportError:  # The supported Windows Python 3.9/3.10 installs.
     tomllib = None
 from dataclasses import dataclass
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -30,6 +32,7 @@ class Fingerprint:
     value: str = ""
     weight: int = 6
     default: str | None = None
+    default_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,7 @@ class HomeSignature:
 CLAUDE_GLOBS = ("projects/**/*.jsonl",)
 CODEX_GLOBS = ("sessions/**/*.jsonl", "archived_sessions/**/*.jsonl")
 CODEBUDDY = Fingerprint("brand.codebuddy", "exists", ".codebuddy.json", weight=12)
+CODEBUDDY_CONFIG = Fingerprint("config.codebuddy", "exists", "codebuddy.json", weight=12)
 GROK = Fingerprint("originator.grok", "jsonl_prefix", key="payload.originator", value="grok", weight=12)
 KIMI = Fingerprint("originator.kimi", "jsonl_prefix", key="payload.originator", value="kimi", weight=12)
 GROK_PROVIDER = Fingerprint("provider.grok", "toml_key", "config.toml", "model_provider", "grok", 12)
@@ -70,6 +74,7 @@ GROK_NAME = Fingerprint("home.grok", "filename", ".", value=r"^\.(?:trappist-)?g
 KIMI_NAME = Fingerprint("home.kimi_code", "filename", ".", value=r"^\.kimi-code$", weight=12)
 GROK_MODEL = Fingerprint("model.grok", "jsonl_prefix", key="payload.model", value="grok", weight=12)
 KIMI_MODEL = Fingerprint("model.kimi", "jsonl_prefix", key="payload.model", value="kimi", weight=12)
+KIMI_CONFIG = Fingerprint("config.kimi", "exists", "kimi.json", weight=12)
 
 REGISTRY = (
     HomeSignature(
@@ -78,33 +83,36 @@ REGISTRY = (
         (Fingerprint("identity.claude_oauth", "json_key", ".claude.json", "oauthAccount"),
          Fingerprint("identity.claude_user", "json_key", ".claude.json", "userID"),
          Fingerprint("model.claude", "jsonl_prefix", key="message.model", value="claude-")),
-        (CODEBUDDY, CODEBUDDY_NAME), CLAUDE_GLOBS,
+        (CODEBUDDY, CODEBUDDY_NAME, CODEBUDDY_CONFIG), CLAUDE_GLOBS,
         IdentityExtractor(".claude.json", ("oauthAccount.accountUuid", "oauthAccount.accountId"),
                           ("oauthAccount.emailAddress",), ("oauthAccount.organizationRateLimitTier",), "../.claude.json"),
     ),
     HomeSignature(
         "codex", "provider", "codex", ("CODEX_HOME",), (".codex",),
-        (), ("sessions", "archived_sessions", "auth.json", "config.toml"),
+        (), ("sessions", "archived_sessions", "auth.json", "config.toml", "session_index.jsonl", "state_*.sqlite"),
         (Fingerprint("originator.codex", "jsonl_prefix", key="payload.originator", value="codex"),
          Fingerprint("identity.openai", "json_key", "auth.json", "tokens.id_token"),
-         Fingerprint("provider.openai", "toml_key", "config.toml", "model_provider", "openai", default="openai"),
+         Fingerprint("provider.openai", "toml_key", "config.toml", "model_provider", "openai", default="openai",
+                     default_keys=("model", "model_reasoning_effort", "approval_policy", "sandbox_mode")),
+         Fingerprint("index.codex", "exists", "session_index.jsonl"),
+         Fingerprint("state.codex", "exists", "state_*.sqlite"),
          Fingerprint("filename.codex_rollout", "filename", value=r"^rollout-.*[0-9a-f-]{36}\.jsonl$", weight=2)),
-        (GROK, KIMI, GROK_PROVIDER, KIMI_PROVIDER, GROK_XAI, GROK_NAME, KIMI_NAME, GROK_MODEL, KIMI_MODEL), CODEX_GLOBS,
+        (GROK, KIMI, GROK_PROVIDER, KIMI_PROVIDER, GROK_XAI, GROK_NAME, KIMI_NAME, GROK_MODEL, KIMI_MODEL, KIMI_CONFIG), CODEX_GLOBS,
         IdentityExtractor("auth.json", ("tokens.account_id",)),
         ("Library/Application Support/orca/codex-runtime-home/home",
          "Library/Application Support/orca/codex-accounts/*/home"),
     ),
     HomeSignature("codebuddy", "foreign", "claude", default_names=(".codebuddy",),
-                  structure_any=("projects", ".codebuddy.json"),
-                  fingerprints=(CODEBUDDY, CODEBUDDY_NAME, Fingerprint("config.codebuddy", "exists", "codebuddy.json", weight=12)),
+                  structure_any=("projects", ".codebuddy.json", "codebuddy.json"),
+                  fingerprints=(CODEBUDDY, CODEBUDDY_NAME, CODEBUDDY_CONFIG),
                   usage_globs=CLAUDE_GLOBS),
     HomeSignature("grok", "foreign", "codex", default_names=(".grok",),
-                  structure_any=("sessions", "config.toml"),
+                  structure_any=("sessions", "archived_sessions", "config.toml", "auth.json", "session_index.jsonl", "state_*.sqlite"),
                   fingerprints=(GROK, GROK_PROVIDER, GROK_XAI, GROK_NAME, GROK_MODEL),
                   usage_globs=CODEX_GLOBS),
     HomeSignature("kimi-code", "foreign", "codex", default_names=(".kimi-code",),
-                  structure_any=("sessions", "config.toml", "kimi.json"),
-                  fingerprints=(KIMI, KIMI_PROVIDER, KIMI_NAME, Fingerprint("config.kimi", "exists", "kimi.json", weight=12), KIMI_MODEL),
+                  structure_any=("sessions", "archived_sessions", "config.toml", "auth.json", "session_index.jsonl", "state_*.sqlite", "kimi.json"),
+                  fingerprints=(KIMI, KIMI_PROVIDER, KIMI_NAME, KIMI_CONFIG, KIMI_MODEL),
                   usage_globs=CODEX_GLOBS),
 )
 
@@ -202,6 +210,65 @@ def usage_files(path: Path, patterns: Sequence[str], *, fs=None, deadline=None, 
         status["capped"] = bool(stack or visited >= limit or fs.now() >= deadline)
 
 
+def sample_usage_files(path: Path, patterns: Sequence[str], *, fs=None, deadline=None,
+                       count=4, limit=50000, status=None):
+    """Visit newest date/project directories, stopping after K matching files.
+
+    Sorting happens only at directory levels, never over the rollout corpus.
+    Within a leaf directory, scandir order suffices for a bounded sample.
+    """
+    fs = fs or LocalFS()
+    deadline = fs.now() + ScanLimits().seconds if deadline is None else deadline
+    status = {} if status is None else status
+    status.update(capped=False, partial=False)
+    visited = 0
+    found = []
+
+    def visit(root):
+        nonlocal visited
+        if fs.now() >= deadline or visited >= limit:
+            status["capped"] = True
+            return
+        if fs.is_symlink(root) or not fs.is_dir(root):
+            return
+        directories = []
+        for child in fs.children(root):
+            visited += 1
+            if fs.now() >= deadline or visited > limit:
+                status["capped"] = True
+                break
+            if fs.is_symlink(child):
+                continue
+            if fs.is_dir(child):
+                directories.append(child)
+            elif child.suffix == ".jsonl" and fs.is_file(child):
+                relative = child.relative_to(path).as_posix()
+                if any(fnmatch.fnmatchcase(relative, p) or fnmatch.fnmatchcase(relative, p.replace("**/", "")) for p in patterns):
+                    found.append(child)
+                    if len(found) >= count:
+                        status["partial"] = True
+                        return
+        def newest(directory):
+            # ISO date components sort chronologically; projects sort by mtime.
+            if directory.name.isdigit() and directory.relative_to(path).parts[0] in ("sessions", "archived_sessions"):
+                return (1, int(directory.name))
+            try:
+                return (0, fs.stat(directory).st_mtime)
+            except OSError:
+                return (0, 0)
+        directories.sort(key=newest, reverse=True)
+        for directory in directories:
+            if len(found) >= count or status["capped"]:
+                break
+            visit(directory)
+
+    for name in dict.fromkeys(p.split("/")[0] for p in patterns):
+        if len(found) >= count or status["capped"]:
+            break
+        visit(path / name)
+    return found
+
+
 def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits(), threshold=6, margin=3,
                   deadline=None) -> dict:
     fs = fs or LocalFS()
@@ -210,6 +277,7 @@ def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits()
     failed_reads = set()
     samples: dict[tuple[str, ...], list[tuple[Path, list[Any]]]] = {}
     timed_out = False
+    partial = False
 
     def target(name):
         # Some standard homes store metadata beside the directory. The
@@ -219,12 +287,15 @@ def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits()
             extractor = signature.identity
             if extractor and extractor.file == name and extractor.default_file and path.name in signature.default_names:
                 default = path / extractor.default_file
-                if fs.is_file(default):
+                if not fs.is_file(direct) and fs.is_file(default):
                     return default
         return direct
 
     def exists(name):
         resolved = target(name)
+        if "*" in resolved.name:
+            return any(fnmatch.fnmatchcase(child.name, resolved.name) and not fs.is_symlink(child) and fs.is_file(child)
+                       for child in fs.children(resolved.parent))
         return not fs.is_symlink(resolved) and (fs.is_dir(resolved) or fs.is_file(resolved))
 
     def read(name):
@@ -250,15 +321,14 @@ def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits()
             return {}
 
     def sample(signature):
+        nonlocal timed_out, partial
         patterns = signature.usage_globs
         if patterns not in samples:
-            files = list(usage_files(path, patterns, fs=fs, deadline=deadline, limit=limits.entries))
-            def newest(file):
-                try:
-                    return fs.stat(file).st_mtime
-                except OSError:
-                    return 0
-            files.sort(key=newest, reverse=True)
+            status = {}
+            files = sample_usage_files(path, patterns, fs=fs, deadline=deadline,
+                                       count=limits.newest_jsonl, limit=limits.entries, status=status)
+            timed_out |= status["capped"]
+            partial |= status["partial"]
             rows = []
             for file in files[:limits.newest_jsonl]:
                 objects = []
@@ -291,9 +361,12 @@ def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits()
                 return False
             if tomllib is not None:
                 try:
-                    value = tomllib.loads(content).get(fp.key, fp.default)
+                    obj = tomllib.loads(content)
                 except ValueError:
                     return False
+                if fp.key not in obj and fp.default_keys and not any(key in obj for key in fp.default_keys):
+                    return False
+                value = obj.get(fp.key, fp.default)
                 return isinstance(value, str) and value.lower().startswith(fp.value.lower())
             root = content.split("[", 1)[0]
             for line in root.splitlines():
@@ -302,11 +375,17 @@ def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits()
             match = re.search(r"(?m)^\s*" + re.escape(fp.key) + r"\s*=\s*['\"]([^'\"]+)['\"]", root)
             if match:
                 return match.group(1).lower().startswith(fp.value.lower())
-            return bool(fp.default == fp.value and not re.search(r"(?m)^\s*" + re.escape(fp.key) + r"\s*=", root))
+            defaults_match = not fp.default_keys or any(re.search(r"(?m)^\s*" + re.escape(key) + r"\s*=", root) for key in fp.default_keys)
+            return bool(defaults_match and fp.default == fp.value and not re.search(r"(?m)^\s*" + re.escape(fp.key) + r"\s*=", root))
         raise ValueError("unknown fingerprint operation")
 
     ranked = []
     layouts = set()
+    eligible = []
+    def cheap(fp):
+        return fp.operation != "jsonl_prefix" and not (fp.operation == "filename" and not fp.file)
+
+    # Read every cheap identity/reject before any signature requests JSONL IO.
     for signature in registry:
         if fs.now() >= deadline:
             timed_out = True
@@ -316,9 +395,16 @@ def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits()
         if signature.structure_any and not any(exists(m) for m in signature.structure_any):
             continue
         layouts.add(signature.layout)
-        positive = [fp for fp in signature.fingerprints if matches(fp, signature)]
-        negative = [fp for fp in signature.negative_fingerprints if matches(fp, signature)]
+        positive = [fp for fp in signature.fingerprints if cheap(fp) and matches(fp, signature)]
+        negative = [fp for fp in signature.negative_fingerprints if cheap(fp) and matches(fp, signature)]
+        eligible.append((signature, positive, negative))
+    for signature, positive, negative in eligible:
+        positive += [fp for fp in signature.fingerprints if not cheap(fp) and matches(fp, signature)]
+        negative += [fp for fp in signature.negative_fingerprints if not cheap(fp) and matches(fp, signature)]
         score = sum(fp.weight for fp in positive) - sum(fp.weight for fp in negative)
+        # Rejects are ownership decisions, not a score that extra positives undo.
+        if negative:
+            score = min(score, 0)
         ranked.append((score, signature, [fp.code for fp in positive] + ["reject." + fp.code for fp in negative]))
     ranked.sort(key=lambda row: row[0], reverse=True)
     result = {"provider": None, "kind": "ambiguous", "score": ranked[0][0] if ranked else 0,
@@ -330,13 +416,14 @@ def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits()
         return result
     score, winner, evidence = ranked[0]
     result["evidence"] = evidence
-    if timed_out or fs.now() >= deadline:
-        result["evidence"].append("scan.budget")
-        return result
-    if score < threshold or (len(ranked) > 1 and score - ranked[1][0] < margin):
+    if timed_out or partial or fs.now() >= deadline:
+        result["evidence"].append("scan.partial")
+    product_conflict = sum(s >= threshold and sig.kind == "provider" for s, sig, _ in ranked) > 1
+    if product_conflict or score < threshold or (len(ranked) > 1 and score - ranked[1][0] < margin):
         result["evidence"].append("classification.ambiguous")
         return result
     result.update(provider=winner.provider, kind=winner.kind)
+    result["layouts"] = [winner.layout]
     if winner.identity:
         obj = json_file(winner.identity.file)
         native = next((v for key in winner.identity.account_paths if (v := _key(obj, key))), None)
@@ -346,6 +433,86 @@ def classify_home(path: Path, registry=REGISTRY, *, fs=None, limits=ScanLimits()
         if hashed:
             result["identity"] = {"accountKey": hashed}
     return result
+
+
+SESSION_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+
+
+def session_inventory(path: Path, patterns: Sequence[str], *, fs=None, deadline=None,
+                      sample_count=256, index_limit=50000) -> dict:
+    """Bounded filename sample plus local ID indexes; never parse transcripts.
+
+    Index files and SQLite are read-only. IDs and paths stay inside discovery;
+    only counts, ages and evidence codes reach the snapshot.
+    """
+    fs = fs or LocalFS()
+    deadline = fs.now() + ScanLimits().seconds if deadline is None else deadline
+    status = {}
+    files = sample_usage_files(path, patterns, fs=fs, deadline=deadline,
+                               count=sample_count, status=status)
+    sessions = {}
+    newest = None
+    for file in files:
+        match = SESSION_UUID.search(file.name)
+        if match:
+            sessions[match.group().lower()] = file.relative_to(path)
+        if fs.now() >= deadline:
+            status["capped"] = True
+            break
+        try:
+            mtime = fs.stat(file).st_mtime
+            newest = mtime if newest is None else max(newest, mtime)
+        except OSError:
+            continue
+    indexed = set()
+    index_partial = False
+    index = path / "session_index.jsonl"
+    if fs.now() < deadline and not fs.is_symlink(index) and fs.is_file(index):
+        try:
+            byte_limit = 8 * 1024 * 1024
+            raw = fs.read(index, byte_limit + 1)
+            index_partial = len(raw) > byte_limit
+            # A truncated final row cannot count as a complete index entry.
+            lines = raw[:byte_limit].splitlines()
+            if index_partial:
+                lines = lines[:-1]
+            for line in lines:
+                if fs.now() >= deadline or len(indexed) >= index_limit:
+                    index_partial = True
+                    break
+                try:
+                    obj = json.loads(line)
+                    value = obj.get("id", obj.get("session_id"))
+                    if isinstance(value, str) and SESSION_UUID.fullmatch(value):
+                        indexed.add(value.lower())
+                except (ValueError, AttributeError):
+                    continue
+        except OSError:
+            index_partial = True
+    # State-only homes and incomplete JSONL indexes still have cheap ID metadata.
+    for database in fs.children(path):
+        if fs.now() >= deadline or len(indexed) >= index_limit:
+            index_partial = True
+            break
+        if not fnmatch.fnmatchcase(database.name, "state_*.sqlite") or fs.is_symlink(database):
+            continue
+        try:
+            # Immutable mode avoids creating WAL/SHM sidecars in a CLI home.
+            # Filename samples cover live IDs not yet checkpointed in the DB.
+            with closing(sqlite3.connect(database.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=0)) as conn:
+                conn.set_progress_handler(lambda: int(fs.now() >= deadline), 1000)
+                for (value,) in conn.execute("SELECT id FROM threads LIMIT ?", (index_limit + 1,)):
+                    if fs.now() >= deadline or len(indexed) >= index_limit:
+                        index_partial = True
+                        break
+                    if isinstance(value, str) and SESSION_UUID.fullmatch(value):
+                        indexed.add(value.lower())
+        except (OSError, sqlite3.Error):
+            index_partial = True
+    return {"sessions": set(sessions) | indexed, "paths": sessions,
+            "stats": {"files": max(len(files), len(indexed)), "newestMtime": newest,
+                      "capped": bool(status["capped"] or status["partial"] or index_partial)},
+            "partial": bool(status["capped"] or index_partial)}
 
 
 def _expand(value: str, home: Path) -> Path | None:

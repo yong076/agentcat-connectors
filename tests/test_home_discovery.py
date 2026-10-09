@@ -287,12 +287,16 @@ class TrackedHomesTests(HomeDiscoveryTestCase):
             agentcat.tracked_provider_homes("codex"), [agentcat.HOME / ".codex"]
         )
 
-    def test_missing_adopted_home_is_skipped(self) -> None:
-        self._adopt("codex", agentcat.HOME / "does-not-exist")
+    def test_missing_adopted_home_stays_tracked_for_back_compat(self) -> None:
+        missing = agentcat.HOME / "does-not-exist"
+        self._adopt("codex", missing)
 
         self.assertEqual(
-            agentcat.tracked_provider_homes("codex"), [agentcat.HOME / ".codex"]
+            agentcat.tracked_provider_homes("codex"), [agentcat.HOME / ".codex", missing]
         )
+        candidate = next(c for c in agentcat.provider_home_candidates("codex") if c["path"] == missing)
+        self.assertFalse(candidate["exists"])
+        self.assertEqual(agentcat.codex_session_files(), [])
 
 
 class CandidateDiscoveryTests(HomeDiscoveryTestCase):

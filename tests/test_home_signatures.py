@@ -1,5 +1,6 @@
 """Signature engine tests use only temporary directories and injected IO."""
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,12 @@ import agentcat_home_signatures as signatures
 class RecordingFS(signatures.LocalFS):
     def __init__(self):
         self.reads = []
+        self.entries = []
+
+    def children(self, path):
+        for child in super().children(path):
+            self.entries.append(child)
+            yield child
 
     def read(self, path, limit):
         self.reads.append((path, limit))
@@ -50,6 +57,80 @@ class HomeSignatureTests(unittest.TestCase):
         home = self.home(".claude", "claude")
         (self.root / ".claude.json").write_text('{"oauthAccount":{"accountUuid":"standard"}}')
         self.assertEqual(signatures.classify_home(home)["identity"]["accountKey"], signatures.account_key("claude", "standard"))
+
+    def test_home_claude_identity_precedes_root_fallback(self):
+        home = self.home(".claude", "claude")
+        (self.root / ".claude.json").write_text('{"oauthAccount":{"accountUuid":"root"}}')
+        (home / ".claude.json").write_text('{"oauthAccount":{"accountUuid":"local"}}')
+        self.assertEqual(signatures.classify_home(home)["identity"]["accountKey"], signatures.account_key("claude", "local"))
+
+    def test_all_config_fingerprints_precede_jsonl_reads(self):
+        home = self.home("cheap-first")
+        (home / "auth.json").write_text('{"tokens":{"id_token":"fixture","account_id":"native"}}')
+        (home / "config.toml").write_text('model_provider = "openai"\n')
+        fs = RecordingFS()
+        signatures.classify_home(home, fs=fs)
+        names = [p.name for p, _ in fs.reads]
+        self.assertLess(names.index("auth.json"), names.index("session.jsonl"))
+        self.assertLess(names.index("config.toml"), names.index("session.jsonl"))
+
+    def test_partial_scan_keeps_cheap_identity_and_reject(self):
+        class ExhaustedSampleFS(RecordingFS):
+            elapsed = 0
+
+            def now(self):
+                return self.elapsed
+
+            def children(self, path):
+                for child in super().children(path):
+                    if path.name == "sessions":
+                        self.elapsed = 1
+                    yield child
+
+        home = self.home(".grok")
+        (home / "auth.json").write_text('{"tokens":{"id_token":"fixture","account_id":"native"}}')
+        for name, expected in ((".grok", "foreign"), ("native", "provider")):
+            path = home if name == ".grok" else home.rename(self.root / name)
+            result = signatures.classify_home(path, fs=ExhaustedSampleFS())
+            self.assertEqual(result["kind"], expected)
+            self.assertIn("scan.partial", result["evidence"])
+            if expected == "provider":
+                self.assertEqual(result["identity"]["accountKey"], signatures.account_key("codex", "native"))
+
+    def test_newest_date_and_project_directories_are_sampled_without_old_tree(self):
+        for layout in ("codex", "claude"):
+            with self.subTest(layout=layout):
+                home = self.root / layout
+                root = home / ("sessions" if layout == "codex" else "projects")
+                older = root / ("2025/01/01" if layout == "codex" else "older")
+                newer = root / ("2026/10/09" if layout == "codex" else "newer")
+                for directory in (older, newer):
+                    directory.mkdir(parents=True)
+                    for i in range(20):
+                        (directory / f"{i}.jsonl").write_text("{}\n")
+                os.utime(older, (1, 1))
+                os.utime(newer, (2, 2))
+                fs = RecordingFS()
+                files = signatures.sample_usage_files(home, (f"{root.name}/**/*.jsonl",), fs=fs, count=4)
+                self.assertEqual(len(files), 4)
+                self.assertTrue(all(p.parent == newer for p in files))
+                self.assertFalse(any(p.parent == older for p in fs.entries))
+                self.assertLessEqual(len([p for p in fs.entries if p.suffix == ".jsonl"]), 4)
+
+    def test_codex_index_and_state_presence_are_cheap_fingerprints(self):
+        for marker in ("session_index.jsonl", "state_5.sqlite"):
+            with self.subTest(marker=marker):
+                home = self.root / marker
+                home.mkdir()
+                (home / marker).write_text("")
+                result = signatures.classify_home(home)
+                self.assertEqual((result["provider"], result["kind"]), ("codex", "provider"))
+
+    def test_two_provider_fingerprints_are_conflicting_even_with_different_scores(self):
+        home = self.home("both", "claude")
+        (home / ".claude.json").write_text('{"oauthAccount":{"accountUuid":"claude"},"userID":"user"}')
+        (home / "auth.json").write_text('{"tokens":{"id_token":"fixture"}}')
+        self.assertEqual(signatures.classify_home(home)["kind"], "ambiguous")
 
     def test_codebuddy_brand_beats_claude_model(self):
         home = self.home("renamed", "claude")
@@ -107,6 +188,8 @@ class HomeSignatureTests(unittest.TestCase):
         (home / "config.toml").write_text('model = "gpt-fixture"\n')
         self.assertEqual(signatures.classify_home(home)["provider"], "codex")
         (home / "config.toml").write_text('this is not TOML')
+        self.assertIsNone(signatures.classify_home(home)["provider"])
+        (home / "config.toml").write_text('theme = "dark"\n')
         self.assertIsNone(signatures.classify_home(home)["provider"])
 
     def test_launcher_echo_is_not_an_assignment(self):

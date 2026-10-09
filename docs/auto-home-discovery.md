@@ -19,20 +19,34 @@ environment variables, default names, all/any structure markers, positive and
 negative weighted fingerprints, usage globs, identity JSON paths, and runtime
 globs. Supported fingerprint operations are file existence, JSON key/prefix,
 JSONL field prefix, usage filename regex, and root TOML key. Claude and Codex are
-providers; CodeBuddy, Grok CLI, and Kimi Code are foreign layout owners. Foreign
-homes remain with their existing readers and never enter Claude/Codex accounting.
+providers; CodeBuddy, Grok CLI, and Kimi Code are foreign layout owners.
+Automatically detected foreign homes remain with their existing readers and
+never enter Claude/Codex accounting; explicit homes follow the compatibility
+rule below.
 
-Classification requires score >= 6 and a margin >= 3 over the runner-up. Ties,
-weak evidence, or an expired IO budget fail closed for automatic tracking.
-Explicit default/adopted homes retain the previous reading behavior when there
-is no contradictory fingerprint; a foreign match or competing strong signatures
-still block them. Missing default homes stay visible for diagnosis.
+Classification evaluates all config/identity and reject fingerprints before
+reading JSONL. Claude uses the home's `.claude.json`; the standard `.claude`
+home falls back to HOME's `.claude.json` when its own file is absent. Codex uses
+`auth.json`, the root provider in `config.toml`, `session_index.jsonl`, and
+`state_*.sqlite` presence. Classification requires score >= 6 and a margin >= 3
+over the runner-up. Reject fingerprints override positive scores; conflicting
+provider fingerprints are ambiguous. A partial scan never demotes a positive
+cheap fingerprint. Generic directories with no positive CLI evidence are
+omitted, and confident homes appear only under their owning layout.
 
-Discovery is cached for ten minutes, with a five-second cycle budget and at most
-32 candidates per layout. Classification reads at most 64 KiB per file, the
-first 24 lines of the newest four JSONL files, and at most 50,000 filesystem
-entries per traversal within a 250 ms budget. A budget-limited classification
-cannot authorize tracking. Settings mutations invalidate discovery immediately.
+Default/adopted homes always retain the previous reading behavior, including
+foreign/conflicting fingerprints, missing directories, and exhausted budgets.
+An explicit exclusion still wins. Classification evidence remains visible.
+
+Discovery is cached for ten minutes, with at most 32 emitted candidates per
+layout. Candidate collection takes at most two seconds; each home has its own
+250 ms classification/inventory budget so one large corpus cannot starve later
+accounts. Classification reads at most 64 KiB per file and the first 24 lines
+of four sampled JSONL files. It visits newest Codex date directories and newest
+Claude project directories first, stopping at the sample size without listing
+or sorting the whole corpus. Within a leaf directory it uses scandir order.
+Partial work adds `scan.partial`; no reads fit in a zero budget (`scan.budget`).
+Settings mutations invalidate discovery immediately.
 
 ## States and usage
 
@@ -40,9 +54,23 @@ cannot authorize tracking. Settings mutations invalidate discovery immediately.
 | --- | --- |
 | `tracked` | Automatically reads usage and probes; default, adopted, auto, or launcher source |
 | `excluded` | User's off switch; takes precedence over automatic tracking and adoption |
-| `mirror` | At least 90% of session IDs already belong to earlier tracked homes; no unique usage or probe |
+| `mirror` | At least 90% of sampled/indexed session IDs belong to tracked homes; no unique usage or probe |
 | `foreign` | Another product owns the layout; no Claude/Codex usage or probe |
-| `ambiguous` | No confident winner; no automatic usage or probe |
+| `ambiguous` | Conflicting fingerprints; no automatic usage or probe |
+
+Mirror discovery samples at most 256 filenames and reads only session IDs from
+Codex's JSONL index (at most 8 MiB) and read-only SQLite `threads` indexes (at
+most 50,000 IDs). Matching relative file paths cover copies whose IDs were not
+sampled in the owner. Precedence is deterministic: default, adopted, launcher,
+direct HOME, then runtime account homes and runtime aggregate homes. Larger ID
+inventories precede subsets at the same priority. Explicit homes stay tracked.
+Without a complete index the 90% decision is a sample estimate; tracked homes
+still use the existing full usage dedup. Unsampled mirror files are checked
+against their original owners during usage scanning, so a unique tail is not
+counted and longer shared copies can still win.
+
+The diagnostic `files` count is a sampled/indexed lower bound for large homes;
+discovery never enumerates every rollout just to report an exact count.
 
 Mirrors participate in the existing inode and session-ID dedup so the longer
 copy still wins. Only their shared sessions survive; those tokens belong to the

@@ -1745,11 +1745,11 @@ def _discover_provider_homes(force: bool = False) -> Dict[str, List[Dict[str, An
             return 0 if "default" in sources else 1 if "adopted" in sources else 2 if "launcher" in sources or "env" in sources else 3 if "auto" in sources else 4
         ordered = sorted(explicit.values(), key=lambda row: (source_priority(row), str(row["path"])))
         for row in ordered:
-            if time.monotonic() >= deadline:
-                complete = False
-                break
             path = row["path"]
-            classification = home_signatures.classify_home(path, deadline=deadline)
+            # Every home gets its own budget. Large homes cannot starve the next
+            # account, and stats/mirror discovery cannot consume identity IO.
+            home_deadline = time.monotonic() + home_signatures.ScanLimits().seconds
+            classification = home_signatures.classify_home(path, deadline=home_deadline)
             providers = set(classification["layouts"]) | set(row.get("providers", []))
             for provider in providers:
                 if provider not in grouped:
@@ -1761,18 +1761,17 @@ def _discover_provider_homes(force: bool = False) -> Dict[str, List[Dict[str, An
                 entry = _home_settings(provider, settings)
                 excluded = any(_same_path(path, h) for h in _home_path_list(entry, "excluded"))
                 trusted = provider in row.get("providers", [])
-                # Preserve the diagnostic default and explicitly adopted empty
-                # profiles. Fingerprint conflicts and ambiguous matches still win.
+                # Generic projects/sessions/config directories are not CLI
+                # evidence. Keep ambiguous rows only for actual conflicts.
+                if not trusted and classification["kind"] in ("unknown", "ambiguous") and classification["score"] < 6:
+                    continue
+                # Explicit homes retain the pre-discovery reading behavior.
                 classified = classification["kind"] == "provider" and classification["provider"] == provider
-                fallback = (trusted and classification["kind"] in ("unknown", "ambiguous")
-                            and classification["score"] < 6
-                            and "scan.budget" not in classification["evidence"]
-                            and not any(e.startswith("reject.") for e in classification["evidence"]))
                 if "scan.budget" in classification["evidence"]:
                     complete = False
-                if "default" not in row["sources"] and not path.is_dir():
+                if not trusted and not path.is_dir():
                     continue
-                state = "foreign" if classification["kind"] == "foreign" else "tracked" if classified or fallback else "ambiguous"
+                state = "tracked" if trusted or classified else "foreign" if classification["kind"] == "foreign" else "ambiguous"
                 if excluded:
                     state = "excluded"
                 sources = list(row["sources"])
@@ -1781,34 +1780,45 @@ def _discover_provider_homes(force: bool = False) -> Dict[str, List[Dict[str, An
                     "path": path, "id": home_signatures.home_id(path), "source": source,
                     "sources": sources, "launchers": sorted(row["launchers"]),
                     "exists": path.is_dir(), "state": state, "tracked": state == "tracked", "excluded": excluded,
-                    "evidence": classification["evidence"], "identity": classification["identity"],
+                    "evidence": classification["evidence"], "identity": classification["identity"] if classified else {},
                     "stats": {"files": 0, "newestMtime": None, "capped": False},
                 }
-                if path.is_dir() and time.monotonic() < deadline:
-                    scan_status: Dict[str, Any] = {}
-                    files = list(home_signatures.usage_files(path, spec["usageGlobs"], deadline=deadline, limit=HOME_DISCOVERY_FILE_CAP, status=scan_status))
-                    stat_cache: Dict[str, Any] = {}
-                    mtimes = [stat.st_mtime for f in files if (stat := _stat_quiet(f, stat_cache))]
-                    candidate["stats"] = {"files": len(files), "newestMtime": max(mtimes, default=None),
-                                          "capped": bool(scan_status.get("capped"))}
-                    candidate["_sessionIds"] = {sid for f in files if (sid := _session_identity(f))}
+                candidate["_explicit"] = trusted
+                candidate["_priority"] = source_priority(row)
+                if path.is_dir():
+                    inventory = home_signatures.session_inventory(path, spec["usageGlobs"], deadline=home_deadline)
+                    candidate["stats"] = inventory["stats"]
+                    candidate["_sessionIds"] = inventory["sessions"]
+                    candidate["_sessionPaths"] = inventory["paths"]
+                    if inventory["partial"] and "scan.partial" not in candidate["evidence"]:
+                        candidate["evidence"] = candidate["evidence"] + ["scan.partial"]
                 grouped[provider].append(candidate)
         for candidates in grouped.values():
-            owners: Dict[str, str] = {}
-            for candidate in candidates:
+            owners: List[Dict[str, Any]] = []
+            # Stable precedence, independent of scandir/launcher enumeration.
+            # Runtime aggregate homes follow account homes; larger ID indexes
+            # precede subsets within the same source priority.
+            ranked = sorted(candidates, key=lambda c: (
+                c["_priority"], "codex-runtime-home" in c["path"].parts,
+                -len(c.get("_sessionIds", ())), str(c["path"]),
+            ))
+            for candidate in ranked:
                 if not candidate["tracked"]:
                     continue
-                sessions = candidate.pop("_sessionIds", set())
-                shared = sessions & owners.keys()
-                if sessions and len(shared) / len(sessions) >= 0.9 and not candidate["stats"]["capped"]:
+                sessions = candidate.get("_sessionIds", set())
+                shared = {}
+                for sid in sessions:
+                    relative = candidate.get("_sessionPaths", {}).get(sid)
+                    owner = _session_owner_in_homes(sid, relative, owners)
+                    if owner:
+                        shared[sid] = owner
+                if not candidate["_explicit"] and sessions and len(shared) / len(sessions) >= 0.9:
                     candidate.update(state="mirror", tracked=False)
                     candidate["evidence"] = candidate["evidence"] + ["sessions.mirror"]
-                    candidate["_mirrorOwners"] = {sid: owners[sid] for sid in shared}
+                    candidate["_mirrorOwners"] = shared
+                    candidate["_mirrorSourceIds"] = [owner["id"] for owner in owners]
                 else:
-                    for sid in sessions:
-                        owners.setdefault(sid, candidate["id"])
-            for candidate in candidates:
-                candidate.pop("_sessionIds", None)
+                    owners.append(candidate)
         _HOME_CANDIDATES_VALUE, _HOME_CANDIDATES_KEY = grouped, cache_key
         _HOME_CANDIDATES_AT = time.monotonic()
         _HOME_CANDIDATES_COMPLETE = complete
@@ -1841,7 +1851,27 @@ def _usage_home_id(provider: str, path: Path) -> Optional[str]:
         if candidate["state"] == "tracked":
             return candidate["id"]
         if candidate["state"] == "mirror":
-            return candidate.get("_mirrorOwners", {}).get(_session_identity(path))
+            sid = _session_identity(path)
+            if not sid:
+                return None
+            owners = candidate["_mirrorOwners"]
+            if sid not in owners:
+                sources = [c for c in _HOME_CANDIDATES_VALUE.get(provider, [])
+                           if c["id"] in candidate["_mirrorSourceIds"]]
+                owners[sid] = _session_owner_in_homes(sid, path.relative_to(candidate["path"]), sources)
+            return owners[sid]
+    return None
+
+
+def _session_owner_in_homes(session: str, relative: Optional[Path], homes: List[Dict[str, Any]]) -> Optional[str]:
+    """Indexes cover moved files; direct path checks cover unsampled copies."""
+    for home in homes:
+        if session in home.get("_sessionIds", ()):
+            return home["id"]
+        if relative is not None:
+            original = home["path"] / relative
+            if original.is_file() and not original.is_symlink():
+                return home["id"]
     return None
 
 
