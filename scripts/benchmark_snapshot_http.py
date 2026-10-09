@@ -50,6 +50,12 @@ def run():
             serving.start()
             building.start()
             entered.wait()
+            activity_stop = threading.Event()
+            sampler = None
+            if hasattr(module, "activity_refresh_loop"):
+                sampler = threading.Thread(target=module.activity_refresh_loop,
+                                           args=(module.ACTIVITY_REFRESH_INTERVAL_SECONDS, activity_stop))
+                sampler.start()
             try:
                 for suffix in ("?sections=activity", ""):
                     timings = []
@@ -61,10 +67,15 @@ def run():
                         with urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}/v1/snapshot{suffix}", timeout=5) as response:
                             response.read()
                         timings.append((time.perf_counter() - start) * 1000)
+                        # Span multiple real 2s sampling ticks; pacing is outside timing.
+                        time.sleep(0.025)
                     print(json.dumps({"endpoint": "/v1/snapshot" + suffix, "requests": 100,
                                       "p50_ms": round(statistics.median(timings), 3),
                                       "p95_ms": round(sorted(timings)[94], 3)}), flush=True)
             finally:
+                activity_stop.set()
+                if sampler is not None:
+                    sampler.join()
                 release.set()
                 building.join()
                 server.shutdown()

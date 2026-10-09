@@ -24,6 +24,7 @@ class SnapshotHTTPCacheTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.original = redirect_module_paths(agentcat, Path(self.temp.name), Path(self.temp.name) / ".agentcat")
         agentcat._HTTP_SNAPSHOT_CACHE = None
+        agentcat._HTTP_ACTIVITY_CACHE = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
@@ -33,6 +34,7 @@ class SnapshotHTTPCacheTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
         agentcat._HTTP_SNAPSHOT_CACHE = None
+        agentcat._HTTP_ACTIVITY_CACHE = None
         restore_module_paths(agentcat, self.original)
         self.temp.cleanup()
 
@@ -107,3 +109,73 @@ class SnapshotHTTPCacheTests(unittest.TestCase):
                     self.assertNotIn("providers", self.get("?sections=servedAt"))
             else:
                 self.assertIsNone(agentcat.snapshot_for_http())
+
+    def test_activity_stays_fresh_during_blocked_build_without_request_scans(self):
+        interval = agentcat.ACTIVITY_REFRESH_INTERVAL_SECONDS
+        previous = {"generatedAt": "old", "providers": {}, "activity": {"status": "old"}}
+        agentcat.publish_http_snapshot(previous)
+        entered, release, sampled, stop = (threading.Event() for _ in range(4))
+        calls = []
+        def build():
+            entered.set()
+            release.wait()
+            return {**previous, "generatedAt": "new"}
+        def sample():
+            self.assertIs(threading.current_thread(), sampler)
+            calls.append(time.monotonic())
+            sampled.set()
+            return {"status": "ok", "sampledMonotonic": calls[-1],
+                    "updatedAt": agentcat.now_iso(), "processCount": len(calls) % 2}
+        sampler = threading.Thread(target=agentcat.activity_refresh_loop, args=(interval, stop))
+        worker = threading.Thread(target=agentcat.build_snapshot)
+        with patch.object(agentcat, "_build_snapshot_impl", side_effect=build), \
+             patch.object(agentcat, "terminal_activity_snapshot", side_effect=sample), \
+             patch.object(agentcat.subprocess, "run", side_effect=AssertionError("unexpected ps")) as ps:
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            sampler.start()
+            try:
+                self.assertTrue(sampled.wait(1))
+                seen = set()
+                deadline = time.monotonic() + 3 * interval
+                while time.monotonic() < deadline:
+                    for suffix in ("?sections=activity", ""):
+                        payload = self.get(suffix)
+                        activity = payload["activity"]
+                        self.assertLess(time.monotonic() - activity["sampledMonotonic"], 2 * interval)
+                        self.assertEqual(payload["generatedAt"], "old")
+                        seen.add(activity["sampledMonotonic"])
+                    time.sleep(interval / 8)
+                self.assertGreaterEqual(len(seen), 3)
+                # Even a later publication of the old build sample cannot regress activity.
+                release.set()
+                worker.join(1)
+                self.assertEqual(self.get()["generatedAt"], "new")
+                self.assertEqual(self.get()["activity"]["status"], "ok")
+                ps.assert_not_called()
+            finally:
+                stop.set()
+                release.set()
+                sampler.join(1)
+                worker.join(1)
+        self.assertFalse(sampler.is_alive())
+
+    def test_sampler_reports_failure_and_recovers(self):
+        agentcat.publish_http_snapshot({"providers": {}, "activity": {"status": "old"}})
+        stop = threading.Event()
+        # Stop each iteration after it publishes so both failure and recovery are observable.
+        def fail():
+            stop.set()
+            raise RuntimeError("synthetic sample failure")
+        with patch.object(agentcat, "terminal_activity_snapshot", side_effect=fail):
+            agentcat.activity_refresh_loop(0.01, stop)
+        failed = self.get("?sections=activity")["activity"]
+        self.assertEqual(failed["status"], "error")
+        self.assertIn("updatedAt", failed)
+        stop.clear()
+        def recover():
+            stop.set()
+            return {"status": "ok", "updatedAt": "recovered"}
+        with patch.object(agentcat, "terminal_activity_snapshot", side_effect=recover):
+            agentcat.activity_refresh_loop(0.01, stop)
+        self.assertEqual(self.get()["activity"]["updatedAt"], "recovered")

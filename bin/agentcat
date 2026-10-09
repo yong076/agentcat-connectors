@@ -14253,6 +14253,28 @@ def _build_snapshot_impl() -> Dict[str, Any]:
 
 # Published as one immutable generation; readers never acquire the build lock.
 _HTTP_SNAPSHOT_CACHE: Optional[Tuple[bytes, Dict[str, bytes]]] = None
+_HTTP_ACTIVITY_CACHE: Optional[bytes] = None
+# TerminalAgentMonitor polls every 2s while active (20s while idle).
+ACTIVITY_REFRESH_INTERVAL_SECONDS = 2.0
+
+
+def activity_refresh_loop(interval_seconds: float = ACTIVITY_REFRESH_INTERVAL_SECONDS,
+                          stop: Optional[threading.Event] = None) -> None:
+    """Sample immediately, then at a short cadence independent of snapshot builds."""
+    global _HTTP_ACTIVITY_CACHE
+    stop = stop if stop is not None else threading.Event()
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            activity = terminal_activity_snapshot()
+        except Exception as exc:
+            # Publish failure rather than silently keeping an old healthy sample.
+            activity = {"status": "error", "updatedAt": now_iso(),
+                        "error": log_safe_error(exc)}
+        encoded = json.dumps(activity, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        _HTTP_ACTIVITY_CACHE = b'"activity":' + encoded
+        # Account for sampling time; never overlap scans or take the build lock.
+        stop.wait(max(0.0, interval_seconds - (time.monotonic() - started)))
 
 
 def publish_http_snapshot(snapshot: Dict[str, Any]) -> None:
@@ -14264,14 +14286,15 @@ def publish_http_snapshot(snapshot: Dict[str, Any]) -> None:
         json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         for key, value in snapshot.items() if key != "servedAt"
     }
-    body = b",".join(sections.values())
+    body = b",".join(value for key, value in sections.items() if key != "activity")
     _HTTP_SNAPSHOT_CACHE = (body, sections)
 
 
 def initialize_http_snapshot_cache() -> None:
     """Read the previous generation once, before accepting HTTP requests."""
-    global _HTTP_SNAPSHOT_CACHE
+    global _HTTP_SNAPSHOT_CACHE, _HTTP_ACTIVITY_CACHE
     _HTTP_SNAPSHOT_CACHE = None
+    _HTTP_ACTIVITY_CACHE = None
     cached = read_json(LATEST_SNAPSHOT)
     if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
         publish_http_snapshot(cached)
@@ -14323,15 +14346,23 @@ def snapshot_for_http(requested: str = "") -> Optional[Tuple[bytes, ...]]:
     if cache is None:
         return None
     body, sections = cache
+    # A completed slow build must never overwrite a newer short-loop sample.
+    activity = _HTTP_ACTIVITY_CACHE
+    if activity is None:
+        activity = sections.get("activity")
     keep = {name.strip() for name in requested.split(",") if name.strip()}
-    if keep and ("servedAt" in keep or any(key in keep for key in sections)):
+    if keep and ("servedAt" in keep or ("activity" in keep and activity is not None)
+                 or any(key in keep for key in sections)):
         body = b",".join(value for key, value in sections.items()
-                         if key in keep or key in _SNAPSHOT_ENVELOPE_KEYS)
-    # servedAt is transport time, never a replacement for generatedAt or quota
-    # freshness. Activity, desktopApps and update retain their last build sample.
+                         if key != "activity" and (key in keep or key in _SNAPSHOT_ENVELOPE_KEYS))
+        if "activity" not in keep:
+            activity = None
+    # servedAt is transport time. Activity has its own updatedAt; provider
+    # generatedAt and quota freshness still refer to the last full build.
     served = b'"servedAt":' + json.dumps(now_iso()).encode("utf-8")
     # Keep the large full-body buffer intact, including on the socket write.
-    return (b"{" + served + (b"," if body else b""), body, b"}")
+    return (b"{" + served, b"," if body else b"", body,
+            b"," if activity else b"", activity or b"", b"}")
 
 
 def snapshot_refresh_loop(interval_seconds: float) -> None:
@@ -18955,6 +18986,12 @@ def run_daemon(args: argparse.Namespace) -> int:
             print(f"agentcatd initial snapshot build failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
         snapshot_refresh_loop(60.0)
 
+    activity_stop = threading.Event()
+    activity_thread = threading.Thread(
+        target=activity_refresh_loop, args=(ACTIVITY_REFRESH_INTERVAL_SECONDS, activity_stop),
+        daemon=True,
+    )
+    activity_thread.start()
     threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
     threading.Thread(
         target=cli_probe_loop,
@@ -18989,6 +19026,7 @@ def run_daemon(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        activity_stop.set()
         shutdown_codex_app_servers()
         server.server_close()
     return 0
