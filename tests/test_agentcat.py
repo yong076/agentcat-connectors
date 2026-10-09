@@ -4118,6 +4118,48 @@ class AgentCatConnectorTests(unittest.TestCase):
                 finally:
                     writer.close()
 
+    def test_foreign_sqlite_retries_unstable_private_copies(self) -> None:
+        for checkpoint in (False, True):
+            for changes in (1, 3):
+                with self.subTest(checkpoint=checkpoint, changes=changes):
+                    database = self.root / f"copy-{checkpoint}-{changes}.db"
+                    with closing(sqlite3.connect(database)) as writer:
+                        writer.execute("pragma journal_mode=wal")
+                        writer.execute("create table fixture (value integer)")
+                        writer.execute("insert into fixture values (1)")
+                        writer.commit()
+                        copied_databases = []
+                        real_copy = agentcat.shutil.copyfile
+                        temp_roots = []
+
+                        def copy(source, target):
+                            self.assertFalse(str(source).endswith("-shm"))
+                            result = real_copy(source, target)
+                            temp_roots.append(Path(target).parent)
+                            if Path(source).resolve() == database.resolve():
+                                copied_databases.append(source)
+                                if len(copied_databases) <= changes:
+                                    writer.execute("insert into fixture values (?)", (len(copied_databases) + 1,))
+                                    writer.commit()
+                                    if checkpoint:
+                                        writer.execute("pragma wal_checkpoint(truncate)")
+                            return result
+
+                        def read(connection):
+                            location = connection.execute("pragma database_list").fetchone()[2]
+                            if Path(location).resolve() == database.resolve():
+                                raise sqlite3.OperationalError("unable to open database file")
+                            return connection.execute("select value from fixture order by value").fetchall()
+
+                        with patch.object(agentcat.shutil, "copyfile", side_effect=copy):
+                            if changes == 3:
+                                with self.assertRaisesRegex(sqlite3.OperationalError, "changed while copying"):
+                                    agentcat.read_foreign_sqlite(database, read)
+                            else:
+                                self.assertEqual(agentcat.read_foreign_sqlite(database, read), [(1,), (2,)])
+                        self.assertEqual(len(copied_databases), 3 if changes == 3 else 2)
+                        self.assertTrue(all(not folder.exists() for folder in temp_roots))
+
     def test_foreign_sqlite_retries_failed_read_on_private_copy(self) -> None:
         database = self.root / "retry.db"
         with closing(sqlite3.connect(database)) as writer:

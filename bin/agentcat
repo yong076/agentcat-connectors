@@ -12108,6 +12108,16 @@ def _antigravity_db_signature(database: Path) -> Optional[Tuple[int, int, int, i
     return (stat.st_size, stat.st_mtime_ns, wal_sig[0], wal_sig[1])
 
 
+def _foreign_sqlite_signature(database: Path) -> Tuple[int, int, int, int]:
+    stat = database.stat()
+    try:
+        wal = database.with_name(database.name + "-wal").stat()
+        wal_sig = (wal.st_size, wal.st_mtime_ns)
+    except FileNotFoundError:
+        wal_sig = (-1, -1)
+    return (stat.st_size, stat.st_mtime_ns, *wal_sig)
+
+
 def read_foreign_sqlite(
     database: Path, read: Callable[[sqlite3.Connection], Any], *, timeout: float = 5.0,
 ) -> Any:
@@ -12149,19 +12159,27 @@ def read_foreign_sqlite(
             break
         except OSError:
             break
-    with tempfile.TemporaryDirectory(prefix="agentcat-sqlite-") as temp_dir:
-        copied = Path(temp_dir) / "database.db"
-        shutil.copyfile(database, copied)
-        for suffix in ("-wal", "-shm"):
+    # Retry two times if a writer changes the DB/WAL while they are copied.
+    # Each attempt gets a new directory so vanished WALs cannot leave old frames.
+    for attempt in range(3):
+        with tempfile.TemporaryDirectory(prefix="agentcat-sqlite-") as temp_dir:
+            copied = Path(temp_dir) / "database.db"
             try:
-                shutil.copyfile(
-                    database.with_name(database.name + suffix),
-                    copied.with_name(copied.name + suffix),
-                )
+                before = _foreign_sqlite_signature(database)
+                shutil.copyfile(database, copied)
+                if before[2] != -1:
+                    shutil.copyfile(database.with_name(database.name + "-wal"),
+                                    copied.with_name(copied.name + "-wal"))
+                after = _foreign_sqlite_signature(database)
             except FileNotFoundError:
+                # The owner may checkpoint and remove its WAL between stat/copy.
                 continue
-        with closing(sqlite3.connect(str(copied), timeout=timeout)) as connection:
-            return read(connection)
+            if before != after:
+                continue
+            # Never copy the owner's shared-memory index; SQLite rebuilds it here.
+            with closing(sqlite3.connect(str(copied), timeout=timeout)) as connection:
+                return read(connection)
+    raise sqlite3.OperationalError("foreign database changed while copying")
 
 
 def antigravity_read_gen_rows(database: Path) -> List[Any]:
