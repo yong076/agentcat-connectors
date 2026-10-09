@@ -12118,6 +12118,23 @@ def _foreign_sqlite_signature(database: Path) -> Tuple[int, int, int, int]:
     return (stat.st_size, stat.st_mtime_ns, *wal_sig)
 
 
+def _foreign_sqlite_copy_error(exc: sqlite3.Error) -> bool:
+    """Copy only for source access, locking, I/O or damaged database errors."""
+    message = str(exc).lower()
+    if any(text in message for text in ("no such column", "no such table", "syntax error")):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        # Mask extended codes (including READONLY_CANTINIT and IOERR_SHMOPEN).
+        return (code & 0xff) in (5, 6, 8, 10, 11, 14, 15, 26)
+    # Python 3.9/3.10 do not attach SQLite result codes to exceptions.
+    return any(text in message for text in (
+        "unable to open database", "database is locked", "database table is locked",
+        "database schema is locked", "disk i/o error", "database disk image is malformed",
+        "file is not a database", "readonly database", "read-only database", "locking protocol",
+    ))
+
+
 def read_foreign_sqlite(
     database: Path, read: Callable[[sqlite3.Connection], Any], *, timeout: float = 5.0,
 ) -> Any:
@@ -12161,7 +12178,7 @@ def read_foreign_sqlite(
                     continue
             return result
         except sqlite3.Error as exc:
-            if "no such table" in str(exc):
+            if not _foreign_sqlite_copy_error(exc):
                 raise
             break
         except OSError:

@@ -4209,6 +4209,52 @@ class AgentCatConnectorTests(unittest.TestCase):
             self.assertEqual({p.name: (p.stat().st_size, p.stat().st_mtime_ns, p.read_bytes())
                               for p in folder.iterdir()}, before)
 
+    def test_foreign_sqlite_schema_errors_never_copy(self) -> None:
+        for live_wal in (False, True):
+            database = self.root / f"schema-{live_wal}.db"
+            writer = sqlite3.connect(database)
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("create table fixture (value integer)")
+            writer.commit()
+            if not live_wal:
+                writer.close()
+            try:
+                for sql, message in (("select missing from fixture", "no such column"),
+                                     ("select * from missing", "no such table"),
+                                     ("select from fixture", "syntax error")):
+                    with self.subTest(live_wal=live_wal, sql=sql), patch.object(
+                            agentcat.shutil, "copyfile", side_effect=AssertionError("must not copy")):
+                        with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                            agentcat.read_foreign_sqlite(database, lambda conn: conn.execute(sql).fetchall())
+            finally:
+                writer.close()
+
+    def test_foreign_sqlite_copy_fallback_is_limited_to_recoverable_errors(self) -> None:
+        database = self.root / "errors.db"
+        with closing(sqlite3.connect(database)) as writer:
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+        for message in ("database is locked", "disk I/O error", "database disk image is malformed",
+                        "file is not a database", "attempt to write a readonly database", "interrupted"):
+            with self.subTest(message=message):
+                calls = []
+
+                def read(connection):
+                    calls.append(connection)
+                    if len(calls) == 1:
+                        raise sqlite3.OperationalError(message)
+                    return connection.execute("select value from fixture").fetchall()
+
+                if message == "interrupted":
+                    with patch.object(agentcat.shutil, "copyfile", side_effect=AssertionError("must not copy")):
+                        with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                            agentcat.read_foreign_sqlite(database, read)
+                    self.assertEqual(len(calls), 1)
+                else:
+                    self.assertEqual(agentcat.read_foreign_sqlite(database, read), [(123,)])
+                    self.assertEqual(len(calls), 2)
+
     def test_foreign_sqlite_retries_failed_read_on_private_copy(self) -> None:
         database = self.root / "retry.db"
         with closing(sqlite3.connect(database)) as writer:
