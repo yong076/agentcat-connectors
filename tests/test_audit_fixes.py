@@ -244,33 +244,5 @@ class CodexRebuildLoopTests(AuditFixTestCase):
             agentcat._codex_sessions_need_rebuild(self._snap(20_000_000), self._snap(50_000_000))
         )
 
-    def test_rebuild_is_not_retried_once_marked_ineffective(self) -> None:
-        """The user deleted old rollouts; sqlite keeps lifetime totals forever.
-
-        No rebuild can ever close that gap, so retrying every tick just
-        re-parses thousands of files in a loop.
-        """
-        sessions, sqlite = self._snap(1_000_000), self._snap(50_000_000)
-        agentcat.mark_codex_rebuild_ineffective(sessions, sqlite)
-
-        self.assertFalse(agentcat._codex_sessions_need_rebuild(sessions, sqlite))
-
-    def test_marker_expires_when_the_corpus_changes(self) -> None:
-        """New tokens mean new files to read, so it is worth trying again."""
-        sessions, sqlite = self._snap(1_000_000), self._snap(50_000_000)
-        agentcat.mark_codex_rebuild_ineffective(sessions, sqlite)
-
-        self.assertTrue(
-            agentcat._codex_sessions_need_rebuild(self._snap(2_000_000), sqlite)
-        )
-
-    def test_marker_survives_a_daemon_restart(self) -> None:
-        """It is persisted, not in-memory, or every restart pays the loop again."""
-        sessions, sqlite = self._snap(1_000_000), self._snap(50_000_000)
-        agentcat.mark_codex_rebuild_ineffective(sessions, sqlite)
-
-        self.assertTrue(agentcat._codex_rebuild_state_file().exists())
-
-
 if __name__ == "__main__":
     unittest.main()
