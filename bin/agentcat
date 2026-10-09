@@ -12968,19 +12968,24 @@ def executable_path(command: str, *, windows: Optional[bool] = None) -> Optional
         return Path(value.replace("\\", "/")).name.lower()
 
     executable = basename(first)
-    if executable in {"node", "node.exe"} and len(parts) > 1:
+    if re.fullmatch(r"(?:python(?:3(?:\.\d+)?)?|node|bun|deno)(?:\.exe)?", executable):
+        is_python = executable.startswith("python")
         arguments = iter(parts[1:])
         for part in arguments:
             # Inline code and option values are not executable script names.
-            if part in {"-e", "--eval", "-p", "--print"} or part.startswith(("--eval=", "--print=")):
+            if part in {"-", "-c", "-m", "-e", "--eval", "-p", "--print", "eval"} or part.startswith(("--eval=", "--print=")):
                 return None
-            if part in {"-r", "--require", "--import", "--loader", "--experimental-loader"}:
+            if part in {"-r", "--require", "--import", "--loader", "--experimental-loader", "-W", "-X"}:
                 next(arguments, None)
                 continue
+            if is_python and part.startswith(("-c", "-m")):
+                return None
             if part.startswith("-"):
                 continue
-            first = part
-            break
+            if executable.removesuffix(".exe") in {"bun", "deno"} and part == "run":
+                continue
+            return part
+        return None
     return first
 
 
@@ -13029,25 +13034,33 @@ def classify_process(command: str, *, windows: Optional[bool] = None) -> Optiona
         return None
 
     # Package-based wrappers must match the executed script, never its arguments.
-    if executable in {"codex", "codex.exe", "codex.cmd"} or "@openai/codex" in executable_path_normalized:
+    if executable in {"codex", "codex.exe", "codex.cmd"} or re.search(r"(?:^|/)@openai/codex/bin/codex\.(?:m|c)?js$", executable_path_normalized):
         return "codex"
-    if executable in {"claude", "claude.exe", "claude.cmd"} or "@anthropic-ai/claude" in executable_path_normalized or "claude-code" in executable_path_normalized:
+    if executable in {"claude", "claude.exe", "claude.cmd"} or re.search(r"(?:^|/)@anthropic-ai/claude-code/cli\.(?:m|c)?js$", executable_path_normalized):
         return "claude"
     if (
         executable in {"agy", "agy.exe", "antigravity", "antigravity.exe", "antigravity-cli"}
         or "/.gemini/antigravity-cli/" in executable_path_normalized
-        or "com.google.antigravity" in executable_path_normalized
+        or "/com.google.antigravity/" in executable_path_normalized
     ):
         return "antigravity"
     if (
         executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli"}
-        or "@google/gemini" in executable_path_normalized
+        or re.search(r"(?:^|/)@google/gemini-cli/(?:index|dist/index|bundle/gemini)\.(?:m|c)?js$", executable_path_normalized)
     ):
         return "gemini"
     if executable in {"kimi", "kimi.exe", "kimi.cmd", "kimi-code", "kimi-code.exe", "kimi-code.cmd"}:
         return "kimi"
     if executable in {"grok", "grok.exe", "grok.cmd", "grok-code", "grok-code.exe", "grok-code.cmd", "grock"}:
         return "grok"
+    if executable in {"hermes", "hermes.exe", "hermes.cmd"}:
+        return "hermes"
+    if executable in {"opencode", "opencode.exe", "opencode.cmd"}:
+        return "opencode"
+    if executable in {"copilot", "copilot.exe", "copilot.cmd"} or re.search(
+        r"(?:^|/)@github/copilot/(?:index|dist/index)\.(?:m|c)?js$", executable_path_normalized
+    ):
+        return "copilot"
     return None
 
 
@@ -13206,12 +13219,12 @@ $ErrorActionPreference = 'SilentlyContinue'
 # sample, so no second-sample delta is needed. Without this, CPU was always 0.
 $perf = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | Group-Object IDProcess -AsHashTable -AsString
 # Match image names, never prompt text or a directory containing a provider name.
-$candidatePattern = '^(codex|claude|gemini|gemini-cli|agy|antigravity|antigravity-cli|kimi|kimi-code|grok|grok-code|grock|node)(\.(exe|cmd))?$'
+$candidatePattern = '^(codex|claude|gemini|gemini-cli|agy|antigravity|antigravity-cli|kimi|kimi-code|grok|grok-code|grock|hermes|opencode|copilot|node|bun|deno|python(?:3(?:\.\d+)?)?)(\.(exe|cmd))?$'
 $processes = @(Get-Process)
 $rows = @(
 $processes |
   Where-Object {
-    $_.ProcessName -match $candidatePattern -and $_.ProcessName -notmatch '^node(\.exe)?$'
+    $_.ProcessName -match $candidatePattern -and $_.ProcessName -notmatch '^(node|bun|deno|python(?:3(?:\.\d+)?)?)(\.exe)?$'
   } |
   ForEach-Object {
     $cpu = 0
@@ -13228,13 +13241,13 @@ $processes |
   }
 )
 $includeNative = -not $rows
-# Node's image path cannot identify its CLI script. Collect its command line
+# Interpreter image paths cannot identify CLI scripts. Collect their command lines
 # even when native CLIs were found, without counting the native rows twice.
-if ($includeNative -or ($processes | Where-Object { $_.ProcessName -match '^node(\.exe)?$' })) {
+if ($includeNative -or ($processes | Where-Object { $_.ProcessName -match '^(node|bun|deno|python(?:3(?:\.\d+)?)?)(\.exe)?$' })) {
   $rows += @(
   Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,WorkingSetSize |
     Where-Object {
-      $_.Name -match $candidatePattern -and ($includeNative -or $_.Name -match '^node(\.exe)?$')
+      $_.Name -match $candidatePattern -and ($includeNative -or $_.Name -match '^(node|bun|deno|python(?:3(?:\.\d+)?)?)(\.exe)?$')
     } |
     ForEach-Object {
       $cpu = 0

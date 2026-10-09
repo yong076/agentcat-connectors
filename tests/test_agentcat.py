@@ -4541,6 +4541,103 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual((snapshot.get("projects") or {}).get("items") or [], [])
         self.assertEqual(snapshot["sources"]["workspaceFolders"], 1)
 
+    def test_process_scan_agent_entrypoint_fixtures(self) -> None:
+        fixtures = (
+            ("/opt/bin/codex --prompt hello", "codex"),
+            ("node /opt/node_modules/@openai/codex/bin/codex.js", "codex"),
+            ("node /opt/node_modules/@openai/codex/bin/codex.mjs", "codex"),
+            ("node /opt/node_modules/@openai/codex/bin/codex.cjs", "codex"),
+            ("/opt/bin/claude --prompt hello", "claude"),
+            ("node /opt/node_modules/@anthropic-ai/claude-code/cli.js", "claude"),
+            ("node /opt/node_modules/@anthropic-ai/claude-code/cli.mjs", "claude"),
+            ("node /opt/node_modules/@anthropic-ai/claude-code/cli.cjs", "claude"),
+            ("node /opt/node_modules/@google/gemini-cli/dist/index.js", "gemini"),
+            ("node /opt/node_modules/@google/gemini-cli/dist/index.mjs", "gemini"),
+            ("node /opt/node_modules/@google/gemini-cli/dist/index.cjs", "gemini"),
+            ("/opt/bin/gemini", "gemini"),
+            ("/opt/bin/agy", "antigravity"),
+            ("/opt/bin/antigravity-cli", "antigravity"),
+            ("/opt/bin/kimi-code", "kimi"),
+            ("/opt/bin/grok-code", "grok"),
+            ("/opt/bin/grock", "grok"),
+            ("/opt/bin/hermes", "hermes"),
+            ("python3.9 /opt/venv/bin/hermes", "hermes"),
+            ("/opt/bin/opencode", "opencode"),
+            ("node /opt/node_modules/opencode-ai/bin/opencode", "opencode"),
+            ("/opt/bin/copilot", "copilot"),
+            ("node /opt/node_modules/@github/copilot/index.js", "copilot"),
+            ("node /opt/node_modules/@github/copilot/index.mjs", "copilot"),
+            ("node /opt/node_modules/@github/copilot/index.cjs", "copilot"),
+            ("bun run /opt/node_modules/@github/copilot/index.js", "copilot"),
+            ("deno run /opt/node_modules/@anthropic-ai/claude-code/cli.js", "claude"),
+        )
+        for command, provider in fixtures:
+            with self.subTest(command=command):
+                self.assertEqual(agentcat.classify_process(command, windows=False), provider)
+        for provider in ("opencode", "copilot", "hermes"):
+            with self.subTest(provider=provider):
+                self.assertEqual(agentcat.classify_process(
+                    '"C:\\Program Files\\Agents\\' + provider + '.exe"', windows=True
+                ), provider)
+
+    def test_process_scan_rejects_report_scripts_and_argument_mentions(self) -> None:
+        for interpreter in ("python", "python3", "python3.9", "node", "bun", "deno"):
+            for script in (
+                "~/scripts/claude_report.py",
+                "/home/example/codex/report.js",
+                "/home/example/claude-code/report.js",
+                "/opt/@anthropic-ai/claude-code-backup/cli.js",
+                "/opt/@openai/codex-report/bin/codex.js",
+                "/opt/@github/copilot-backup/index.js",
+                "/opt/@google/gemini-cli-report/dist/index.js",
+                "worker.js --prompt claude",
+                "worker.js /opt/@anthropic-ai/claude-code/cli.js",
+                "-e claude",
+            ):
+                command = interpreter + " " + script
+                with self.subTest(command=command):
+                    self.assertIsNone(agentcat.classify_process(command, windows=False))
+        for command in ("python3 -c claude", "python3 -m claude", "python3 -cpass claude", "python3 -mhttp.server codex", "echo claude", "node --require claude worker.js"):
+            with self.subTest(command=command):
+                self.assertIsNone(agentcat.classify_process(command, windows=False))
+
+    def test_process_scan_new_providers_use_existing_motion_logic(self) -> None:
+        for provider in ("opencode", "copilot"):
+            for cpu, state, stage in ((0.0, "S", "walking"), (4.0, "R", "running")):
+                completed = agentcat.subprocess.CompletedProcess(
+                    args=["ps"], returncode=0, stderr="",
+                    stdout=f"101 1 {cpu} 1024 {state} /opt/bin/{provider}\n"
+                           "102 1 30.0 1024 R python3 ~/scripts/claude_report.py\n",
+                )
+                with self.subTest(provider=provider, stage=stage), \
+                     patch.object(agentcat, "IS_WINDOWS", False), \
+                     patch.object(agentcat.subprocess, "run", return_value=completed), \
+                     patch.object(agentcat, "safe_runtime_modes_snapshot", return_value=[]):
+                    snapshot = agentcat.terminal_activity_snapshot()
+                self.assertEqual(snapshot["processCount"], 1)
+                self.assertEqual(snapshot["countsByProvider"][provider], 1)
+                self.assertEqual(snapshot["countsByProvider"]["claude"], 0)
+                self.assertEqual(snapshot["motionStage"], stage)
+                self.assertEqual(snapshot["processes"][0]["kind"], provider)
+
+    def test_windows_process_scan_opencode_and_copilot_running(self) -> None:
+        for provider, command in (
+            ("opencode", r'C:\Tools\opencode.exe'),
+            ("copilot", r'node.exe C:\Tools\node_modules\@github\copilot\index.js'),
+        ):
+            completed = agentcat.subprocess.CompletedProcess(
+                ["powershell.exe"], 0,
+                json.dumps([{"ProcessId": 101, "CommandLine": command,
+                             "CpuPercent": 4, "WorkingSetSize": 1024}]), "",
+            )
+            with self.subTest(provider=provider), \
+                 patch.object(agentcat.subprocess, "run", return_value=completed), \
+                 patch.object(agentcat, "safe_runtime_modes_snapshot", return_value=[]):
+                snapshot = agentcat.terminal_activity_snapshot_windows()
+            self.assertEqual(snapshot["countsByProvider"][provider], 1)
+            self.assertEqual(snapshot["motionStage"], "running")
+            self.assertEqual(snapshot["processes"][0]["state"], "running")
+
     def test_classify_gemini_node_wrapper_processes(self) -> None:
         self.assertEqual(
             agentcat.classify_process("node --no-warnings=DEP0040 /opt/homebrew/bin/gemini"),
@@ -4849,7 +4946,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             agentcat.terminal_activity_snapshot_windows()
         script = run.call_args.args[0][-1]
         pattern = agentcat.re.search(r"\$candidatePattern = '([^']+)'", script).group(1)
-        for name in ("kimi", "kimi-code", "grok", "grok-code", "node"):
+        for name in ("kimi", "kimi-code", "grok", "grok-code", "hermes", "opencode", "copilot", "node", "bun", "deno", "python", "python3", "python3.9"):
             for suffix in ("", ".exe", ".cmd"):
                 with self.subTest(name=name, suffix=suffix):
                     self.assertRegex(name + suffix, pattern)
