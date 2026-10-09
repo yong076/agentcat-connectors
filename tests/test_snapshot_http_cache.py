@@ -2,6 +2,8 @@
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
 import threading
@@ -25,6 +27,9 @@ class SnapshotHTTPCacheTests(unittest.TestCase):
         self.original = redirect_module_paths(agentcat, Path(self.temp.name), Path(self.temp.name) / ".agentcat")
         agentcat._HTTP_SNAPSHOT_CACHE = None
         agentcat._HTTP_ACTIVITY_CACHE = None
+        self.refresh_patch = patch.object(agentcat, "refresh_activity_if_stale")
+        self.refresh_patch.start()
+        self.addCleanup(self.refresh_patch.stop)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), agentcat.AgentCatHandler)
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
@@ -110,72 +115,94 @@ class SnapshotHTTPCacheTests(unittest.TestCase):
             else:
                 self.assertIsNone(agentcat.snapshot_for_http())
 
-    def test_activity_stays_fresh_during_blocked_build_without_request_scans(self):
-        interval = agentcat.ACTIVITY_REFRESH_INTERVAL_SECONDS
-        previous = {"generatedAt": "old", "providers": {}, "activity": {"status": "old"}}
-        agentcat.publish_http_snapshot(previous)
-        entered, release, sampled, stop = (threading.Event() for _ in range(4))
-        calls = []
+    def wait_refresh(self):
+        self.assertTrue(agentcat._HTTP_ACTIVITY_REFRESH_LOCK.acquire(timeout=2))
+        agentcat._HTTP_ACTIVITY_REFRESH_LOCK.release()
+
+    def test_idle_and_active_polling_during_blocked_build(self):
+        self.refresh_patch.stop()
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        from benchmark_snapshot_http import simulate_polling
+        entered, release = threading.Event(), threading.Event()
         def build():
             entered.set()
             release.wait()
-            return {**previous, "generatedAt": "new"}
-        def sample():
-            self.assertIs(threading.current_thread(), sampler)
-            calls.append(time.monotonic())
-            sampled.set()
-            return {"status": "ok", "sampledMonotonic": calls[-1],
-                    "updatedAt": agentcat.now_iso(), "processCount": len(calls) % 2}
-        sampler = threading.Thread(target=agentcat.activity_refresh_loop, args=(interval, stop))
-        worker = threading.Thread(target=agentcat.build_snapshot)
-        with patch.object(agentcat, "_build_snapshot_impl", side_effect=build), \
-             patch.object(agentcat, "terminal_activity_snapshot", side_effect=sample), \
-             patch.object(agentcat.subprocess, "run", side_effect=AssertionError("unexpected ps")) as ps:
+            return {"providers": {}, "activity": {"status": "obsolete"}}
+        with patch.object(agentcat, "_build_snapshot_impl", side_effect=build):
+            worker = threading.Thread(target=agentcat.build_snapshot)
             worker.start()
             self.assertTrue(entered.wait(1))
-            sampler.start()
             try:
-                self.assertTrue(sampled.wait(1))
-                seen = set()
-                deadline = time.monotonic() + 3 * interval
-                while time.monotonic() < deadline:
-                    for suffix in ("?sections=activity", ""):
-                        payload = self.get(suffix)
-                        activity = payload["activity"]
-                        self.assertLess(time.monotonic() - activity["sampledMonotonic"], 2 * interval)
-                        self.assertEqual(payload["generatedAt"], "old")
-                        seen.add(activity["sampledMonotonic"])
-                    time.sleep(interval / 8)
-                self.assertGreaterEqual(len(seen), 3)
-                # Even a later publication of the old build sample cannot regress activity.
+                for interval in (20, 2):
+                    result = simulate_polling(agentcat, f"http://127.0.0.1:{self.server.server_port}", interval)
+                    self.assertEqual(result["ps_invocations"], 60 // interval)
+                    self.assertTrue(result["background_only"])
+                    self.assertEqual(result["ps_without_requests"], 0)
+                    if interval == 2:
+                        self.assertLessEqual(result["max_served_sample_age_s"], 2 * interval)
                 release.set()
                 worker.join(1)
-                self.assertEqual(self.get()["generatedAt"], "new")
+                # The just-finished old build cannot overwrite the on-demand sample.
+                self.refresh_patch.start()
                 self.assertEqual(self.get()["activity"]["status"], "ok")
+            finally:
+                release.set()
+                worker.join(1)
+                self.wait_refresh()
+
+    def test_concurrent_stale_requests_start_one_refresh_without_waiting(self):
+        self.refresh_patch.stop()
+        agentcat.publish_http_snapshot({"providers": {}, "activity": {"status": "old"}})
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def sample():
+            calls.append(threading.current_thread().name)
+            entered.set()
+            release.wait()
+            return {"status": "new"}
+        with patch.object(agentcat, "terminal_activity_snapshot", side_effect=sample), \
+             patch.object(agentcat.subprocess, "run", side_effect=AssertionError("request ps")) as ps:
+            try:
+                self.assertEqual(self.get()["activity"]["status"], "old")
+                self.assertTrue(entered.wait(1))
+                # The first scan remains blocked while all concurrent requests complete.
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    responses = list(pool.map(lambda _: self.get("?sections=activity"), range(20)))
+                self.assertTrue(all(row["activity"]["status"] == "old" for row in responses))
+                self.assertEqual(len(calls), 1)
+                self.assertIn("_refresh_http_activity", calls[0])
                 ps.assert_not_called()
             finally:
-                stop.set()
                 release.set()
-                sampler.join(1)
-                worker.join(1)
-        self.assertFalse(sampler.is_alive())
+                self.wait_refresh()
+            self.assertEqual(self.get()["activity"]["status"], "new")
+            self.assertEqual(len(calls), 1)
 
-    def test_sampler_reports_failure_and_recovers(self):
+    def test_refresh_failure_is_debounced_and_recovers(self):
+        self.refresh_patch.stop()
         agentcat.publish_http_snapshot({"providers": {}, "activity": {"status": "old"}})
-        stop = threading.Event()
-        # Stop each iteration after it publishes so both failure and recovery are observable.
-        def fail():
-            stop.set()
-            raise RuntimeError("synthetic sample failure")
-        with patch.object(agentcat, "terminal_activity_snapshot", side_effect=fail):
-            agentcat.activity_refresh_loop(0.01, stop)
-        failed = self.get("?sections=activity")["activity"]
-        self.assertEqual(failed["status"], "error")
-        self.assertIn("updatedAt", failed)
-        stop.clear()
-        def recover():
-            stop.set()
-            return {"status": "ok", "updatedAt": "recovered"}
-        with patch.object(agentcat, "terminal_activity_snapshot", side_effect=recover):
-            agentcat.activity_refresh_loop(0.01, stop)
-        self.assertEqual(self.get()["activity"]["updatedAt"], "recovered")
+        clock = [0.0]
+        with patch.object(agentcat, "_activity_monotonic", side_effect=lambda: clock[0]), \
+             patch.object(agentcat, "terminal_activity_snapshot", side_effect=RuntimeError("synthetic failure")) as sample:
+            self.get()
+            self.wait_refresh()
+            failed = self.get()["activity"]
+            self.assertEqual(failed["status"], "error")
+            self.assertIn("updatedAt", failed)
+            self.assertEqual(sample.call_count, 1)
+            clock[0] = 2.0
+            sample.side_effect = None
+            sample.return_value = {"status": "ok"}
+            self.get()
+            self.wait_refresh()
+            self.assertEqual(self.get()["activity"]["status"], "ok")
+            self.assertEqual(sample.call_count, 2)
+
+    def test_non_activity_section_does_not_trigger_scan(self):
+        self.refresh_patch.stop()
+        agentcat.publish_http_snapshot({"providers": {}, "activity": {"status": "old"}})
+        with patch.object(agentcat, "terminal_activity_snapshot", side_effect=AssertionError("unused scan")) as scan:
+            self.get("?sections=providers")
+            self.get("?sections=servedAt")
+            self.wait_refresh()
+            scan.assert_not_called()

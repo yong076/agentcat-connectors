@@ -1202,7 +1202,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
+        with patch.object(agentcat, "refresh_activity_if_stale"):
             agentcat.initialize_http_snapshot_cache()
             snapshot = json.loads(b"".join(agentcat.snapshot_for_http()))
 
@@ -1981,7 +1981,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         )
         agentcat.initialize_http_snapshot_cache()
         with patch.object(agentcat, "_build_snapshot_impl", side_effect=AssertionError("must not rebuild")), \
-             patch.object(agentcat, "terminal_activity_snapshot", side_effect=AssertionError("must not scan")), \
+             patch.object(agentcat, "refresh_activity_if_stale"), \
              patch.object(agentcat, "read_json", side_effect=AssertionError("must not read")):
             snap = json.loads(b"".join(agentcat.snapshot_for_http()))
         self.assertIn("servedAt", snap)
