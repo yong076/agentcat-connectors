@@ -25,6 +25,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+HOME = Path((os.environ.get("USERPROFILE") if os.name == "nt" else None)
+            or os.environ.get("HOME") or os.path.expanduser("~"))
 CLAUDE_USAGE_TIMEOUT_SECONDS = 60
 _EMAIL_RE = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,253}$")
 _CLAUDE_LINE_RE = re.compile(
@@ -786,7 +788,7 @@ def parse_auggie_status(raw: Any, now: Optional[float] = None) -> Dict[str, Any]
 
 
 def probe_auggie(executable: str, run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
-    home = Path.home() / ".augment"
+    home = HOME / ".augment"
     try:
         proc = run([executable, "account", "status", "--json"], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
         raw = json.loads(proc.stdout) if proc.returncode == 0 else None
@@ -812,7 +814,7 @@ def parse_amp_usage(text: str) -> Dict[str, Any]:
 
 
 def probe_amp(executable: str, run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
-    home = Path.home() / ".amp"
+    home = HOME / ".amp"
     try:
         proc = run([executable, "usage"], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
         text = proc.stdout if proc.returncode == 0 else ""

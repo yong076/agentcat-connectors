@@ -4255,6 +4255,22 @@ class AgentCatConnectorTests(unittest.TestCase):
                     self.assertEqual(agentcat.read_foreign_sqlite(database, read), [(123,)])
                     self.assertEqual(len(calls), 2)
 
+    def test_foreign_sqlite_sweep_removes_only_old_private_copies(self) -> None:
+        temp_root = self.root / "temp-copies"
+        temp_root.mkdir()
+        for name in ("agentcat-sqlite-old", "agentcat-sqlite-fresh", "agentcat-sqlite-unknown", "unrelated"):
+            folder = temp_root / name
+            folder.mkdir()
+            (folder / "database.db").write_bytes(b"fixture")
+            if name.endswith("unknown"):
+                (folder / "keep.txt").write_text("not a database copy")
+            os.utime(folder, (1000, 1000) if not name.endswith("fresh") else (5000, 5000))
+        with patch.object(agentcat.tempfile, "gettempdir", return_value=str(temp_root)), patch.object(
+                agentcat.time, "time", return_value=5000):
+            agentcat.sweep_foreign_sqlite_copies()
+        self.assertEqual({p.name for p in temp_root.iterdir()},
+                         {"agentcat-sqlite-fresh", "agentcat-sqlite-unknown", "unrelated"})
+
     def test_foreign_sqlite_retries_failed_read_on_private_copy(self) -> None:
         database = self.root / "retry.db"
         with closing(sqlite3.connect(database)) as writer:

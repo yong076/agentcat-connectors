@@ -12142,6 +12142,30 @@ def _foreign_sqlite_copy_error(exc: sqlite3.Error) -> bool:
     ))
 
 
+def sweep_foreign_sqlite_copies() -> None:
+    """Remove abandoned private database copies after one hour, best effort."""
+    cutoff = time.time() - 3600
+    try:
+        candidates = list(Path(tempfile.gettempdir()).glob("agentcat-sqlite-*"))
+    except OSError:
+        return
+    for folder in candidates:
+        try:
+            metadata = folder.lstat()
+            if folder.is_symlink() or not folder.is_dir() or metadata.st_mtime >= cutoff:
+                continue
+            if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+                continue
+            # Only our known disposable copy files, never another task's data.
+            if any(child.is_symlink() or not child.is_file() or child.name not in
+                   ("database.db", "database.db-wal", "database.db-shm", "database.db-journal")
+                   for child in folder.iterdir()):
+                continue
+            shutil.rmtree(folder)
+        except OSError:
+            continue
+
+
 def read_foreign_sqlite(
     database: Path, read: Callable[[sqlite3.Connection], Any], *, timeout: float = 5.0,
 ) -> Any:
@@ -14062,12 +14086,12 @@ def run_cli_probes() -> Dict[str, Any]:
         if current is None or (current["status"] != "ok" and row["status"] == "ok"):
             seen[key] = row
     results.extend(r for r in seen.values() if r.get("email") or r["status"] == "ok")
-    claude = shutil.which("claude") or (str(Path.home() / ".local" / "bin" / "claude") if (Path.home() / ".local" / "bin" / "claude").exists() else None)
+    claude = shutil.which("claude") or (str(HOME / ".local" / "bin" / "claude") if (HOME / ".local" / "bin" / "claude").exists() else None)
     default_claude = default_provider_home("claude")
     for home in tracked_provider_homes("claude"):
         results.append(cli_probe.probe_claude_home(home, default_claude, claude, cwd=cwd))
     for provider, relative, token_key in (("grok", ".grok", "token"), ("kimi", ".kimi-code", "access")):
-        home = Path.home() / relative
+        home = HOME / relative
         if home.is_dir():
             try:
                 results.append(cli_probe.probe_token_home(provider, home, _cli_probe_token_module(provider), token_key))
@@ -14080,7 +14104,7 @@ def run_cli_probes() -> Dict[str, Any]:
             try:
                 results.append(probe(executable))
             except Exception:
-                results.append(cli_probe._result(provider, Path.home(), status="error", reason="cli_failed"))
+                results.append(cli_probe._result(provider, HOME, status="error", reason="cli_failed"))
     if shutil.which("gh"):
         try:
             # Copilot rides the GitHub login the gh CLI already holds.
@@ -16258,20 +16282,27 @@ def reflect_sync(files: Optional[List[Tuple[str, Path]]] = None) -> Dict[str, An
     """Index every session file; files whose (mtime, size) match the stored row are skipped."""
     candidates = files if files is not None else reflect_session_files()
     known: Dict[str, Tuple[float, int]] = {}
+    cursor_signatures: Dict[str, str] = {}
     with closing(_reflect_connect()) as conn:
         for row in conn.execute("select id, file_mtime, file_size from sessions"):
             known[row["id"]] = (float(row["file_mtime"] or 0.0), int(row["file_size"] or 0))
+        cursor_signatures = dict(conn.execute(
+            "select key, value from state where key like 'cursor_source_signature:%'"))
     indexed = 0
     skipped = 0
     empty = 0
     for tool, path in candidates:
         try:
             stat = path.stat()
+            cursor_signature = (json.dumps(_foreign_sqlite_signature(path.resolve()))
+                                if tool == "cursor" else None)
         except OSError:
             continue
         session_id = reflect_session_id(tool, path)
         previous = known.get(session_id)
-        if previous is not None and previous == (float(stat.st_mtime), int(stat.st_size)):
+        signature_key = "cursor_source_signature:" + session_id
+        if (previous is not None and previous == (float(stat.st_mtime), int(stat.st_size))
+                and (tool != "cursor" or cursor_signatures.get(signature_key) == cursor_signature)):
             skipped += 1
             continue
         digest = reflect_parse_session(tool, path)
@@ -16279,6 +16310,8 @@ def reflect_sync(files: Optional[List[Tuple[str, Path]]] = None) -> Dict[str, An
             empty += 1
             continue
         reflect_upsert_session(reflect_session_row(digest), float(stat.st_mtime), int(stat.st_size))
+        if cursor_signature is not None:
+            reflect_state_set(signature_key, cursor_signature)
         indexed += 1
     with closing(_reflect_connect()) as conn:
         total = int(conn.execute("select count(*) from sessions").fetchone()[0])
@@ -18536,6 +18569,7 @@ def run_daemon(args: argparse.Namespace) -> int:
         rotate_daemon_log()
     except Exception:
         pass
+    sweep_foreign_sqlite_copies()
     # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
     prune_events()
     print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)

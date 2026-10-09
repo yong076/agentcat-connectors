@@ -473,6 +473,13 @@ class CreditProbeTests(unittest.TestCase):
         self.assertEqual(row["email"], "someone@example.com")
         self.assertEqual(cli_probe.parse_amp_usage("Not signed in")["reason"], "usage_unavailable")
 
+    def test_credit_probes_use_module_home_when_platform_home_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(cli_probe, "HOME", Path(tmp)), patch.object(
+                Path, "home", side_effect=RuntimeError("home unavailable")):
+            for probe, relative in ((cli_probe.probe_auggie, ".augment"), (cli_probe.probe_amp, ".amp")):
+                row = probe("fixture", lambda args, **kw: subprocess.CompletedProcess(args, 1, stdout=""))
+                self.assertEqual(row["homeKey"], cli_probe.home_key(Path(tmp) / relative))
+
     def test_probe_runs_only_the_read_only_account_command(self):
         calls = []
         def run(args, **kwargs):
