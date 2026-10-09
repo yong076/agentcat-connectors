@@ -547,6 +547,7 @@ class AgentCatConnectorTests(unittest.TestCase):
             home = agentcat.HOME / name
             home.mkdir(parents=True)
             (home / "sessions").mkdir()
+            (home / "config.toml").write_text('model_provider = "openai"\n')
             (home / "auth.json").write_text(
                 json.dumps({"tokens": {"access_token": f"expired-{name}", "refresh_token": "cli-owned", "account_id": f"acct{name}"}}),
                 encoding="utf-8",

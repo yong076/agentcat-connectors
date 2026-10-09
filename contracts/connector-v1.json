@@ -20,7 +20,8 @@
     "providerInstances.v1": {
       "owner": "shared",
       "fields": ["providerInstances"],
-      "fallback": "render the aggregate providers map as one connection per provider"
+      "fallback": "render the aggregate providers map as one connection per provider",
+      "optionalFields": ["providerInstances[].usage.today", "providerInstances[].usage.week", "providerInstances[].usage.month"]
     },
     "connections.openrouter.v1": {
       "owner": "shared",
@@ -45,6 +46,40 @@
         "providers.copilot.tokens.estimatedShare"
       ],
       "fallback": "render provider token totals without provenance details"
+    },
+    "homes.discovery": {
+      "owner": "shared",
+      "fields": [
+        "homes.<provider>.tracked",
+        "homes.<provider>.discovered[].id",
+        "homes.<provider>.discovered[].path",
+        "homes.<provider>.discovered[].sources",
+        "homes.<provider>.discovered[].launchers",
+        "homes.<provider>.discovered[].state",
+        "homes.<provider>.discovered[].evidence",
+        "homes.<provider>.discovered[].usage"
+      ],
+      "fallback": "ignore optional home diagnostics; render aggregate provider usage",
+      "itemShape": {
+        "id": "sha256(realpath)[:12]",
+        "path": "tilde-relative; external homes use ~/<external-ID>",
+        "sources": "array of default, adopted, env, known_runtime, auto, launcher",
+        "launchers": "array of launcher names",
+        "state": [
+          "tracked",
+          "excluded",
+          "mirror",
+          "foreign",
+          "ambiguous"
+        ],
+        "evidence": "array of codes only",
+        "usage": {
+          "today": "tokens",
+          "week": "tokens",
+          "month": "tokens",
+          "all": "tokens"
+        }
+      }
     }
   },
   "sharedRequired": [

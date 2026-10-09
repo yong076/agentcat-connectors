@@ -128,7 +128,8 @@ def _claude_account_config(home: Path, default_home: Path) -> Path:
     # config homes keep it inside. Resolve both from the selected home, without
     # consulting the daemon user's HOME/USERPROFILE or platform account database.
     home = Path(home)
-    return (home.parent if home == Path(default_home) else home) / ".claude.json"
+    standard = home.parent / ".claude.json"
+    return standard if home == Path(default_home) and standard.is_file() else home / ".claude.json"
 
 
 def claude_identity(home: Path, default_home: Path) -> Dict[str, Optional[str]]:

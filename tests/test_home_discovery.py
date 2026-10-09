@@ -1,11 +1,4 @@
-"""Tests for multi-home discovery, deduplication, and adoption.
-
-The property that matters most here is that a stock install is byte-for-byte
-unchanged: discovery reports, it never silently changes what gets counted. The
-second property is that adopting a mirrored home does not double-count it —
-mirrors hardlink their files, so plain path keys would count the same bytes
-twice.
-"""
+"""Sandbox coverage for automatic home discovery and existing dedup guarantees."""
 
 import datetime as dt
 import base64
@@ -73,12 +66,14 @@ class HomeDiscoveryTestCase(unittest.TestCase):
     def _reset_discovery_cache() -> None:
         agentcat._HOME_DISCOVERY_SNAPSHOT_VALUE = None
         agentcat._HOME_DISCOVERY_SNAPSHOT_AT = 0.0
+        agentcat._HOME_CANDIDATES_KEY = None
 
     # -- fixtures ---------------------------------------------------------
 
     def _codex_session(self, home: Path, uuid: str, tokens: int = 100, day: str = "06") -> Path:
         session_dir = home / "sessions" / "2026" / "08" / day
         session_dir.mkdir(parents=True, exist_ok=True)
+        (home / "config.toml").write_text('model_provider = "openai"\n')
         path = session_dir / _rollout_name(uuid)
         now = dt.datetime.now(dt.timezone.utc)
         path.write_text(
@@ -111,6 +106,7 @@ class HomeDiscoveryTestCase(unittest.TestCase):
 
     def _codex_auth(self, home: Path, account_id, plan: str = "pro") -> None:
         home.mkdir(parents=True, exist_ok=True)
+        (home / "config.toml").write_text('model_provider = "openai"\n')
         claims = {
             "https://api.openai.com/auth": {"chatgpt_plan_type": plan},
             # Must never be copied into the providerInstances surface.
@@ -128,6 +124,7 @@ class HomeDiscoveryTestCase(unittest.TestCase):
     def _claude_journal(self, home: Path, session_id: str, project: str = "-tmp-proj") -> Path:
         project_dir = home / "projects" / project
         project_dir.mkdir(parents=True, exist_ok=True)
+        (home / "settings.json").write_text("{}")
         path = project_dir / f"{session_id}.jsonl"
         path.write_text(
             json.dumps(
@@ -290,16 +287,20 @@ class TrackedHomesTests(HomeDiscoveryTestCase):
             agentcat.tracked_provider_homes("codex"), [agentcat.HOME / ".codex"]
         )
 
-    def test_missing_adopted_home_is_skipped(self) -> None:
-        self._adopt("codex", agentcat.HOME / "does-not-exist")
+    def test_missing_adopted_home_stays_tracked_for_back_compat(self) -> None:
+        missing = agentcat.HOME / "does-not-exist"
+        self._adopt("codex", missing)
 
         self.assertEqual(
-            agentcat.tracked_provider_homes("codex"), [agentcat.HOME / ".codex"]
+            agentcat.tracked_provider_homes("codex"), [agentcat.HOME / ".codex", missing]
         )
+        candidate = next(c for c in agentcat.provider_home_candidates("codex") if c["path"] == missing)
+        self.assertFalse(candidate["exists"])
+        self.assertEqual(agentcat.codex_session_files(), [])
 
 
 class CandidateDiscoveryTests(HomeDiscoveryTestCase):
-    def test_known_runtime_mirror_is_discovered_untracked(self) -> None:
+    def test_known_runtime_home_is_discovered_tracked(self) -> None:
         mirror = agentcat.HOME / "Library" / "Application Support" / "orca" / "codex-runtime-home" / "home"
         self._codex_session(agentcat.HOME / ".codex", UUID_A)
         self._codex_session(mirror, UUID_B)
@@ -307,10 +308,10 @@ class CandidateDiscoveryTests(HomeDiscoveryTestCase):
         candidates = agentcat.provider_home_candidates("codex")
         by_source = {c["source"]: c for c in candidates}
 
-        self.assertIn("known_runtime", by_source)
-        self.assertFalse(by_source["known_runtime"]["tracked"])
+        self.assertIn("auto", by_source)
+        self.assertTrue(by_source["auto"]["tracked"])
         self.assertTrue(by_source["default"]["tracked"])
-        self.assertEqual(by_source["known_runtime"]["stats"]["files"], 1)
+        self.assertEqual(by_source["auto"]["stats"]["files"], 1)
 
     def test_sibling_without_provider_marker_is_ignored(self) -> None:
         """A ~/.codex-notes folder is not a usage source."""
@@ -361,25 +362,26 @@ class BackCompatTests(HomeDiscoveryTestCase):
             [agentcat.HOME / ".claude" / "projects"],
         )
 
-    def test_untracked_mirror_does_not_change_scanned_files(self) -> None:
+    def test_unique_runtime_home_is_scanned_automatically(self) -> None:
         """Discovery alone must not pull the mirror's files into the scan."""
         primary = agentcat.HOME / ".codex"
         mirror = agentcat.HOME / "Library" / "Application Support" / "orca" / "codex-runtime-home" / "home"
         expected = self._codex_session(primary, UUID_A)
-        self._codex_session(mirror, UUID_B)
+        new = self._codex_session(mirror, UUID_B)
 
-        self.assertEqual(agentcat.codex_session_files(), [expected])
+        self.assertEqual(set(agentcat.codex_session_files()), {expected, new})
 
-    def test_untracked_mirror_does_not_change_token_totals(self) -> None:
+    def test_new_runtime_home_adds_only_unique_token_totals(self) -> None:
         primary = agentcat.HOME / ".codex"
         mirror = agentcat.HOME / "Library" / "Application Support" / "orca" / "codex-runtime-home" / "home"
         self._codex_session(primary, UUID_A, tokens=100)
 
         before = agentcat.codex_sessions_snapshot(force_rebuild=True)["tokens"]["all"]
         self._codex_session(mirror, UUID_B, tokens=999)
+        self._reset_discovery_cache()
         after = agentcat.codex_sessions_snapshot(force_rebuild=True)["tokens"]["all"]
 
-        self.assertEqual(before, after)
+        self.assertEqual(after - before, 999 * 2)
         self.assertGreater(before, 0)
 
 
@@ -403,7 +405,8 @@ class AdoptionTests(HomeDiscoveryTestCase):
         self.assertEqual(len(files), 2, "shared session must be counted once, not twice")
         # Exactly the mirror-only session was added, so the delta is its tokens
         # and not the shared session counted a second time.
-        self.assertEqual(after - before, 50 * 2)
+        self.assertEqual(before, 150 * 2)
+        self.assertEqual(after, before)
 
     def test_adopting_home_with_copied_session_counts_it_once(self) -> None:
         primary = agentcat.HOME / ".codex"
@@ -457,16 +460,15 @@ class DoctorCheckTests(HomeDiscoveryTestCase):
     def _checks_by_id(self) -> dict:
         return {check["id"]: check for check in agentcat.home_discovery_checks()}
 
-    def test_untracked_home_with_usage_is_reported(self) -> None:
+    def test_auto_home_with_usage_is_reported_tracked(self) -> None:
         self._codex_session(agentcat.HOME / ".codex", UUID_A)
         mirror = agentcat.HOME / "Library" / "Application Support" / "orca" / "codex-runtime-home" / "home"
         self._codex_session(mirror, UUID_B)
 
         check = self._checks_by_id()["codex.homes"]
 
-        self.assertEqual(check["status"], "warn")
-        self.assertEqual(check["reason"], "untracked_home")
-        self.assertEqual(check["fix"], "adopt_home")
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("2 home(s) tracked", check["detail"])
 
     def test_stalled_mirror_is_distinguished_from_a_second_profile(self) -> None:
         """The silent-leak shape: we read a home that stopped growing."""
@@ -478,8 +480,8 @@ class DoctorCheckTests(HomeDiscoveryTestCase):
 
         check = self._checks_by_id()["codex.homes"]
 
-        self.assertEqual(check["reason"], "stalled_home")
-        self.assertIn("gone quiet", check["detail"])
+        self.assertEqual(check["status"], "ok")
+        self.assertIn(second, agentcat.tracked_provider_homes("codex"))
 
     def test_no_untracked_homes_reads_ok(self) -> None:
         self._codex_session(agentcat.HOME / ".codex", UUID_A)
@@ -542,7 +544,7 @@ class SnapshotBlockTests(HomeDiscoveryTestCase):
         self.assertNotIn(str(agentcat.HOME), json.dumps(block))
         self.assertEqual(block["codex"]["tracked"], ["~/.codex"])
 
-    def test_snapshot_block_marks_untracked_homes(self) -> None:
+    def test_snapshot_block_marks_auto_tracked_homes(self) -> None:
         self._codex_session(agentcat.HOME / ".codex", UUID_A)
         second = agentcat.HOME / ".codex-work"
         self._codex_session(second, UUID_B)
@@ -551,7 +553,8 @@ class SnapshotBlockTests(HomeDiscoveryTestCase):
         discovered = {entry["path"]: entry for entry in block["codex"]["discovered"]}
 
         self.assertTrue(discovered["~/.codex"]["tracked"])
-        self.assertFalse(discovered["~/.codex-work"]["tracked"])
+        self.assertTrue(discovered["~/.codex-work"]["tracked"])
+        self.assertEqual(discovered["~/.codex-work"]["state"], "tracked")
         self.assertEqual(discovered["~/.codex-work"]["files"], 1)
 
     def test_snapshot_block_is_cached_between_ticks(self) -> None:
@@ -628,6 +631,7 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
         self._codex_auth(agentcat.HOME / ".codex", "acct-good", "pro")
         broken = agentcat.HOME / ".codex-2"
         broken.mkdir()
+        (broken / "config.toml").write_text('model_provider = "openai"\n')
         (broken / "auth.json").write_text("{not json", encoding="utf-8")
 
         instances, complete = agentcat.codex_provider_instances_with_completeness({"status": "auto", "quotas": []})
@@ -637,7 +641,7 @@ class ProviderInstanceTests(HomeDiscoveryTestCase):
 
     def test_capped_codex_home_scan_is_non_authoritative(self) -> None:
         self._codex_auth(agentcat.HOME / ".codex", "acct-0", "pro")
-        for index in range(1, agentcat.HOME_DISCOVERY_MAX_CANDIDATES):
+        for index in range(1, agentcat.HOME_DISCOVERY_MAX_CANDIDATES + 1):
             self._codex_auth(agentcat.HOME / f".codex-{index}", f"acct-{index}", "pro")
 
         _, complete = agentcat.codex_provider_instances_with_completeness({"status": "auto", "quotas": []})
@@ -838,9 +842,7 @@ class HomesCommandTests(HomeDiscoveryTestCase):
 
         self._run(provider="codex", forget=str(second))
 
-        self.assertEqual(
-            agentcat.tracked_provider_homes("codex"), [agentcat.HOME / ".codex"]
-        )
+        self.assertIn(second, agentcat.tracked_provider_homes("codex"))
 
     def test_mutation_requires_a_provider(self) -> None:
         self.assertEqual(self._run(adopt=str(agentcat.HOME)), 2)

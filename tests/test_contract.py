@@ -164,6 +164,22 @@ class ConnectorContractTests(unittest.TestCase):
         self.assertGreaterEqual(copilot_tokens["estimatedShare"], 0.0)
         self.assertLessEqual(copilot_tokens["estimatedShare"], 1.0)
 
+    def test_additive_home_contract_and_fixture_account_sums(self) -> None:
+        contract = agentcat.connector_contract_payload()
+        shape = contract["capabilityRegistry"]["homes.discovery"]["itemShape"]
+        self.assertEqual(set(shape["state"]), {"tracked", "excluded", "mirror", "foreign", "ambiguous"})
+        snapshot = json.loads((REPO_ROOT / "contracts/fixtures/multi-account.json").read_text())["snapshot"]
+        homes = snapshot["homes"]["codex"]["discovered"]
+        self.assertEqual({home["state"] for home in homes}, {"tracked", "mirror"})
+        for home in homes:
+            self.assertRegex(home["id"], r"^[0-9a-f]{12}$")
+            self.assertTrue(home["path"].startswith("~"))
+            self.assertIsInstance(home["evidence"], list)
+            self.assertTrue(all(value >= 0 for value in home["usage"].values()))
+        for period in ("today", "week", "month"):
+            self.assertEqual(sum(home["usage"][period] for home in homes), sum(row["usage"][period] for row in snapshot["providerInstances"]))
+        self.assertEqual(sum(home["usage"]["all"] for home in homes), snapshot["providers"]["codex"]["tokens"]["all"])
+
 
 if __name__ == "__main__":
     unittest.main()
