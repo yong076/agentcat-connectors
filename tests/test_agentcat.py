@@ -4875,7 +4875,8 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(limits["shortWindowMinutes"], 300)
         self.assertEqual(limits["weeklyUsedPercent"], 10.0)
         self.assertEqual(limits["weeklyResetAt"], 1770000400)
-        self.assertFalse(limits["stale"])
+        self.assertTrue(limits["stale"])
+        self.assertEqual(limits["reason"], "statusline_window_reset")
         self.assertIsNotNone(limits["updatedAt"])
         self.assertEqual([quota["id"] for quota in limits["quotas"]], ["claude:five_hour", "claude:seven_day", "claude:session"])
         self.assertEqual(limits["quotas"][0]["remainingPercent"], 96.0)
@@ -4908,6 +4909,26 @@ class AgentCatConnectorTests(unittest.TestCase):
         live.update(shortUsedPercent=5, stale=False)
         self.assertEqual(agentcat.prefer_live_limits(live, limits)["shortUsedPercent"], 5)
         self.assertFalse(agentcat.prefer_live_limits(live, limits)["stale"])
+
+    def test_claude_statusline_reset_boundary_marks_any_window_stale(self) -> None:
+        captured = 1791400000
+        for window in ("five_hour", "seven_day", "seven_day_sonnet"):
+            for offset in (-1, 0, 1):
+                with self.subTest(window=window, offset=offset), patch.object(
+                        agentcat.time, "time", return_value=captured):
+                    agentcat.store_event("claude", "claude-statusline", "statusline", {
+                        "rate_limits": {
+                            "five_hour": {"used_percentage": 42, "resets_at": captured + 300},
+                            window: {"used_percentage": 50, "resets_at": captured + offset},
+                        },
+                    })
+                    limits = agentcat.claude_runtime_limits()
+                    self.assertEqual(limits["stale"], offset <= 0)
+                    self.assertEqual(limits["updatedAt"], agentcat.iso_from_timestamp(captured))
+                    if offset <= 0:
+                        self.assertEqual(limits["reason"], "statusline_window_reset")
+                    else:
+                        self.assertNotIn("reason", limits)
 
     def test_claude_statusline_invalid_event_timestamp_is_stale(self) -> None:
         agentcat.store_event("claude", "claude-statusline", "statusline", {

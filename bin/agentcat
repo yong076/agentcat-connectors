@@ -3650,7 +3650,8 @@ def claude_runtime_limits() -> Dict[str, Any]:
     # Use the collector's event timestamp, never a timestamp supplied by the
     # statusline payload. Keep old values visible only with honest freshness.
     observed = parse_timestamp(record["timestamp"])
-    age = time.time() - observed.timestamp() if observed is not None else None
+    now = time.time()
+    age = now - observed.timestamp() if observed is not None else None
     limits["updatedAt"] = iso_from_timestamp(observed.timestamp()) if observed is not None else None
     limits["stale"] = age is None or not 0 <= age <= LIVE_LIMITS_MAX_AGE_SECONDS
     if limits["stale"]:
@@ -3674,6 +3675,12 @@ def claude_runtime_limits() -> Dict[str, Any]:
 
     rate_limits = payload.get("rate_limits")
     if isinstance(rate_limits, dict):
+        for window in rate_limits.values():
+            reset = int_limit(window.get("resets_at")) if isinstance(window, dict) else None
+            if reset is not None and reset <= now:
+                limits["stale"] = True
+                limits["reason"] = "statusline_window_reset"
+                break
         seven_day = rate_limits.get("seven_day")
         if isinstance(seven_day, dict):
             limits["weeklyUsedPercent"] = float_percent(seven_day.get("used_percentage"))
