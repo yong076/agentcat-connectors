@@ -56,6 +56,24 @@ def unavailable_usage(source: str) -> Dict[str, Any]:
     }
 
 
+USAGE_FRESH_SECONDS = 300
+
+
+def age_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    """Project stored quota freshness without advancing its successful fetch time."""
+    out = copy.deepcopy(usage)
+    try:
+        fetched = dt.datetime.fromisoformat(str(out.get("updatedAt")).replace("Z", "+00:00"))
+        age = (dt.datetime.now(dt.timezone.utc) - fetched).total_seconds()
+    except (ValueError, TypeError, OverflowError):
+        age = None
+    out["updatedAt"] = out.get("updatedAt")
+    out["stale"] = out.get("freshness") != "live" or age is None or age > USAGE_FRESH_SECONDS
+    if out.get("freshness") == "live" and out["stale"]:
+        out["freshness"] = "stale"
+    return out
+
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -414,7 +432,11 @@ class ManagedAccounts:
 
     @staticmethod
     def public(row: Dict[str, Any]) -> Dict[str, Any]:
-        return {key: copy.deepcopy(row[key]) for key in PUBLIC_FIELDS if key in row}
+        out = {key: copy.deepcopy(row[key]) for key in PUBLIC_FIELDS if key in row}
+        if (row.get("provider") == "gemini" and isinstance(out.get("usage"), dict)
+                and out["usage"].get("freshness") != "unavailable"):
+            out["usage"] = age_usage(out["usage"])
+        return out
 
     def capabilities(self) -> Dict[str, Any]:
         providers = []

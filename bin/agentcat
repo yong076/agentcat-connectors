@@ -10,6 +10,7 @@ from contextlib import closing
 import logging
 import datetime as dt
 import email.utils
+import errno
 import hashlib
 import hmac
 import html
@@ -19,12 +20,14 @@ import os
 import re
 import shutil
 import shlex
+import signal
 import subprocess
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -46,7 +49,7 @@ from agentcat_codex_app_server import (
 )
 import agentcat_cli_probe as cli_probe
 import agentcat_home_signatures as home_signatures
-from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS
+from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS, USAGE_FRESH_SECONDS, age_usage
 from agentcat_openrouter_managed import OpenRouterManagedAuth, OpenRouterManagedError, build_adapter as build_openrouter_managed_adapter
 
 
@@ -252,7 +255,7 @@ PROJECT_DAILY_STATE_VERSION = 2
 GROK_ACCOUNTING_STATE_VERSION = 2
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.41.4")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.41.5")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -1703,6 +1706,23 @@ def default_provider_home(provider: str) -> Path:
     if override:
         return Path(override).expanduser()
     return HOME / str(spec.get("defaultName") or f".{provider}")
+
+
+def active_codex_home(candidates: Optional[List[Dict[str, Any]]] = None) -> Path:
+    """Use an explicit runtime override, else the most recently used tracked home."""
+    default = default_provider_home("codex")
+    if os.environ.get("CODEX_HOME"):
+        return default
+    selected = default
+    newest = 0.0
+    for candidate in candidates if candidates is not None else provider_home_candidates("codex"):
+        home = candidate.get("path")
+        stamp = (candidate.get("stats") or {}).get("newestMtime")
+        if (isinstance(home, Path) and candidate.get("exists")
+                and candidate.get("state") == "tracked"
+                and isinstance(stamp, (int, float)) and stamp > newest):
+            selected, newest = home, stamp
+    return selected
 
 
 def _explicit_home_rows(settings):
@@ -3546,7 +3566,7 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     retry_at = int_limit(limits.get("retryAt"))
     if retry_at is not None:
         if retry_at > now:
-            effective_max_age = max(retry_at - cached_at, 0)
+            effective_max_age = max(retry_at - (int_limit(entry.get("lastAttemptAt")) or cached_at), 0)
         elif not allow_stale:
             return None
         else:
@@ -3563,7 +3583,8 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
         and retry_at is None
         and failure_streak == 0
     )
-    expired = age >= effective_max_age if adaptive_due else age > effective_max_age
+    poll_age = now - (int_limit(entry.get("lastAttemptAt")) or cached_at) if failure_streak else age
+    expired = poll_age >= effective_max_age if adaptive_due else poll_age > effective_max_age
     if expired and not allow_stale:
         return None
     out = dict(limits)
@@ -3571,6 +3592,9 @@ def cached_live_limits(provider: str, max_age_seconds: int, allow_stale: bool = 
     out["cacheAgeSeconds"] = max(age, 0)
     if expired:
         out["stale"] = True
+    if provider in {"gemini", "antigravity"}:
+        out.setdefault("updatedAt", dt.datetime.fromtimestamp(cached_at, dt.timezone.utc).isoformat().replace("+00:00", "Z"))
+        out = normalize_gemini_limits(out)
     return out
 
 
@@ -3616,7 +3640,8 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
             reset_signal_at=reset_signal_at,
         )
         cache[provider] = {
-            "cachedAt": now,
+            "cachedAt": previous.get("cachedAt", limits.get("cachedAt", now)) if failed else now,
+            "lastAttemptAt": now,
             "failureStreak": previous_streak + 1 if failed else 0,
             "limits": limits,
             "pollPolicy": poll_policy,
@@ -3667,15 +3692,9 @@ def serve_stale_live_limits(
     project_id: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Return the last-good live limits during a probe failure, re-stamping the
-    cache so the daemon does not re-probe (and re-refresh the OAuth token) on every
-    60s tick while the provider keeps failing. Without the re-stamp, `cachedAt`
-    never advances once the good entry goes stale, so one revoked/expired token
-    turns into a full refresh POST — and for Antigravity a ~140MB binary re-scan —
-    every tick. Re-stamping throttles re-probing to one attempt per max-age window.
+    """Keep the last-good fetch time; lastAttemptAt independently throttles retries.
 
-    ``reason`` overrides the generic HTTP-derived reason code when the caller
-    knows more (e.g. a CLI-owned login that expired).
+    ``reason`` overrides the generic HTTP-derived reason code.
     """
     stale = dict(stale)
     stale["liveError"] = str(exc)
@@ -3812,7 +3831,7 @@ def codex_runtime_limits() -> Dict[str, Any]:
             return 0.0
 
     try:
-        candidates = list((codex_home() / "sessions").glob("**/rollout-*.jsonl"))
+        candidates = list((active_codex_home() / "sessions").glob("**/rollout-*.jsonl"))
     except OSError:
         candidates = []
     # Safe mtime key: a session file deleted between glob and stat must not raise
@@ -4625,11 +4644,11 @@ def codex_live_limits_for_auth(
 
 
 def codex_live_limits(force: bool = False) -> Dict[str, Any]:
-    auth = read_codex_auth()
+    home = active_codex_home()
+    auth = read_codex_auth(home)
     if not auth:
         return empty_limits()
-    # Keep the legacy provider-level key for installed clients and migrations.
-    return codex_live_limits_for_auth(auth, "codex", force=force)
+    return codex_live_limits_for_auth(auth, codex_home_limits_cache_key(home, auth), force=force)
 
 
 def log_codex_reset_credit_diagnostic(
@@ -4657,6 +4676,13 @@ def _resolved_path_key(path: Path) -> str:
         return str(path)
 
 
+def codex_home_limits_cache_key(home: Path, auth: Dict[str, Any]) -> str:
+    native_id = codex_auth_identity(auth).get("accountID")
+    seed = f"native:{native_id}" if native_id else f"profile:{_resolved_path_key(home)}"
+    instance_id = provider_instance_id("codex", seed)
+    return f"codex-instance:{instance_id.rsplit(':', 1)[-1]}"
+
+
 def codex_provider_instances(current_limits: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Discover N Codex identities and collapse profiles sharing one account ID.
 
@@ -4681,7 +4707,7 @@ def codex_provider_instances_with_completeness(
     # Hitting the bounded discovery limit means there may be another home we
     # did not inspect. Treat that snapshot as advisory.
     complete = _HOME_CANDIDATES_COMPLETE and sum(not c.get("_explicit") for c in candidates) < HOME_DISCOVERY_MAX_CANDIDATES
-    active_path = _resolved_path_key(default_provider_home("codex"))
+    active_path = _resolved_path_key(active_codex_home(candidates))
     grouped: Dict[str, Dict[str, Any]] = {}
 
     for candidate in candidates:
@@ -4809,7 +4835,7 @@ def codex_provider_instances_with_completeness(
     ), complete
 
 
-CODEX_MANAGED_USAGE_FRESH_SECONDS = 300
+CODEX_MANAGED_USAGE_FRESH_SECONDS = USAGE_FRESH_SECONDS
 
 
 def codex_managed_connection_limits(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -6539,6 +6565,8 @@ def gemini_limits_from_quota_response(
                 )
             )
 
+    limits["updatedAt"] = now_iso()
+    limits["stale"] = False
     limits["quotas"] = sorted_gemini_quotas(quotas)
     if not quotas:
         limits["status"] = "not_configured"
@@ -6555,7 +6583,7 @@ def normalize_gemini_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
     quotas = limits.get("quotas")
     if not isinstance(quotas, list):
         return limits
-    out = dict(limits)
+    out = age_usage({**limits, "freshness": "stale" if limits.get("stale") else "live"})
     out["quotas"] = sorted_gemini_quotas([q for q in quotas if isinstance(q, dict)])
     return out
 
@@ -9176,9 +9204,44 @@ def codex_session_files() -> List[Path]:
     return files
 
 
+_CODEX_FILE_IDENTITY_CACHE = {}
+_CODEX_FILE_IDENTITY_CACHE_HOME = None
+_CODEX_FILE_GROUPS = {}
+_CODEX_FILE_SELECTED = {}
+_CODEX_FILE_CURSOR = None
+_CODEX_FILE_PATHS = []
+
+
+def _codex_file_identity(path: Path, stat=None, known=None) -> str:
+    """Local-only session key; a rollout may move or have multiple copies."""
+    session = _session_identity(path)
+    if session:
+        return "session:" + session
+    if stat is None:
+        try:
+            stat = path.stat()
+        except OSError:
+            # Legacy unnamed files already removed cannot be identified safely.
+            return "legacy:" + str(path)
+    inode = f"inode:{stat.st_dev}:{stat.st_ino}"
+    if known and inode in known:
+        return known[inode]
+    try:
+        with path.open("rb") as fh:
+            first = json.loads(fh.readline(65536))
+        payload = first.get("payload") if isinstance(first, dict) else None
+        session = payload.get("id") if isinstance(payload, dict) and first.get("type") == "session_meta" else None
+        if isinstance(session, str) and _SESSION_UUID_RE.fullmatch(session):
+            return "session:" + session.lower()
+    except (OSError, ValueError):
+        pass
+    return inode
+
+
 def _empty_codex_cursor() -> Dict[str, Any]:
     return {
         "version": CODEX_SESSIONS_CURSOR_VERSION,
+        "fileIdentityVersion": 1,
         "files": {},
         # Accumulated rollups, persisted across snapshots.
         "daily": {},          # dateStr -> total tokens
@@ -9238,6 +9301,7 @@ def _read_codex_sessions_cursor() -> Dict[str, Any]:
             if not isinstance(meta, dict):
                 continue
             cursor["files"][str(path_str)] = {
+                "inode": meta.get("inode"),
                 "offset": int(meta.get("offset") or 0),
                 "mtime": float(meta.get("mtime") or 0.0),
                 "size": int(meta.get("size") or 0),
@@ -9275,6 +9339,22 @@ def _read_codex_sessions_cursor() -> Dict[str, Any]:
     for key in ("homeDaily", "usagePaths", "homeAccounts", "lastRebuildAt", "pendingReconcile", "homeConfiguration"):
         if key in raw:
             cursor[key] = raw[key]
+    if raw.get("fileIdentityVersion") != 1:
+        identities = {path: _codex_file_identity(Path(path)) for path in cursor["files"]}
+        migrated = {}
+        for path, meta in cursor["files"].items():
+            identity = identities[path]
+            try:
+                stat = Path(path).stat()
+                meta["inode"] = f"inode:{stat.st_dev}:{stat.st_ino}"
+            except OSError:
+                pass
+            if identity not in migrated or meta["offset"] > migrated[identity]["offset"]:
+                migrated[identity] = meta
+        cursor["files"] = migrated
+        cursor["usagePaths"] = {(identities[path] if path in identities else _codex_file_identity(Path(path))): hid
+                                for path, hid in cursor.get("usagePaths", {}).items()}
+        cursor["_dirty"] = True
     return cursor
 
 
@@ -9346,7 +9426,78 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
 
     account_changed = _prepare_home_accounts("codex", cursor)
     previous_accounts = cursor.get("homeAccounts", {})
-    selected = {str(p): _usage_home_id("codex", p) for p in files}
+    # Cache identities by path + (size, mtime_ns). Keep groups as well so an
+    # unchanged tick does not rebuild the duplicate-selection index either.
+    global _CODEX_FILE_IDENTITY_CACHE, _CODEX_FILE_IDENTITY_CACHE_HOME
+    global _CODEX_FILE_GROUPS, _CODEX_FILE_SELECTED, _CODEX_FILE_CURSOR, _CODEX_FILE_PATHS
+    cache_home = str(CODEX_SESSIONS_CURSOR_FILE)
+    if _CODEX_FILE_IDENTITY_CACHE_HOME != cache_home:
+        _CODEX_FILE_IDENTITY_CACHE = {}
+        _CODEX_FILE_GROUPS = {}
+        _CODEX_FILE_SELECTED = {}
+        _CODEX_FILE_IDENTITY_CACHE_HOME = cache_home
+    identity_cache = _CODEX_FILE_IDENTITY_CACHE
+    groups = _CODEX_FILE_GROUPS
+    selected = _CODEX_FILE_SELECTED
+    known = None
+    changed_identities = {}
+    regroup = set()
+    paths_changed = files != _CODEX_FILE_PATHS
+    seen_paths = set() if paths_changed else None
+    cursor_reloaded = cursor is not _CODEX_FILE_CURSOR
+    for path in files:
+        path_key = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if seen_paths is not None:
+            seen_paths.add(path_key)
+        stamp = (stat.st_size, stat.st_mtime_ns)
+        cached = identity_cache.get(path_key)
+        if (cached is not None and cached[0] == stamp
+                and (not cursor_reloaded or cached[1] in cursor["files"])):
+            identity = cached[1]
+            if cached[2] is None or (cursor_reloaded and cursor["files"].get(identity) is not cached[2]):
+                changed_identities[identity] = None
+            continue
+        previous_stat = groups[cached[1]][path_key][1] if cached is not None else None
+        if (not cursor_reloaded and previous_stat is not None
+                and (previous_stat.st_dev, previous_stat.st_ino) == (stat.st_dev, stat.st_ino)):
+            aliases = {f"inode:{stat.st_dev}:{stat.st_ino}": cached[1]}
+        else:
+            if known is None:
+                known = {meta["inode"]: key for key, meta in cursor["files"].items() if meta.get("inode")}
+            aliases = known
+        identity = _codex_file_identity(path, stat, aliases)
+        if cached is not None:
+            groups[cached[1]].pop(path_key, None)
+            regroup.add(cached[1])
+        identity_cache[path_key] = (stamp, identity, None)
+        groups.setdefault(identity, {})[path_key] = (path, stat)
+        regroup.add(identity)
+        changed_identities[identity] = None
+    for path_key in (identity_cache.keys() - seen_paths if seen_paths is not None else ()):
+        _, identity, _ = identity_cache.pop(path_key)
+        groups[identity].pop(path_key, None)
+        regroup.add(identity)
+    if regroup or configuration_changed:
+        selected = dict(selected)
+    for identity in regroup:
+        if not groups[identity]:
+            del groups[identity]
+            selected.pop(identity, None)
+        else:
+            path, _ = max(groups[identity].values(), key=lambda item: item[1].st_size)
+            selected[identity] = _usage_home_id("codex", path)
+            changed_identities[identity] = None
+    if configuration_changed:
+        for identity, candidates in groups.items():
+            path, _ = max(candidates.values(), key=lambda item: item[1].st_size)
+            selected[identity] = _usage_home_id("codex", path)
+    # Copy-on-write selection preserves the cursor's prior topology.
+    _CODEX_FILE_SELECTED = selected
+    _CODEX_FILE_PATHS = list(files)
     old_paths = cursor.get("usagePaths", {})
     topology_changed = (
         bool(cursor.get("files")) and "homeDaily" not in cursor
@@ -9375,18 +9526,6 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
         if not cursor.get("pendingReconcile"):
             cursor["pendingReconcile"] = True
             cursor["_dirty"] = True
-        if topology_changed:
-            # A moved archive / longer mirror keeps its offset. Retain cursors
-            # evicted by the cap until reconciliation so reappearance is not
-            # counted as a fresh session. Rollout names contain the session UUID.
-            missing = {_session_identity(Path(p)): p for p in old_paths
-                       if p not in selected and _session_identity(Path(p))}
-            for path in files:
-                old = missing.get(_session_identity(path))
-                if old and str(path) not in cursor["files"] and old in cursor["files"]:
-                    cursor["files"][str(path)] = cursor["files"].pop(old)
-                    old_paths.pop(old, None)
-                    cursor["_dirty"] = True
         cursor["usagePaths"] = {**old_paths, **selected}
     else:
         cursor["usagePaths"] = selected
@@ -9404,15 +9543,14 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
     # unconditional 60s re-serialization was a steady daemon CPU cost.
     changed = bool(rebuild or account_changed or cursor.get("_dirty"))
 
-    for path in files:
-        path_str = str(path)
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
+    # A cached completed read can skip parsing checks, but a new cursor object
+    # (external edit/reload), incomplete tail or rebuild must still be examined.
+    pending_files = ((identity, max(groups[identity].values(), key=lambda item: item[1].st_size))
+                     for identity in (groups if rebuild else changed_identities) if identity in groups)
+    for identity, (path, stat) in pending_files:
         size = int(stat.st_size)
         mtime = float(stat.st_mtime)
-        meta = file_cursors.get(path_str) or {}
+        meta = file_cursors.get(identity) or {}
         prev_offset = int(meta.get("offset") or 0)
         prev_mtime = float(meta.get("mtime") or 0.0)
         prev_size = int(meta.get("size") or 0)
@@ -9420,9 +9558,14 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
         # Unchanged file (same size + mtime): nothing new to parse. The byte
         # offset alone guarantees dedup; mtime+size is the cheap skip gate.
         if prev_offset >= size and prev_mtime == mtime and prev_size == size:
+            cached = identity_cache[str(path)]
+            identity_cache[str(path)] = (cached[0], identity, meta)
             continue
         # Truncated/rotated file: re-read from the start. The byte offset is
         # the dedup boundary, so resetting it re-counts the whole (new) file.
+        if prev_offset > size and identity.startswith("session:"):
+            # A stale copy is not a new session; retain the furthest offset.
+            continue
         if prev_offset > size:
             prev_offset = 0
             turn_index = 0
@@ -9503,7 +9646,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
                         hour_key = hour_key_for_timestamp(when)
                         if day_key is not None:
                             daily[day_key] = daily.get(day_key, 0) + total
-                            home_buckets = home_daily.setdefault(selected[path_str], {})
+                            home_buckets = home_daily.setdefault(selected[identity], {})
                             home_buckets[day_key] = home_buckets.get(day_key, 0) + total
                             md = model_daily.setdefault(model, {})
                             md[day_key] = md.get(day_key, 0) + total
@@ -9524,7 +9667,8 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
             continue
 
         changed = True
-        file_cursors[path_str] = {
+        file_cursors[identity] = {
+            "inode": f"inode:{stat.st_dev}:{stat.st_ino}",
             "offset": new_offset,
             "mtime": mtime,
             "size": size,
@@ -9535,6 +9679,11 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
             "sawDivergentTotals": saw_divergent_totals,
         }
 
+        if new_offset == size:
+            cached = identity_cache[str(path)]
+            identity_cache[str(path)] = (cached[0], identity, file_cursors[identity])
+
+    _CODEX_FILE_CURSOR = cursor
     cursor["turns"] = int(cursor.get("turns") or 0) + new_turns
     cursor["_dirty"] = changed
     if changed and (rebuild or account_changed or not cursor_recently_saved(CODEX_SESSIONS_CURSOR_FILE)):
@@ -10325,7 +10474,8 @@ def live_usage_provider_from_limits(limits: Dict[str, Any]) -> Dict[str, Any]:
         "model": None,
         "tokens": {"total": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
         "cost_usd": None,
-        "updated_at": now_iso(),
+        "updated_at": limits.get("updatedAt") or now_iso(),
+        "stale": bool(limits.get("stale")),
     }
     if limits.get("reason"):
         provider["reason"] = limits["reason"]
@@ -14088,7 +14238,9 @@ def build_snapshot() -> Dict[str, Any]:
     # interleaved builds re-book the same growth into today's projectsDaily (audit #4).
     # An RLock keeps it safe even if a future caller nests a build.
     with _BUILD_SNAPSHOT_LOCK:
-        return _build_snapshot_impl()
+        snapshot = _build_snapshot_impl()
+        publish_http_snapshot(snapshot)
+        return snapshot
 
 
 def _build_snapshot_impl() -> Dict[str, Any]:
@@ -14249,27 +14401,72 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     return snapshot
 
 
-_HTTP_LIVE_CACHE_LOCK = threading.Lock()
-_HTTP_LIVE_CACHE: Optional[Tuple[float, Dict[str, Any], Dict[str, Any]]] = None
-HTTP_LIVE_CACHE_TTL = float(os.environ.get("AGENTCAT_HTTP_LIVE_CACHE_SECONDS", "2.0"))
+# Published as one immutable generation; readers never acquire the build lock.
+_HTTP_SNAPSHOT_CACHE: Optional[Tuple[bytes, Dict[str, bytes]]] = None
+_HTTP_ACTIVITY_CACHE: Optional[Tuple[float, bytes]] = None
+_HTTP_ACTIVITY_REFRESH_LOCK = threading.Lock()
+# TerminalAgentMonitor polls every 2s while active (20s while idle).
+ACTIVITY_CACHE_TTL_SECONDS = 2.0
+_activity_monotonic = time.monotonic
 
 
-def _live_activity_and_desktop() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """The per-request live overlay (process scan + desktop-app walk), cached for a
-    couple of seconds. The app polls /v1/snapshot every ~2-5s, and each call otherwise
-    spawned `/bin/ps` (or WMI) and walked the desktop tree — 10-13% of a core steady
-    state (audit #6). The 60s background loop keeps the snapshot body fresh; this only
-    throttles the live overlay."""
-    global _HTTP_LIVE_CACHE
-    now = time.monotonic()
-    with _HTTP_LIVE_CACHE_LOCK:
-        if _HTTP_LIVE_CACHE is not None and (now - _HTTP_LIVE_CACHE[0]) < HTTP_LIVE_CACHE_TTL:
-            return _HTTP_LIVE_CACHE[1], _HTTP_LIVE_CACHE[2]
-    activity = terminal_activity_snapshot()
-    desktop_apps = desktop_app_sources_snapshot(agentcat_settings())
-    with _HTTP_LIVE_CACHE_LOCK:
-        _HTTP_LIVE_CACHE = (time.monotonic(), activity, desktop_apps)
-    return activity, desktop_apps
+def _refresh_http_activity() -> None:
+    """One background scan. The caller reserves the single-flight lock first."""
+    global _HTTP_ACTIVITY_CACHE
+    started = _activity_monotonic()
+    try:
+        try:
+            activity = terminal_activity_snapshot()
+        except Exception as exc:
+            activity = {"status": "error", "updatedAt": now_iso(),
+                        "error": log_safe_error(exc)}
+        encoded = json.dumps(activity, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        # Age starts at scan start, so scan duration does not hide stale data.
+        _HTTP_ACTIVITY_CACHE = (started, b'"activity":' + encoded)
+    finally:
+        _HTTP_ACTIVITY_REFRESH_LOCK.release()
+
+
+def refresh_activity_if_stale() -> None:
+    """Schedule at most one scan; requests never wait for a scan or a lock."""
+    cached = _HTTP_ACTIVITY_CACHE
+    if cached is not None and _activity_monotonic() - cached[0] < ACTIVITY_CACHE_TTL_SECONDS:
+        return
+    if not _HTTP_ACTIVITY_REFRESH_LOCK.acquire(blocking=False):
+        return
+    try:
+        # Another worker may have published between the first check and acquire.
+        cached = _HTTP_ACTIVITY_CACHE
+        if cached is not None and _activity_monotonic() - cached[0] < ACTIVITY_CACHE_TTL_SECONDS:
+            _HTTP_ACTIVITY_REFRESH_LOCK.release()
+            return
+        threading.Thread(target=_refresh_http_activity, name="agentcat_refresh_http_activity", daemon=True).start()
+    except Exception:
+        _HTTP_ACTIVITY_REFRESH_LOCK.release()
+        logging.debug("activity refresh could not start", exc_info=True)
+
+
+def publish_http_snapshot(snapshot: Dict[str, Any]) -> None:
+    global _HTTP_SNAPSHOT_CACHE
+    # Encode each section once. Full and filtered replies reuse these bytes;
+    # subsequent mutations of the builder's dictionaries cannot alter a reply.
+    sections = {
+        key: json.dumps(key).encode("utf-8") + b":" +
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        for key, value in snapshot.items() if key != "servedAt"
+    }
+    body = b",".join(value for key, value in sections.items() if key != "activity")
+    _HTTP_SNAPSHOT_CACHE = (body, sections)
+
+
+def initialize_http_snapshot_cache() -> None:
+    """Read the previous generation once, before accepting HTTP requests."""
+    global _HTTP_SNAPSHOT_CACHE, _HTTP_ACTIVITY_CACHE
+    _HTTP_SNAPSHOT_CACHE = None
+    _HTTP_ACTIVITY_CACHE = None
+    cached = read_json(LATEST_SNAPSHOT)
+    if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
+        publish_http_snapshot(cached)
 
 
 # Cheap envelope keys that always ride along: a caller filtering for one
@@ -14313,20 +14510,29 @@ def filter_snapshot_sections(payload: Dict[str, Any], requested: str) -> Dict[st
     return filtered
 
 
-def snapshot_for_http() -> Dict[str, Any]:
-    cached = read_json(LATEST_SNAPSHOT)
-    if isinstance(cached, dict) and isinstance(cached.get("providers"), dict):
-        snapshot = copy.deepcopy(cached)
-        snapshot["servedAt"] = now_iso()
-        snapshot["update"] = auto_update_status_snapshot()
-        activity, desktop_apps = _live_activity_and_desktop()
-        snapshot["activity"] = activity
-        snapshot["desktopApps"] = desktop_apps
-        providers = snapshot.get("providers")
-        if isinstance(providers, dict):
-            attach_desktop_app_sources(providers, desktop_apps)
-        return snapshot
-    return build_snapshot()
+def snapshot_for_http(requested: str = "") -> Optional[Tuple[bytes, ...]]:
+    cache = _HTTP_SNAPSHOT_CACHE
+    if cache is None:
+        return None
+    body, sections = cache
+    # A completed slow build must never overwrite a newer on-demand sample.
+    activity_cache = _HTTP_ACTIVITY_CACHE
+    activity = activity_cache[1] if activity_cache is not None else sections.get("activity")
+    keep = {name.strip() for name in requested.split(",") if name.strip()}
+    if keep and ("servedAt" in keep or ("activity" in keep and activity is not None)
+                 or any(key in keep for key in sections)):
+        body = b",".join(value for key, value in sections.items()
+                         if key != "activity" and (key in keep or key in _SNAPSHOT_ENVELOPE_KEYS))
+        if "activity" not in keep:
+            activity = None
+    if activity is not None:
+        refresh_activity_if_stale()
+    # servedAt is transport time. Activity has its own updatedAt; provider
+    # generatedAt and quota freshness still refer to the last full build.
+    served = b'"servedAt":' + json.dumps(now_iso()).encode("utf-8")
+    # Keep the large full-body buffer intact, including on the socket write.
+    return (b"{" + served, b"," if body else b"", body,
+            b"," if activity else b"", activity or b"", b"}")
 
 
 def snapshot_refresh_loop(interval_seconds: float) -> None:
@@ -18173,14 +18379,22 @@ class AgentCatHandler(BaseHTTPRequestHandler):
 
     def send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        self.send_json_bytes(status, body)
+
+    def send_json_bytes(self, status: int, body: bytes) -> None:
+        self.send_json_chunks(status, (body,))
+
+    def send_json_chunks(self, status: int, chunks: Tuple[bytes, ...]) -> None:
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(sum(len(chunk) for chunk in chunks)))
             self.end_headers()
         except (BrokenPipeError, ConnectionResetError):
             return
-        self.write_response_body(body)
+        for chunk in chunks:
+            if not self.write_response_body(chunk):
+                break
 
     def send_html(self, status: int, document: str) -> None:
         body = document.encode("utf-8")
@@ -18240,11 +18454,14 @@ class AgentCatHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/snapshot":
             try:
-                payload = snapshot_for_http()
                 requested = urllib.parse.parse_qs(
                     urllib.parse.urlparse(self.path).query
                 ).get("sections", [""])[0]
-                self.send_json(200, filter_snapshot_sections(payload, requested))
+                body = snapshot_for_http(requested)
+                if body is None:
+                    self.send_json(503, {"error": "snapshot_not_ready"})
+                else:
+                    self.send_json_chunks(200, body)
             except Exception as exc:
                 self.send_json(500, {"error": "snapshot_failed", "message": str(exc)})
             return
@@ -18883,6 +19100,21 @@ def daemon_log_rotation_loop(interval_seconds: float = DAEMON_LOG_ROTATE_INTERVA
             print(f"agentcatd log rotation failed: {type(exc).__name__}", file=sys.stderr, flush=True)
 
 
+def healthy_daemon_on_port(host: str, port: int) -> bool:
+    """Probe only the conflicting local listener, without proxies or redirects."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    probe_host = host
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(f"http://{probe_host}:{port}/healthz", timeout=1.0) as response:
+            return response.status == 200 and response.read(16) == b"ok\n"
+    except (OSError, ValueError, HTTPException):
+        return False
+
+
 def run_daemon(args: argparse.Namespace) -> int:
     ensure_dirs()
     # Connection clients read this file before their first authenticated request.
@@ -18901,79 +19133,99 @@ def run_daemon(args: argparse.Namespace) -> int:
     # Bind and start accepting connections BEFORE the initial snapshot build (audit #3).
     # The first build_snapshot() streams the full local history — gigabytes, minutes, for
     # the heaviest users — and previously ran before the port bind, so the app got
-    # connection-refused the whole time and reported the user "not detected". Since
-    # snapshot_for_http() already serves the cached latest-snapshot.json, we bind first
+    # connection-refused the whole time and reported the user "not detected".
+    # The previous snapshot is loaded once into memory after binding; we bind first
     # and move the initial build into the background: returning users see their last
     # snapshot instantly while it refreshes underneath them.
     try:
         server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
     except OSError as exc:
-        # One line, not a traceback: launchd restarts us (its 10 s default
-        # throttle spaces the retries) and the usual cause is another agentcatd.
+        if exc.errno == errno.EADDRINUSE and healthy_daemon_on_port(args.host, args.port):
+            return 0
+        # EX_TEMPFAIL remains nonzero for service-manager retries, spaced by
+        # launchd's default throttle. A healthy duplicate exits successfully.
         print(
             f"agentcatd cannot listen on {args.host}:{args.port}: "
             f"{exc.strerror or type(exc).__name__} (is another agentcatd running?)",
             file=sys.stderr,
             flush=True,
         )
-        return 1
-    # Only the instance that owns the port maintains shared state: a second
-    # agentcatd that loses the bind must not rotate the live daemon's log or
-    # vacuum its database.
-    try:
-        # Bound the launchd/installer stderr file (#121).
-        ensure_daemon_stderr_appends()
-        rotate_daemon_log()
-    except Exception:
-        pass
-    sweep_foreign_sqlite_copies()
-    # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
-    prune_events()
-    print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
+        return 75
+    previous_handlers = {}
 
-    def _initial_build_then_refresh() -> None:
+    def request_stop(signum, frame):
+        # Raising on the main thread unwinds serve_forever without the deadlock
+        # caused by calling server.shutdown() from its own serving thread.
+        raise KeyboardInterrupt
+
+    try:
+        for signum in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+            if signum is not None:
+                previous_handlers[signum] = signal.signal(signum, request_stop)
+        initialize_http_snapshot_cache()
+        # Only the instance that owns the port maintains shared state: a second
+        # agentcatd that loses the bind must not rotate the live daemon's log or
+        # vacuum its database.
         try:
-            build_snapshot()
-        except Exception as exc:
-            print(f"agentcatd initial snapshot build failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
-        snapshot_refresh_loop(60.0)
+            # Bound the launchd/installer stderr file (#121).
+            ensure_daemon_stderr_appends()
+            rotate_daemon_log()
+        except Exception:
+            pass
+        sweep_foreign_sqlite_copies()
+        # Bound events.sqlite on startup (append-only otherwise; audit #5). Best-effort.
+        prune_events()
+        print(f"agentcatd listening on http://{args.host}:{args.port}", flush=True)
 
-    threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
-    threading.Thread(
-        target=cli_probe_loop,
-        args=(CLI_PROBE_INTERVAL_SECONDS,),
-        daemon=True,
-    ).start()
-    threading.Thread(
-        target=managed_quota_refresh_loop,
-        args=(MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS,),
-        daemon=True,
-    ).start()
-    update_enabled, _update_reason = auto_update_enabled_status()
-    if update_enabled and AUTO_UPDATE_INTERVAL_SECONDS > 0:
+        def _initial_build_then_refresh() -> None:
+            try:
+                build_snapshot()
+            except Exception as exc:
+                print(f"agentcatd initial snapshot build failed: {log_safe_error(exc)}", file=sys.stderr, flush=True)
+            snapshot_refresh_loop(60.0)
+
+        threading.Thread(target=_initial_build_then_refresh, daemon=True).start()
         threading.Thread(
-            target=auto_update_loop,
-            args=(float(AUTO_UPDATE_INTERVAL_SECONDS), float(AUTO_UPDATE_INITIAL_DELAY_SECONDS)),
+            target=cli_probe_loop,
+            args=(CLI_PROBE_INTERVAL_SECONDS,),
             daemon=True,
         ).start()
-    if PRICING_FETCH_INTERVAL_SECONDS > 0:
         threading.Thread(
-            target=pricing_refresh_loop,
-            args=(float(PRICING_FETCH_INTERVAL_SECONDS), float(PRICING_FETCH_INITIAL_DELAY_SECONDS)),
+            target=managed_quota_refresh_loop,
+            args=(MANAGED_QUOTA_REFRESH_INTERVAL_SECONDS,),
             daemon=True,
         ).start()
-    # Reflect: the default config is written once (enabled=false); the scheduler
-    # loop re-reads it every tick, so flipping the file to true needs no restart.
-    reflect_write_default_config()
-    threading.Thread(target=reflect_scheduler_loop, args=(60.0,), daemon=True).start()
-    threading.Thread(target=daemon_log_rotation_loop, daemon=True).start()
-    try:
+        update_enabled, _update_reason = auto_update_enabled_status()
+        if update_enabled and AUTO_UPDATE_INTERVAL_SECONDS > 0:
+            threading.Thread(
+                target=auto_update_loop,
+                args=(float(AUTO_UPDATE_INTERVAL_SECONDS), float(AUTO_UPDATE_INITIAL_DELAY_SECONDS)),
+                daemon=True,
+            ).start()
+        if PRICING_FETCH_INTERVAL_SECONDS > 0:
+            threading.Thread(
+                target=pricing_refresh_loop,
+                args=(float(PRICING_FETCH_INTERVAL_SECONDS), float(PRICING_FETCH_INITIAL_DELAY_SECONDS)),
+                daemon=True,
+            ).start()
+        # Reflect: the default config is written once (enabled=false); the scheduler
+        # loop re-reads it every tick, so flipping the file to true needs no restart.
+        reflect_write_default_config()
+        threading.Thread(target=reflect_scheduler_loop, args=(60.0,), daemon=True).start()
+        threading.Thread(target=daemon_log_rotation_loop, daemon=True).start()
         server.serve_forever()
     except KeyboardInterrupt:
         return 0
     finally:
-        shutdown_codex_app_servers()
-        server.server_close()
+        # Repeated stop signals must not interrupt child-process cleanup.
+        for signum in previous_handlers:
+            signal.signal(signum, signal.SIG_IGN)
+        try:
+            shutdown_codex_app_servers()
+        finally:
+            server.server_close()
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
     return 0
 
 

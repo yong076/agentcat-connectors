@@ -1,5 +1,6 @@
 """Codex polling uses a persisted daily rebuild budget and an in-memory cursor."""
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -78,7 +79,7 @@ class CodexRebuildBudgetTests(HomeDiscoveryTestCase):
             self.append()
             snap = agentcat.codex_sessions_snapshot()
             self.assertEqual(snap['tokens']['all'], 400 + 200 * i)
-            self.assertTrue(snap['pendingReconcile'])
+            self.assertNotIn('pendingReconcile', snap)
         other = self._codex_session(self.home, UUID_B)
         with patch.object(agentcat, 'codex_session_files', return_value=[other]):
             self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 1000)
@@ -93,6 +94,121 @@ class CodexRebuildBudgetTests(HomeDiscoveryTestCase):
             self.clock += 1
             self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 1000)
             self.assertEqual(rebuild.call_count, 1)
+
+    def test_identity_moves_survive_restart_without_rebuild(self):
+        for kind in ('filename', 'record', 'inode'):
+            with self.subTest(kind=kind):
+                if kind != 'filename':
+                    renamed = self.path.with_name(kind + '.jsonl')
+                    self.path.rename(renamed)
+                    self.path = renamed
+                    if kind == 'record':
+                        self.path.write_text(json.dumps({'type': 'session_meta',
+                            'payload': {'id': UUID_A}}) + '\n' + self.path.read_text())
+                    else:
+                        self.path.write_text('\n'.join(self.path.read_text().splitlines()[1:]) + '\n')
+                before = agentcat.codex_sessions_snapshot(force_rebuild=True)
+                agentcat.save_codex_sessions_cursor(agentcat.load_codex_sessions_cursor())
+                moved = self.path.with_name('moved-' + self.path.name)
+                self.path.rename(moved)
+                self.path = moved
+                agentcat._CODEX_CURSOR_CACHE = None
+                agentcat.load_codex_sessions_cursor()
+                with patch.object(agentcat, '_empty_codex_cursor', wraps=agentcat._empty_codex_cursor) as rebuild:
+                    self.append()
+                    snap = agentcat.codex_sessions_snapshot()
+                    self.assertEqual(snap['tokens']['all'], before['tokens']['all'] + 200)
+                    self.assertNotIn('pendingReconcile', snap)
+                    rebuild.assert_not_called()
+
+    def test_identity_cache_resolves_only_new_changed_and_moved_files(self):
+        with patch.object(agentcat, '_codex_file_identity', wraps=agentcat._codex_file_identity) as resolve:
+            agentcat.codex_sessions_snapshot()
+            self.assertEqual(resolve.call_count, 1)
+            resolve.reset_mock()
+            for _ in range(3):
+                agentcat.codex_sessions_snapshot()
+            resolve.assert_not_called()
+            self.append()
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 400)
+            self.assertEqual(resolve.call_count, 1)
+            resolve.reset_mock()
+            moved = self.path.with_name('moved-' + self.path.name)
+            self.path.rename(moved)
+            self.path = moved
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 400)
+            self.assertEqual(resolve.call_count, 1)
+            resolve.reset_mock()
+            self._codex_session(self.home, UUID_B)
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 600)
+            self.assertEqual(resolve.call_count, 1)
+            resolve.reset_mock()
+            agentcat.codex_sessions_snapshot(force_rebuild=True)
+            resolve.assert_not_called()
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 600)
+
+    def test_identity_cache_invalidates_on_nanosecond_mtime_change(self):
+        agentcat.codex_sessions_snapshot()
+        stat = self.path.stat()
+        os.utime(self.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        with patch.object(agentcat, '_codex_file_identity', wraps=agentcat._codex_file_identity) as resolve:
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 200)
+            resolve.assert_called_once()
+            resolve.reset_mock()
+            agentcat.codex_sessions_snapshot()
+            resolve.assert_not_called()
+
+    def test_unnamed_hardlinks_count_once(self):
+        unnamed = self.path.with_name('unnamed.jsonl')
+        self.path.rename(unnamed)
+        alias = unnamed.with_name('alias.jsonl')
+        os.link(unnamed, alias)
+        with patch.object(agentcat, 'codex_session_files', return_value=[unnamed, alias]):
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 200)
+            self.assertEqual(len(agentcat.load_codex_sessions_cursor()['files']), 1)
+
+    def test_duplicate_copies_and_new_session(self):
+        copy = self.path.with_name('copy-' + self.path.name)
+        copy.write_bytes(self.path.read_bytes())
+        self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 200)
+        self.append()
+        self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 400)
+        # A shorter mirror appearing alone must not rewind the cursor.
+        with patch.object(agentcat, 'codex_session_files', return_value=[copy]):
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 400)
+        self._codex_session(self.home, UUID_B)
+        self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 600)
+
+    def test_path_cursor_migration_preserves_rollups_and_offsets(self):
+        for unnamed in (False, True):
+            with self.subTest(unnamed=unnamed):
+                if unnamed:
+                    moved = self.path.with_name('unnamed.jsonl')
+                    self.path.rename(moved)
+                    self.path = moved
+                before = agentcat.codex_sessions_snapshot(force_rebuild=True)
+                raw = json.loads(agentcat.CODEX_SESSIONS_CURSOR_FILE.read_text())
+                meta = next(iter(raw['files'].values()))
+                meta.pop('inode', None)
+                raw.pop('fileIdentityVersion')
+                raw['files'] = {str(self.path): meta}
+                raw['usagePaths'] = {str(self.path): next(iter(raw['usagePaths'].values()))}
+                agentcat.CODEX_SESSIONS_CURSOR_FILE.write_text(json.dumps(raw))
+                if not unnamed:
+                    moved = self.path.with_name('archived-' + self.path.name)
+                    self.path.rename(moved)
+                    self.path = moved
+                agentcat._CODEX_CURSOR_CACHE = None
+                migrated = agentcat.load_codex_sessions_cursor()
+                self.assertEqual(migrated['daily'], raw['daily'])
+                self.assertEqual(next(iter(migrated['files'].values()))['offset'], meta['offset'])
+                self.assertTrue(next(iter(migrated['files'])).startswith('inode:' if unnamed else 'session:'))
+                with patch.object(agentcat, '_empty_codex_cursor', wraps=agentcat._empty_codex_cursor) as rebuild:
+                    self.append()
+                    snap = agentcat.codex_sessions_snapshot()
+                    self.assertEqual(snap['tokens']['all'], before['tokens']['all'] + 200)
+                    self.assertNotIn('pendingReconcile', snap)
+                    rebuild.assert_not_called()
 
     def test_force_bypasses_window_and_append_is_not_double_counted(self):
         agentcat.codex_sessions_snapshot()

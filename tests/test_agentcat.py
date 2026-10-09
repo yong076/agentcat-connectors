@@ -455,7 +455,9 @@ class AgentCatConnectorTests(unittest.TestCase):
             {"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 30, "reset_at": 1770000000}}},
             source="https://chatgpt.com/backend-api/wham/usage",
         )
-        agentcat.write_live_limits_cache("codex", good)
+        agentcat.write_live_limits_cache(
+            agentcat.codex_home_limits_cache_key(codex_home, agentcat.read_codex_auth(codex_home)), good
+        )
 
         requests: list = []
         with self._codex_unauthorized_network(requests):
@@ -1202,13 +1204,13 @@ class AgentCatConnectorTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}):
-            snapshot = agentcat.snapshot_for_http()
+        with patch.object(agentcat, "refresh_activity_if_stale"):
+            agentcat.initialize_http_snapshot_cache()
+            snapshot = json.loads(b"".join(agentcat.snapshot_for_http()))
 
         self.assertEqual(snapshot["generatedAt"], "2026-05-01T00:00:00Z")
         self.assertIn("servedAt", snapshot)
-        self.assertIn("update", snapshot)
-        self.assertEqual(snapshot["activity"], {"status": "ok"})
+        self.assertEqual(snapshot["activity"], {"status": "old"})
 
     def test_version_json_matches_snapshot_schema_version(self) -> None:
         buf = io.StringIO()
@@ -1936,27 +1938,6 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertEqual(agentcat.filter_snapshot_sections(payload, "   "), payload)
         self.assertEqual(agentcat.filter_snapshot_sections(payload, "nonexistent"), payload)
 
-    def test_http_live_overlay_is_cached_within_ttl(self) -> None:
-        # Audit #6: /v1/snapshot GET must not spawn ps + walk the desktop tree on every
-        # poll (~2-5s). The live overlay is cached for a couple of seconds.
-        from unittest.mock import patch as _p
-        agentcat._HTTP_LIVE_CACHE = None
-        calls = {"n": 0}
-
-        def act():
-            calls["n"] += 1
-            return {"status": "ok", "n": calls["n"]}
-
-        try:
-            with _p.object(agentcat, "terminal_activity_snapshot", side_effect=act), \
-                 _p.object(agentcat, "desktop_app_sources_snapshot", side_effect=lambda *a, **k: {}):
-                a1, _ = agentcat._live_activity_and_desktop()
-                a2, _ = agentcat._live_activity_and_desktop()
-            self.assertEqual(calls["n"], 1)  # computed once, second call served from cache
-            self.assertIs(a1, a2)
-        finally:
-            agentcat._HTTP_LIVE_CACHE = None
-
     def test_terminal_activity_error_path_populates_runtime_modes(self) -> None:
         # Audit #6: the wasted eager runtimeModes query was removed from the initializer;
         # the ps-error path must still populate it (it's the only place it's needed there).
@@ -2000,16 +1981,13 @@ class AgentCatConnectorTests(unittest.TestCase):
             agentcat.LATEST_SNAPSHOT,
             {"schemaVersion": 1, "providers": {"codex": {"status": "ok"}}},
         )
-        agentcat._HTTP_LIVE_CACHE = None
-        try:
-            with patch.object(agentcat, "_build_snapshot_impl", side_effect=AssertionError("must not rebuild")), \
-                 patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok"}), \
-                 patch.object(agentcat, "desktop_app_sources_snapshot", return_value={}):
-                snap = agentcat.snapshot_for_http()
-            self.assertIn("servedAt", snap)
-            self.assertEqual(snap["providers"]["codex"]["status"], "ok")
-        finally:
-            agentcat._HTTP_LIVE_CACHE = None
+        agentcat.initialize_http_snapshot_cache()
+        with patch.object(agentcat, "_build_snapshot_impl", side_effect=AssertionError("must not rebuild")), \
+             patch.object(agentcat, "refresh_activity_if_stale"), \
+             patch.object(agentcat, "read_json", side_effect=AssertionError("must not read")):
+            snap = json.loads(b"".join(agentcat.snapshot_for_http()))
+        self.assertIn("servedAt", snap)
+        self.assertEqual(snap["providers"]["codex"]["status"], "ok")
 
     def test_codexbar_cost_cache_floors_codex_totals_when_larger(self) -> None:
         today = dt.datetime.now().date().isoformat()
@@ -6320,10 +6298,8 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         self.assertIn(limits["status"], {"not_configured", None})
         self.assertFalse(limits.get("quotas"))
 
-    def test_serve_stale_restamps_cache_to_throttle_reprobe(self) -> None:
-        # Audit H1: on probe failure we return the last-good numbers but MUST
-        # re-stamp the cache so the daemon does not re-probe (and re-refresh the
-        # OAuth token / re-scan the agy binary) on every 60s tick.
+    def test_serve_stale_preserves_fetch_time_and_throttles_reprobe(self) -> None:
+        # Retry timing must not advance the last successful fetch timestamp.
         good = agentcat.empty_limits(status="auto")
         good["quotas"] = [{"id": "gemini:pro", "label": "Pro", "remainingPercent": 90.0, "usedPercent": 10.0}]
         agentcat.write_live_limits_cache("antigravity", good)
@@ -6333,8 +6309,7 @@ class AntigravityLiveLimitsTests(unittest.TestCase):
         served = agentcat.serve_stale_live_limits("antigravity", before, RuntimeError("boom"))
         self.assertEqual(served["liveError"], "boom")
         self.assertTrue(served.get("quotas"))
-        # serve_stale re-wrote the cache entry (fresh cachedAt + liveError), so the
-        # next tick short-circuits on the cache instead of re-probing the token.
+        # The separate attempt timestamp throttles the next probe.
         after = agentcat.cached_live_limits("antigravity", agentcat.LIVE_LIMITS_MAX_AGE_SECONDS)
         self.assertIsNotNone(after)
         self.assertEqual(after.get("liveError"), "boom")

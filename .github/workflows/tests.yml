@@ -14,6 +14,7 @@ jobs:
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -41,4 +42,4 @@ jobs:
         run: python -m py_compile bin/agentcat scripts/install.py scripts/public_channel_install.py scripts/verify_update_path.py scripts/check_promotion.py scripts/run_sandboxed_tests.py
 
       - name: Sandboxed suite, update survival, and N-1 to N rehearsal
-        run: python scripts/run_sandboxed_tests.py --previous-version 26.41.3
+        run: python scripts/run_sandboxed_tests.py --previous-version 26.41.4

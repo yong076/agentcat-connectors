@@ -17,6 +17,9 @@ import logging
 import os
 import plistlib
 import socket
+import signal
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import subprocess
 import sys
 import tempfile
@@ -256,11 +259,105 @@ class DaemonLogHygieneTests(unittest.TestCase):
                 code = agentcat.run_daemon(argparse.Namespace(host="127.0.0.1", port=port))
         finally:
             blocker.close()
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 75)
         lines = [line for line in stderr.getvalue().splitlines() if line.strip()]
         self.assertEqual(len(lines), 1, lines)
         self.assertIn(f"agentcatd cannot listen on 127.0.0.1:{port}", lines[0])
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "Windows SO_REUSEADDR semantics differ; the bind guard is the same code")
+    def test_healthy_duplicate_exits_quietly(self):
+        class HealthHandler(BaseHTTPRequestHandler):
+            body = b"ok\n"
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(self.body if self.path == "/healthz" else b"wrong")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), HealthHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # A separate process gives a hard deadline and is killed/reaped on
+            # timeout, even if a regression binds successfully and serves forever.
+            script = textwrap.dedent(f"""
+                import argparse, sys
+                from unittest.mock import patch
+                sys.path.insert(0, {str(REPO / 'tests')!r})
+                from test_daemon_log_hygiene import agentcat
+                with patch.object(agentcat, 'build_snapshot') as build, \
+                     patch.object(agentcat.threading, 'Thread'), \
+                     patch.object(agentcat, 'ensure_daemon_stderr_appends'), \
+                     patch.object(agentcat, 'rotate_daemon_log'), \
+                     patch.object(agentcat, 'sweep_foreign_sqlite_copies'), \
+                     patch.object(agentcat, 'prune_events'), \
+                     patch.object(agentcat, 'reflect_write_default_config'), \
+                     patch.object(agentcat, 'shutdown_codex_app_servers'):
+                    code = agentcat.run_daemon(argparse.Namespace(
+                        host='127.0.0.1', port={server.server_port}))
+                    build.assert_not_called()
+                    sys.exit(code)
+            """)
+            env = dict(os.environ, HOME=str(self.home), USERPROFILE=str(self.home),
+                       AGENTCAT_HOME=str(self.state))
+
+            def run_duplicate():
+                return subprocess.run([sys.executable, "-c", script], env=env,
+                                      stdin=subprocess.DEVNULL, capture_output=True,
+                                      text=True, timeout=10)
+
+            result = run_duplicate()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            HealthHandler.body = b"unrelated service"
+            result = run_duplicate()
+            self.assertEqual(result.returncode, 75, result.stderr)
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    @unittest.skipIf(os.name == "nt", "POSIX process signals; Windows termination is forceful")
+    def test_stop_signals_cleanup_and_exit_zero(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            for phase in ("serve_forever", "prune_events"):
+                with self.subTest(signal=signum, phase=phase):
+                    script = textwrap.dedent(f"""
+                        import argparse, os, signal, sys
+                        from unittest.mock import Mock, patch
+                        sys.path.insert(0, {str(REPO / 'tests')!r})
+                        from test_daemon_log_hygiene import agentcat
+                        server = Mock()
+                        def stop():
+                            os.kill(os.getpid(), {int(signum)})
+                        server.serve_forever.side_effect = stop
+                        with patch.object(agentcat, 'ThreadingHTTPServer', return_value=server), \
+                             patch.object(agentcat.threading, 'Thread'), \
+                             patch.object(agentcat, 'ensure_daemon_stderr_appends'), \
+                             patch.object(agentcat, 'rotate_daemon_log'), \
+                             patch.object(agentcat, 'sweep_foreign_sqlite_copies'), \
+                             patch.object(agentcat, 'prune_events', side_effect=stop if {phase!r} == 'prune_events' else None), \
+                             patch.object(agentcat, 'reflect_write_default_config'), \
+                             patch.object(agentcat, 'shutdown_codex_app_servers') as cleanup:
+                            previous = signal.getsignal(signal.SIGTERM)
+                            code = agentcat.run_daemon(argparse.Namespace(host='127.0.0.1', port=0))
+                            cleanup.assert_called_once_with()
+                            server.server_close.assert_called_once_with()
+                            assert signal.getsignal(signal.SIGTERM) == previous
+                            assert code == 0
+                            print('cleanup verified')
+                            sys.exit(code)
+                    """)
+                    env = dict(os.environ, HOME=str(self.home), AGENTCAT_HOME=str(self.state))
+                    result = subprocess.run([sys.executable, "-c", script], env=env,
+                                            stdin=subprocess.DEVNULL, capture_output=True,
+                                            text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("cleanup verified", result.stdout)
 
 
 class LaunchAgentPlistTests(unittest.TestCase):
@@ -269,7 +366,7 @@ class LaunchAgentPlistTests(unittest.TestCase):
         # `launchctl kickstart -k` wait that long, which overran the
         # auto-update installer's 30 s budget on a real Mac (26.41.0).
         plist = plistlib.loads(install.plist_text().encode("utf-8"))
-        self.assertIs(plist["KeepAlive"], True)
+        self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
         self.assertNotIn("ThrottleInterval", plist)
         self.assertTrue(plist["StandardErrorPath"].endswith("agentcatd.err.log"))
 

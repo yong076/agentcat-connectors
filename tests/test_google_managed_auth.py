@@ -280,6 +280,8 @@ class GoogleManagedAuthTests(unittest.TestCase):
         self.assertEqual(result["providerIdentity"], {"accountID": "google-account-42"})
         self.assertEqual(result["usage"]["scope"], "gemini_code_assist_request_quota")
         self.assertEqual(result["usage"]["freshness"], "live")
+        self.assertTrue(result["usage"]["updatedAt"].endswith("Z"))
+        self.assertFalse(ManagedAccounts.public({"provider": "gemini", "usage": result["usage"]})["usage"]["stale"])
         self.assertEqual(result["usage"]["windows"][0]["remainingPercent"], 75.0)
         self.assertEqual(calls[0].get_header("Authorization"), "Bearer managed-token")
         self.assertNotIn("owner-token", str(calls))

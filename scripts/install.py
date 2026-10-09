@@ -233,11 +233,9 @@ def plist_text() -> str:
         ("HOME", str(HOME)),
         ("PATH", f"{LOCAL_BIN}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
     ]
-    # launchd does not inherit the interactive shell environment, so the background daemon
-    # can't see provider config-dir overrides the user exported in their shell rc. Capture
-    # them at install time and pin them into the plist, or the daemon silently reads the
-    # defaults (~/.claude, ~/.codex) and never finds a dotfiles/multi-account user's data.
-    for var in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+    # Preserve Claude's config override, but never pin Codex to the installer's
+    # account. Rewriting the plist also removes CODEX_HOME from older installs.
+    for var in ("CLAUDE_CONFIG_DIR",):
         value = os.environ.get(var)
         if value:
             env_entries.append((var, value))
@@ -259,7 +257,10 @@ def plist_text() -> str:
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>StandardOutPath</key>
   <string>{AGENTCAT_HOME}/agentcatd.out.log</string>
   <key>StandardErrorPath</key>
