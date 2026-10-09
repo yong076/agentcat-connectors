@@ -1,5 +1,6 @@
 """Codex polling uses a persisted daily rebuild budget and an in-memory cursor."""
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -119,6 +120,43 @@ class CodexRebuildBudgetTests(HomeDiscoveryTestCase):
                     self.assertEqual(snap['tokens']['all'], before['tokens']['all'] + 200)
                     self.assertNotIn('pendingReconcile', snap)
                     rebuild.assert_not_called()
+
+    def test_identity_cache_resolves_only_new_changed_and_moved_files(self):
+        with patch.object(agentcat, '_codex_file_identity', wraps=agentcat._codex_file_identity) as resolve:
+            agentcat.codex_sessions_snapshot()
+            self.assertEqual(resolve.call_count, 1)
+            resolve.reset_mock()
+            for _ in range(3):
+                agentcat.codex_sessions_snapshot()
+            resolve.assert_not_called()
+            self.append()
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 400)
+            self.assertEqual(resolve.call_count, 1)
+            resolve.reset_mock()
+            moved = self.path.with_name('moved-' + self.path.name)
+            self.path.rename(moved)
+            self.path = moved
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 400)
+            self.assertEqual(resolve.call_count, 1)
+            resolve.reset_mock()
+            self._codex_session(self.home, UUID_B)
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 600)
+            self.assertEqual(resolve.call_count, 1)
+            resolve.reset_mock()
+            agentcat.codex_sessions_snapshot(force_rebuild=True)
+            resolve.assert_not_called()
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 600)
+
+    def test_identity_cache_invalidates_on_nanosecond_mtime_change(self):
+        agentcat.codex_sessions_snapshot()
+        stat = self.path.stat()
+        os.utime(self.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        with patch.object(agentcat, '_codex_file_identity', wraps=agentcat._codex_file_identity) as resolve:
+            self.assertEqual(agentcat.codex_sessions_snapshot()['tokens']['all'], 200)
+            resolve.assert_called_once()
+            resolve.reset_mock()
+            agentcat.codex_sessions_snapshot()
+            resolve.assert_not_called()
 
     def test_unnamed_hardlinks_count_once(self):
         unnamed = self.path.with_name('unnamed.jsonl')

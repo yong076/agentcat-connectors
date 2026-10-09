@@ -9176,6 +9176,14 @@ def codex_session_files() -> List[Path]:
     return files
 
 
+_CODEX_FILE_IDENTITY_CACHE = {}
+_CODEX_FILE_IDENTITY_CACHE_HOME = None
+_CODEX_FILE_GROUPS = {}
+_CODEX_FILE_SELECTED = {}
+_CODEX_FILE_CURSOR = None
+_CODEX_FILE_PATHS = []
+
+
 def _codex_file_identity(path: Path, stat=None, known=None) -> str:
     """Local-only session key; a rollout may move or have multiple copies."""
     session = _session_identity(path)
@@ -9390,19 +9398,78 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
 
     account_changed = _prepare_home_accounts("codex", cursor)
     previous_accounts = cursor.get("homeAccounts", {})
-    # Resolve once per tick, selecting the longest copy before reading any tail.
-    # Persisted inode aliases avoid reopening unnamed files on every idle tick.
-    known = {meta["inode"]: key for key, meta in cursor["files"].items() if meta.get("inode")}
-    identified = {}
+    # Cache identities by path + (size, mtime_ns). Keep groups as well so an
+    # unchanged tick does not rebuild the duplicate-selection index either.
+    global _CODEX_FILE_IDENTITY_CACHE, _CODEX_FILE_IDENTITY_CACHE_HOME
+    global _CODEX_FILE_GROUPS, _CODEX_FILE_SELECTED, _CODEX_FILE_CURSOR, _CODEX_FILE_PATHS
+    cache_home = str(CODEX_SESSIONS_CURSOR_FILE)
+    if _CODEX_FILE_IDENTITY_CACHE_HOME != cache_home:
+        _CODEX_FILE_IDENTITY_CACHE = {}
+        _CODEX_FILE_GROUPS = {}
+        _CODEX_FILE_SELECTED = {}
+        _CODEX_FILE_IDENTITY_CACHE_HOME = cache_home
+    identity_cache = _CODEX_FILE_IDENTITY_CACHE
+    groups = _CODEX_FILE_GROUPS
+    selected = _CODEX_FILE_SELECTED
+    known = None
+    changed_identities = {}
+    regroup = set()
+    paths_changed = files != _CODEX_FILE_PATHS
+    seen_paths = set() if paths_changed else None
+    cursor_reloaded = cursor is not _CODEX_FILE_CURSOR
     for path in files:
+        path_key = str(path)
         try:
             stat = path.stat()
         except OSError:
             continue
-        identity = _codex_file_identity(path, stat, known)
-        if identity not in identified or stat.st_size > identified[identity][1].st_size:
-            identified[identity] = (path, stat)
-    selected = {key: _usage_home_id("codex", path) for key, (path, _) in identified.items()}
+        if seen_paths is not None:
+            seen_paths.add(path_key)
+        stamp = (stat.st_size, stat.st_mtime_ns)
+        cached = identity_cache.get(path_key)
+        if (cached is not None and cached[0] == stamp
+                and (not cursor_reloaded or cached[1] in cursor["files"])):
+            identity = cached[1]
+            if cached[2] is None or (cursor_reloaded and cursor["files"].get(identity) is not cached[2]):
+                changed_identities[identity] = None
+            continue
+        previous_stat = groups[cached[1]][path_key][1] if cached is not None else None
+        if (not cursor_reloaded and previous_stat is not None
+                and (previous_stat.st_dev, previous_stat.st_ino) == (stat.st_dev, stat.st_ino)):
+            aliases = {f"inode:{stat.st_dev}:{stat.st_ino}": cached[1]}
+        else:
+            if known is None:
+                known = {meta["inode"]: key for key, meta in cursor["files"].items() if meta.get("inode")}
+            aliases = known
+        identity = _codex_file_identity(path, stat, aliases)
+        if cached is not None:
+            groups[cached[1]].pop(path_key, None)
+            regroup.add(cached[1])
+        identity_cache[path_key] = (stamp, identity, None)
+        groups.setdefault(identity, {})[path_key] = (path, stat)
+        regroup.add(identity)
+        changed_identities[identity] = None
+    for path_key in (identity_cache.keys() - seen_paths if seen_paths is not None else ()):
+        _, identity, _ = identity_cache.pop(path_key)
+        groups[identity].pop(path_key, None)
+        regroup.add(identity)
+    if regroup or configuration_changed:
+        selected = dict(selected)
+    for identity in regroup:
+        if not groups[identity]:
+            del groups[identity]
+            selected.pop(identity, None)
+        else:
+            path, _ = max(groups[identity].values(), key=lambda item: item[1].st_size)
+            selected[identity] = _usage_home_id("codex", path)
+            changed_identities[identity] = None
+    if configuration_changed:
+        for identity, candidates in groups.items():
+            path, _ = max(candidates.values(), key=lambda item: item[1].st_size)
+            selected[identity] = _usage_home_id("codex", path)
+    # Copy-on-write selection preserves the cursor's prior topology.
+    _CODEX_FILE_SELECTED = selected
+    _CODEX_FILE_PATHS = list(files)
     old_paths = cursor.get("usagePaths", {})
     topology_changed = (
         bool(cursor.get("files")) and "homeDaily" not in cursor
@@ -9448,7 +9515,11 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
     # unconditional 60s re-serialization was a steady daemon CPU cost.
     changed = bool(rebuild or account_changed or cursor.get("_dirty"))
 
-    for identity, (path, stat) in identified.items():
+    # A cached completed read can skip parsing checks, but a new cursor object
+    # (external edit/reload), incomplete tail or rebuild must still be examined.
+    pending_files = ((identity, max(groups[identity].values(), key=lambda item: item[1].st_size))
+                     for identity in (groups if rebuild else changed_identities) if identity in groups)
+    for identity, (path, stat) in pending_files:
         size = int(stat.st_size)
         mtime = float(stat.st_mtime)
         meta = file_cursors.get(identity) or {}
@@ -9459,6 +9530,8 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
         # Unchanged file (same size + mtime): nothing new to parse. The byte
         # offset alone guarantees dedup; mtime+size is the cheap skip gate.
         if prev_offset >= size and prev_mtime == mtime and prev_size == size:
+            cached = identity_cache[str(path)]
+            identity_cache[str(path)] = (cached[0], identity, meta)
             continue
         # Truncated/rotated file: re-read from the start. The byte offset is
         # the dedup boundary, so resetting it re-counts the whole (new) file.
@@ -9578,6 +9651,11 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
             "sawDivergentTotals": saw_divergent_totals,
         }
 
+        if new_offset == size:
+            cached = identity_cache[str(path)]
+            identity_cache[str(path)] = (cached[0], identity, file_cursors[identity])
+
+    _CODEX_FILE_CURSOR = cursor
     cursor["turns"] = int(cursor.get("turns") or 0) + new_turns
     cursor["_dirty"] = changed
     if changed and (rebuild or account_changed or not cursor_recently_saved(CODEX_SESSIONS_CURSOR_FILE)):
