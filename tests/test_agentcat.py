@@ -1175,7 +1175,7 @@ class AgentCatConnectorTests(unittest.TestCase):
                             patch.object(agentcat.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")):
                         snapshot = agentcat.build_snapshot()
                         agentcat.write_json_atomic(agentcat.LATEST_SNAPSHOT, snapshot)
-                        served = agentcat.snapshot_for_http()
+                        served = json.loads(b"".join(agentcat.snapshot_for_http()))
                     check.assert_not_called()
                     for payload in (snapshot, served):
                         update = payload["update"]
