@@ -4160,6 +4160,33 @@ class AgentCatConnectorTests(unittest.TestCase):
                         self.assertEqual(len(copied_databases), 3 if changes == 3 else 2)
                         self.assertTrue(all(not folder.exists() for folder in temp_roots))
 
+    def test_foreign_sqlite_resolves_symlink_before_finding_wal(self) -> None:
+        database = self.root / "target # % 한글.db"
+        link = self.root / "linked.db"
+        with closing(sqlite3.connect(database)) as writer:
+            writer.execute("pragma journal_mode=wal")
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+            try:
+                link.symlink_to(database)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            self.assertFalse(link.with_name(link.name + "-wal").exists())
+            self.assertEqual(agentcat.read_foreign_sqlite(link, lambda conn:
+                conn.execute("select value from fixture").fetchall()), [(123,)])
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended-length paths")
+    def test_foreign_sqlite_windows_extended_path(self) -> None:
+        database = self.root / "extended # % 한글.db"
+        with closing(sqlite3.connect(database)) as writer:
+            writer.execute("create table fixture (value integer)")
+            writer.execute("insert into fixture values (123)")
+            writer.commit()
+        extended = Path("\\\\?\\" + str(database.resolve()))
+        self.assertEqual(agentcat.read_foreign_sqlite(extended, lambda conn:
+            conn.execute("select value from fixture").fetchall()), [(123,)])
+
     def test_foreign_sqlite_retries_failed_read_on_private_copy(self) -> None:
         database = self.root / "retry.db"
         with closing(sqlite3.connect(database)) as writer:

@@ -12129,6 +12129,8 @@ def read_foreign_sqlite(
     read require a private copy including WAL frames. The callback must fully
     materialize its result before the connection closes and may be retried.
     """
+    database = database.resolve()
+
     def sidecars() -> Tuple[bool, bool]:
         return (database.with_name(database.name + "-wal").exists(),
                 database.with_name(database.name + "-shm").exists())
@@ -12140,7 +12142,12 @@ def read_foreign_sqlite(
         immutable = attempt == 0 and not wal_exists and not shm_exists
         if not immutable and not (wal_exists and shm_exists):
             break
-        uri = database.resolve().as_uri() + "?mode=ro"
+        # pathname2url handles Windows extended-length paths without making
+        # the \? prefix a URI authority. Keep UNC shares in the URI path too.
+        uri_path = urllib.request.pathname2url(os.path.abspath(database))
+        if uri_path.startswith("//") and not uri_path.startswith("///"):
+            uri_path = "//" + uri_path
+        uri = "file:" + uri_path + "?mode=ro"
         if immutable:
             uri += "&immutable=1"
         try:
