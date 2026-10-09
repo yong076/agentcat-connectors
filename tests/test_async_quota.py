@@ -30,6 +30,8 @@ class AsyncQuotaTests(unittest.TestCase):
         self.daemon_patch = patch.object(a, "_RUNNING_DAEMON", True)
         self.daemon_patch.start()
         self.jobs = []
+        self.non_quota_targets = []
+        self.original_thread = threading.Thread
         self.thread_patch = patch.object(a.threading, 'Thread', side_effect=self.thread)
         self.thread_patch.start()
 
@@ -40,6 +42,11 @@ class AsyncQuotaTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def thread(self, *, target, **kwargs):
+        # threading is shared with subprocess: Windows pipe reader threads must
+        # run normally, while only quota workers use our deferred executor.
+        if not kwargs.get('name', '').startswith('quota-'):
+            self.non_quota_targets.append(getattr(target, '__qualname__', repr(target)))
+            return self.original_thread(target=target, **kwargs)
         jobs = self.jobs
         class DeferredThread:
             def start(self):
@@ -67,7 +74,11 @@ class AsyncQuotaTests(unittest.TestCase):
                 snapshot = a.build_snapshot()
                 self.assertEqual(snapshot['generatedAt'], str(before))
                 self.assertLessEqual(clock[0] - before, 2)
-            self.assertEqual(len(self.jobs), 1)
+            self.assertEqual(
+                len(self.jobs), 1,
+                msg="Expected exactly one quota job; non-quota targets: "
+                    + repr(self.non_quota_targets),
+            )
             request.assert_not_called()
 
     def test_offline_breakdown_calls_url_once_in_fifteen_minutes(self):
