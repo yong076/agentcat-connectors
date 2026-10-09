@@ -3533,7 +3533,7 @@ def background_live_limits(provider: str, refresh: Any) -> Dict[str, Any]:
             return empty_limits()
         provider = codex_home_limits_cache_key(home, auth)
     cached = cached_live_limits(provider, LIVE_LIMITS_MAX_AGE_SECONDS)
-    if cached is None or not _RUNNING_DAEMON:
+    if cached is None:
         refreshed = schedule_quota_refresh(provider.split("-instance:")[0], refresh, key=provider)
         if isinstance(refreshed, dict):
             return refreshed
@@ -5744,7 +5744,7 @@ def cached_codex_usage_breakdown() -> Dict[str, Any]:
     fetched = int_limit(raw.get("fetched_at"))
     fresh = data is not None and fetched is not None and 0 <= time.time() - fetched < CODEX_USAGE_BREAKDOWN_TTL_SECONDS
     failure = raw.get("failure") if isinstance(raw.get("failure"), dict) else {}
-    if not _RUNNING_DAEMON or (not fresh and (int_limit(failure.get("retryAt")) or 0) <= time.time()):
+    if not fresh and (int_limit(failure.get("retryAt")) or 0) <= time.time():
         refreshed = schedule_quota_refresh("codex", codex_usage_breakdown, key="breakdown")
         if isinstance(refreshed, dict):
             # One-shot callers must see the inline result on this invocation,

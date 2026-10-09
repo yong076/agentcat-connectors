@@ -203,3 +203,38 @@ class AsyncQuotaTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 a.run_daemon(a.argparse.Namespace())
             self.assertFalse(a._RUNNING_DAEMON)
+
+    def test_one_shot_fresh_limits_skip_refresh(self):
+        good = {'status': 'auto', 'updatedAt': 'original', 'quotas': [{'usedPercent': 10}]}
+        with patch.object(a.time, 'time', return_value=1000):
+            a.write_live_limits_cache('claude', good)
+        with patch.object(a, '_RUNNING_DAEMON', False), \
+             patch.object(a.time, 'time', return_value=1001), \
+             patch.object(a, 'claude_live_limits') as refresh, \
+             patch.object(a.urllib.request, 'urlopen') as request:
+            result = a.background_live_limits('claude', refresh)
+        refresh.assert_not_called()
+        request.assert_not_called()
+        self.assertEqual(result['quotas'], good['quotas'])
+        self.assertEqual(result['updatedAt'], 'original')
+        self.assertFalse(result.get('stale', False))
+        self.assertEqual(self.jobs, [])
+
+    def test_one_shot_breakdown_backoff_serves_stale_without_request(self):
+        data = a.codex_usage_breakdown_from_response({'data': []})
+        a.write_json_atomic(a.CODEX_USAGE_BREAKDOWN_CACHE, {
+            'fetched_at': 1, 'data': data,
+            'failure': {'retryAt': 2500, 'streak': 1, 'reason': 'cli_login_expired'},
+        })
+        with patch.object(a, '_RUNNING_DAEMON', False), \
+             patch.object(a.time, 'time', return_value=2000), \
+             patch.object(a, 'read_codex_auth', return_value={'tokens': {'access_token': 'fixture'}}) as auth, \
+             patch.object(a, 'codex_usage_breakdown_request', return_value={'data': []}) as request:
+            result = a.cached_codex_usage_breakdown()
+        auth.assert_not_called()
+        request.assert_not_called()
+        self.assertTrue(result['stale'])
+        self.assertEqual(result['reason'], 'cli_login_expired')
+        self.assertEqual(result['bySurface'], data['bySurface'])
+        self.assertEqual(json.loads(a.CODEX_USAGE_BREAKDOWN_CACHE.read_text())['fetched_at'], 1)
+        self.assertEqual(self.jobs, [])
