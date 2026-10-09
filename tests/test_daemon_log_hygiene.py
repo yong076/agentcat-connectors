@@ -241,6 +241,7 @@ class DaemonLogHygieneTests(unittest.TestCase):
         # A sibling directory that merely shares the prefix is not rewritten.
         self.assertEqual(agentcat._tilde_text(f"{self.home}-old/x"), f"{self.home}-old/x")
 
+    @unittest.skipIf(os.name == "nt", "Windows SO_REUSEADDR semantics differ; the bind guard is the same code")
     def test_port_in_use_is_one_line_and_exit_code(self):
         blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         blocker.bind(("127.0.0.1", 0))
@@ -264,6 +265,7 @@ class DaemonLogHygieneTests(unittest.TestCase):
         self.assertIn(f"agentcatd cannot listen on 127.0.0.1:{port}", lines[0])
         self.assertNotIn("Traceback", stderr.getvalue())
 
+    @unittest.skipIf(os.name == "nt", "Windows SO_REUSEADDR semantics differ; the bind guard is the same code")
     def test_healthy_duplicate_exits_quietly(self):
         class HealthHandler(BaseHTTPRequestHandler):
             body = b"ok\n"
