@@ -12884,9 +12884,9 @@ def classify_process(command: str, *, windows: Optional[bool] = None) -> Optiona
         return None
 
     # Package-based wrappers must match the executed script, never its arguments.
-    if executable in {"codex", "codex.exe", "codex.cmd"} or re.search(r"(?:^|/)@openai/codex/bin/codex\.js$", executable_path_normalized):
+    if executable in {"codex", "codex.exe", "codex.cmd"} or re.search(r"(?:^|/)@openai/codex/bin/codex\.(?:m|c)?js$", executable_path_normalized):
         return "codex"
-    if executable in {"claude", "claude.exe", "claude.cmd"} or re.search(r"(?:^|/)@anthropic-ai/claude-code/cli\.js$", executable_path_normalized):
+    if executable in {"claude", "claude.exe", "claude.cmd"} or re.search(r"(?:^|/)@anthropic-ai/claude-code/cli\.(?:m|c)?js$", executable_path_normalized):
         return "claude"
     if (
         executable in {"agy", "agy.exe", "antigravity", "antigravity.exe", "antigravity-cli"}
@@ -12896,7 +12896,7 @@ def classify_process(command: str, *, windows: Optional[bool] = None) -> Optiona
         return "antigravity"
     if (
         executable in {"gemini", "gemini.exe", "gemini.cmd", "gemini-cli"}
-        or re.search(r"(?:^|/)@google/gemini-cli/(?:index|dist/index|bundle/gemini)\.js$", executable_path_normalized)
+        or re.search(r"(?:^|/)@google/gemini-cli/(?:index|dist/index|bundle/gemini)\.(?:m|c)?js$", executable_path_normalized)
     ):
         return "gemini"
     if executable in {"kimi", "kimi.exe", "kimi.cmd", "kimi-code", "kimi-code.exe", "kimi-code.cmd"}:
@@ -12908,7 +12908,7 @@ def classify_process(command: str, *, windows: Optional[bool] = None) -> Optiona
     if executable in {"opencode", "opencode.exe", "opencode.cmd"}:
         return "opencode"
     if executable in {"copilot", "copilot.exe", "copilot.cmd"} or re.search(
-        r"(?:^|/)@github/copilot/(?:index|dist/index)\.js$", executable_path_normalized
+        r"(?:^|/)@github/copilot/(?:index|dist/index)\.(?:m|c)?js$", executable_path_normalized
     ):
         return "copilot"
     return None
