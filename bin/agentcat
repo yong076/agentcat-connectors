@@ -12857,9 +12857,37 @@ def safe_activity_command(provider: str, pid: int) -> str:
     return f"{provider} pid {pid}"
 
 
-def motion_stage(process_count: int, total_cpu: float, runnable_process_count: int) -> str:
+def has_recent_motion_activity(active_providers: Iterable[str]) -> bool:
+    """Use recorded hook/notify activity, not periodic statusline refreshes."""
+    providers = tuple(set(active_providers))
+    if not providers or not EVENTS_DB.is_file():
+        return False
+    current = time.time()
+    try:
+        with closing(sqlite3.connect(EVENTS_DB.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as conn:
+            return any(
+                conn.execute(
+                    "select 1 from events where provider = ? and ts >= ? and ts <= ? "
+                    "and source in ('claude-hook', 'gemini-hook', 'codex-notify') limit 1",
+                    (provider, current - 60, current),
+                ).fetchone() is not None
+                for provider in providers
+            )
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def motion_stage(
+    process_count: int, total_cpu: float, runnable_process_count: int,
+    *, recent_activity: bool = False,
+) -> str:
     if process_count <= 0:
         return "sleeping"
+
+    # ps CPU can remain high while agents wait for input. Require a runnable
+    # process or a recent recorded activity event before using faster stages.
+    if runnable_process_count <= 0 and not recent_activity:
+        return "walking"
 
     activity_score = total_cpu + float(runnable_process_count) * 4.0
     if activity_score >= 22:
@@ -12931,7 +12959,12 @@ def windows_activity_from_rows(
             "totalMemoryBytes": total_memory,
             "runnableProcessCount": runnable_process_count,
             "activityScore": activity_score,
-            "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
+            "motionStage": motion_stage(
+                len(rows), total_cpu, runnable_process_count,
+                recent_activity=has_recent_motion_activity(
+                    provider for provider, count in counts.items() if count > 0
+                ) if rows and runnable_process_count == 0 and total_cpu >= 7 else False,
+            ),
             "runtimeModes": safe_runtime_modes_snapshot(
                 active_providers=[provider for provider, count in counts.items() if count > 0]
             ),
@@ -13217,7 +13250,12 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
             "totalMemoryBytes": total_memory,
             "runnableProcessCount": runnable_process_count,
             "activityScore": activity_score,
-            "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
+            "motionStage": motion_stage(
+                len(rows), total_cpu, runnable_process_count,
+                recent_activity=has_recent_motion_activity(
+                    provider for provider, count in counts.items() if count > 0
+                ) if rows and runnable_process_count == 0 and total_cpu >= 7 else False,
+            ),
             "runtimeModes": safe_runtime_modes_snapshot(
                 active_providers=[provider for provider, count in counts.items() if count > 0]
             ),
