@@ -13834,6 +13834,7 @@ def start_auto_update_install(remote_version: str) -> subprocess.Popen:
         if repo_dir is None or repo_dir != agentcat_connectors_dir():
             raise ValueError("refusing to update outside the managed connector install")
         if IS_WINDOWS:
+            env["AGENTCAT_PYTHON"] = sys.executable
             script_path = repo_dir / "install.ps1"
             if not script_path.is_file():
                 raise ValueError("trusted Windows installer is missing")

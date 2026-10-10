@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -196,9 +197,19 @@ def install_binary(repo_dir: Path, backup_dir: Path) -> None:
         # %USERPROFILE% so the shim body stays ASCII regardless of username.
         script_ref = _windows_shim_path(src)
         home_ref = _windows_shim_path(AGENTCAT_HOME)
+        pinned_lines = []
+        if sys.executable:
+            python_ref = _windows_shim_path(Path(sys.executable))
+            pinned_lines = [
+                f'if exist "{python_ref}" (',
+                f'  "{python_ref}" "{script_ref}" %*',
+                '  goto :eof',
+                ')',
+            ]
         shim = "\r\n".join([
             "@echo off",
             f'set "AGENTCAT_HOME={home_ref}"',
+            *pinned_lines,
             'where py >nul 2>nul',
             'if %ERRORLEVEL% EQU 0 (',
             f'  py -3 "{script_ref}" %*',
