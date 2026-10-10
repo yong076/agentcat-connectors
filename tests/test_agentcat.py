@@ -5393,6 +5393,7 @@ class AgentCatConnectorTests(unittest.TestCase):
         self.assertNotIn("iex", command_text)
         if not agentcat.IS_WINDOWS:
             self.assertTrue(captured["start_new_session"])
+            self.assertEqual(captured["env"].get("AGENTCAT_PYTHON"), os.environ.get("AGENTCAT_PYTHON"))
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX sessions and bash")
     def test_detached_auto_update_keeps_stdout_and_stderr_logs(self) -> None:
@@ -5427,13 +5428,17 @@ class AgentCatConnectorTests(unittest.TestCase):
 
         with patch.object(agentcat, "IS_WINDOWS", True), \
                 patch.object(agentcat, "CREATE_NO_WINDOW", 0), \
-                patch.dict(agentcat.os.environ, {"PSModulePath": r"C:\Program Files\PowerShell\7\Modules"}), \
+                patch.dict(agentcat.os.environ, {"PSModulePath": r"C:\Program Files\PowerShell\7\Modules",
+                                                   "AGENTCAT_PYTHON": "stale-python.exe"}), \
+                patch.object(agentcat.sys, "executable", r"C:\Users\아트 심\.agentcat\python\3.13.16\python.exe"), \
                 patch.object(agentcat, "current_connector_repo_dir", return_value=install_dir), \
                 patch.object(agentcat.subprocess, "Popen", side_effect=fake_popen):
             agentcat.start_auto_update_install("99.0.0")
 
         self.assertFalse(any(key.upper() == "PSMODULEPATH" for key in captured["env"]))
         self.assertNotIn("start_new_session", captured)
+        self.assertEqual(captured["env"]["AGENTCAT_PYTHON"],
+                         r"C:\Users\아트 심\.agentcat\python\3.13.16\python.exe")
 
     def test_public_update_manifest_requires_release_url_and_digest(self) -> None:
         manifest = {
