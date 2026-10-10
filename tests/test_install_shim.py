@@ -45,6 +45,32 @@ class WindowsShimPathTests(unittest.TestCase):
 
 
 class WindowsShimGenerationTests(unittest.TestCase):
+    def test_empty_executable_uses_path_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            repo = home / "connectors"
+            src = repo / "bin" / "agentcat"
+            src.parent.mkdir(parents=True)
+            src.write_text("# fixture", encoding="ascii")
+            shim = home / "agentcat.cmd"
+            with unittest.mock.patch.multiple(
+                install, HOME=home, AGENTCAT_HOME=home / ".agentcat",
+                BIN_PATH=shim, IS_WINDOWS=True,
+            ), unittest.mock.patch.object(install.sys, "executable", ""), \
+                    unittest.mock.patch.object(install, "ensure_windows_user_path"), \
+                    unittest.mock.patch.object(install, "log"):
+                install.install_binary(repo, home / "backups")
+            self.assertEqual(shim.read_bytes(), (
+                '@echo off\r\n'
+                'set "AGENTCAT_HOME=%USERPROFILE%\\.agentcat"\r\n'
+                'where py >nul 2>nul\r\n'
+                'if %ERRORLEVEL% EQU 0 (\r\n'
+                '  py -3 "%USERPROFILE%\\connectors\\bin\\agentcat" %*\r\n'
+                ') else (\r\n'
+                '  python "%USERPROFILE%\\connectors\\bin\\agentcat" %*\r\n'
+                ')\r\n'
+            ).encode("ascii"))
+
     def test_install_prefers_pinned_interpreter_with_legacy_fallback(self) -> None:
         for username in ("Alice Smith", "아트 심", "田中"):
             for outside_home in (False, True):

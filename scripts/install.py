@@ -197,14 +197,19 @@ def install_binary(repo_dir: Path, backup_dir: Path) -> None:
         # %USERPROFILE% so the shim body stays ASCII regardless of username.
         script_ref = _windows_shim_path(src)
         home_ref = _windows_shim_path(AGENTCAT_HOME)
-        python_ref = _windows_shim_path(Path(sys.executable))
+        pinned_lines = []
+        if sys.executable:
+            python_ref = _windows_shim_path(Path(sys.executable))
+            pinned_lines = [
+                f'if exist "{python_ref}" (',
+                f'  "{python_ref}" "{script_ref}" %*',
+                '  goto :eof',
+                ')',
+            ]
         shim = "\r\n".join([
             "@echo off",
             f'set "AGENTCAT_HOME={home_ref}"',
-            f'if exist "{python_ref}" (',
-            f'  "{python_ref}" "{script_ref}" %*',
-            '  goto :eof',
-            ')',
+            *pinned_lines,
             'where py >nul 2>nul',
             'if %ERRORLEVEL% EQU 0 (',
             f'  py -3 "{script_ref}" %*',
