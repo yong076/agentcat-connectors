@@ -4655,7 +4655,10 @@ def codex_limits_from_usage_response(payload: Dict[str, Any], source: str = "cod
 
     limits["quotas"] = quotas
     if not quotas and not limits.get("planType"):
+        # The token authenticated but the account reports no quota or plan, so a
+        # login would not help; same as Claude's empty usage response (TRA-2762).
         limits["status"] = "not_configured"
+        limits["reason"] = "not_applicable"
     return limits
 
 
@@ -4689,7 +4692,10 @@ def codex_live_limits_for_auth(
     elif cached:
         return _codex_public_limits(sanitize_codex_cached_limits(cached))
     if not isinstance(access_token, str) or not access_token:
-        return empty_limits()
+        # An API-key login has no subscription quota; anything else needs `codex login`
+        # (TRA-2762). Without a reason the app could only point at Setup, a dead end.
+        api_key = auth.get("OPENAI_API_KEY")
+        return empty_limits(reason="not_applicable" if isinstance(api_key, str) and api_key else "token_missing")
 
     last_error: Optional[Exception] = None
     login_expired = False
@@ -4749,7 +4755,7 @@ def codex_live_limits(force: bool = False) -> Dict[str, Any]:
     home = active_codex_home()
     auth = read_codex_auth(home)
     if not auth:
-        return empty_limits()
+        return empty_limits(reason="token_missing")
     return codex_live_limits_for_auth(auth, codex_home_limits_cache_key(home, auth), force=force)
 
 
@@ -6698,6 +6704,7 @@ def gemini_limits_from_quota_response(
     limits["quotas"] = sorted_gemini_quotas(quotas)
     if not quotas:
         limits["status"] = "not_configured"
+        limits["reason"] = "not_applicable"
     return limits
 
 
@@ -6806,12 +6813,14 @@ def gemini_live_limits(force: bool = False) -> Dict[str, Any]:
         return normalize_gemini_limits(cached)
     auth_type = read_gemini_auth_type()
     if auth_type != "oauth-personal":
-        return empty_limits()
+        # API-key and Vertex logins have no Code Assist quota (TRA-2762). No auth
+        # type at all means Gemini CLI was never set up, which stays reasonless.
+        return empty_limits(reason="not_applicable" if auth_type else None)
     project_id = gemini_local_project_id()
     try:
         token = gemini_access_token()
         if not token:
-            return empty_limits()
+            return empty_limits(reason="token_missing")
         tier_payload, quota_payload = fetch_code_assist_quota(token, project_id)
         limits = gemini_limits_from_quota_response(quota_payload, tier_payload, source=GEMINI_CODE_ASSIST_URL)
         write_live_limits_cache("gemini", limits)
