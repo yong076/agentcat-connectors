@@ -138,6 +138,7 @@
     }
   },
   "compatibilityAliases": {
-    "connector.daemon": "connector.daemon.status.v1"
+    "connector.daemon": "connector.daemon.status.v1",
+    "config.providers": "connector.config"
   }
 }

@@ -4101,8 +4101,18 @@ class AgentCatConnectorTests(unittest.TestCase):
                             database.write_bytes(staging.read_bytes())
                             database.with_name(database.name + "-wal").write_bytes(
                                 staging.with_name(staging.name + "-wal").read_bytes())
+                        else:
+                            writer.execute("pragma wal_checkpoint(TRUNCATE)")
                     finally:
                         writer.close()
+                    if not wal_only:
+                        # Apple's SQLite can retain empty WAL/SHM files after
+                        # close. Build the intended sidecar-free fixture explicitly.
+                        wal = database.with_name(database.name + "-wal")
+                        if wal.exists():
+                            self.assertEqual(wal.stat().st_size, 0)
+                            wal.unlink()
+                        database.with_name(database.name + "-shm").unlink(missing_ok=True)
                     self.assertFalse(database.with_name(database.name + "-shm").exists())
                     self.assertEqual(database.with_name(database.name + "-wal").exists(), wal_only)
                     if reader == "opencode":
@@ -4138,6 +4148,12 @@ class AgentCatConnectorTests(unittest.TestCase):
                     writer.execute("create table fixture (value integer)")
                     writer.execute("insert into fixture values (1)")
                     writer.commit()
+                    writer.execute("pragma wal_checkpoint(TRUNCATE)")
+                wal = database.with_name(database.name + "-wal")
+                if wal.exists():
+                    self.assertEqual(wal.stat().st_size, 0)
+                    wal.unlink()
+                database.with_name(database.name + "-shm").unlink(missing_ok=True)
                 writer = sqlite3.connect(database)
                 calls = []
 

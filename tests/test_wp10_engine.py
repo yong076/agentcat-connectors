@@ -28,7 +28,7 @@ SPEC.loader.exec_module(agentcat)
 PUBLIC_CAPABILITIES = (
     "snapshot.metadata", "connector.contract.v1", "connector.autoUpdate", "connector.channel",
     "connector.daemon", "connector.daemon.status.v1", "activity.terminal", "activity.memory",
-    "activity.runtimeModes", "connector.config", "desktopApps.localMetadata", "events.sqlite",
+    "activity.runtimeModes", "connector.config", "config.providers", "desktopApps.localMetadata", "events.sqlite",
     "usage.dailyTokens", "usage.hourlyTokens", "usage.breakdown", "usage.projects",
     "usage.coverage", "projects.daily", "homes.discovery", "providerInstances.v1", "pricing.feed",
     "usage.opencode.sqlite", "usage.antigravity.sqlite", "usage.copilot.localLogs",
