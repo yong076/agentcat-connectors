@@ -116,6 +116,8 @@ class OpenCodeReadersTests(unittest.TestCase):
         self.message(conn, 'old')
         self.message(conn, 'new', v2=True)
         self.message(conn, 'compact', v2=True, kind='compaction', model=False)
+        self.message(conn, 'shared-user', kind='user')
+        self.message(conn, 'shared-user', v2=True, kind='user')
         conn.execute("update session_message set data = ? where id = 'new'",
                      (json.dumps({'model': {'id': 'test-model'}, 'tokens': {'input': 10, 'output': 10},
                                   'content': {'a': {'type': 'tool', 'name': 'bash'}}}),))
@@ -217,3 +219,50 @@ class OpenCodeReadersTests(unittest.TestCase):
         snapshot = app.opencode_snapshot()
         self.assertEqual(snapshot['tokens']['all'], 20)
         self.assertEqual(snapshot['projects']['status'], 'not_available')
+
+    def test_renamed_lineage_preserved_ids_keep_old_only_summary(self):
+        conn = self.database(sessions=('session_v2',))
+        self.message(conn, 'shared', amount=90)
+        self.message(conn, 'shared', v2=True)  # 20, replaces old copy
+        self.message(conn, 'summary', amount=5)  # 15, preserved old-only row
+        snapshot = app.opencode_snapshot()
+        self.assertEqual(snapshot['tokens']['all'], 35)
+        self.assertEqual(snapshot['events'], 2)
+
+    def test_mixed_session_lineages_without_session_v2(self):
+        conn = self.database(sessions=('session',))
+        self.message(conn, 'shared', amount=90)
+        self.message(conn, 'shared', v2=True)  # preserved session: 20 + 15
+        self.message(conn, 'summary', amount=5)
+        self.message(conn, 'different-old', amount=90)
+        self.message(conn, 'different-new', v2=True, amount=30)  # 40 once
+        self.message(conn, 'old-only', amount=2)  # 12, no new rows
+        for session in ('different', 'old-only'):
+            conn.execute('insert into session select ?, directory, path, null, null, model from session where id = ?',
+                         (session, 's'))
+        conn.execute("update message set session_id = 'different' where id = 'different-old'")
+        conn.execute("update session_message set session_id = 'different' where id = 'different-new'")
+        conn.execute("update message set session_id = 'old-only' where id = 'old-only'")
+        conn.commit()
+        snapshot = app.opencode_snapshot()
+        self.assertEqual(snapshot['tokens']['all'], 87)  # 20 + 15 + 40 + 12
+        self.assertEqual(snapshot['events'], 4)
+
+    def test_shared_user_id_preserves_old_only_assistant_usage(self):
+        conn = self.database(sessions=('session_v2',))
+        self.message(conn, 'shared-user', kind='user')
+        self.message(conn, 'shared-user', v2=True, kind='user')
+        self.message(conn, 'old-assistant', amount=5)  # 15
+        self.message(conn, 'new-assistant', v2=True, amount=20)  # 30
+        snapshot = app.opencode_snapshot()
+        self.assertEqual(snapshot['tokens']['all'], 45)
+        self.assertEqual(snapshot['events'], 2)
+
+    def test_session_migration_decision_does_not_cross_databases(self):
+        primary = self.database()
+        preview = self.database('opencode-next.db')
+        self.message(primary, 'new', v2=True)  # 20
+        self.message(preview, 'old', amount=5)  # 15, this DB has no new rows
+        snapshot = app.opencode_snapshot()
+        self.assertEqual(snapshot['tokens']['all'], 35)
+        self.assertEqual(snapshot['events'], 2)

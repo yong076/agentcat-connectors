@@ -76,6 +76,9 @@ class ReaderAccountingMigrationTests(unittest.TestCase):
                                                                'tokens': {'input': 100, 'output': 10}})))
             conn.execute('create table session_message(id text, session_id text, time_created int, type text, data text)')
             conn.execute('insert into session_message values (?, ?, ?, ?, ?)',
+                         ('old', 's', 1700000000000, 'assistant',
+                          json.dumps({'model': {'id': 'test-model'}, 'tokens': {'input': 100, 'output': 10}})))
+            conn.execute('insert into session_message values (?, ?, ?, ?, ?)',
                          ('historical-new', 's', 1700000000000, 'assistant',
                           json.dumps({'model': {'id': 'test-model'}, 'tokens': {'input': 200, 'output': 20}})))
         key = self.old_state('opencode', app.project_snapshot_identity(project), 110)

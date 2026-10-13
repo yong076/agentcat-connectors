@@ -8734,6 +8734,7 @@ def opencode_database_rows(conn: sqlite3.Connection) -> Tuple[List[Any], List[st
         has_json = False
     rows: List[Any] = []
     warnings: List[str] = []
+    new_generation_read = False
     for table, is_v2 in (("session_message", True), ("message", False)):
         if table not in tables:
             continue
@@ -8755,11 +8756,18 @@ def opencode_database_rows(conn: sqlite3.Connection) -> Tuple[List[Any], List[st
                 live_allowed = " and ".join(f"live.{name} is null" for name in ("time_archived", "parent_id")
                                             if name in live_columns) or "1"
                 allowed = f"case when live.id is not null then ({live_allowed}) else ({allowed}) end"
-            lineage_filter = ""
-            if not is_v2 and "session" not in tables and "session_v2" in tables and "session_message" in tables:
+            sessions_with_new: Set[Any] = set()
+            sessions_with_shared_ids: Set[Any] = set()
+            if not is_v2 and new_generation_read and "session_id" in message_columns:
+                # IDs are not guaranteed equal. Inspect all roles once per DB;
+                # shared IDs preserve old-only summaries without an indexed lookup per row.
+                sessions_with_new = {row[0] for row in conn.execute("select distinct session_id from session_message")}
                 new_columns = {row[1] for row in conn.execute("pragma table_info(session_message)")}
-                if "session_id" in new_columns:
-                    lineage_filter = "where not exists (select 1 from session_message n where n.session_id = m.session_id) "
+                if "id" in message_columns and "id" in new_columns:
+                    sessions_with_shared_ids = {row[0] for row in conn.execute(
+                        "select distinct old.session_id from message old join session_message new on old.id = new.id "
+                        "where typeof(old.id) = 'text' and old.id != '' and typeof(new.id) = 'text'"
+                    )}
             session_model = "s.model" if "model" in columns else "null"
             kind = "m.type" if is_v2 else "null"
             if has_json:
@@ -8784,9 +8792,11 @@ def opencode_database_rows(conn: sqlite3.Connection) -> Tuple[List[Any], List[st
             # Filtered v2 rows still claim their IDs, without transferring their blobs.
             query = (f"select {message_id}, m.time_created, {path}, ({allowed}), "
                      f"case when {allowed} then {data} end, {kind}, "
-                     f"{session_model if not has_json else 'null'} from {table} m {join} "
-                     f"{lineage_filter}order by m.time_created asc")
-            for message_id_value, created, project, include, raw_data, row_kind, fallback_model in conn.execute(query):
+                     f"{session_model if not has_json else 'null'}, m.session_id from {table} m {join} "
+                     "order by m.time_created asc")
+            for message_id_value, created, project, include, raw_data, row_kind, fallback_model, session_id in conn.execute(query):
+                if not is_v2 and include and session_id in sessions_with_new and session_id not in sessions_with_shared_ids:
+                    continue
                 if not has_json and include:
                     try:
                         value = json.loads(raw_data)
@@ -8812,6 +8822,8 @@ def opencode_database_rows(conn: sqlite3.Connection) -> Tuple[List[Any], List[st
             warnings.append(f"{table}: skipped incompatible generation")
         else:
             rows.extend(generation_rows)
+            if is_v2:
+                new_generation_read = True
     return rows, warnings
 
 
