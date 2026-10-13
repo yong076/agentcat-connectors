@@ -8849,23 +8849,90 @@ def copilot_legacy_model(event: Dict[str, Any], current_model: Optional[str]) ->
     return current_model
 
 
-def parse_copilot_legacy_file(path: Path, result: Dict[str, Any]) -> int:
+def copilot_usage_metrics(usage: Dict[str, Any]) -> Dict[str, int]:
+    input_tokens = nonnegative_int(usage.get("inputTokens")) or 0
+    cached = nonnegative_int(usage.get("cacheReadTokens")) or 0
+    written = nonnegative_int(usage.get("cacheWriteTokens")) or 0
+    if cached <= input_tokens:
+        written = min(written, input_tokens - cached)
+        input_tokens -= cached + written
+    # Some providers report cache separately; reasoning is already in output.
+    return {"inputTokens": input_tokens, "outputTokens": nonnegative_int(usage.get("outputTokens")) or 0,
+            "cacheReadInputTokens": cached, "cacheCreationInputTokens": written}
+
+
+def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
+    """Select one usage source per file, retaining only accounting metadata."""
     current_model: Optional[str] = None
-    events = 0
+    calls: Dict[str, List[Any]] = {"assistant.usage": [], "model.model_call_success": []}
+    seen: Dict[str, Set[str]] = {kind: set() for kind in calls}
+    messages: List[Any] = []
+    trailing: List[Any] = []
+    shutdowns: List[Any] = []
+    previous: Dict[str, Dict[str, int]] = {}
+    saw_shutdown = False
+    fields = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens")
+    for event in events:
+        current_model = copilot_legacy_model(event, current_model)
+        kind = event.get("type")
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        when = parse_timestamp(event.get("timestamp"))
+        if kind in calls:
+            if kind == "assistant.usage":
+                usage = data
+                call_id = data.get("apiCallId")
+            else:
+                response = data.get("responseUsage")
+                if not isinstance(response, dict):
+                    continue
+                details = response.get("prompt_tokens_details")
+                details = details if isinstance(details, dict) else {}
+                usage = {"inputTokens": response.get("prompt_tokens"), "outputTokens": response.get("completion_tokens"),
+                         "cacheReadTokens": details.get("cached_tokens"), "cacheWriteTokens": details.get("cache_creation_tokens")}
+                call_id = data.get("callId")
+            if call_id:
+                key = str(call_id)
+                if key in seen[kind]:
+                    continue
+                seen[kind].add(key)
+            calls[kind].append((current_model or "copilot-auto", copilot_usage_metrics(usage), when))
+        elif kind == "session.shutdown":
+            trailing.clear()
+            metrics = data.get("modelMetrics")
+            if not isinstance(metrics, dict):
+                continue
+            current = {model: {field: nonnegative_int(metric["usage"].get(field)) or 0 for field in fields}
+                       for model, metric in metrics.items()
+                       if isinstance(metric, dict) and isinstance(metric.get("usage"), dict)}
+            if not current:
+                continue
+            saw_shutdown = True
+            # Resume semantics are unknown: monotonic per-model fields mean cumulative
+            # usage; otherwise treat the shutdown as an independent run.
+            cumulative = all(model in current and all(current[model][field] >= values[field] for field in fields)
+                             for model, values in previous.items())
+            for model, usage in current.items():
+                delta = {field: value - previous.get(model, {}).get(field, 0) if cumulative else value
+                         for field, value in usage.items()}
+                shutdowns.append((model, copilot_usage_metrics(delta), when))
+            previous = current
+        elif kind == "assistant.message":
+            output = nonnegative_int(data.get("outputTokens")) or 0
+            if output > 0 and current_model:
+                record = (current_model, {"outputTokens": output}, when)
+                messages.append(record)
+                trailing.append(record)
+    return calls["assistant.usage"] or calls["model.model_call_success"] or (shutdowns + trailing if saw_shutdown else messages)
+
+
+def parse_copilot_legacy_file(path: Path, result: Dict[str, Any]) -> int:
     try:
         file_when = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
     except OSError:
         file_when = None
-    for event in iter_jsonl_file(path):
-        current_model = copilot_legacy_model(event, current_model)
-        if event.get("type") != "assistant.message":
-            continue
-        data = event.get("data") if isinstance(event.get("data"), dict) else {}
-        output_tokens = nonnegative_int(data.get("outputTokens")) or 0
-        if output_tokens <= 0 or not current_model:
-            continue
-        metrics = {"outputTokens": output_tokens}
-        if add_usage_metrics(result, current_model, metrics, parse_timestamp(event.get("timestamp")) or file_when):
+    events = 0
+    for model, metrics, when in copilot_usage_records(iter_jsonl_file(path)):
+        if add_usage_metrics(result, model, metrics, when or file_when):
             events += 1
     return events
 
@@ -16149,24 +16216,16 @@ def reflect_parse_opencode_session(path: Path) -> Dict[str, Any]:
 def reflect_parse_copilot_session(path: Path) -> Dict[str, Any]:
     usage_by_model: Dict[str, Dict[str, int]] = {}
     project: Any = None
-    shutdown_usage: Dict[str, Dict[str, int]] = {}
-    saw_usage = False
     for event in _reflect_iter_jsonl(path):
-        event_type = str(event.get("type") or "")
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
-        if event_type in ("session.start", "session.context_changed"):
+        if event.get("type") in ("session.start", "session.context_changed"):
             context = data.get("context") if isinstance(data.get("context"), dict) else data
             project = context.get("cwd") or context.get("gitRoot") or context.get("repository") or project
-        elif event_type == "assistant.usage":
-            saw_usage = True
-            _reflect_add_usage(usage_by_model, data.get("model"), data.get("inputTokens"), data.get("outputTokens"), data.get("cacheReadTokens"), data.get("cacheWriteTokens"))
-        elif event_type == "session.shutdown":
-            metrics = data.get("modelMetrics") if isinstance(data.get("modelMetrics"), dict) else {}
-            for model, metric in metrics.items():
-                usage = metric.get("usage") if isinstance(metric, dict) and isinstance(metric.get("usage"), dict) else {}
-                _reflect_add_usage(shutdown_usage, model, usage.get("inputTokens"), usage.get("outputTokens"), usage.get("cacheReadTokens"), usage.get("cacheWriteTokens"))
+    for model, metrics, _ in copilot_usage_records(_reflect_iter_jsonl(path)):
+        _reflect_add_usage(usage_by_model, model, metrics.get("inputTokens"), metrics.get("outputTokens"),
+                           metrics.get("cacheReadInputTokens"), metrics.get("cacheCreationInputTokens"))
     return _reflect_digest_from_shared_turns(
-        "copilot", path, reflect_read_copilot_turns(path), project, usage_by_model if saw_usage else shutdown_usage
+        "copilot", path, reflect_read_copilot_turns(path), project, usage_by_model
     )
 
 
