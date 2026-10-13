@@ -14,7 +14,49 @@ being redirected here.
 
 from pathlib import Path
 import os
+import subprocess
+import sys
 from unittest.mock import patch
+
+
+_ANTIGRAVITY_KEYCHAIN_ATTEMPTS = 0
+
+
+def _guard_antigravity_keychain(event, args):
+    global _ANTIGRAVITY_KEYCHAIN_ATTEMPTS
+    if sys.platform != 'darwin' or event != 'subprocess.Popen' or len(args) < 2:
+        return
+    executable, command = args[:2]
+    if isinstance(command, str):
+        # Recognize simple argument strings only, never parse arbitrary shell or
+        # Windows quoting. Unrecognized strings must not disrupt other tests.
+        words = []
+        for word in command.split():
+            if len(word) >= 2 and word[0] in ('"', "'") and word[-1] == word[0]:
+                word = word[1:-1]
+            if '"' in word or "'" in word:
+                return
+            words.append(word)
+        command = words
+    if (not isinstance(command, (list, tuple)) or len(command) < 2
+            or not all(isinstance(word, str) for word in command)):
+        return
+    try:
+        name = Path(os.fsdecode(executable or command[0])).name
+    except (TypeError, ValueError):
+        return
+    options = set(zip(command[2:], command[3:]))
+    if (name == 'security' and command[1] == 'find-generic-password' and '-w' in command
+            and ('-s', 'gemini') in options and ('-a', 'antigravity') in options):
+        _ANTIGRAVITY_KEYCHAIN_ATTEMPTS += 1
+        raise AssertionError('real Antigravity Keychain access attempted; inject the runner')
+
+
+sys.addaudithook(_guard_antigravity_keychain)
+
+
+def _missing_antigravity_keychain(command, **kwargs):
+    return subprocess.CompletedProcess(command, 44, b'')
 
 
 def _redirect(home: Path, agentcat_home: Path) -> dict:
@@ -67,6 +109,11 @@ def _redirect(home: Path, agentcat_home: Path) -> dict:
 def redirect_module_paths(module, home: Path, agentcat_home: Path) -> dict:
     """Point every path constant at the sandbox. Returns the originals."""
     originals = {}
+    for name, value in (("antigravity_keychain_run", _missing_antigravity_keychain),
+                        ("_ANTIGRAVITY_KEYCHAIN_CACHE", None), ("_ANTIGRAVITY_KEYCHAIN_WARNED", False)):
+        if hasattr(module, name):
+            originals[name] = getattr(module, name)
+            setattr(module, name, value)
     # A fake HOME does not neutralize a launcher-inherited CODEX_HOME. Remove
     # ambient CLI overrides before any discovery/probe runs; tests can inject
     # their own overrides after redirecting, and restoration is paired below.
@@ -102,6 +149,9 @@ def restore_module_paths(module, originals: dict) -> None:
             value.stop()
         else:
             setattr(module, name, value)
+
+    if _ANTIGRAVITY_KEYCHAIN_ATTEMPTS:
+        raise AssertionError("a test attempted a real Antigravity Keychain read")
 
 
 def block_network(module):

@@ -6299,6 +6299,12 @@ class PricingFeedTests(unittest.TestCase):
 
 class AntigravityLiveLimitsTests(unittest.TestCase):
     def setUp(self) -> None:
+        runner = patch.object(agentcat, "antigravity_keychain_run", return_value=agentcat.subprocess.CompletedProcess([], 44, b""))
+        runner.start()
+        self.addCleanup(runner.stop)
+        cache = patch.object(agentcat, "_ANTIGRAVITY_KEYCHAIN_CACHE", None)
+        cache.start()
+        self.addCleanup(cache.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.saved = {
