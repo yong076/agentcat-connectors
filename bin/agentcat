@@ -8626,6 +8626,80 @@ def grok_snapshot() -> Dict[str, Any]:
     return result
 
 
+def opencode_database_rows(conn: sqlite3.Connection) -> List[Any]:
+    tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
+    if not tables.intersection(("message", "session_message")):
+        raise sqlite3.OperationalError("no message table")
+    try:
+        conn.execute("select json_extract('{}', '$.id'), json_group_array(1)")
+        conn.execute("select value from json_each('[]')")
+        has_json = True
+    except sqlite3.OperationalError:
+        has_json = False
+    rows: List[Any] = []
+    for table, is_v2 in (("session_message", True), ("message", False)):
+        if table not in tables:
+            continue
+        session = next((name for name in (("session_v2", "session") if is_v2 else
+                                         ("session", "session_v2")) if name in tables), None)
+        columns = {row[1] for row in conn.execute(f"pragma table_info({session})")} if session else set()
+        message_columns = {row[1] for row in conn.execute(f"pragma table_info({table})")}
+        message_id = "m.id" if "id" in message_columns else "null"
+        path = next((f"s.{name}" for name in ("directory", "cwd", "working_directory", "path")
+                     if name in columns), "''")
+        join = f"left join {session} s on s.id = m.session_id" if session else ""
+        allowed = " and ".join(f"s.{name} is null" for name in ("time_archived", "parent_id")
+                               if name in columns) or "1"
+        session_model = "s.model" if "model" in columns else "null"
+        kind = "m.type" if is_v2 else "null"
+        if has_json:
+            raw = "case when json_valid(m.data) then m.data else '{}' end"
+            role = kind if is_v2 else f"json_extract({raw}, '$.role')"
+            model = f"json_extract({raw}, '$.model.id')" if is_v2 else f"json_extract({raw}, '$.modelID')"
+            if is_v2:
+                model = (f"coalesce({model}, case when m.type = 'compaction' and json_valid({session_model}) "
+                         f"then json_extract({session_model}, '$.id') end)")
+            tool_path = "$.content" if is_v2 else "$.toolRequests"
+            tool_name = "json_extract(t.value, '$.name')" if is_v2 else (
+                "coalesce(json_extract(t.value, '$.toolName'), json_extract(t.value, '$.name'), "
+                "json_extract(t.value, '$.tool'))")
+            tool_filter = "and json_extract(t.value, '$.type') = 'tool'" if is_v2 else ""
+            tools = (f"(select json_group_array(json_object('name', {tool_name})) "
+                     f"from json_each({raw}, '{tool_path}') t where t.type = 'object' {tool_filter})")
+            data = (f"json_object('role', {role}, 'modelID', {model}, "
+                    f"'tokens', json_extract({raw}, '$.tokens'), 'toolRequests', {tools})")
+        else:
+            data = "m.data"
+        # Filtered v2 rows still claim their IDs, without transferring their blobs.
+        query = (f"select {message_id}, m.time_created, {path}, ({allowed}), "
+                 f"case when {allowed} then {data} end, {kind}, "
+                 f"{session_model if not has_json else 'null'} from {table} m {join} "
+                 "order by m.time_created asc")
+        for message_id_value, created, project, include, raw_data, row_kind, fallback_model in conn.execute(query):
+            if not has_json and include:
+                try:
+                    value = json.loads(raw_data)
+                    if not isinstance(value, dict):
+                        value = {}
+                    if is_v2:
+                        value['role'] = row_kind
+                        model_value = value.get('model')
+                        if (not isinstance(model_value, dict) or model_value.get('id') is None) and row_kind == 'compaction' and fallback_model:
+                            try:
+                                model_value = json.loads(fallback_model)
+                            except (ValueError, TypeError):
+                                model_value = None
+                        value['modelID'] = model_value.get('id') if isinstance(model_value, dict) else None
+                        content = value.get('content')
+                        value['toolRequests'] = [{'name': tool.get('name')} for tool in content
+                                                 if isinstance(tool, dict) and tool.get('type') == 'tool'] if isinstance(content, list) else []
+                    raw_data = json.dumps(value)
+                except (ValueError, TypeError):
+                    raw_data = '{}'
+            rows.append((is_v2, message_id_value, created, raw_data, project, include))
+    return rows
+
+
 def opencode_snapshot() -> Dict[str, Any]:
     data_dir = opencode_data_dir()
     result = empty_provider_usage(source=str(data_dir))
@@ -8642,66 +8716,54 @@ def opencode_snapshot() -> Dict[str, Any]:
     errors: List[str] = []
     project_tokens: Dict[str, int] = {}
     project_last: Dict[str, dt.datetime] = {}
+    rows: List[Any] = []
     for db_path in db_paths:
-        def read_rows(conn: sqlite3.Connection) -> List[Any]:
-            session_columns = {row[1] for row in conn.execute("pragma table_info(session)").fetchall()}
-            # Session schemas across opencode releases have used `path`,
-            # `cwd`, and `working_directory`. Try each — first hit wins.
-            path_col: Optional[str] = None
-            for candidate in ("path", "cwd", "working_directory"):
-                if candidate in session_columns:
-                    path_col = candidate
-                    break
-            select_path = f"session.{path_col}" if path_col else "''"
-            return conn.execute(
-                f"""
-                select message.time_created, message.data, {select_path}
-                from message
-                left join session on session.id = message.session_id
-                where (session.time_archived is null or session.id is null)
-                  and (session.parent_id is null or session.id is null)
-                order by message.time_created asc
-                """
-            ).fetchall()
-
         try:
-            rows = read_foreign_sqlite(db_path, read_rows)
+            rows.extend(read_foreign_sqlite(db_path, opencode_database_rows))
         except Exception as exc:
             errors.append(f"{db_path.name}: {exc}")
+    seen_ids: Set[str] = set()
+    # V2 wins even across imported preview databases; excluded rows claim IDs too.
+    for is_v2, message_id, created_raw, data_raw, project_raw, include in sorted(rows, key=lambda row: not row[0]):
+        if message_id is not None:
+            if message_id in seen_ids:
+                continue
+            seen_ids.add(message_id)
+        if not include:
             continue
-
-        for created_raw, data_raw, project_raw in rows:
-            try:
-                data = json.loads(data_raw.decode("utf-8", errors="replace") if isinstance(data_raw, bytes) else str(data_raw))
-            except Exception:
-                continue
-            if not isinstance(data, dict) or data.get("role") != "assistant":
-                continue
-            metrics = opencode_message_metrics(data)
-            when = parse_timestamp(created_raw)
-            if add_usage_metrics(result, data.get("modelID"), metrics, when):
-                events += 1
-            project_path = str(project_raw or "").strip()
-            if project_path:
-                total = usage_token_total(metrics)
-                if total > 0:
-                    project_tokens[project_path] = project_tokens.get(project_path, 0) + total
-                if when is not None:
-                    current = project_last.get(project_path)
-                    if current is None or when > current:
-                        project_last[project_path] = when
-            # PR-C: feed event-type breakdown so the Tools/MCP/Shell
-            # panels stop being placeholders for opencode users.
-            tool_requests = data.get("toolRequests")
-            tool_names: List[str] = []
-            if isinstance(tool_requests, list):
-                for tool in tool_requests:
-                    if not isinstance(tool, dict):
-                        continue
-                    name = tool.get("toolName") or tool.get("name") or tool.get("tool")
-                    if name:
-                        tool_names.append(str(name))
-            update_breakdown(result["breakdown"], chat=1, tools=tool_names)
+        try:
+            data = json.loads(data_raw.decode("utf-8", errors="replace") if isinstance(data_raw, bytes) else str(data_raw))
+        except Exception:
+            continue
+        if not isinstance(data, dict) or data.get("role") not in (("assistant", "compaction") if is_v2 else ("assistant",)):
+            continue
+        if is_v2 and not isinstance(data.get("tokens"), dict):
+            continue
+        metrics = opencode_message_metrics(data)
+        when = parse_timestamp(created_raw)
+        if add_usage_metrics(result, data.get("modelID"), metrics, when):
+            events += 1
+        project_path = str(project_raw or "").strip()
+        if project_path:
+            total = usage_token_total(metrics)
+            if total > 0:
+                project_tokens[project_path] = project_tokens.get(project_path, 0) + total
+            if when is not None:
+                current = project_last.get(project_path)
+                if current is None or when > current:
+                    project_last[project_path] = when
+        # PR-C: feed event-type breakdown so the Tools/MCP/Shell
+        # panels stop being placeholders for opencode users.
+        tool_requests = data.get("toolRequests")
+        tool_names: List[str] = []
+        if isinstance(tool_requests, list):
+            for tool in tool_requests:
+                if not isinstance(tool, dict):
+                    continue
+                name = tool.get("toolName") or tool.get("name") or tool.get("tool")
+                if name:
+                    tool_names.append(str(name))
+        update_breakdown(result["breakdown"], chat=1, tools=tool_names)
 
     if events == 0 and errors:
         result["status"] = "error"
