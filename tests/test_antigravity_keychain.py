@@ -1,5 +1,6 @@
 """Antigravity Keychain reads use injected synthetic responses only."""
 import base64
+import datetime as dt
 import importlib.util
 import json
 import subprocess
@@ -135,6 +136,33 @@ class AntigravityKeychainTests(unittest.TestCase):
                     app.read_antigravity_keychain_credentials()
                 self.assertEqual(self.runner.call_count, 2)
 
+    def test_fractional_timestamps_on_all_supported_python_versions(self):
+        for digits, micros in [('1', 100000), ('12', 120000), ('12345', 123450),
+                               ('1234567', 123456), ('123456789', 123456)]:
+            for suffix, hour in [('Z', 9), ('+09:00', 0), ('', 9)]:
+                with self.subTest(digits=digits, suffix=suffix):
+                    self.assertEqual(app.parse_timestamp('2026-01-02T09:00:00.' + digits + suffix),
+                                     dt.datetime(2026, 1, 2, hour, microsecond=micros, tzinfo=dt.timezone.utc))
+
+    def test_go_style_keychain_expiry_future_and_past(self):
+        for expiry, expired in [('1970-01-01T10:16:40.12345+09:00', False),
+                                ('1970-01-01T00:00:01.123456789Z', True)]:
+            app._ANTIGRAVITY_KEYCHAIN_CACHE = None
+            self.respond(json.dumps({'token': {'access_token': 'fixture-access', 'expiry': expiry}}).encode())
+            creds = app.read_antigravity_keychain_credentials()
+            self.assertEqual(app.antigravity_app_login_expired(creds), expired)
+            self.assertEqual(app.antigravity_access_token(), None if expired else 'fixture-access')
+
+    def test_recursive_decode_failure_is_memoized(self):
+        self.respond(b'[' * 60000)
+        with patch.object(app.time, 'monotonic', return_value=100):
+            for _ in range(3):
+                self.assertIsNone(app.read_antigravity_keychain_credentials())
+        self.assertEqual(self.runner.call_count, 1)
+        with patch.object(app.time, 'monotonic', return_value=160):
+            self.assertIsNone(app.read_antigravity_keychain_credentials())
+        self.assertEqual(self.runner.call_count, 2)
+
     def test_non_darwin_never_spawns(self):
         for platform in ('linux', 'win32'):
             with patch.object(app.sys, 'platform', platform):
@@ -165,7 +193,8 @@ class AntigravityKeychainTests(unittest.TestCase):
     def test_sandbox_guard_blocks_security_before_execution(self):
         with patch.object(sandbox, '_ANTIGRAVITY_KEYCHAIN_ATTEMPTS', 0):
             with self.assertRaisesRegex(AssertionError, 'inject the runner'):
-                subprocess.Popen(['/usr/bin/security', 'find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w'])
+                sandbox._guard_antigravity_keychain('subprocess.Popen', (
+                    '/usr/bin/security', ['/usr/bin/security', 'find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w'], None, None))
             self.assertEqual(sandbox._ANTIGRAVITY_KEYCHAIN_ATTEMPTS, 1)
             with self.assertRaisesRegex(AssertionError, 'inject the runner'):
                 sandbox._guard_antigravity_keychain('subprocess.Popen', (

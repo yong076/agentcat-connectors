@@ -6625,20 +6625,23 @@ def read_antigravity_keychain_credentials(run: Optional[Callable[..., Any]] = No
                 check=False, timeout=5,
             )
             if completed.returncode == 0:
-                if len(completed.stdout) > 65536:
-                    raise ValueError("Keychain item exceeds size limit")
-                value = completed.stdout.decode("utf-8").strip()
-                if value.startswith("go-keyring-base64:"):
-                    value = base64.b64decode(value[len("go-keyring-base64:"):], validate=True).decode("utf-8")
-                elif value.startswith("go-keyring-encoded:"):
-                    value = bytes.fromhex(value[len("go-keyring-encoded:"):]).decode("utf-8")
-                raw = json.loads(value)
-                if isinstance(raw, dict):
-                    candidate = unwrap_antigravity_oauth_token(raw)
-                    if isinstance(candidate.get("access_token"), str) and candidate["access_token"]:
-                        candidate[ANTIGRAVITY_CREDS_SOURCE_KEY] = ANTIGRAVITY_KEYCHAIN_SOURCE
-                        creds = candidate
-                failed = creds is None
+                try:
+                    if len(completed.stdout) > 65536:
+                        raise ValueError("Keychain item exceeds size limit")
+                    value = completed.stdout.decode("utf-8").strip()
+                    if value.startswith("go-keyring-base64:"):
+                        value = base64.b64decode(value[len("go-keyring-base64:"):], validate=True).decode("utf-8")
+                    elif value.startswith("go-keyring-encoded:"):
+                        value = bytes.fromhex(value[len("go-keyring-encoded:"):]).decode("utf-8")
+                    raw = json.loads(value)
+                    if isinstance(raw, dict):
+                        candidate = unwrap_antigravity_oauth_token(raw)
+                        if isinstance(candidate.get("access_token"), str) and candidate["access_token"]:
+                            candidate[ANTIGRAVITY_CREDS_SOURCE_KEY] = ANTIGRAVITY_KEYCHAIN_SOURCE
+                            creds = candidate
+                    failed = creds is None
+                except Exception:  # Malformed/recursive credential payloads are unavailable.
+                    failed = True
             else:
                 failed = completed.returncode != 44
         except (OSError, subprocess.SubprocessError, ValueError, UnicodeError):
@@ -7757,6 +7760,9 @@ def parse_timestamp(raw: Any) -> Optional[dt.datetime]:
         text = raw.strip()
         if text.isdigit():
             return parse_timestamp(int(text))
+        # Python 3.9 accepts only millisecond/microsecond ISO fractions.
+        text = re.sub(r"(\d{2}:\d{2}:\d{2})[.,](\d+)",
+                      lambda match: match[1] + "." + match[2][:6].ljust(6, "0"), text)
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         try:
