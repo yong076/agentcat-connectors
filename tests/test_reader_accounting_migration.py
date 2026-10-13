@@ -1,4 +1,5 @@
 """Hand-computed historical baselines from the pre-reader-change state format."""
+from contextlib import closing
 import datetime as dt
 import json
 import sqlite3
@@ -66,7 +67,7 @@ class ReaderAccountingMigrationTests(unittest.TestCase):
     def test_opencode_v1_history_reseeds_new_generation_then_books_growth(self):
         database = self.root / 'opencode.db'
         project = str(self.root / 'fixture-project')
-        with sqlite3.connect(database) as conn:
+        with closing(sqlite3.connect(database)) as conn, conn:
             conn.execute('create table session(id text, directory text, path text, parent_id text, time_archived int)')
             conn.execute('insert into session values (?, ?, ?, null, null)', ('s', project, project))
             conn.execute('create table message(id text, session_id text, time_created int, data text)')
@@ -83,7 +84,7 @@ class ReaderAccountingMigrationTests(unittest.TestCase):
             self.assertEqual(snapshot['tokens']['all'], 330)
             self.assertEqual(app.update_project_daily({'opencode': snapshot}, now=self.now), {})
             self.assert_saved('opencode', key, 330)
-            with sqlite3.connect(database) as conn:
+            with closing(sqlite3.connect(database)) as conn, conn:
                 conn.execute('insert into session_message values (?, ?, ?, ?, ?)',
                              ('real-new', 's', 1800000000000, 'assistant',
                               json.dumps({'model': {'id': 'test-model'}, 'tokens': {'input': 40, 'output': 4}})))
