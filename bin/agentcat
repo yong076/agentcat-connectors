@@ -254,6 +254,8 @@ PROJECT_DAILY_STATE_VERSION = 2
 # Provider accounting revisions live inside the shared project-daily state so
 # a source-specific correction never invalidates unrelated provider baselines.
 GROK_ACCOUNTING_STATE_VERSION = 2
+COPILOT_ACCOUNTING_STATE_VERSION = 1
+OPENCODE_ACCOUNTING_STATE_VERSION = 1
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.41.7")
@@ -8980,17 +8982,33 @@ def copilot_usage_metrics(usage: Dict[str, Any]) -> Dict[str, int]:
             "cacheReadInputTokens": cached, "cacheCreationInputTokens": written}
 
 
+def copilot_shutdown_deltas(metrics: Any, previous: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
+    """Conservatively reconcile each model/field; absent models retain their baseline."""
+    deltas: Dict[str, Dict[str, int]] = {}
+    if not isinstance(metrics, dict):
+        return deltas
+    for model, metric in metrics.items():
+        if not isinstance(metric, dict) or not isinstance(metric.get("usage"), dict):
+            continue
+        current = {field: nonnegative_int(metric["usage"].get(field)) or 0
+                   for field in ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens")}
+        prior = previous.get(model, {})
+        # Growing fields are cumulative; a shrinking field starts a new run.
+        deltas[model] = {field: value - prior.get(field, 0) if value >= prior.get(field, 0) else value
+                         for field, value in current.items()}
+        previous[model] = current
+    return deltas
+
+
 def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
-    """Select one usage source per file, retaining only accounting metadata."""
+    """Choose a nonzero usage source per run ending at session.shutdown."""
     current_model: Optional[str] = None
     calls: Dict[str, List[Any]] = {"assistant.usage": [], "model.model_call_success": []}
     seen: Dict[str, Set[str]] = {kind: set() for kind in calls}
+    call_totals: Dict[str, Dict[str, Dict[str, int]]] = {kind: {} for kind in calls}
     messages: List[Any] = []
-    trailing: List[Any] = []
-    shutdowns: List[Any] = []
+    records: List[Any] = []
     previous: Dict[str, Dict[str, int]] = {}
-    saw_shutdown = False
-    fields = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens")
     for event in events:
         current_model = copilot_legacy_model(event, current_model)
         kind = event.get("type")
@@ -9009,39 +9027,44 @@ def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
                 usage = {"inputTokens": response.get("prompt_tokens"), "outputTokens": response.get("completion_tokens"),
                          "cacheReadTokens": details.get("cached_tokens"), "cacheWriteTokens": details.get("cache_creation_tokens")}
                 call_id = data.get("callId")
+            normalized = copilot_usage_metrics(usage)
+            if not any(normalized.values()):
+                continue
             if call_id:
                 key = str(call_id)
                 if key in seen[kind]:
                     continue
                 seen[kind].add(key)
-            calls[kind].append((current_model or "copilot-auto", copilot_usage_metrics(usage), when))
+            model = current_model or "copilot-auto"
+            calls[kind].append((model, normalized, when))
+            totals = call_totals[kind].setdefault(model, {})
+            for field in ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"):
+                totals[field] = totals.get(field, 0) + (nonnegative_int(usage.get(field)) or 0)
         elif kind == "session.shutdown":
-            trailing.clear()
-            metrics = data.get("modelMetrics")
-            if not isinstance(metrics, dict):
-                continue
-            current = {model: {field: nonnegative_int(metric["usage"].get(field)) or 0 for field in fields}
-                       for model, metric in metrics.items()
-                       if isinstance(metric, dict) and isinstance(metric.get("usage"), dict)}
-            if not current:
-                continue
-            saw_shutdown = True
-            # Resume semantics are unknown: monotonic per-model fields mean cumulative
-            # usage; otherwise treat the shutdown as an independent run.
-            cumulative = all(model in current and all(current[model][field] >= values[field] for field in fields)
-                             for model, values in previous.items())
-            for model, usage in current.items():
-                delta = {field: value - previous.get(model, {}).get(field, 0) if cumulative else value
-                         for field, value in usage.items()}
-                shutdowns.append((model, copilot_usage_metrics(delta), when))
-            previous = current
+            # Advance the raw shutdown baseline even when calls supply this run:
+            # a later cumulative shutdown must not book those calls again.
+            deltas = copilot_shutdown_deltas(data.get("modelMetrics"), previous)
+            chosen = next((source for source, values in calls.items() if values), None)
+            if chosen:
+                for model, totals in call_totals[chosen].items():
+                    if model not in deltas:
+                        # Missing shutdown metrics still need a baseline for counted calls.
+                        prior = previous.setdefault(model, {})
+                        for field, value in totals.items():
+                            prior[field] = prior.get(field, 0) + value
+            shutdowns = [(model, copilot_usage_metrics(delta), when) for model, delta in deltas.items()]
+            records.extend(calls["assistant.usage"] or calls["model.model_call_success"] or shutdowns or messages)
+            for values in calls.values():
+                values.clear()
+            for totals in call_totals.values():
+                totals.clear()
+            messages.clear()
         elif kind == "assistant.message":
             output = nonnegative_int(data.get("outputTokens")) or 0
             if output > 0 and current_model:
-                record = (current_model, {"outputTokens": output}, when)
-                messages.append(record)
-                trailing.append(record)
-    return calls["assistant.usage"] or calls["model.model_call_success"] or (shutdowns + trailing if saw_shutdown else messages)
+                messages.append((current_model, {"outputTokens": output}, when))
+    records.extend(calls["assistant.usage"] or calls["model.model_call_success"] or messages)
+    return records
 
 
 def parse_copilot_legacy_file(path: Path, result: Dict[str, Any]) -> int:
@@ -14326,17 +14349,17 @@ def load_project_daily_state() -> Dict[str, Any]:
                 normalized[str(model)] = {"tokens": tokens, "classes": classes}
             if normalized:
                 model_baselines[str(key)] = normalized
-    grok_revision_changed = raw.get("grokAccountingVersion") != GROK_ACCOUNTING_STATE_VERSION
-    if grok_revision_changed:
-        baselines = {key: value for key, value in baselines.items() if not key.startswith("grok|")}
-        model_baselines = {
-            key: value for key, value in model_baselines.items() if not key.startswith("grok|")
-        }
-    return {
-        "baselines": baselines,
-        "modelBaselines": model_baselines,
-        "_grokRevisionChanged": grok_revision_changed,
-    }
+    versions = {"grok": GROK_ACCOUNTING_STATE_VERSION,
+                "copilot": COPILOT_ACCOUNTING_STATE_VERSION,
+                "opencode": OPENCODE_ACCOUNTING_STATE_VERSION}
+    changed = {provider for provider, version in versions.items()
+               if raw.get(provider + "AccountingVersion") != version}
+    prefixes = tuple(provider + "|" for provider in changed)
+    if prefixes:
+        baselines = {key: value for key, value in baselines.items() if not key.startswith(prefixes)}
+        model_baselines = {key: value for key, value in model_baselines.items() if not key.startswith(prefixes)}
+    return {"baselines": baselines, "modelBaselines": model_baselines,
+            "_accountingRevisionChanged": bool(changed)}
 
 
 def prune_project_daily(days: Dict[str, Dict[str, Any]], today: "dt.date") -> bool:
@@ -14562,7 +14585,7 @@ def update_project_daily(
     baselines: Dict[str, int] = state["baselines"]
     model_baselines: Dict[str, Dict[str, Dict[str, Any]]] = state["modelBaselines"]
     days_changed = prune_project_daily(days, today)
-    state_changed = bool(state.get("_grokRevisionChanged"))
+    state_changed = bool(state.get("_accountingRevisionChanged"))
     for key, observed in snapshot_project_cumulative(providers).items():
         tokens = observed["tokens"]
         key_models = model_baselines.setdefault(key, {})
@@ -14616,6 +14639,8 @@ def update_project_daily(
             {
                 "version": PROJECT_DAILY_STATE_VERSION,
                 "grokAccountingVersion": GROK_ACCOUNTING_STATE_VERSION,
+                "copilotAccountingVersion": COPILOT_ACCOUNTING_STATE_VERSION,
+                "opencodeAccountingVersion": OPENCODE_ACCOUNTING_STATE_VERSION,
                 "baselines": baselines,
                 "modelBaselines": {k: v for k, v in model_baselines.items() if v},
             },
@@ -16335,16 +16360,30 @@ def reflect_parse_opencode_session(path: Path) -> Dict[str, Any]:
 def reflect_parse_copilot_session(path: Path) -> Dict[str, Any]:
     usage_by_model: Dict[str, Dict[str, int]] = {}
     project: Any = None
+    shutdown_usage: Dict[str, Dict[str, int]] = {}
+    saw_usage = False
+    seen_calls: Set[str] = set()
+    previous: Dict[str, Dict[str, int]] = {}
     for event in _reflect_iter_jsonl(path):
+        event_type = str(event.get("type") or "")
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
-        if event.get("type") in ("session.start", "session.context_changed"):
+        if event_type in ("session.start", "session.context_changed"):
             context = data.get("context") if isinstance(data.get("context"), dict) else data
             project = context.get("cwd") or context.get("gitRoot") or context.get("repository") or project
-    for model, metrics, _ in copilot_usage_records(_reflect_iter_jsonl(path)):
-        _reflect_add_usage(usage_by_model, model, metrics.get("inputTokens"), metrics.get("outputTokens"),
-                           metrics.get("cacheReadInputTokens"), metrics.get("cacheCreationInputTokens"))
+        elif event_type == "assistant.usage":
+            call_id = data.get("apiCallId")
+            if call_id:
+                if str(call_id) in seen_calls:
+                    continue
+                seen_calls.add(str(call_id))
+            saw_usage = True
+            _reflect_add_usage(usage_by_model, data.get("model"), data.get("inputTokens"), data.get("outputTokens"), data.get("cacheReadTokens"), data.get("cacheWriteTokens"))
+        elif event_type == "session.shutdown":
+            metrics = data.get("modelMetrics") if isinstance(data.get("modelMetrics"), dict) else {}
+            for model, usage in copilot_shutdown_deltas(metrics, previous).items():
+                _reflect_add_usage(shutdown_usage, model, usage.get("inputTokens"), usage.get("outputTokens"), usage.get("cacheReadTokens"), usage.get("cacheWriteTokens"))
     return _reflect_digest_from_shared_turns(
-        "copilot", path, reflect_read_copilot_turns(path), project, usage_by_model
+        "copilot", path, reflect_read_copilot_turns(path), project, usage_by_model if saw_usage else shutdown_usage
     )
 
 

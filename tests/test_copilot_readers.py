@@ -67,34 +67,48 @@ class CopilotReadersTests(unittest.TestCase):
         self.assert_tokens(result)
         self.assertIn('tracked', result['models'])
 
-    def test_one_per_call_source_wins_over_other_sources(self):
+    def test_one_per_call_source_wins_within_a_segment(self):
         count, result = self.parse([
             event('model.model_call_success', responseUsage={'prompt_tokens': 900}),
-            shutdown(other=usage(800)), event('assistant.message', model='other', outputTokens=700),
-            event('assistant.usage', model='chosen', **usage())])
+            event('assistant.usage', model='chosen', **usage()),
+            event('assistant.message', model='chosen', outputTokens=20), shutdown(chosen=usage())])
         self.assertEqual(count, 1)
         self.assert_tokens(result)
         self.assertEqual(set(result['models']), {'chosen'})
 
-    def test_model_call_wins_over_shutdown(self):
-        count, result = self.parse([shutdown(other=usage()), event('model.model_call_success', responseUsage={'completion_tokens': 7})])
+    def test_model_call_wins_over_shutdown_in_same_segment(self):
+        count, result = self.parse([event('model.model_call_success', responseUsage={'completion_tokens': 7}),
+                                    shutdown(other=usage())])
         self.assertEqual(count, 1)
         self.assertEqual(result['tokens']['all'], 7)
-        self.assertIn('copilot-auto', result['models'])
 
-    def test_zero_per_call_usage_still_suppresses_fallback(self):
-        count, result = self.parse([event('assistant.usage', inputTokens=0),
-                                    event('model.model_call_success', responseUsage={'completion_tokens': 7})])
-        self.assertEqual(count, 0)
-        self.assertEqual(result['tokens']['all'], 0)
+    def test_zero_per_call_usage_does_not_suppress_real_sources(self):
+        zero = event('assistant.usage', inputTokens=0)
+        for records, total in [([zero, event('model.model_call_success', responseUsage={'completion_tokens': 7})], 7),
+                               ([zero, event('assistant.message', model='m', outputTokens=8)], 8),
+                               ([zero, shutdown(m=usage())], 120)]:
+            self.assertEqual(self.parse(records)[1]['tokens']['all'], total)
 
-    def test_trailing_messages_start_after_last_shutdown(self):
+    def test_source_selection_changes_at_shutdown(self):
+        call = event('assistant.usage', model='m', apiCallId='one', **usage(1000, 100, 0, 0))
+        # First run 1100; cumulative second shutdown adds 4000 input + 200 output.
+        records = [call, shutdown(m=usage(1000, 100, 0, 0)),
+                   event('session.resume'), shutdown(m=usage(5000, 300, 0, 0))]
+        self.assertEqual(self.parse(records)[1]['tokens']['all'], 5300)
+        # A smaller independent run contributes 40 + 10 after the first 1100.
+        records[-1] = shutdown(m=usage(40, 10, 0, 0))
+        self.assertEqual(self.parse(records)[1]['tokens']['all'], 1150)
+        self.assertEqual(self.parse([shutdown(m=usage(1000, 100, 0, 0)), call])[1]['tokens']['all'], 2200)
+
+    def test_missing_shutdown_metrics_retain_counted_call_baseline(self):
+        call = event('assistant.usage', model='m', apiCallId='one', **usage(1000, 100, 0, 0))
+        records = [call, event('session.shutdown'), shutdown(m=usage(1500, 150, 0, 0))]
+        self.assertEqual(self.parse(records)[1]['tokens']['all'], 1650)
+
+    def test_empty_shutdown_preserves_segment_message_fallback(self):
         _, result = self.parse([shutdown(model=usage()), event('assistant.message', model='model', outputTokens=8),
                                 event('session.shutdown'), event('assistant.message', outputTokens=7)])
-        self.assert_tokens(result, 127, 60, 27, 30, 10)
-        _, result = self.parse([event('assistant.message', model='model', outputTokens=8),
-                                event('session.shutdown'), event('assistant.message', outputTokens=7)])
-        self.assertEqual(result['tokens']['all'], 15)
+        self.assert_tokens(result, 135, 60, 35, 30, 10)
 
     def test_unknown_model_and_calls_without_ids(self):
         count, result = self.parse([event('assistant.usage', **usage()), event('assistant.usage', **usage())])
@@ -119,11 +133,14 @@ class CopilotReadersTests(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assert_tokens(result, 180, 95, 30, 40, 15)
 
-    def test_shutdown_dominance_requires_every_model_and_field(self):
-        _, result = self.parse([shutdown(a=usage(), b=usage()), shutdown(a=usage(200, 40, 60, 20, 10))])
-        self.assert_tokens(result, 480, 240, 80, 120, 40)
-        _, result = self.parse([shutdown(a=usage()), shutdown(a=usage(200, 40, 60, 20, 1))])
-        self.assert_tokens(result, 360, 180, 60, 90, 30)
+    def test_shutdown_delta_is_per_field_and_retains_absent_models(self):
+        _, result = self.parse([shutdown(a=usage(1000, 500, 0, 0)), shutdown(a=usage(400, 800, 0, 0))])
+        self.assert_tokens(result, 2200, 1400, 800, 0, 0)
+        records = [shutdown(a=usage(1000, 100, 0, 0), b=usage(500, 50, 0, 0)),
+                   shutdown(a=usage(1200, 120, 0, 0)),
+                   shutdown(a=usage(1300, 130, 0, 0), b=usage(500, 50, 0, 0))]
+        self.assertEqual(self.parse(records)[1]['tokens']['all'], 1980)
+        self.assertEqual(app.reflect_parse_copilot_session(self.path)['tokens'], 1980)
 
     def test_legacy_output_only_is_unchanged(self):
         count, result = self.parse([event('assistant.message', outputTokens=99),
@@ -152,10 +169,14 @@ class CopilotReadersTests(unittest.TestCase):
             app.parse_copilot_legacy_file(self.path, app.empty_provider_usage())
         self.assertEqual(add.call_args.args[3].timestamp(), 1700000000)
 
-    def test_reflect_uses_same_source_dedup_and_subset_math(self):
+    def test_reflect_preserves_separate_cache_accounting_and_deduplicates(self):
         row = event('assistant.usage', apiCallId='same', model='test-model', **usage())
         self.parse([row, row, shutdown(model=usage(500))])
-        self.assertEqual(app.reflect_parse_copilot_session(self.path)['tokens'], 120)
+        self.assertEqual(app.reflect_parse_copilot_session(self.path)['tokens'], 160)
         self.parse([shutdown(model=usage()), shutdown(model=usage(150, 35, 40, 15, 7)),
                     event('assistant.message', model='model', outputTokens=7)])
-        self.assertEqual(app.reflect_parse_copilot_session(self.path)['tokens'], 192)
+        self.assertEqual(app.reflect_parse_copilot_session(self.path)['tokens'], 240)
+        self.parse([shutdown(model=usage(1000, 30, 600, 0))])
+        self.assertEqual(app.reflect_parse_copilot_session(self.path)['tokens'], 1630)
+        self.parse([shutdown(model=usage(1000, 500, 0, 0)), shutdown(model=usage(400, 800, 0, 0))])
+        self.assertEqual(app.reflect_parse_copilot_session(self.path)['tokens'], 2200)

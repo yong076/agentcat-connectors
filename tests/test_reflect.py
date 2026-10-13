@@ -500,7 +500,7 @@ class IndexerTests(ReflectTestCase):
         self.assertTrue(all(set(turn) == {"role", "text", "tool", "ts"} for turn in turns))
         digest = agentcat.reflect_parse_copilot_session(path)
         self.assertEqual((digest["project"], digest["user_turns"]), ("copilot-repo", 1))
-        self.assertEqual((digest["tool_call_counts"], digest["tokens"]), ({"shell": 1}, 150))
+        self.assertEqual((digest["tool_call_counts"], digest["tokens"]), ({"shell": 1}, 160))
         self.assertFalse(digest["counts_only"])
 
     def test_grok_reader_yields_shared_turns_and_digest(self):
