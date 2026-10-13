@@ -8720,7 +8720,7 @@ def grok_snapshot() -> Dict[str, Any]:
     return result
 
 
-def opencode_database_rows(conn: sqlite3.Connection) -> List[Any]:
+def opencode_database_rows(conn: sqlite3.Connection) -> Tuple[List[Any], List[str]]:
     tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
     if not tables.intersection(("message", "session_message")):
         raise sqlite3.OperationalError("no message table")
@@ -8731,67 +8731,86 @@ def opencode_database_rows(conn: sqlite3.Connection) -> List[Any]:
     except sqlite3.OperationalError:
         has_json = False
     rows: List[Any] = []
+    warnings: List[str] = []
     for table, is_v2 in (("session_message", True), ("message", False)):
         if table not in tables:
             continue
-        session = next((name for name in (("session_v2", "session") if is_v2 else
-                                         ("session", "session_v2")) if name in tables), None)
-        columns = {row[1] for row in conn.execute(f"pragma table_info({session})")} if session else set()
-        message_columns = {row[1] for row in conn.execute(f"pragma table_info({table})")}
-        message_id = "m.id" if "id" in message_columns else "null"
-        path = next((f"s.{name}" for name in ("directory", "cwd", "working_directory", "path")
-                     if name in columns), "''")
-        join = f"left join {session} s on s.id = m.session_id" if session else ""
-        allowed = " and ".join(f"s.{name} is null" for name in ("time_archived", "parent_id")
-                               if name in columns) or "1"
-        session_model = "s.model" if "model" in columns else "null"
-        kind = "m.type" if is_v2 else "null"
-        if has_json:
-            raw = "case when json_valid(m.data) then m.data else '{}' end"
-            role = kind if is_v2 else f"json_extract({raw}, '$.role')"
-            model = f"json_extract({raw}, '$.model.id')" if is_v2 else f"json_extract({raw}, '$.modelID')"
-            if is_v2:
-                model = (f"coalesce({model}, case when m.type = 'compaction' and json_valid({session_model}) "
-                         f"then json_extract({session_model}, '$.id') end)")
-            tool_path = "$.content" if is_v2 else "$.toolRequests"
-            tool_name = "json_extract(t.value, '$.name')" if is_v2 else (
-                "coalesce(json_extract(t.value, '$.toolName'), json_extract(t.value, '$.name'), "
-                "json_extract(t.value, '$.tool'))")
-            tool_filter = "and json_extract(t.value, '$.type') = 'tool'" if is_v2 else ""
-            tools = (f"(select json_group_array(json_object('name', {tool_name})) "
-                     f"from json_each({raw}, '{tool_path}') t where t.type = 'object' {tool_filter})")
-            data = (f"json_object('role', {role}, 'modelID', {model}, "
-                    f"'tokens', json_extract({raw}, '$.tokens'), 'toolRequests', {tools})")
+        generation_rows: List[Any] = []
+        try:
+            session = next((name for name in (("session_v2", "session") if is_v2 else
+                                             ("session", "session_v2")) if name in tables), None)
+            columns = {row[1] for row in conn.execute(f"pragma table_info({session})")} if session else set()
+            message_columns = {row[1] for row in conn.execute(f"pragma table_info({table})")}
+            message_id = "m.id" if "id" in message_columns else "null"
+            path = next((f"s.{name}" for name in ("directory", "cwd", "working_directory", "path")
+                         if name in columns), "''")
+            join = f"left join {session} s on s.id = m.session_id" if session else ""
+            allowed = " and ".join(f"s.{name} is null" for name in ("time_archived", "parent_id")
+                                   if name in columns) or "1"
+            if not is_v2 and session == "session" and "session_v2" in tables:
+                live_columns = {row[1] for row in conn.execute("pragma table_info(session_v2)")}
+                join += " left join session_v2 live on live.id = m.session_id"
+                live_allowed = " and ".join(f"live.{name} is null" for name in ("time_archived", "parent_id")
+                                            if name in live_columns) or "1"
+                allowed = f"case when live.id is not null then ({live_allowed}) else ({allowed}) end"
+            lineage_filter = ""
+            if not is_v2 and "session" not in tables and "session_v2" in tables and "session_message" in tables:
+                new_columns = {row[1] for row in conn.execute("pragma table_info(session_message)")}
+                if "session_id" in new_columns:
+                    lineage_filter = "where not exists (select 1 from session_message n where n.session_id = m.session_id) "
+            session_model = "s.model" if "model" in columns else "null"
+            kind = "m.type" if is_v2 else "null"
+            if has_json:
+                raw = "case when json_valid(m.data) then m.data else '{}' end"
+                role = kind if is_v2 else f"json_extract({raw}, '$.role')"
+                model = f"json_extract({raw}, '$.model.id')" if is_v2 else f"json_extract({raw}, '$.modelID')"
+                if is_v2:
+                    model = (f"coalesce({model}, case when m.type = 'compaction' and json_valid({session_model}) "
+                             f"then json_extract({session_model}, '$.id') end)")
+                tool_path = "$.content" if is_v2 else "$.toolRequests"
+                tool_name = "json_extract(t.value, '$.name')" if is_v2 else (
+                    "coalesce(json_extract(t.value, '$.toolName'), json_extract(t.value, '$.name'), "
+                    "json_extract(t.value, '$.tool'))")
+                tool_filter = "and json_extract(t.value, '$.type') = 'tool'" if is_v2 else ""
+                tools = (f"(select json_group_array(json_object('name', {tool_name})) "
+                         f"from json_each({raw}, '{tool_path}') t where json_type({raw}, '{tool_path}') = 'array' and t.type = 'object' {tool_filter})")
+                data = (f"json_object('role', {role}, 'modelID', {model}, "
+                        f"'tokens', json_extract({raw}, '$.tokens'), 'toolRequests', {tools})")
+            else:
+                # Only SQLite builds without JSON functions load whole rows here.
+                data = "m.data"
+            # Filtered v2 rows still claim their IDs, without transferring their blobs.
+            query = (f"select {message_id}, m.time_created, {path}, ({allowed}), "
+                     f"case when {allowed} then {data} end, {kind}, "
+                     f"{session_model if not has_json else 'null'} from {table} m {join} "
+                     f"{lineage_filter}order by m.time_created asc")
+            for message_id_value, created, project, include, raw_data, row_kind, fallback_model in conn.execute(query):
+                if not has_json and include:
+                    try:
+                        value = json.loads(raw_data)
+                        if not isinstance(value, dict):
+                            value = {}
+                        if is_v2:
+                            value['role'] = row_kind
+                            model_value = value.get('model')
+                            if (not isinstance(model_value, dict) or model_value.get('id') is None) and row_kind == 'compaction' and fallback_model:
+                                try:
+                                    model_value = json.loads(fallback_model)
+                                except (ValueError, TypeError):
+                                    model_value = None
+                            value['modelID'] = model_value.get('id') if isinstance(model_value, dict) else None
+                            content = value.get('content')
+                            value['toolRequests'] = [{'name': tool.get('name')} for tool in content
+                                                     if isinstance(tool, dict) and tool.get('type') == 'tool'] if isinstance(content, list) else []
+                        raw_data = json.dumps(value)
+                    except (ValueError, TypeError):
+                        raw_data = '{}'
+                generation_rows.append((is_v2, message_id_value, created, raw_data, project, include))
+        except sqlite3.Error:
+            warnings.append(f"{table}: skipped incompatible generation")
         else:
-            data = "m.data"
-        # Filtered v2 rows still claim their IDs, without transferring their blobs.
-        query = (f"select {message_id}, m.time_created, {path}, ({allowed}), "
-                 f"case when {allowed} then {data} end, {kind}, "
-                 f"{session_model if not has_json else 'null'} from {table} m {join} "
-                 "order by m.time_created asc")
-        for message_id_value, created, project, include, raw_data, row_kind, fallback_model in conn.execute(query):
-            if not has_json and include:
-                try:
-                    value = json.loads(raw_data)
-                    if not isinstance(value, dict):
-                        value = {}
-                    if is_v2:
-                        value['role'] = row_kind
-                        model_value = value.get('model')
-                        if (not isinstance(model_value, dict) or model_value.get('id') is None) and row_kind == 'compaction' and fallback_model:
-                            try:
-                                model_value = json.loads(fallback_model)
-                            except (ValueError, TypeError):
-                                model_value = None
-                        value['modelID'] = model_value.get('id') if isinstance(model_value, dict) else None
-                        content = value.get('content')
-                        value['toolRequests'] = [{'name': tool.get('name')} for tool in content
-                                                 if isinstance(tool, dict) and tool.get('type') == 'tool'] if isinstance(content, list) else []
-                    raw_data = json.dumps(value)
-                except (ValueError, TypeError):
-                    raw_data = '{}'
-            rows.append((is_v2, message_id_value, created, raw_data, project, include))
-    return rows
+            rows.extend(generation_rows)
+    return rows, warnings
 
 
 def opencode_snapshot() -> Dict[str, Any]:
@@ -8800,7 +8819,8 @@ def opencode_snapshot() -> Dict[str, Any]:
     if not data_dir.exists():
         return result
 
-    db_paths = sorted(path for path in data_dir.glob("opencode*.db") if path.is_file())
+    db_paths = sorted((path for path in data_dir.glob("opencode*.db") if path.is_file()),
+                      key=lambda path: (path.name != "opencode.db", path.name))
     if not db_paths:
         return result
 
@@ -8813,13 +8833,18 @@ def opencode_snapshot() -> Dict[str, Any]:
     rows: List[Any] = []
     for db_path in db_paths:
         try:
-            rows.extend(read_foreign_sqlite(db_path, opencode_database_rows))
+            database_rows, warnings = read_foreign_sqlite(db_path, opencode_database_rows)
+            rows.extend(database_rows)
+            errors.extend(f"{db_path.name}: {warning}" for warning in warnings)
         except Exception as exc:
             errors.append(f"{db_path.name}: {exc}")
     seen_ids: Set[str] = set()
-    # V2 wins even across imported preview databases; excluded rows claim IDs too.
-    for is_v2, message_id, created_raw, data_raw, project_raw, include in sorted(rows, key=lambda row: not row[0]):
-        if message_id is not None:
+    # Exclusions apply across all files before primary DB / v2 precedence.
+    excluded_ids = {row[1] for row in rows if not row[5] and isinstance(row[1], str) and row[1]}
+    for is_v2, message_id, created_raw, data_raw, project_raw, include in rows:
+        if isinstance(message_id, str) and message_id:
+            if message_id in excluded_ids:
+                continue
             if message_id in seen_ids:
                 continue
             seen_ids.add(message_id)
@@ -8838,7 +8863,7 @@ def opencode_snapshot() -> Dict[str, Any]:
         if add_usage_metrics(result, data.get("modelID"), metrics, when):
             events += 1
         project_path = str(project_raw or "").strip()
-        if project_path:
+        if project_path and _is_absolute_snapshot_path(project_path):
             total = usage_token_total(metrics)
             if total > 0:
                 project_tokens[project_path] = project_tokens.get(project_path, 0) + total
@@ -8862,7 +8887,7 @@ def opencode_snapshot() -> Dict[str, Any]:
     if events == 0 and errors:
         result["status"] = "error"
         result["error"] = "; ".join(errors[:3])
-    elif errors:
+    if errors:
         result["warnings"] = errors[:3]
     result["events"] = events
     if project_tokens:

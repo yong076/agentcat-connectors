@@ -116,7 +116,12 @@ class OpenCodeReadersTests(unittest.TestCase):
         self.message(conn, 'old')
         self.message(conn, 'new', v2=True)
         self.message(conn, 'compact', v2=True, kind='compaction', model=False)
+        conn.execute("update session_message set data = ? where id = 'new'",
+                     (json.dumps({'model': {'id': 'test-model'}, 'tokens': {'input': 10, 'output': 10},
+                                  'content': {'a': {'type': 'tool', 'name': 'bash'}}}),))
+        conn.commit()
         expected = app.opencode_snapshot()
+        self.assertEqual(expected['breakdown']['tools'], 2)
         real_reader = app.read_foreign_sqlite
 
         class WithoutJSON:
@@ -136,3 +141,79 @@ class OpenCodeReadersTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(actual['tokens']['all'], 60)
         self.assertEqual(actual['events'], 3)
+
+    def test_primary_database_wins_and_exclusions_precede_all_copies(self):
+        primary = self.database()
+        preview = self.database('opencode-next.db')
+        other = self.database('opencode-z.db')
+        self.message(primary, 'shared', v2=True, amount=90)  # 100, not stale 20
+        self.message(preview, 'shared', v2=True)
+        self.assertEqual(app.opencode_snapshot()['tokens']['all'], 100)
+        primary.execute('update session_v2 set time_archived = 1')
+        primary.commit()
+        self.assertEqual(app.opencode_snapshot()['tokens']['all'], 0)
+        # Excluded copy encountered last must also suppress an earlier live copy.
+        self.message(preview, 'late-exclusion', v2=True)
+        self.message(other, 'late-exclusion', v2=True)
+        other.execute("update session_v2 set parent_id = 'parent'")
+        other.commit()
+        self.assertEqual(app.opencode_snapshot()['tokens']['all'], 0)
+
+    def test_old_only_rows_follow_live_session_or_fall_back(self):
+        conn = self.database()
+        self.message(conn, 'old-only')
+        for column, value in [('time_archived', 1), ('parent_id', 'parent')]:
+            conn.execute(f'update session_v2 set {column} = ?', (value,))
+            conn.commit()
+            self.assertEqual(app.opencode_snapshot()['tokens']['all'], 0)
+            conn.execute(f'update session_v2 set {column} = null')
+        conn.execute('delete from session_v2')
+        conn.commit()
+        self.assertEqual(app.opencode_snapshot()['tokens']['all'], 20)
+
+    def test_only_nonempty_string_ids_deduplicate(self):
+        for name in ['opencode.db', 'opencode-next.db']:
+            conn = self.database(name)
+            # Untyped columns retain integer IDs instead of coercing to strings.
+            conn.execute('drop table message')
+            conn.execute('create table message(id, session_id text, time_created int, data text)')
+            for message_id in [None, None, '', '', 1, 1]:
+                self.message(conn, message_id)
+        self.assertEqual(app.opencode_snapshot()['tokens']['all'], 240)  # 12 * 20
+        self.assertEqual(app.opencode_snapshot()['events'], 12)
+
+    def test_each_generation_survives_the_other_schema_failure(self):
+        for broken, valid_v2 in [('session_message', False), ('message', True)]:
+            with self.subTest(broken=broken):
+                conn = self.database('opencode-' + broken + '.db')
+                self.message(conn, broken, v2=valid_v2)
+                conn.execute(f'drop table {broken}')
+                conn.execute(f'create table {broken}(id text, data text)')
+                conn.commit()
+        snapshot = app.opencode_snapshot()
+        self.assertEqual(snapshot['tokens']['all'], 40)
+        self.assertEqual(snapshot['events'], 2)
+        self.assertTrue(any('session_message: skipped' in warning for warning in snapshot['warnings']))
+        self.assertTrue(any('message: skipped' in warning for warning in snapshot['warnings']))
+
+    def test_renamed_lineage_different_ids_and_unmigrated_session(self):
+        conn = self.database(sessions=('session_v2',))
+        self.message(conn, 'old-id', amount=90)
+        self.message(conn, 'new-id', v2=True)  # 20; old migrated session is excluded
+        self.message(conn, 'unmigrated', amount=5)  # 15; session has no new rows
+        conn.execute("insert into session_v2 select 'unmigrated', directory, path, null, null, model from session_v2")
+        conn.execute("update message set session_id = 'unmigrated' where id = 'unmigrated'")
+        conn.commit()
+        self.assertEqual(app.opencode_snapshot()['tokens']['all'], 35)
+        self.assertEqual(app.opencode_snapshot()['events'], 2)
+
+    def test_relative_project_path_is_not_a_project(self):
+        conn = self.database(sessions=('session',))
+        self.message(conn, 'relative')
+        conn.execute('alter table session rename to old_session')
+        conn.execute('create table session(id text, path text)')
+        conn.execute("insert into session values ('s', '../../relative')")
+        conn.commit()
+        snapshot = app.opencode_snapshot()
+        self.assertEqual(snapshot['tokens']['all'], 20)
+        self.assertEqual(snapshot['projects']['status'], 'not_available')
