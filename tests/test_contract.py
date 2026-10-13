@@ -40,6 +40,8 @@ class ConnectorContractTests(unittest.TestCase):
             self.assertIn(replacement, capabilities)
 
     def test_version_payload_contract_is_available_to_apps(self) -> None:
+        self.assertIn("config.providers", agentcat.CONNECTOR_CAPABILITIES)
+        self.assertIn("connector.config", agentcat.CONNECTOR_CAPABILITIES)
         self.assertIn("connector.contract.v1", agentcat.CONNECTOR_CAPABILITIES)
         self.assertIn("connector.daemon", agentcat.CONNECTOR_CAPABILITIES)
         self.assertIn("connector.daemon.status.v1", agentcat.CONNECTOR_CAPABILITIES)

@@ -2,6 +2,11 @@
   "contractVersion": 1,
   "snapshotSchemaVersion": 4,
   "capabilityRegistry": {
+    "config.providers": {
+      "owner": "shared",
+      "fields": ["capabilities"],
+      "fallback": "compatibility alias for connector.config; provider controls use GET and POST /v1/config"
+    },
     "connector.contract.v1": {
       "owner": "shared",
       "fields": ["contractVersion"],

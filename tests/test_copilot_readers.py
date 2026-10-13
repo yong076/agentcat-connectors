@@ -76,11 +76,34 @@ class CopilotReadersTests(unittest.TestCase):
         self.assert_tokens(result)
         self.assertEqual(set(result['models']), {'chosen'})
 
-    def test_model_call_wins_over_shutdown_in_same_segment(self):
+    def test_unlabelled_call_does_not_replace_model_summary(self):
         count, result = self.parse([event('model.model_call_success', responseUsage={'completion_tokens': 7}),
                                     shutdown(other=usage())])
         self.assertEqual(count, 1)
-        self.assertEqual(result['tokens']['all'], 7)
+        self.assertEqual(result['tokens']['all'], 120)
+
+    def test_auxiliary_calls_do_not_hide_main_model_cumulative_totals(self):
+        auxiliary = event('model.model_call_success', model='aux', callId='a',
+                          responseUsage={'prompt_tokens': 10, 'completion_tokens': 2})
+        first = shutdown(main=usage(1000, 100, 0, 0), aux=usage(10, 2, 0, 0))
+        records = [auxiliary, auxiliary, first, first,
+                   shutdown(main=usage(1500, 150, 0, 0), aux=usage(10, 2, 0, 0))]
+        _, result = self.parse(records)
+        self.assertEqual(result['tokens']['all'], 1662)
+        self.assertEqual(set(result['models']), {'main', 'aux'})
+
+    def test_model_missing_from_summary_keeps_its_calls_once(self):
+        records = [event('model.model_call_success', model='aux', callId='a',
+                         responseUsage={'prompt_tokens': 10, 'completion_tokens': 2}),
+                   shutdown(main=usage(1000, 100, 0, 0)),
+                   shutdown(main=usage(1000, 100, 0, 0), aux=usage(10, 2, 0, 0))]
+        self.assertEqual(self.parse(records)[1]['tokens']['all'], 1112)
+
+    def test_partial_calls_for_same_model_use_complete_summary(self):
+        records = [event('model.model_call_success', model='main', callId='a',
+                         responseUsage={'prompt_tokens': 10, 'completion_tokens': 2}),
+                   shutdown(main=usage(1000, 100, 0, 0))]
+        self.assertEqual(self.parse(records)[1]['tokens']['all'], 1100)
 
     def test_zero_per_call_usage_does_not_suppress_real_sources(self):
         zero = event('assistant.usage', inputTokens=0)
