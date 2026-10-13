@@ -198,6 +198,48 @@ class OpenCodeReadersTests(unittest.TestCase):
         self.assertTrue(any('session_message: skipped' in warning for warning in snapshot['warnings']))
         self.assertTrue(any('message: skipped' in warning for warning in snapshot['warnings']))
 
+    def test_generation_query_errors_retry_private_copy_only_when_retryable(self):
+        conn = self.database()
+        self.message(conn, 'shared', amount=100)
+        self.message(conn, 'shared', v2=True, amount=100)
+        for index in range(4):
+            self.message(conn, 'new-' + str(index), v2=True, amount=45)
+        self.message(conn, 'summary', amount=0)
+        real_reader = app.read_foreign_sqlite
+        for error, expected, retries in [('database is locked', 340, 2),
+                                         ('disk I/O error', 340, 2),
+                                         ('no such column: m.type', 120, 1)]:
+            with self.subTest(error=error):
+                paths = []
+                failed = []
+
+                class FailingQuery:
+                    def __init__(self, connection):
+                        self.connection = connection
+
+                    def execute(self, query):
+                        if 'from session_message m' in query and not failed:
+                            failed.append(True)
+                            raise sqlite3.OperationalError(error)
+                        return self.connection.execute(query)
+
+                def reader(path, callback):
+                    def read(connection):
+                        paths.append(connection.execute('pragma database_list').fetchone()[2])
+                        return callback(FailingQuery(connection))
+                    return real_reader(path, read)
+
+                with patch.object(app, 'read_foreign_sqlite', side_effect=reader):
+                    snapshot = app.opencode_snapshot()
+                self.assertEqual(snapshot['tokens']['all'], expected)
+                self.assertEqual(len(paths), retries)
+                if retries == 2:
+                    self.assertNotEqual(paths[0], paths[1])
+                    self.assertFalse(snapshot.get('warnings'))
+                else:
+                    self.assertTrue(any('session_message: skipped' in warning
+                                        for warning in snapshot['warnings']))
+
     def test_renamed_lineage_different_ids_and_unmigrated_session(self):
         conn = self.database(sessions=('session_v2',))
         self.message(conn, 'old-id', amount=90)

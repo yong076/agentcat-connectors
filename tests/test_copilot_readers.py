@@ -110,6 +110,34 @@ class CopilotReadersTests(unittest.TestCase):
                                 event('session.shutdown'), event('assistant.message', outputTokens=7)])
         self.assert_tokens(result, 135, 60, 35, 30, 10)
 
+    def test_message_fallback_advances_shutdown_output_baseline(self):
+        for empty in [event('session.shutdown'), shutdown()]:
+            _, result = self.parse([
+                event('assistant.message', model='m', outputTokens=500), empty,
+                event('assistant.message', model='m', outputTokens=300),
+                shutdown(m=usage(9000, 800, 8000, 0))])
+            self.assert_tokens(result, 9800, 1000, 800, 8000, 0)
+
+    def test_shutdown_cache_subset_uses_raw_values_and_bounds_deltas(self):
+        _, result = self.parse([shutdown(m=usage(1000, 100, 0, 0)),
+                                shutdown(m=usage(100000, 2000, 99500, 0))])
+        # Input delta 99000 includes min(99500, 99000) cached tokens;
+        # output delta 1900 plus the first 1100 gives 102000, not 201500.
+        self.assert_tokens(result, 1100 + 99000 + 1900, 1000, 2000, 99000, 0)
+        self.assertLessEqual(result['tokens']['all'], 103100)
+
+    def test_unconfirmed_baseline_shrink_does_not_rebook_crashed_runs(self):
+        records = [event('assistant.usage', model='a', **usage(1000, 500, 0, 500)),
+                   event('session.resume'),
+                   event('assistant.usage', model='a', **usage(1000, 50, 0, 1000)),
+                   event('assistant.usage', model='b', **usage(0, 500, 0, 0)),
+                   event('assistant.usage', model='a', **usage(10, 0, 5, 5)),
+                   event('session.shutdown'), event('session.resume'),
+                   shutdown(a=usage(1010, 50, 5, 1005), b=usage(0, 500, 0, 0))]
+        # The summary omits the first crashed run; all 3060 tokens were counted
+        # from calls already. Inferred baseline shrinkage adds no new usage.
+        self.assertEqual(self.parse(records)[1]['tokens']['all'], 3060)
+
     def test_unknown_model_and_calls_without_ids(self):
         count, result = self.parse([event('assistant.usage', **usage()), event('assistant.usage', **usage())])
         self.assertEqual(count, 2)

@@ -7762,13 +7762,16 @@ def parse_timestamp(raw: Any) -> Optional[dt.datetime]:
         text = raw.strip()
         if text.isdigit():
             return parse_timestamp(int(text))
-        # Python 3.9 accepts only millisecond/microsecond ISO fractions.
-        text = re.sub(r"(\d{2}:\d{2}:\d{2})[.,](\d+)",
-                      lambda match: match[1] + "." + match[2][:6].ljust(6, "0"), text)
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         try:
-            parsed = dt.datetime.fromisoformat(text)
+            try:
+                parsed = dt.datetime.fromisoformat(text)
+            except ValueError:
+                # Python 3.9 accepts only millisecond/microsecond ISO fractions.
+                text = re.sub(r"(\d{2}:\d{2}:\d{2})[.,](\d+)",
+                              lambda match: match[1] + "." + match[2][:6].ljust(6, "0"), text)
+                parsed = dt.datetime.fromisoformat(text)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=dt.timezone.utc)
             return parsed.astimezone(dt.timezone.utc)
@@ -8818,7 +8821,9 @@ def opencode_database_rows(conn: sqlite3.Connection) -> Tuple[List[Any], List[st
                     except (ValueError, TypeError):
                         raw_data = '{}'
                 generation_rows.append((is_v2, message_id_value, created, raw_data, project, include))
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if _foreign_sqlite_copy_error(exc):
+                raise
             warnings.append(f"{table}: skipped incompatible generation")
         else:
             rows.extend(generation_rows)
@@ -8982,11 +8987,14 @@ def copilot_legacy_model(event: Dict[str, Any], current_model: Optional[str]) ->
     return current_model
 
 
-def copilot_usage_metrics(usage: Dict[str, Any]) -> Dict[str, int]:
+def copilot_usage_metrics(usage: Dict[str, Any], cache_is_subset: Optional[bool] = None) -> Dict[str, int]:
     input_tokens = nonnegative_int(usage.get("inputTokens")) or 0
     cached = nonnegative_int(usage.get("cacheReadTokens")) or 0
     written = nonnegative_int(usage.get("cacheWriteTokens")) or 0
-    if cached <= input_tokens:
+    if cache_is_subset is None:
+        cache_is_subset = cached <= input_tokens
+    if cache_is_subset:
+        cached = min(cached, input_tokens)
         written = min(written, input_tokens - cached)
         input_tokens -= cached + written
     # Some providers report cache separately; reasoning is already in output.
@@ -8994,7 +9002,8 @@ def copilot_usage_metrics(usage: Dict[str, Any]) -> Dict[str, int]:
             "cacheReadInputTokens": cached, "cacheCreationInputTokens": written}
 
 
-def copilot_shutdown_deltas(metrics: Any, previous: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
+def copilot_shutdown_deltas(metrics: Any, previous: Dict[str, Dict[str, int]],
+                            unconfirmed: Optional[Set[str]] = None) -> Dict[str, Dict[str, int]]:
     """Conservatively reconcile each model/field; absent models retain their baseline."""
     deltas: Dict[str, Dict[str, int]] = {}
     if not isinstance(metrics, dict):
@@ -9005,10 +9014,15 @@ def copilot_shutdown_deltas(metrics: Any, previous: Dict[str, Dict[str, int]]) -
         current = {field: nonnegative_int(metric["usage"].get(field)) or 0
                    for field in ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens")}
         prior = previous.get(model, {})
-        # Growing fields are cumulative; a shrinking field starts a new run.
-        deltas[model] = {field: value - prior.get(field, 0) if value >= prior.get(field, 0) else value
+        # A baseline inferred without shutdown metrics can include crashed runs
+        # that the next summary omits. Shrinkage cannot confirm a new run there.
+        shrinking_value = 0 if unconfirmed is not None and model in unconfirmed else None
+        deltas[model] = {field: value - prior.get(field, 0) if value >= prior.get(field, 0)
+                         else (value if shrinking_value is None else shrinking_value)
                          for field, value in current.items()}
         previous[model] = current
+        if unconfirmed is not None:
+            unconfirmed.discard(model)
     return deltas
 
 
@@ -9021,6 +9035,7 @@ def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
     messages: List[Any] = []
     records: List[Any] = []
     previous: Dict[str, Dict[str, int]] = {}
+    unconfirmed: Set[str] = set()
     for event in events:
         current_model = copilot_legacy_model(event, current_model)
         kind = event.get("type")
@@ -9055,16 +9070,24 @@ def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
         elif kind == "session.shutdown":
             # Advance the raw shutdown baseline even when calls supply this run:
             # a later cumulative shutdown must not book those calls again.
-            deltas = copilot_shutdown_deltas(data.get("modelMetrics"), previous)
+            deltas = copilot_shutdown_deltas(data.get("modelMetrics"), previous, unconfirmed)
             chosen = next((source for source, values in calls.items() if values), None)
             if chosen:
                 for model, totals in call_totals[chosen].items():
                     if model not in deltas:
                         # Missing shutdown metrics still need a baseline for counted calls.
                         prior = previous.setdefault(model, {})
+                        unconfirmed.add(model)
                         for field, value in totals.items():
                             prior[field] = prior.get(field, 0) + value
-            shutdowns = [(model, copilot_usage_metrics(delta), when) for model, delta in deltas.items()]
+            shutdowns = [(model, copilot_usage_metrics(
+                delta, previous[model]["cacheReadTokens"] <= previous[model]["inputTokens"]), when)
+                         for model, delta in deltas.items()]
+            if not chosen and not shutdowns:
+                for model, metrics, _when in messages:
+                    prior = previous.setdefault(model, {})
+                    unconfirmed.add(model)
+                    prior["outputTokens"] = prior.get("outputTokens", 0) + metrics["outputTokens"]
             records.extend(calls["assistant.usage"] or calls["model.model_call_success"] or shutdowns or messages)
             for values in calls.values():
                 values.clear()
