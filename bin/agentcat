@@ -6501,6 +6501,8 @@ def antigravity_oauth_client_candidates() -> List[Tuple[str, str]]:
 
 
 def refresh_antigravity_access_token(creds: Dict[str, Any]) -> Dict[str, Any]:
+    if creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) in (ANTIGRAVITY_APP_SOURCE, ANTIGRAVITY_KEYCHAIN_SOURCE):
+        raise RuntimeError("Antigravity login is read-only")
     refresh_token = creds.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
         raise RuntimeError("No refresh token in antigravity-oauth-token")
@@ -6570,10 +6572,89 @@ def antigravity_oauth_token_paths() -> List[Path]:
 # refreshes it (rule R1), even though Google refresh tokens do not rotate.
 ANTIGRAVITY_CREDS_SOURCE_KEY = "_agentcatSource"
 ANTIGRAVITY_APP_SOURCE = "antigravity-app"
+ANTIGRAVITY_KEYCHAIN_SOURCE = "antigravity-keychain"
+_ANTIGRAVITY_KEYCHAIN_CACHE: Optional[Tuple[float, Optional[Dict[str, Any]]]] = None
+_ANTIGRAVITY_KEYCHAIN_LOCK = threading.Lock()
+_ANTIGRAVITY_KEYCHAIN_WARNED = False
+
+
+def antigravity_keychain_run(command: List[str], **kwargs: Any) -> Any:
+    """Separate runner so sandbox tests never reach the real Keychain."""
+    import selectors
+
+    with subprocess.Popen(command, stdin=kwargs["stdin"], stdout=kwargs["stdout"], stderr=kwargs["stderr"]) as process:
+        deadline = time.monotonic() + kwargs["timeout"]
+        output = bytearray()
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                    chunk = os.read(process.stdout.fileno(), min(8192, 65537 - len(output)))
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if len(output) > 65536:
+                        raise ValueError("Keychain item exceeds size limit")
+            code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            return subprocess.CompletedProcess(command, code, bytes(output))
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+def read_antigravity_keychain_credentials(run: Optional[Callable[..., Any]] = None) -> Optional[Dict[str, Any]]:
+    """Read the CLI-owned macOS grant, caching both success and failure in memory."""
+    global _ANTIGRAVITY_KEYCHAIN_CACHE, _ANTIGRAVITY_KEYCHAIN_WARNED
+    if sys.platform != "darwin":
+        return None
+    with _ANTIGRAVITY_KEYCHAIN_LOCK:
+        now = time.monotonic()
+        if _ANTIGRAVITY_KEYCHAIN_CACHE is not None and now - _ANTIGRAVITY_KEYCHAIN_CACHE[0] < 60:
+            cached = _ANTIGRAVITY_KEYCHAIN_CACHE[1]
+            return dict(cached) if cached is not None else None
+        creds = None
+        failed = False
+        try:
+            completed = (run or antigravity_keychain_run)(
+                ["/usr/bin/security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                check=False, timeout=5,
+            )
+            if completed.returncode == 0:
+                if len(completed.stdout) > 65536:
+                    raise ValueError("Keychain item exceeds size limit")
+                value = completed.stdout.decode("utf-8").strip()
+                if value.startswith("go-keyring-base64:"):
+                    value = base64.b64decode(value[len("go-keyring-base64:"):], validate=True).decode("utf-8")
+                elif value.startswith("go-keyring-encoded:"):
+                    value = bytes.fromhex(value[len("go-keyring-encoded:"):]).decode("utf-8")
+                raw = json.loads(value)
+                if isinstance(raw, dict):
+                    candidate = unwrap_antigravity_oauth_token(raw)
+                    if isinstance(candidate.get("access_token"), str) and candidate["access_token"]:
+                        candidate[ANTIGRAVITY_CREDS_SOURCE_KEY] = ANTIGRAVITY_KEYCHAIN_SOURCE
+                        creds = candidate
+                failed = creds is None
+            else:
+                failed = completed.returncode != 44
+        except (OSError, subprocess.SubprocessError, ValueError, UnicodeError):
+            failed = True
+        if failed and not _ANTIGRAVITY_KEYCHAIN_WARNED:
+            logging.warning("agentcat: Antigravity Keychain read unavailable")
+            _ANTIGRAVITY_KEYCHAIN_WARNED = True
+        _ANTIGRAVITY_KEYCHAIN_CACHE = (time.monotonic(), creds)
+        return dict(creds) if creds is not None else None
 
 
 def read_antigravity_oauth_credentials() -> Optional[Dict[str, Any]]:
-    """Read (never write) the first Antigravity login that carries a token."""
+    """Prefer a current Keychain login, preserving the existing file fallback."""
+    keychain = read_antigravity_keychain_credentials()
+    if keychain is not None and not antigravity_app_login_expired(keychain):
+        return keychain
     fallback: Optional[Dict[str, Any]] = None
     for path in antigravity_oauth_token_paths():
         raw = read_json(path)
@@ -6583,15 +6664,22 @@ def read_antigravity_oauth_credentials() -> Optional[Dict[str, Any]]:
         if path == ANTIGRAVITY_APP_OAUTH_TOKEN:
             creds[ANTIGRAVITY_CREDS_SOURCE_KEY] = ANTIGRAVITY_APP_SOURCE
         if creds.get("access_token") or creds.get("refresh_token"):
+            if keychain is not None:
+                expires_at = antigravity_expiry_ms(creds)
+                current = creds.get("access_token") and expires_at and time.time() * 1000 < expires_at - 60_000
+                refreshable = (creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) != ANTIGRAVITY_APP_SOURCE
+                               and isinstance(creds.get("refresh_token"), str) and creds["refresh_token"])
+                if not current and not refreshable:
+                    continue
             return creds
         if fallback is None:
             fallback = creds
-    return fallback
+    return keychain or fallback
 
 
 def antigravity_app_login_expired(creds: Optional[Dict[str, Any]]) -> bool:
-    """True for the app's own login once its access token has expired."""
-    if not isinstance(creds, dict) or creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) != ANTIGRAVITY_APP_SOURCE:
+    """True for a read-only app or Keychain login once its access token has expired."""
+    if not isinstance(creds, dict) or creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) not in (ANTIGRAVITY_APP_SOURCE, ANTIGRAVITY_KEYCHAIN_SOURCE):
         return False
     expires_at = antigravity_expiry_ms(creds)
     return not creds.get("access_token") or not expires_at or time.time() * 1000 >= expires_at - 60_000
@@ -6614,9 +6702,9 @@ def antigravity_access_token() -> Optional[str]:
     creds = read_antigravity_oauth_credentials()
     if not creds:
         return None
-    if creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) == ANTIGRAVITY_APP_SOURCE:
-        # The Antigravity app's grant: read-only until it expires; the app
-        # refreshes it itself. Never refreshed here, so a failure can never
+    if creds.get(ANTIGRAVITY_CREDS_SOURCE_KEY) in (ANTIGRAVITY_APP_SOURCE, ANTIGRAVITY_KEYCHAIN_SOURCE):
+        # App and Keychain grants stay read-only until expiry; their owner
+        # refreshes them. Never refreshed here, so a failure can never
         # drop agy's cached OAuth client or trigger a binary rescan.
         if antigravity_app_login_expired(creds):
             return None
