@@ -304,6 +304,7 @@ CONNECTOR_CAPABILITIES = (
     "activity.memory",
     "activity.runtimeModes",
     "connector.config",
+    "config.providers",  # Compatibility alias used by released macOS provider controls.
     "connections.openrouter.v1",
     "connections.codex.appServer.v1",
     "connections.managedAccounts.v1",
@@ -7621,7 +7622,7 @@ def copilot_limits_from_user_response(
             if isinstance(snapshots.get(key), dict):
                 raw = snapshots[key]
                 break
-        if not isinstance(raw, dict):
+        if not isinstance(raw, dict) or raw.get("unlimited"):
             return
         entitlement = float_value(raw.get("entitlement"))
         remaining = float_value(raw.get("remaining"))
@@ -7655,6 +7656,12 @@ def copilot_limits_from_user_response(
 
     append_quota(("premiumInteractions", "premium_interactions"), "copilot:premium_interactions", "Premium interactions")
     append_quota(("chat",), "copilot:chat", "Chat")
+    append_quota(("completions",), "copilot:completions", "Completions")
+    if quotas:
+        headline = next((quota for quota in quotas if quota["id"] == "copilot:premium_interactions"), None)
+        if headline is None:
+            headline = max(quotas, key=lambda quota: quota.get("usedPercent") or 0)
+        headline["primary"] = True
     limits["quotas"] = quotas
     if not quotas:
         limits["status"] = "not_configured"
@@ -9027,7 +9034,7 @@ def copilot_shutdown_deltas(metrics: Any, previous: Dict[str, Dict[str, int]],
 
 
 def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
-    """Choose a nonzero usage source per run ending at session.shutdown."""
+    """Reconcile cumulative summaries and call fallbacks separately for each model."""
     current_model: Optional[str] = None
     calls: Dict[str, List[Any]] = {"assistant.usage": [], "model.model_call_success": []}
     seen: Dict[str, Set[str]] = {kind: set() for kind in calls}
@@ -9036,6 +9043,18 @@ def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
     records: List[Any] = []
     previous: Dict[str, Dict[str, int]] = {}
     unconfirmed: Set[str] = set()
+    def selected_calls(covered: Set[str]) -> List[Any]:
+        selected: List[Any] = []
+        selected_models = set(covered)
+        for source in (*calls.values(), messages):
+            models = {record[0] for record in source} - selected_models
+            selected.extend(record for record in source if record[0] in models)
+            selected_models.update(models)
+        # Unlabelled calls cannot be proven distinct from a known summary/call.
+        if any(model != "copilot-auto" for model in selected_models):
+            selected = [record for record in selected if record[0] != "copilot-auto"]
+        return selected
+
     for event in events:
         current_model = copilot_legacy_model(event, current_model)
         kind = event.get("type")
@@ -9071,24 +9090,24 @@ def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
             # Advance the raw shutdown baseline even when calls supply this run:
             # a later cumulative shutdown must not book those calls again.
             deltas = copilot_shutdown_deltas(data.get("modelMetrics"), previous, unconfirmed)
-            chosen = next((source for source, values in calls.items() if values), None)
-            if chosen:
-                for model, totals in call_totals[chosen].items():
-                    if model not in deltas:
-                        # Missing shutdown metrics still need a baseline for counted calls.
-                        prior = previous.setdefault(model, {})
-                        unconfirmed.add(model)
-                        for field, value in totals.items():
-                            prior[field] = prior.get(field, 0) + value
+            # CLI 1.0.96 can log only auxiliary model calls here. A source
+            # decision for the whole run drops the main model's shutdown usage.
+            # Summaries are authoritative per model, including a zero delta.
+            selected = selected_calls(set(deltas))
+            for model in {record[0] for record in selected}:
+                source = next((kind for kind in calls if model in call_totals[kind]), None)
+                totals = call_totals[source][model] if source else {
+                    "outputTokens": sum(metrics.get("outputTokens", 0) for m, metrics, _ in selected if m == model)
+                }
+                prior = previous.setdefault(model, {})
+                unconfirmed.add(model)
+                for field, value in totals.items():
+                    prior[field] = prior.get(field, 0) + value
             shutdowns = [(model, copilot_usage_metrics(
                 delta, previous[model]["cacheReadTokens"] <= previous[model]["inputTokens"]), when)
                          for model, delta in deltas.items()]
-            if not chosen and not shutdowns:
-                for model, metrics, _when in messages:
-                    prior = previous.setdefault(model, {})
-                    unconfirmed.add(model)
-                    prior["outputTokens"] = prior.get("outputTokens", 0) + metrics["outputTokens"]
-            records.extend(calls["assistant.usage"] or calls["model.model_call_success"] or shutdowns or messages)
+            records.extend(record for record in shutdowns if any(record[1].values()))
+            records.extend(selected)
             for values in calls.values():
                 values.clear()
             for totals in call_totals.values():
@@ -9098,7 +9117,7 @@ def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
             output = nonnegative_int(data.get("outputTokens")) or 0
             if output > 0 and current_model:
                 messages.append((current_model, {"outputTokens": output}, when))
-    records.extend(calls["assistant.usage"] or calls["model.model_call_success"] or messages)
+    records.extend(selected_calls(set()))
     return records
 
 

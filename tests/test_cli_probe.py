@@ -348,6 +348,24 @@ class CopilotTests(unittest.TestCase):
         self.assertTrue(parsed["subscribed"])
         self.assertEqual([(w["label"], w["usedPercent"], w["remainingCount"]) for w in parsed["windows"]], [("Premium", 60.0, 120.0)])
 
+    def test_free_seat_has_a_primary_quota_without_premium_requests(self):
+        parsed = cli_probe.parse_copilot_user({"access_type_sku": "free", "quota_snapshots": {
+            "chat": {"entitlement": 50, "remaining": 10},
+            "completions": {"entitlement": 2000, "remaining": 1800}}})
+        primary = [window for window in parsed["windows"] if window["primary"]]
+        self.assertEqual(len(primary), 1)
+        self.assertEqual(primary[0]["id"], "copilot:chat")
+        self.assertEqual(primary[0]["remainingPercent"], 20)
+
+    def test_legacy_free_seat_matches_probe_headline(self):
+        payload = {"quota_snapshots": {
+            "premium_interactions": {"entitlement": 1, "remaining": 0, "unlimited": True},
+            "chat": {"entitlement": 50, "remaining": 10},
+            "completions": {"entitlement": 2000, "remaining": 1800}}}
+        limits = agentcat.copilot_limits_from_user_response(payload)
+        self.assertEqual([quota["id"] for quota in limits["quotas"] if quota.get("primary")], ["copilot:chat"])
+        self.assertEqual(len(limits["quotas"]), 2)
+
     def test_no_access_is_not_subscribed(self):
         parsed = cli_probe.parse_copilot_user({"access_type_sku": "no_access", "can_signup_for_limited": True})
         self.assertFalse(parsed["subscribed"])

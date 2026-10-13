@@ -719,6 +719,10 @@ def parse_copilot_user(payload: Any) -> Dict[str, Any]:
             "model": None, "primary": key == "premium_interactions",
             "remainingCount": remaining, "entitlement": entitlement,
         })
+    # Free seats may expose only Chat/Completions. They still need a
+    # headline window, otherwise the account card shows an unknown quota.
+    if windows and not any(window["primary"] for window in windows):
+        max(windows, key=lambda window: window["usedPercent"])["primary"] = True
     return {
         "windows": windows,
         "subscribed": bool(windows) or (sku not in ("", "no_access")),

@@ -24,6 +24,13 @@ endpoint, or reports quota / reset passes / billing, read
 
 ## Tests
 
+Prefer `python3 scripts/run_sandboxed_tests.py`, the same isolated full-suite
+wrapper used by Actions. Use the workflow's `--previous-version` when validating
+update survival. Targeted tests do not establish that the full suite or Actions
+passed; capability changes also affect the inventory check in
+`tests/test_wp10_engine.py`. Check the latest PR Actions result before reporting
+CI readiness.
+
 Run from a copy with a fake HOME and closed stdin; tests must never read the
 real Keychain, real CLI homes or call a provider (`tests/sandbox.py`, injected
 runners/token readers):
