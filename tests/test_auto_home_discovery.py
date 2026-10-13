@@ -409,6 +409,14 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         self.assertEqual(next(c["usage"]["all"] for c in block if c["state"] == "mirror"), 1998)
         self.assertEqual(sum(c["usage"]["all"] for c in block), 3798)
 
+    def test_literal_shell_alias_is_bound_to_its_account(self):
+        home = agentcat.HOME / ".codex-2"
+        self._codex_session(home, UUID_A)
+        self._codex_auth(home, "second-account")
+        (agentcat.HOME / ".zshrc").write_text("echo 'unfinished\nalias unsafe='CODEX_HOME=$(touch /tmp/never-run) codex'\nalias codex2='CODEX_HOME=~/.codex-2 codex'\n")
+        agentcat.write_json_atomic(agentcat.CLI_PROBE_CACHE, {"results": [self.probe_row("codex", home, "second-account")]})
+        self.assertEqual(agentcat.cli_probe_provider_instances()[0]["cliCommands"], ["codex2"])
+
     def test_launcher_outside_home_named_label_and_private_path(self):
         home = self.root / "outside/team"
         self._codex_session(home, UUID_A)
@@ -421,6 +429,7 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         agentcat.codex_sessions_snapshot(force_rebuild=True)
         row = agentcat.cli_probe_provider_instances()[0]
         self.assertEqual(row["label"], "Codex · codex-team")
+        self.assertEqual(row["cliCommands"], ["codex-team"])
         self.assertEqual(row["usage"]["today"], 200)
         block = agentcat.home_discovery_snapshot()
         self.assertNotIn(str(self.root), json.dumps(block))

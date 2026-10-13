@@ -169,6 +169,16 @@ a launcher that runs the real CLI with `CODEX_HOME` / `CLAUDE_CONFIG_DIR` /
 `KIMI_CODE_HOME` set, and adopts the home for Codex and Claude. It never creates
 or copies credentials, and it refuses to overwrite a file it did not write.
 
+For numbered commands, use `agentcat profile add claude 3 --command claude3`
+(or `codex 2 --command codex2`). Sign in with `~/.local/bin/claude3 auth login`
+or `~/.local/bin/codex2 login`. Pass the same `--command` when removing that
+profile. Existing commands and bindings to another home are not replaced.
+
+Local snapshot account rows include optional `cliCommands` for launcher names
+matched to that account's homes. Simple literal Claude/Codex aliases in standard
+shell startup files are also discovered without executing the shell. This data
+is for local display only; do not upload it or use account order to infer a mapping.
+
 ### Orca Claude account quotas
 
 When the local Orca IDE CLI is available, the connector reads `orca account list

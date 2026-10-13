@@ -681,6 +681,8 @@ def collect_candidates(home: Path, launcher_dirs, runtime_homes, env: Mapping[st
                         else:
                             commands[-1].append(token)
                     for command in commands:
+                        if command and command[0] == "exec":
+                            command = command[1:]
                         if command and command[0] in ("export", "env"):
                             command = command[1:]
                         for token in command:
@@ -691,6 +693,37 @@ def collect_candidates(home: Path, launcher_dirs, runtime_homes, env: Mapping[st
                                 break
             except (OSError, UnicodeError):
                 continue
+    # Read only literal aliases; never source the user's shell or evaluate text.
+    for config in (".zshrc", ".zshenv", ".bashrc", ".bash_profile"):
+        path = home / config
+        try:
+            if fs.now() >= deadline or not fs.is_file(path) or fs.is_symlink(path) or fs.stat(path).st_size > 65536:
+                continue
+            source = fs.read(path, 65537).decode("utf-8")
+            for line in source.splitlines():
+                try:
+                    tokens = shlex.split(line, comments=True)
+                except ValueError:
+                    continue
+                if len(tokens) != 2 or tokens[0] != "alias":
+                    continue
+                alias, sep, body = tokens[1].partition("=")
+                if not sep or not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", alias):
+                    continue
+                try:
+                    words = shlex.split(body)
+                except ValueError:
+                    continue
+                if words and words[0] == "env":
+                    words = words[1:]
+                if len(words) != 2 or words[1] not in ("claude", "codex"):
+                    continue
+                variable, sep, value = words[0].partition("=")
+                expected = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}[words[1]]
+                if sep and variable == expected:
+                    add(_expand(value, home), "launcher", alias)
+        except (OSError, UnicodeError, ValueError):
+            continue
     for index, path in enumerate(fs.children(home)):
         if index >= 4096 or fs.now() >= deadline:
             status["partial"] = True

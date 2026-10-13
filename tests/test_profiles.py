@@ -89,6 +89,36 @@ class ProfileCommandTests(unittest.TestCase):
         # No credential was created or copied.
         self.assertEqual(list(home.iterdir()), [])
 
+    def test_custom_numbered_command_and_removal(self):
+        code, _, err = self.run_cli("profile", "add", "claude", "3", "--command", "claude3")
+        self.assertEqual(code, 0, err)
+        launcher = self.home / ".local" / "bin" / "claude3"
+        self.assertTrue(launcher.exists())
+        self.assertEqual(list((self.agentcat_home / "homes" / "claude3").iterdir()), [])
+        code, _, err = self.run_cli("profile", "remove", "claude", "3", "--command", "claude3")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(launcher.exists())
+
+    def test_custom_command_cannot_remove_another_profile(self):
+        self.assertEqual(self.run_cli("profile", "add", "claude", "3", "--command", "claude3")[0], 0)
+        self.assertEqual(self.run_cli("profile", "remove", "codex", "3", "--command", "claude3")[0], 1)
+        self.assertTrue((self.home / ".local/bin/claude3").exists())
+        self.assertIn("claude3", agentcat._profile_registry())
+
+    def test_custom_command_preserves_existing_path_command(self):
+        existing = self.cli_dir / "claude3"
+        existing.write_text("#!/bin/sh\necho existing\n")
+        existing.chmod(0o755)
+        code, _, _ = self.run_cli("profile", "add", "claude", "3", "--command", "claude3")
+        self.assertEqual(code, 1)
+        self.assertFalse((self.home / ".local/bin/claude3").exists())
+        self.assertIn("echo existing", existing.read_text())
+
+    def test_custom_command_rejects_path_and_provider_collision(self):
+        for command in ("../claude3", "claude", "codex", "claude3;echo", "CLAUDE3"):
+            code, _, _ = self.run_cli("profile", "add", "claude", "3", "--command", command)
+            self.assertEqual(code, 2)
+
     def test_claude_launcher_uses_config_dir_and_login_hint(self):
         code, out, _ = self.run_cli("profile", "add", "claude", "two")
         self.assertEqual(code, 0)

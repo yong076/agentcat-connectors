@@ -2057,6 +2057,7 @@ def _cli_home_metadata(provider: str, row: Dict[str, Any]) -> Dict[str, Any]:
         result["profileCount"] = len(homes)
     if launchers:
         result["label"] = f"{CLI_PROBE_PROVIDER_NAMES[provider]} · {launchers[0]}"
+        result["cliCommands"] = launchers
     return result
 
 
@@ -20470,7 +20471,10 @@ def command_profile_add(args: argparse.Namespace) -> int:
     if not PROFILE_NAME_RE.match(name):
         print("profile name must be 1-32 chars of a-z, 0-9 and '-'", file=sys.stderr)
         return 2
-    command_name = f"{provider}-{name}"
+    command_name = getattr(args, "launcher_command", None) or f"{provider}-{name}"
+    if not PROFILE_NAME_RE.fullmatch(command_name) or command_name in PROFILE_PROVIDERS:
+        print("command must be 1-32 lowercase letters, digits or hyphens, and not the provider CLI", file=sys.stderr)
+        return 2
     home = Path(args.home).expanduser().absolute() if args.home else profile_homes_root() / command_name
     if _same_path(home, default_provider_home(provider)) or _same_path(home, HOME):
         print(f"refusing to use {_tilde(home)}: that is the default {provider} home", file=sys.stderr)
@@ -20485,6 +20489,15 @@ def command_profile_add(args: argparse.Namespace) -> int:
     if launcher.exists() or launcher.is_symlink():
         if launcher.is_symlink() or _profile_launcher_owner(launcher) != (provider, name):
             print(f"refusing to overwrite {_tilde(launcher)}: not created by agentcat", file=sys.stderr)
+            return 1
+
+    existing_command = shutil.which(command_name)
+    if existing_command and not _same_path(Path(existing_command), launcher):
+        print("command already exists on PATH; choose another name", file=sys.stderr)
+        return 1
+    for candidates in _discover_provider_homes().values():
+        if any(command_name in c.get("launchers", []) and not _same_path(c["path"], home) for c in candidates):
+            print("command already points to another home; choose another name", file=sys.stderr)
             return 1
 
     created_home = not home.exists()
@@ -20524,8 +20537,14 @@ def command_profile_remove(args: argparse.Namespace) -> int:
     if profile_unsupported_platform():
         return 2
     provider, name = args.provider, args.name
-    command_name = f"{provider}-{name}"
+    command_name = getattr(args, "launcher_command", None) or f"{provider}-{name}"
+    if not PROFILE_NAME_RE.fullmatch(command_name) or command_name in PROFILE_PROVIDERS:
+        print("command must be 1-32 lowercase letters, digits or hyphens, and not the provider CLI", file=sys.stderr)
+        return 2
     entry = _profile_registry().get(command_name)
+    if entry and (entry.get("provider"), entry.get("name")) != (provider, name):
+        print("command belongs to a different profile", file=sys.stderr)
+        return 1
     launcher = Path(entry["command"]) if entry and entry.get("command") else profile_bin_dir() / command_name
     status = 0
     if launcher.exists() or launcher.is_symlink():
@@ -21875,6 +21894,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile_add = profile_commands.add_parser("add")
     profile_add.add_argument("provider", choices=sorted(PROFILE_PROVIDERS))
     profile_add.add_argument("name")
+    profile_add.add_argument("--command", dest="launcher_command", help="launcher command, e.g. claude3 or codex2")
     profile_add.add_argument("--home", help="use this directory as the account's home")
     profile_add.add_argument("--cli", help=argparse.SUPPRESS)
     profile_add.set_defaults(func=command_profile_add)
@@ -21884,6 +21904,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile_remove = profile_commands.add_parser("remove")
     profile_remove.add_argument("provider", choices=sorted(PROFILE_PROVIDERS))
     profile_remove.add_argument("name")
+    profile_remove.add_argument("--command", dest="launcher_command", help="custom launcher command used when adding the profile")
     profile_remove.add_argument("--delete-home", action="store_true", help="also delete the account's home directory")
     profile_remove.set_defaults(func=command_profile_remove)
 

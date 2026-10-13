@@ -233,8 +233,10 @@ class HomeSignatureTests(unittest.TestCase):
             'export CLAUDE_CONFIG_DIR\nexec "$HOME/.local/bin/claude" "$@"\n')
         (launchers / "braced").write_text('#!/bin/sh\nCODEX_HOME="${WORK_CODEX:=${HOME}/work-codex}" exec codex\n')
         (launchers / "unsafe").write_text('#!/bin/sh\nCODEX_HOME="${X:-$(touch /tmp/never-run)}" exec codex\n')
+        (launchers / "codex4").write_text('#!/bin/sh\nexec env CODEX_HOME="$HOME/.codex4" /usr/bin/codex "$@"\n')
         rows = signatures.collect_candidates(self.root, (launchers,), (), {})
         found = {str(r["path"]): r["launchers"] for r in rows}
+        self.assertEqual(found.get(str(self.root / ".codex4")), ["codex4"])
         self.assertEqual(found.get(str(self.root / ".claude3")), ["claude3"])
         self.assertEqual(found.get(str(self.root / "work-codex")), ["braced"])
         self.assertFalse(any("never-run" in path for path in found))
