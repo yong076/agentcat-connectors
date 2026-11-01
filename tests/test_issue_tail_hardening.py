@@ -4,6 +4,7 @@ import contextlib
 import datetime as dt
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import subprocess
@@ -134,8 +135,8 @@ class IssueTailHardeningTests(unittest.TestCase):
             self.assertEqual(cursor['totals']['all_input'], 50)
             self.assertEqual(cursor['totals']['all_output'], 20)
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX entrypoint; Windows uses uninstall.ps1')
     def test_posix_uninstall_uses_local_installer_without_replacing_source(self):
-        import os
         source = self.root / "installed source"; (source / "scripts").mkdir(parents=True)
         evidence = self.root / "args.json"
         (source / "scripts" / "install.py").write_text(
@@ -216,7 +217,7 @@ class IssueTailHardeningTests(unittest.TestCase):
 
     def test_doctor_system_checks_use_only_bounded_metadata(self):
         app.write_json_atomic(app.LATEST_SNAPSHOT, {"connectorVersion": "1.2.3", "secret": "never-copy"})
-        with patch.object(app.sys, "platform", "darwin"), patch.object(app.subprocess, "run",
+        with patch.object(app.sys, "platform", "darwin"), patch.object(app.os, "getuid", return_value=501, create=True), patch.object(app.subprocess, "run",
             side_effect=[Mock(returncode=0, stdout="private launchctl details"), Mock(returncode=0, stdout="p123\n")]), \
             patch.object(app, "desktop_app_data_roots", return_value=[]):
             checks = app.doctor_system_checks(8765, False)
@@ -225,6 +226,15 @@ class IssueTailHardeningTests(unittest.TestCase):
         self.assertIn("port_in_use", reasons)
         self.assertNotIn("private", json.dumps(checks))
         self.assertNotIn("never-copy", json.dumps(checks))
+
+    def test_windows_doctor_system_checks_use_native_task_evidence(self):
+        with patch.object(app.sys, "platform", "win32"), patch.object(app, "IS_WINDOWS", True), \
+            patch.object(app.subprocess, "run", return_value=Mock(returncode=0, stdout="private task details")) as run, \
+            patch.object(app, "desktop_app_data_roots", return_value=[]):
+            checks = app.doctor_system_checks(8765, True)
+        self.assertEqual(run.call_args.args[0], ['schtasks.exe', '/Query', '/TN', 'AgentCatD', '/FO', 'LIST'])
+        self.assertEqual(next(row for row in checks if row['id'] == 'daemon.registration')['status'], 'ok')
+        self.assertNotIn('private task details', json.dumps(checks))
 
 
 if __name__ == "__main__":
