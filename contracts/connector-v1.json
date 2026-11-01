@@ -12,6 +12,12 @@
       "fields": ["daemon.platform", "daemon.status", "daemon.persistent", "daemon.registration"],
       "fallback": "show connector health as unknown without invalidating provider usage"
     },
+    "connector.health.v1": {
+      "owner": "shared",
+      "fields": ["health.localhost", "health.sources"],
+      "fallback": "show local source health as unknown without affecting public provider status or usage",
+      "notes": "Token-only evidence from the last local build. No extra credentials, network requests or official provider-status assertions. Unknown failure reasons remain health_unknown."
+    },
     "activity.windowsProcessScan": {
       "owner": "windows",
       "fields": ["activity.scanSource"],

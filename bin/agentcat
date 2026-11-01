@@ -203,6 +203,7 @@ GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"""OAUTH_CLIENT_ID\s*[:=]\s*["']([^"']+)["']""")
 GEMINI_TELEMETRY_PARSE_BYTES = int(os.environ.get("AGENTCAT_GEMINI_PARSE_BYTES", str(64 * 1024 * 1024)))
 GEMINI_TELEMETRY_STREAM_CHUNK_BYTES = int(os.environ.get("AGENTCAT_GEMINI_STREAM_CHUNK_BYTES", str(4 * 1024 * 1024)))
+GEMINI_TELEMETRY_MAX_RECORD_CHARS = 8 * 1024 * 1024
 GEMINI_USAGE_CACHE_VERSION = 1
 # Truncate an OTEL telemetry log once it passes this size AND has been fully
 # read. Agent Cat owns these files' lifecycle; left alone they grow without
@@ -300,6 +301,7 @@ CONNECTOR_CAPABILITIES = (
     # object instead of treating daemon support as an unversioned boolean.
     "connector.daemon",
     "connector.daemon.status.v1",
+    "connector.health.v1",
     "activity.terminal",
     "activity.memory",
     "activity.runtimeModes",
@@ -538,7 +540,7 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
 }
 
 
-_PRICING_VARIANT_SUFFIX_RE = re.compile(r"^(?:\.\d|-(?:pro|nano|lite|mini)(?:$|[-.]))")
+_PRICING_VARIANT_SUFFIX_RE = re.compile(r"^(?:\.\d|.*-(?:pro|nano|lite|mini|air)(?:$|[-.]))")
 
 
 def _lookup_pricing(
@@ -3241,7 +3243,9 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = unique_atomic_tmp_path(path)
     with tmp_path.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        # Snapshot readers do not need whitespace for years of usage history.
+        json.dump(payload, fh, ensure_ascii=False, sort_keys=True,
+                  **({"separators": (",", ":")} if path == LATEST_SNAPSHOT else {"indent": 2}))
         fh.write("\n")
     # Lock down private state files (snapshot, caches, update channel/state) to
     # owner-only before publishing. External configs (e.g. ~/.gemini) keep their
@@ -8928,15 +8932,18 @@ def copilot_workspace_storage_dirs() -> List[Path]:
         return [
             HOME / "AppData" / "Roaming" / "Code" / "User" / "workspaceStorage",
             HOME / "AppData" / "Roaming" / "Code - Insiders" / "User" / "workspaceStorage",
+            HOME / "AppData" / "Roaming" / "VSCodium" / "User" / "workspaceStorage",
         ]
     if sys.platform == "darwin":
         return [
             HOME / "Library" / "Application Support" / "Code" / "User" / "workspaceStorage",
             HOME / "Library" / "Application Support" / "Code - Insiders" / "User" / "workspaceStorage",
+            HOME / "Library" / "Application Support" / "VSCodium" / "User" / "workspaceStorage",
         ]
     return [
         HOME / ".config" / "Code" / "User" / "workspaceStorage",
         HOME / ".config" / "Code - Insiders" / "User" / "workspaceStorage",
+        HOME / ".config" / "VSCodium" / "User" / "workspaceStorage",
         HOME / ".vscode-server" / "data" / "User" / "workspaceStorage",
     ]
 
@@ -10507,6 +10514,8 @@ def merge_provider_with_usage_floor(
         merged_periods = periods_from_daily_tokens(int_map(daily))
         for period in ("today", "week", "month"):
             tokens[period] = merged_periods[period]
+        tokens["all"] = max(int(tokens.get("all") or 0), merged_periods["all"])
+        tokens["totalTokens"] = max(int(tokens.get("totalTokens") or 0), tokens["all"])
 
     models = merged.setdefault("models", {})
     floor_models = floor.get("models") if isinstance(floor.get("models"), dict) else {}
@@ -12317,18 +12326,21 @@ def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tup
                     token_key,
                     freeze_identity_value(start_raw),
                 )
+                temporality = metric.get("aggregationTemporality")
+                if temporality in (1, "DELTA", "delta", "AGGREGATION_TEMPORALITY_DELTA"):
+                    # Delta points are independent increments. Include the
+                    # interval end in the dedup identity so equal consecutive
+                    # deltas count, while rescanning the same interval does not.
+                    identity += ("delta", freeze_identity_value(end_raw))
                 records.append((identity, token_key, model, amount, when, start_when))
     return records
 
 
 def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]], Dict[str, int], Dict[str, int], int]:
     records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime], Optional[dt.datetime]]] = []
+    stream_state: Dict[str, Any] = {}
     for payload in iter_json_objects(text):
-        records.extend(gemini_metric_records(payload, "gemini_cli.token.usage"))
-
-    if not records:
-        for payload in iter_json_objects(text):
-            records.extend(gemini_metric_records(payload, "gen_ai.client.token.usage"))
+        records.extend(gemini_stream_records(stream_state, payload))
 
     by_identity: Dict[Tuple[Any, ...], List[Tuple[str, str, int, Optional[dt.datetime], Optional[dt.datetime]]]] = {}
     for identity, token_key, model, amount, when, start_when in records:
@@ -12522,6 +12534,20 @@ def apply_gemini_records_to_state(
             identities[identity_key] = {"amount": previous_amount}
 
 
+def gemini_stream_records(state: Dict[str, Any], payload: Any) -> List[Any]:
+    """Keep one metric family per logical stream across exporter batches."""
+    families = state.setdefault("metricFamilies", {})
+    selected = []
+    for family in ("gemini_cli.token.usage", "gen_ai.client.token.usage"):
+        for record in gemini_metric_records(payload, family):
+            identity = record[0]
+            stream = gemini_identity_key(identity[1:4])
+            chosen = families.setdefault(stream, family)
+            if chosen == family:
+                selected.append(record)
+    return selected
+
+
 def iter_gemini_telemetry_payloads(offset: int = 0, telemetry_path: Optional[Path] = None) -> Iterable[Tuple[Any, int]]:
     telemetry_path = telemetry_path or GEMINI_TELEMETRY
     decoder = json.JSONDecoder()
@@ -12535,6 +12561,11 @@ def iter_gemini_telemetry_payloads(offset: int = 0, telemetry_path: Optional[Pat
             eof = not chunk
             if chunk:
                 buffer += chunk.decode("utf-8", errors="replace")
+                if len(buffer) > GEMINI_TELEMETRY_MAX_RECORD_CHARS:
+                    # An unterminated/malformed object used to retain the whole
+                    # multi-GB file. Keep the cursor unchanged and report an
+                    # honest parse failure; never guess a nested object boundary.
+                    raise ValueError("gemini_telemetry_record_too_large")
 
             index = 0
             while True:
@@ -12600,9 +12631,7 @@ def scan_gemini_telemetry_state(
 
     last_offset = offset
     for payload, end_offset in iter_gemini_telemetry_payloads(offset, telemetry_path=telemetry_path):
-        records = gemini_metric_records(payload, "gemini_cli.token.usage")
-        if not records:
-            records = gemini_metric_records(payload, "gen_ai.client.token.usage")
+        records = gemini_stream_records(state, payload)
         if records:
             apply_gemini_records_to_state(state, records)
         last_offset = max(last_offset, end_offset)
@@ -14394,6 +14423,7 @@ def load_project_daily_state() -> Dict[str, Any]:
         baselines = {key: value for key, value in baselines.items() if not key.startswith(prefixes)}
         model_baselines = {key: value for key, value in model_baselines.items() if not key.startswith(prefixes)}
     return {"baselines": baselines, "modelBaselines": model_baselines,
+            "observedKeys": raw.get("observedKeys") if isinstance(raw.get("observedKeys"), list) else None,
             "_accountingRevisionChanged": bool(changed)}
 
 
@@ -14621,11 +14651,18 @@ def update_project_daily(
     model_baselines: Dict[str, Dict[str, Dict[str, Any]]] = state["modelBaselines"]
     days_changed = prune_project_daily(days, today)
     state_changed = bool(state.get("_accountingRevisionChanged"))
-    for key, observed in snapshot_project_cumulative(providers).items():
+    observations = snapshot_project_cumulative(providers)
+    # A top-N list is not a complete cumulative inventory. Re-entry must
+    # seed a baseline rather than book all usage during the gap to today.
+    previous_observed = state.get("observedKeys")
+    previously_visible = set(previous_observed) if isinstance(previous_observed, list) else None
+    observed_keys = sorted(observations)
+    state_changed = state_changed or previous_observed != observed_keys
+    for key, observed in observations.items():
         tokens = observed["tokens"]
         key_models = model_baselines.setdefault(key, {})
         previous = baselines.get(key)
-        if previous is None or tokens < previous:
+        if previous is None or tokens < previous or (previously_visible is not None and key not in previously_visible):
             baselines[key] = tokens
             _reseed_model_baselines(key_models, observed["models"])
             state_changed = True
@@ -14677,6 +14714,7 @@ def update_project_daily(
                 "copilotAccountingVersion": COPILOT_ACCOUNTING_STATE_VERSION,
                 "opencodeAccountingVersion": OPENCODE_ACCOUNTING_STATE_VERSION,
                 "baselines": baselines,
+                "observedKeys": observed_keys,
                 "modelBaselines": {k: v for k, v in model_baselines.items() if v},
             },
         )
@@ -14684,6 +14722,56 @@ def update_project_daily(
 
 
 _BUILD_SNAPSHOT_LOCK = threading.RLock()
+
+_DAEMON_BIND_PORT = 8765
+
+
+def connector_health_snapshot(providers: Dict[str, Any]) -> Dict[str, Any]:
+    """Bounded, token-only health from already collected local evidence.
+
+    Never run doctor, read credentials, scan files or call providers here.
+    Usage and quota have separate rows so a healthy journal cannot hide an
+    unreadable credential. The public status feed is independent of this.
+    """
+    sources: List[Dict[str, Any]] = []
+    known_reasons = {
+        "keychain_denied": "grant_keychain_access",
+        "token_missing": "relogin_provider",
+        "cli_login_expired": "relogin_provider",
+        "token_expired": "relogin_provider",
+        "not_configured": "run_provider_once",
+        "permission_denied": "grant_full_disk_access",
+    }
+    for provider, data in sorted(providers.items()):
+        if provider not in CONFIG_PROVIDER_IDS or not isinstance(data, dict):
+            continue
+        status = data.get("status")
+        if status == "disabled":
+            continue
+        state = "ok" if status == "ok" and not data.get("stale") else "error" if status == "error" else "warn"
+        row: Dict[str, Any] = {"id": provider + ".usage", "state": state}
+        if state != "ok":
+            row["reason"] = ("usage_error" if state == "error" else "snapshot_stale" if data.get("stale")
+                             else "no_local_activity" if status in ("not_found", "no_token_events_yet", "no_telemetry_yet")
+                             else "health_unknown")
+            row["fix"] = "run_provider_once"
+        sources.append(row)
+        limits = data.get("limits")
+        if not isinstance(limits, dict) or limits.get("status") == "disabled":
+            continue
+        reason = limits.get("reason")
+        if limits.get("stale"):
+            reason = "snapshot_stale"
+        qstate = "ok" if limits.get("status") in ("ok", "available") and not limits.get("stale") and reason not in known_reasons else "warn"
+        quota: Dict[str, Any] = {"id": provider + ".limits", "state": qstate}
+        if qstate != "ok":
+            quota["reason"] = (reason if reason in known_reasons or reason == "snapshot_stale"
+                               else "not_configured" if limits.get("status") == "not_configured" else "health_unknown")
+            if quota["reason"] in known_reasons:
+                quota["fix"] = known_reasons[quota["reason"]]
+        sources.append(quota)
+    return {"localhost": {"host": "127.0.0.1", "port": _DAEMON_BIND_PORT, "state": "ok"},
+            "sources": sources}
 
 
 def build_snapshot() -> Dict[str, Any]:
@@ -14852,6 +14940,11 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             insights_by_period[period] = {"status": "error", "error": str(exc)}
     snapshot["insightsByPeriod"] = insights_by_period
     snapshot["insights"] = insights_by_period["week"]
+    # Health failure must never prevent snapshot publication.
+    try:
+        snapshot["health"] = connector_health_snapshot(providers)
+    except Exception:
+        snapshot["capabilities"].remove("connector.health.v1")
     write_json_atomic(LATEST_SNAPSHOT, snapshot)
     return snapshot
 
@@ -19587,6 +19680,7 @@ def run_daemon(args: argparse.Namespace) -> int:
 
 
 def _run_daemon_impl(args: argparse.Namespace) -> int:
+    global _DAEMON_BIND_PORT
     ensure_dirs()
     # Connection clients read this file before their first authenticated request.
     # Creating it only inside the request guard makes a fresh install unable to
@@ -19610,6 +19704,7 @@ def _run_daemon_impl(args: argparse.Namespace) -> int:
     # snapshot instantly while it refreshes underneath them.
     try:
         server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
+        _DAEMON_BIND_PORT = getattr(server, "server_address", (args.host, args.port))[1]
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE and healthy_daemon_on_port(args.host, args.port):
             return 0
@@ -21804,7 +21899,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     daemon = subparsers.add_parser("daemon")
     daemon.add_argument("--host", default="127.0.0.1")
-    daemon.add_argument("--port", default=8765, type=int)
+    daemon.add_argument("--port", default=os.environ.get("AGENTCAT_PORT") or "8765", type=int)
     daemon.set_defaults(func=run_daemon)
 
     snapshot = subparsers.add_parser("snapshot")

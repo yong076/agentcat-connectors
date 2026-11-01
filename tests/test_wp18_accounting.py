@@ -289,8 +289,8 @@ class PeriodWindowTests(SandboxedCase):
         self.assertEqual(merged["tokens"]["today"], 10)
         self.assertEqual(merged["tokens"]["week"], 30)
         self.assertEqual(merged["tokens"]["month"], 30)
-        self.assertEqual(merged["tokens"]["all"], 20)
-        self.assertEqual(merged["tokens"]["totalTokens"], 20)
+        self.assertEqual(merged["tokens"]["all"], 30)
+        self.assertEqual(merged["tokens"]["totalTokens"], 30)
 
     @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX timezone control")
     def test_claude_stats_model_uses_raw_local_date_bucket(self) -> None:

@@ -18,6 +18,33 @@ SPEC.loader.exec_module(install)
 
 
 class AgentCatInstallTests(unittest.TestCase):
+    def test_windows_claude_hook_is_idempotent_and_repairs_exact_duplicates(self):
+        command = '"C:\\Users\\Test User\\.agentcat\\bin\\agentcat.cmd" claude-hook --event Stop'
+        own = {"type": "command", "command": command, "timeout": 5}
+        other = {"type": "command", "command": "other-agentcat-helper Stop"}
+        settings = {"hooks": {"Stop": [
+            {"matcher": "", "hooks": [dict(own)]},
+            {"matcher": "*", "extra": True, "hooks": [dict(own), other]},
+            {"matcher": "", "hooks": [dict(own)]},
+        ]}}
+        with mock.patch.object(install, "agentcat_shell_command", return_value=command):
+            for _ in range(3):
+                install.ensure_claude_hook(settings, "Stop")
+        groups = settings["hooks"]["Stop"]
+        self.assertEqual(groups, [
+            {"matcher": "", "hooks": [own]},
+            {"matcher": "*", "extra": True, "hooks": [other]},
+        ])
+
+    def test_new_windows_claude_hook_stays_single_across_three_installs(self):
+        settings = {}
+        with mock.patch.object(install, "IS_WINDOWS", True), mock.patch.object(
+            install, "BIN_PATH", Path(r"C:\Users\Test User\.agentcat\bin\agentcat.cmd")
+        ):
+            for _ in range(3):
+                install.ensure_claude_hook(settings, "SessionStart")
+        self.assertEqual(len(settings["hooks"]["SessionStart"]), 1)
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)

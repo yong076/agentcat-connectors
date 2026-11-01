@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Check before downloads or any installation mutation. The daemon's supported
+# floor is Python 3.9; an older interpreter otherwise fails midway through setup.
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'; then
+  printf '[agentcat] Python 3.9 or newer is required; install it before retrying.\n' >&2
+  exit 1
+fi
+
 INSTALL_DIR="${AGENTCAT_CONNECTORS_DIR:-$HOME/.agentcat/connectors}"
 BACKUP_ROOT="${AGENTCAT_CONNECTORS_BACKUP_ROOT:-$HOME/.agentcat/backups/connector-source}"
 MANIFEST_URL="${AGENTCAT_CONNECTORS_MANIFEST_URL:-https://github.com/yong076/agentcat-connectors/releases/latest/download/connector-manifest.json}"

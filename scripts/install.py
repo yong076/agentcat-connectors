@@ -558,10 +558,33 @@ def ensure_claude_hook(settings: Dict[str, Any], event_name: str) -> None:
         hooks[event_name] = entries
 
     command = agentcat_shell_command("claude-hook", "--event", event_name)
+    # Compare decoded values: JSON escapes Windows backslashes and quotes, so
+    # searching its serialized form never matched the actual command. Collapse
+    # only exact copies, keeping other commands and group options unchanged.
+    found = False
+    deduplicated = []
     for entry in entries:
-        if "agentcat" in json.dumps(entry):
-            if command in json.dumps(entry):
-                return
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            deduplicated.append(entry)
+            continue
+        retained = []
+        removed = False
+        for hook in entry["hooks"]:
+            matches = (isinstance(hook, dict) and hook.get("type") == "command"
+                       and hook.get("command") == command)
+            if matches and found:
+                removed = True
+                continue
+            if matches:
+                found = True
+            retained.append(hook)
+        if not removed:
+            deduplicated.append(entry)
+        elif retained:
+            deduplicated.append({**entry, "hooks": retained})
+    entries[:] = deduplicated
+    if found:
+        return
 
     entries.append(
         {
