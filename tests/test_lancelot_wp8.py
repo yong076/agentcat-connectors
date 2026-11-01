@@ -50,7 +50,15 @@ class LancelotWP8TestCase(unittest.TestCase):
         self.agentcat_home.mkdir()
         self.old_paths = redirect_module_paths(agentcat, self.home, self.agentcat_home)
         assert_sandboxed(agentcat, self.home, self.agentcat_home)
-        self.env = patch.dict(os.environ, {}, clear=True)
+        # Python 3.9/3.10 on Windows needs these to initialize a spawned
+        # interpreter. Clearing them can abort discovery workers before their
+        # multiprocessing handshake, leaving Process.start() blocked.
+        bootstrap = {key: os.environ[key] for key in ("SystemRoot", "WINDIR") if key in os.environ}
+        bootstrap.update(HOME=str(self.home), USERPROFILE=str(self.home),
+                         AGENTCAT_HOME=str(self.agentcat_home),
+                         APPDATA=str(self.home / "AppData/Roaming"),
+                         LOCALAPPDATA=str(self.home / "AppData/Local"))
+        self.env = patch.dict(os.environ, bootstrap, clear=True)
         self.env.start()
         self.network = patch.object(
             agentcat.urllib.request,
