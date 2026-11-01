@@ -28,7 +28,7 @@ class ReleaseHardeningTests(unittest.TestCase):
     def test_health_keeps_credential_failure_separate_from_healthy_usage(self):
         health = app.connector_health_snapshot({
             "claude": {"status": "ok", "error": "private arbitrary payload", "limits": {
-                "status": "error", "reason": "keychain_denied", "access_token": "never-copy"}},
+                "status": "error", "reason": "keychain_denied", "stale": True, "access_token": "never-copy"}},
             "codex": {"status": "not_found", "limits": {"status": "error", "reason": "/private/path"}},
         })
         rows = {x["id"]: x for x in health["sources"]}

@@ -8,6 +8,17 @@ from test_home_discovery import HomeDiscoveryTestCase, UUID_A, UUID_B, agentcat
 
 
 class CodexRebuildBudgetTests(HomeDiscoveryTestCase):
+    def test_format_drift_counts_invalid_records_once_across_incremental_scans(self):
+        with self.path.open('a') as handle:
+            handle.write('not-json\n')
+            handle.write(json.dumps({'type': 'event_msg', 'payload': {'type': 'token_count', 'info': 'unknown-format'}}) + '\n')
+        first = agentcat.codex_sessions_snapshot()
+        self.assertEqual(first['parseDrift'], {'invalidRecords': 2})
+        self.assertEqual(agentcat.codex_sessions_snapshot()['parseDrift'], first['parseDrift'])
+        agentcat.save_codex_sessions_cursor(agentcat.load_codex_sessions_cursor())
+        agentcat._CODEX_CURSOR_CACHE = None
+        self.assertEqual(agentcat.codex_sessions_snapshot()['parseDrift'], first['parseDrift'])
+
     def setUp(self):
         super().setUp()
         self.home = agentcat.HOME / '.codex'

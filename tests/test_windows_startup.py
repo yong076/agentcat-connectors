@@ -68,7 +68,7 @@ class WindowsStartupTests(unittest.TestCase):
     def test_logon_task_launches_the_daemon_hidden(
         self, run_mock: mock.Mock, stop_mock: mock.Mock, start_mock: mock.Mock
     ) -> None:
-        run_mock.side_effect = [completed(0), completed(0)]
+        run_mock.side_effect = [completed(0), completed(0), completed(0)]
 
         install.load_windows_daemon()
 
@@ -78,13 +78,17 @@ class WindowsStartupTests(unittest.TestCase):
         ])
         self.assertEqual(task_args[8:], ["/F"])
         self.assert_hidden_launch(self, task_args[7], str(self.launcher()))
+        policy = run_mock.call_args_list[2].args[0]
+        self.assertEqual(policy[:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
+        self.assertIn("-RestartCount 3", policy[4])
+        self.assertIn("-MultipleInstances IgnoreNew", policy[4])
 
         raw = self.launcher().read_bytes()
         self.assertTrue(raw.startswith(b"\xff\xfe"))
         self.assertEqual(
             raw[2:].decode("utf-16-le"),
             'Set shell = CreateObject("WScript.Shell")\r\n'
-            f'shell.Run """{self.bin_path}"" daemon", 0, False\r\n',
+            f'WScript.Quit shell.Run("""{self.bin_path}"" daemon", 0, True)\r\n',
         )
 
     @mock.patch.object(install, "start_windows_daemon")
@@ -110,7 +114,7 @@ class WindowsStartupTests(unittest.TestCase):
         with mock.patch.object(install, "BIN_PATH", korean_bin):
             path = install.write_windows_hidden_launcher()
         text = path.read_bytes()[2:].decode("utf-16-le")
-        self.assertIn(f'"""{korean_bin}"" daemon", 0, False', text)
+        self.assertIn(f'"""{korean_bin}"" daemon", 0, True)', text)
 
     @mock.patch.object(install, "start_windows_daemon")
     @mock.patch.object(install, "stop_windows_daemon")
@@ -191,7 +195,7 @@ class WindowsStartupTests(unittest.TestCase):
     def test_task_registration_removes_stale_fallbacks(
         self, run_mock: mock.Mock, stop_mock: mock.Mock, start_mock: mock.Mock
     ) -> None:
-        run_mock.side_effect = [completed(0), completed(0)]
+        run_mock.side_effect = [completed(0), completed(0), completed(0)]
 
         install.load_windows_daemon()
 

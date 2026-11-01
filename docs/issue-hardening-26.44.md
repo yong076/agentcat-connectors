@@ -48,24 +48,53 @@ the separate Mac and Windows update-path attestations in `release-safety.md`.
   request to narrow the DB glob/include children conflicts with that current
   contract. It is superseded here; no retrospective semantics change is made.
 
-## Remaining work, explicitly not completed by this patch
+## Follow-up unit: remaining audited checklist tails
 
-- #121: retention/pruning for old source backups; Windows scheduled-task
-  automatic restart policy and an `uninstall.ps1` entrypoint. Backups are
-  recovery material and are not deleted by this release patch.
-- #122: Copilot per-file byte cursors, OpenCode high-water incremental reads,
-  historical Claude usage-record pruning and a safe desktop tree-mtime cache.
-  These require preservation of corrections, removals, midnight rebucketing
-  and changing in-place database rows; a timestamp-only cache is insufficient.
-- #123: persistent Gemini/Codex format-drift counters; deterministic pricing
-  alias priority across feed collisions; explicit VSCodium process attribution
-  beyond usage roots (the generic editor process is not proof of Copilot).
-- #41: non-mutating version/port/launchd ownership diagnostics, explicit
-  `doctor --fix` repair orchestration, event-recency/FDA rows, and complete
-  reason-code troubleshooting docs. Existing doctor/network/bundle/logging
-  tools remain available. The new snapshot health block has a smaller bounded
-  contract than the original speculative issue schema.
+- #121: successful installers retain three recent backup folders and compact
+  known closed backups older than 30 days into private recovery archives. Every
+  regular file is SHA256-verified before its source is removed. Dirty-checkout
+  recovery and unknown folders are excluded; compressed archives never expire
+  automatically. Windows hidden launchers wait and forward the daemon exit,
+  with Task Scheduler retries at one-minute intervals (three attempts), no
+  execution time limit and no duplicate task instances. Both uninstall
+  entrypoints use local installed source without downloads or replacement,
+  retaining usage/backups. Both bootstrap platforms require Python >=3.9.
+- #122: Copilot per-file byte cursors keep projected usage metadata only in an
+  8 MiB / 20k-event / 128-file memory cache. Valid incomplete tails are rendered
+  once and replaced on completion; hash-only boundary anchors invalidate
+  rewritten headers/tails. Windows/models/transcript estimates are recomputed
+  from metadata, preserving midnight rebucketing. OpenCode uses narrow per-row
+  ID/update metadata and changed usage rows for supported schemas, recognizing
+  backfill, deletion, session metadata and migration changes. Old/unsupported
+  schemas and histories over 10k rows retain the complete reader. The desktop
+  root-mtime cache has a mandatory five-minute TTL and preserves actual
+  `checkedAt`, because nested file changes need not update the root mtime.
+  Claude hot dedup metadata older than one year or above 50k records is moved
+  transactionally into a private generation-keyed SQLite archive. Exact
+  duplicate/correction metadata remains available after cursor restart; it is
+  not discarded. Missing stale offsets are pruned without changing rollups.
+- #123: Gemini/Codex format-drift counters persist with their usage cursors;
+  bad payloads are not retained. Pricing alias collisions resolve lexically
+  and explicit native IDs win, independent of feed order. Copilot CLI processes
+  are already explicitly recognized. A VSCodium editor process by itself is
+  not evidence of active Copilot and deliberately remains unclassified; its
+  actual usage metadata roots are supported.
+- #41: CLI-only bounded diagnostics cover snapshot version, macOS service
+  registration/port ownership, Windows task evidence, metadata permissions and
+  event recency. `doctor --fix` explicitly backs up and reapplies local
+  hook/telemetry settings and restarts an existing registration; it performs no
+  account action or credential refresh. Child output is not echoed into the
+  report. The English reason-code guide is `docs/troubleshooting.md`, consistent
+  with the repository's English-documentation rule. The additive source health
+  contract follows the app's current decoder rather than the old speculative
+  issue schema.
 
-These are residual issue subitems, not a claim that every historical issue is
-closed. Native update-path tests and app health rendering belong to the parent
-release workflow.
+## Release limitations
+
+Native Mac/Windows update-path attestations remain mandatory for the exact
+release archive checksum, even when unit/CI checks pass. App health rendering
+and real menu-bar gestures belong to the parent release workflow. PowerShell
+entrypoint tests run only where PowerShell exists and report an explicit skip
+on this Mac. The metadata fast paths retain complete-reader fallbacks; they do
+not promise incremental work for every old provider schema. No issue has been
+closed and no production release/deployment has been performed by this leaf.

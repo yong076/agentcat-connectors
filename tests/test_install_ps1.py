@@ -27,14 +27,14 @@ class InstallPowerShellSafetyTests(unittest.TestCase):
             'if ($py -and (Test-Python3 @($py.Source, "-3"))) { return @($py.Source, "-3") }',
             INSTALL_PS1,
         )
-        self.assertIn('throw "Python 3 is required', INSTALL_PS1)
+        self.assertIn('throw "Python 3.9 or newer is required', INSTALL_PS1)
 
     def test_probe_rejects_store_stub_nonzero_exit_and_execution_errors(self) -> None:
         probe = INSTALL_PS1.split("function Test-Python3", 1)[1].split(
             "function Resolve-Python", 1
         )[0]
         self.assertIn('$Prefix[1..($Prefix.Length - 1)]', probe)
-        self.assertIn('import sys; sys.exit(0 if sys.version_info.major == 3 else 1)', probe)
+        self.assertIn('import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)', probe)
         self.assertIn('& $command @probeArguments *> $null', probe)
         self.assertIn('return $LASTEXITCODE -eq 0', probe)
         self.assertRegex(probe, r"catch\s*\{\s*return \$false")

@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,9 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from agentcat_backup_retention import compact_old_backups
 
 
 class DirtyCheckoutError(RuntimeError):
@@ -347,6 +351,10 @@ def install_public_archive(
                 pass
         raise
 
+    try:
+        compact_old_backups(backup_root, re.escape(install_dir.name) + r"-previous-\d{8}-\d{6}(?:-\d+)?")
+    except (OSError, ValueError):
+        pass  # Retention failure must not roll back a verified live install.
     return {
         "status": "installed",
         "channel": "public",

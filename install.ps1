@@ -17,7 +17,7 @@ function Test-Python3([string[]]$Prefix) {
   $command = $Prefix[0]
   $probeArguments = @()
   if ($Prefix.Length -gt 1) { $probeArguments += $Prefix[1..($Prefix.Length - 1)] }
-  $probeArguments += @("-c", "import sys; sys.exit(0 if sys.version_info.major == 3 else 1)")
+  $probeArguments += @("-c", "import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)")
   try {
     & $command @probeArguments *> $null
     return $LASTEXITCODE -eq 0
@@ -36,7 +36,7 @@ function Resolve-Python {
   if ($python -and (Test-Python3 @($python.Source))) { return @($python.Source) }
   $py = Get-Command py -ErrorAction SilentlyContinue
   if ($py -and (Test-Python3 @($py.Source, "-3"))) { return @($py.Source, "-3") }
-  throw "Python 3 is required to install Agent Cat Connectors."
+  throw "Python 3.9 or newer is required to install Agent Cat Connectors."
 }
 
 function Invoke-Python([string[]]$Prefix, [string[]]$Arguments) {
