@@ -331,7 +331,7 @@ class DaemonLogHygieneTests(unittest.TestCase):
                         from unittest.mock import Mock, patch
                         sys.path.insert(0, {str(REPO / 'tests')!r})
                         from test_daemon_log_hygiene import agentcat
-                        server = Mock()
+                        server = Mock(server_address=('127.0.0.1', 18765))
                         def stop():
                             os.kill(os.getpid(), {int(signum)})
                         server.serve_forever.side_effect = stop

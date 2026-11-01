@@ -4102,7 +4102,15 @@ class AgentCatConnectorTests(unittest.TestCase):
                             database.with_name(database.name + "-wal").write_bytes(
                                 staging.with_name(staging.name + "-wal").read_bytes())
                     finally:
+                        if not wal_only:
+                            writer.execute("pragma wal_checkpoint(truncate)")
                         writer.close()
+                    if not wal_only:
+                        # Apple's Python SQLite keeps empty WAL/SHM files on
+                        # close. Explicitly construct the clean/no-sidecars
+                        # fixture; only these closed temporary DBs are touched.
+                        database.with_name(database.name + "-wal").unlink(missing_ok=True)
+                        database.with_name(database.name + "-shm").unlink(missing_ok=True)
                     self.assertFalse(database.with_name(database.name + "-shm").exists())
                     self.assertEqual(database.with_name(database.name + "-wal").exists(), wal_only)
                     if reader == "opencode":
@@ -4138,6 +4146,11 @@ class AgentCatConnectorTests(unittest.TestCase):
                     writer.execute("create table fixture (value integer)")
                     writer.execute("insert into fixture values (1)")
                     writer.commit()
+                    writer.execute("pragma wal_checkpoint(truncate)")
+                # Enter the immutable branch on SQLite builds that retain
+                # empty sidecars after close (including Apple's Python 3.9).
+                database.with_name(database.name + "-wal").unlink(missing_ok=True)
+                database.with_name(database.name + "-shm").unlink(missing_ok=True)
                 writer = sqlite3.connect(database)
                 calls = []
 

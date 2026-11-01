@@ -15,6 +15,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from agentcat_backup_retention import compact_old_backups
+
 
 HOME = Path.home()
 AGENTCAT_HOME = HOME / ".agentcat"
@@ -358,7 +361,7 @@ def windows_hidden_launcher_script(bin_path: Path) -> str:
     """
     return (
         'Set shell = CreateObject("WScript.Shell")\r\n'
-        f'shell.Run """{bin_path}"" daemon", 0, False\r\n'
+        f'WScript.Quit shell.Run("""{bin_path}"" daemon", 0, True)\r\n'
     )
 
 
@@ -450,6 +453,16 @@ def load_windows_daemon() -> None:
     if result.returncode == 0:
         log(f"registered Windows startup task {WINDOWS_TASK_NAME}")
         remove_windows_run_entry()
+        # wscript waits for the hidden child and forwards its exit status, so
+        # Task Scheduler can detect a failure instead of seeing a successful
+        # launcher exit while the actual daemon has already died.
+        policy = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference='Stop'; $settings=New-ScheduledTaskSettingsSet "
+            "-RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) "
+            "-ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; "
+            "Set-ScheduledTask -TaskName 'AgentCatD' -Settings $settings | Out-Null"])
+        if policy.returncode != 0:
+            log("Windows task restart policy could not be configured; startup registration was retained")
     else:
         task_error = result.stderr.strip() or f"exit code {result.returncode}"
         log(f"Windows startup task registration failed: {task_error}")
@@ -558,10 +571,33 @@ def ensure_claude_hook(settings: Dict[str, Any], event_name: str) -> None:
         hooks[event_name] = entries
 
     command = agentcat_shell_command("claude-hook", "--event", event_name)
+    # Compare decoded values: JSON escapes Windows backslashes and quotes, so
+    # searching its serialized form never matched the actual command. Collapse
+    # only exact copies, keeping other commands and group options unchanged.
+    found = False
+    deduplicated = []
     for entry in entries:
-        if "agentcat" in json.dumps(entry):
-            if command in json.dumps(entry):
-                return
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            deduplicated.append(entry)
+            continue
+        retained = []
+        removed = False
+        for hook in entry["hooks"]:
+            matches = (isinstance(hook, dict) and hook.get("type") == "command"
+                       and hook.get("command") == command)
+            if matches and found:
+                removed = True
+                continue
+            if matches:
+                found = True
+            retained.append(hook)
+        if not removed:
+            deduplicated.append(entry)
+        elif retained:
+            deduplicated.append({**entry, "hooks": retained})
+    entries[:] = deduplicated
+    if found:
+        return
 
     entries.append(
         {
@@ -764,7 +800,31 @@ def install(repo_dir: Path) -> int:
         raise RuntimeError(f"connector version check failed: {result.stderr.strip()}")
 
     log(f"backups stored in {backup_dir}")
+    try:
+        compact_old_backups(BACKUPS_DIR, r"(?:repair-|uninstall-)?\d{8}-\d{6}(?:-\d+)?")
+    except (OSError, ValueError):
+        log("older backups retained because archive compaction did not finish")
     log("done. Run: agentcat snapshot")
+    return 0
+
+
+def repair(repo_dir: Path) -> int:
+    """Explicit local configuration repair; never log in or update a binary."""
+    mkdirs()
+    backup_dir = BACKUPS_DIR / f"repair-{timestamp()}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    install_claude_settings(backup_dir)
+    install_gemini_settings(backup_dir)
+    install_codex_config(backup_dir)
+    if IS_WINDOWS:
+        restarted = run(["schtasks.exe", "/Run", "/TN", WINDOWS_TASK_NAME])
+    elif sys.platform == "darwin":
+        restarted = run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LABEL}"])
+    else:
+        # There is no supported Linux service registration to mutate.
+        return 0
+    if restarted.returncode != 0:
+        raise RuntimeError("daemon_restart_failed")
     return 0
 
 
@@ -801,6 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-dir", default=str(Path(__file__).resolve().parents[1]))
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("install")
+    subparsers.add_parser("repair")
     uninstall_parser = subparsers.add_parser("uninstall")
     uninstall_parser.add_argument("--purge", action="store_true")
     return parser
@@ -820,6 +881,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     repo_dir = Path(args.repo_dir).expanduser().resolve()
     if args.command == "install":
         return install(repo_dir)
+    if args.command == "repair":
+        return repair(repo_dir)
     if args.command == "uninstall":
         return uninstall(repo_dir, purge=bool(getattr(args, "purge", False)))
     parser.error("unknown command")

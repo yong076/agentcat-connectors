@@ -49,6 +49,9 @@ from agentcat_codex_app_server import (
 )
 import agentcat_cli_probe as cli_probe
 import agentcat_home_signatures as home_signatures
+from agentcat_opencode_incremental import prepare_rows as prepare_opencode_rows
+from agentcat_jsonl_cursor import ProjectedJSONLCursor
+from agentcat_usage_archive import lookup_record as archived_usage_record, archive_records as archive_usage_records
 from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS, USAGE_FRESH_SECONDS, age_usage
 from agentcat_openrouter_managed import OpenRouterManagedAuth, OpenRouterManagedError, build_adapter as build_openrouter_managed_adapter
 
@@ -203,6 +206,7 @@ GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GEMINI_OAUTH_CLIENT_ID_RE = re.compile(r"""OAUTH_CLIENT_ID\s*[:=]\s*["']([^"']+)["']""")
 GEMINI_TELEMETRY_PARSE_BYTES = int(os.environ.get("AGENTCAT_GEMINI_PARSE_BYTES", str(64 * 1024 * 1024)))
 GEMINI_TELEMETRY_STREAM_CHUNK_BYTES = int(os.environ.get("AGENTCAT_GEMINI_STREAM_CHUNK_BYTES", str(4 * 1024 * 1024)))
+GEMINI_TELEMETRY_MAX_RECORD_CHARS = 8 * 1024 * 1024
 GEMINI_USAGE_CACHE_VERSION = 1
 # Truncate an OTEL telemetry log once it passes this size AND has been fully
 # read. Agent Cat owns these files' lifecycle; left alone they grow without
@@ -258,7 +262,7 @@ COPILOT_ACCOUNTING_STATE_VERSION = 1
 OPENCODE_ACCOUNTING_STATE_VERSION = 1
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.41.7")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.44.0")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -300,6 +304,7 @@ CONNECTOR_CAPABILITIES = (
     # object instead of treating daemon support as an unversioned boolean.
     "connector.daemon",
     "connector.daemon.status.v1",
+    "connector.health.v1",
     "activity.terminal",
     "activity.memory",
     "activity.runtimeModes",
@@ -538,7 +543,7 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
 }
 
 
-_PRICING_VARIANT_SUFFIX_RE = re.compile(r"^(?:\.\d|-(?:pro|nano|lite|mini)(?:$|[-.]))")
+_PRICING_VARIANT_SUFFIX_RE = re.compile(r"^(?:\.\d|.*-(?:pro|nano|lite|mini|air)(?:$|[-.]))")
 
 
 def _lookup_pricing(
@@ -718,7 +723,9 @@ def litellm_price_table(raw: Any) -> Dict[str, Dict[str, Any]]:
         return {}
     table: Dict[str, Dict[str, Any]] = {}
     aliases: Dict[str, Dict[str, Any]] = {}
-    for key, spec in raw.items():
+    # Native unprefixed IDs are authoritative; collisions between imported
+    # provider aliases resolve lexically, independent of feed object ordering.
+    for key, spec in sorted(raw.items(), key=lambda item: str(item[0])):
         if not isinstance(key, str) or key == "sample_spec" or not isinstance(spec, dict):
             continue
         entry: Dict[str, Any] = {}
@@ -2248,7 +2255,35 @@ def desktop_app_data_roots(provider: str) -> List[Path]:
     return roots
 
 
+_DESKTOP_METADATA_CACHE: Dict[str, Any] = {}
+_DESKTOP_METADATA_LOCK = threading.Lock()
+DESKTOP_METADATA_CACHE_SECONDS = 300
+
+
 def scan_desktop_app_data_root(root: Path) -> Dict[str, Any]:
+    key = str(root)
+    try:
+        stat = root.stat()
+        signature = (stat.st_dev, stat.st_ino, stat.st_mtime_ns)
+    except OSError:
+        signature = None
+    clock = time.monotonic()
+    with _DESKTOP_METADATA_LOCK:
+        previous = _DESKTOP_METADATA_CACHE.get(key)
+        if previous is not None and previous[0] == signature and 0 <= clock - previous[1] < DESKTOP_METADATA_CACHE_SECONDS:
+            return copy.deepcopy(previous[2])
+    result = _scan_desktop_app_data_root(root)
+    # Preserve the actual scan time on cache hits. A nested file update need
+    # not change the root mtime, so the five-minute TTL remains mandatory.
+    result["checkedAt"] = now_iso()
+    with _DESKTOP_METADATA_LOCK:
+        _DESKTOP_METADATA_CACHE[key] = (signature, clock, copy.deepcopy(result))
+        while len(_DESKTOP_METADATA_CACHE) > 32:
+            _DESKTOP_METADATA_CACHE.pop(next(iter(_DESKTOP_METADATA_CACHE)))
+    return result
+
+
+def _scan_desktop_app_data_root(root: Path) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         # Home-layout data roots, not the user-chosen app bundle.
         "path": snapshot_source_label(root),
@@ -3241,7 +3276,9 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = unique_atomic_tmp_path(path)
     with tmp_path.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        # Snapshot readers do not need whitespace for years of usage history.
+        json.dump(payload, fh, ensure_ascii=False, sort_keys=True,
+                  **({"separators": (",", ":")} if path == LATEST_SNAPSHOT else {"indent": 2}))
         fh.write("\n")
     # Lock down private state files (snapshot, caches, update channel/state) to
     # owner-only before publishing. External configs (e.g. ~/.gemini) keep their
@@ -8725,7 +8762,7 @@ def grok_snapshot() -> Dict[str, Any]:
     return result
 
 
-def opencode_database_rows(conn: sqlite3.Connection) -> Tuple[List[Any], List[str]]:
+def opencode_database_rows(conn: sqlite3.Connection, changed_ids: Optional[Dict[str, List[str]]] = None) -> Tuple[List[Any], List[str]]:
     tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
     if not tables.intersection(("message", "session_message")):
         raise sqlite3.OperationalError("no message table")
@@ -8793,11 +8830,15 @@ def opencode_database_rows(conn: sqlite3.Connection) -> Tuple[List[Any], List[st
                 # Only SQLite builds without JSON functions load whole rows here.
                 data = "m.data"
             # Filtered v2 rows still claim their IDs, without transferring their blobs.
+            selected_ids = changed_ids.get(table, []) if changed_ids is not None else None
+            condition = (" where m.id in (" + ",".join("?" for _ in selected_ids) + ")"
+                         if selected_ids else " where 0") if selected_ids is not None else ""
             query = (f"select {message_id}, m.time_created, {path}, ({allowed}), "
                      f"case when {allowed} then {data} end, {kind}, "
-                     f"{session_model if not has_json else 'null'}, m.session_id from {table} m {join} "
+                     f"{session_model if not has_json else 'null'}, m.session_id from {table} m {join}{condition} "
                      "order by m.time_created asc")
-            for message_id_value, created, project, include, raw_data, row_kind, fallback_model, session_id in conn.execute(query):
+            query_rows = conn.execute(query) if selected_ids is None else conn.execute(query, selected_ids)
+            for message_id_value, created, project, include, raw_data, row_kind, fallback_model, session_id in query_rows:
                 if not is_v2 and include and session_id in sessions_with_new and session_id not in sessions_with_shared_ids:
                     continue
                 if not has_json and include:
@@ -8832,6 +8873,24 @@ def opencode_database_rows(conn: sqlite3.Connection) -> Tuple[List[Any], List[st
     return rows, warnings
 
 
+_OPENCODE_ROW_CACHE: Dict[str, Any] = {}
+_OPENCODE_ROW_CACHE_LOCK = threading.Lock()
+
+
+def cached_opencode_rows(db_path: Path) -> Tuple[List[Any], List[str]]:
+    stat = db_path.stat()
+    key = str(db_path.resolve()) + f"|{stat.st_dev}:{stat.st_ino}"
+    with _OPENCODE_ROW_CACHE_LOCK:
+        rows, warnings, candidate = read_foreign_sqlite(db_path, lambda conn:
+            prepare_opencode_rows(conn, opencode_database_rows, _OPENCODE_ROW_CACHE.get(key)))
+        _OPENCODE_ROW_CACHE.pop(key, None)
+        if candidate is not None:
+            _OPENCODE_ROW_CACHE[key] = candidate
+        while len(_OPENCODE_ROW_CACHE) > 4:
+            _OPENCODE_ROW_CACHE.pop(next(iter(_OPENCODE_ROW_CACHE)))
+    return rows, warnings
+
+
 def opencode_snapshot() -> Dict[str, Any]:
     data_dir = opencode_data_dir()
     result = empty_provider_usage(source=str(data_dir))
@@ -8852,7 +8911,7 @@ def opencode_snapshot() -> Dict[str, Any]:
     rows: List[Any] = []
     for db_path in db_paths:
         try:
-            database_rows, warnings = read_foreign_sqlite(db_path, opencode_database_rows)
+            database_rows, warnings = cached_opencode_rows(db_path)
             rows.extend(database_rows)
             errors.extend(f"{db_path.name}: {warning}" for warning in warnings)
         except Exception as exc:
@@ -8928,15 +8987,18 @@ def copilot_workspace_storage_dirs() -> List[Path]:
         return [
             HOME / "AppData" / "Roaming" / "Code" / "User" / "workspaceStorage",
             HOME / "AppData" / "Roaming" / "Code - Insiders" / "User" / "workspaceStorage",
+            HOME / "AppData" / "Roaming" / "VSCodium" / "User" / "workspaceStorage",
         ]
     if sys.platform == "darwin":
         return [
             HOME / "Library" / "Application Support" / "Code" / "User" / "workspaceStorage",
             HOME / "Library" / "Application Support" / "Code - Insiders" / "User" / "workspaceStorage",
+            HOME / "Library" / "Application Support" / "VSCodium" / "User" / "workspaceStorage",
         ]
     return [
         HOME / ".config" / "Code" / "User" / "workspaceStorage",
         HOME / ".config" / "Code - Insiders" / "User" / "workspaceStorage",
+        HOME / ".config" / "VSCodium" / "User" / "workspaceStorage",
         HOME / ".vscode-server" / "data" / "User" / "workspaceStorage",
     ]
 
@@ -9102,13 +9164,65 @@ def copilot_usage_records(events: Iterable[Dict[str, Any]]) -> List[Any]:
     return records
 
 
+_COPILOT_USAGE_CURSOR = ProjectedJSONLCursor()
+
+
+def copilot_usage_event_projection(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Retain usage metadata, never transcript/prompt content, in cursor RAM."""
+    kind = event.get("type")
+    if kind not in ("session.start", "session.model_change", "session.shutdown", "assistant.usage",
+                    "model.model_call_success", "user.message", "assistant.message"):
+        return None
+    source = event.get("data") if isinstance(event.get("data"), dict) else {}
+    data: Dict[str, Any] = {}
+    for name in ("model", "newModel", "producer", "apiCallId", "callId"):
+        value = source.get(name)
+        if isinstance(value, str):
+            data[name] = value[:256]
+    fields = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens")
+    for name in fields:
+        value = nonnegative_int(source.get(name))
+        if value is not None:
+            data[name] = value
+    response = source.get("responseUsage")
+    if isinstance(response, dict):
+        details = response.get("prompt_tokens_details")
+        data["responseUsage"] = {name: nonnegative_int(response.get(name)) or 0
+            for name in ("prompt_tokens", "completion_tokens")}
+        if isinstance(details, dict):
+            data["responseUsage"]["prompt_tokens_details"] = {name: nonnegative_int(details.get(name)) or 0
+                for name in ("cached_tokens", "cache_creation_tokens")}
+    metrics = source.get("modelMetrics")
+    if isinstance(metrics, dict):
+        data["modelMetrics"] = {model: {"usage": {name: nonnegative_int((entry.get("usage") or {}).get(name)) or 0 for name in fields}}
+            for model, entry in metrics.items() if isinstance(model, str) and len(model) <= 256
+            and isinstance(entry, dict) and isinstance(entry.get("usage"), dict)}
+    if kind in ("user.message", "assistant.message"):
+        data["_agentcatContentTokens"] = char_token_estimate(source.get("content"))
+        data["_agentcatReasoningTokens"] = char_token_estimate(source.get("reasoningText"))
+        tools = source.get("toolRequests")
+        if isinstance(tools, list):
+            data["toolRequests"] = [{key: tool[key][:256] for key in ("name", "toolName", "tool", "toolCallId")
+                                     if isinstance(tool.get(key), str)} for tool in tools if isinstance(tool, dict)]
+    timestamp = event.get("timestamp")
+    if not isinstance(timestamp, (str, int, float)) or isinstance(timestamp, bool):
+        timestamp = None
+    if isinstance(timestamp, str):
+        timestamp = timestamp[:128]
+    return {"type": kind, "timestamp": timestamp, "data": data}
+
+
+def copilot_usage_events(path: Path) -> List[Dict[str, Any]]:
+    return _COPILOT_USAGE_CURSOR.read(path, copilot_usage_event_projection, LOCAL_PROVIDER_PARSE_BYTES)
+
+
 def parse_copilot_legacy_file(path: Path, result: Dict[str, Any]) -> int:
     try:
         file_when = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
     except OSError:
         file_when = None
     events = 0
-    for model, metrics, when in copilot_usage_records(iter_jsonl_file(path)):
+    for model, metrics, when in copilot_usage_records(copilot_usage_events(path)):
         if add_usage_metrics(result, model, metrics, when or file_when):
             events += 1
     return events
@@ -9151,7 +9265,7 @@ def char_token_estimate(text: Any) -> int:
 
 
 def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> Tuple[int, int]:
-    events = list(iter_jsonl_file(path))
+    events = copilot_usage_events(path)
     if not events:
         return 0, 0
     first = events[0]
@@ -9170,18 +9284,18 @@ def parse_copilot_transcript_file(path: Path, result: Dict[str, Any]) -> Tuple[i
     for event in events:
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         if event.get("type") == "user.message":
-            pending_input_tokens = char_token_estimate(data.get("content"))
+            pending_input_tokens = data.get("_agentcatContentTokens", 0)
             continue
         if event.get("type") != "assistant.message":
             continue
         explicit_output_tokens = nonnegative_int(data.get("outputTokens"))
         estimated_content_tokens = (
-            char_token_estimate(data.get("content"))
+            data.get("_agentcatContentTokens", 0)
             if explicit_output_tokens is None
             else 0
         )
         content_tokens = explicit_output_tokens if explicit_output_tokens is not None else estimated_content_tokens
-        reasoning_tokens = char_token_estimate(data.get("reasoningText"))
+        reasoning_tokens = data.get("_agentcatReasoningTokens", 0)
         tool_requests = data.get("toolRequests")
         if (
             pending_input_tokens <= 0
@@ -9742,6 +9856,7 @@ def _read_codex_sessions_cursor() -> Dict[str, Any]:
                 "countedRawTotals": _codex_coerce_raw_totals(meta.get("countedRawTotals")),
                 "rawTotalsBaseline": _codex_coerce_raw_totals(meta.get("rawTotalsBaseline")),
                 "sawDivergentTotals": bool(meta.get("sawDivergentTotals")),
+                "parseDrift": nonnegative_int(meta.get("parseDrift")) or 0,
             }
     cursor["daily"] = _coerce_int_map(raw.get("daily"))
     cursor["hourly"] = _coerce_int_map(raw.get("hourly"))
@@ -10003,6 +10118,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
             turn_index = 0
 
         new_offset = prev_offset
+        parse_drift = nonnegative_int(meta.get("parseDrift")) or 0
         # Carry the last model seen in this file across incremental reads — the
         # turn_context that set it may live before prev_offset. NOT gated on
         # turn_index: a fresh `codex exec` session is usually first scanned
@@ -10030,6 +10146,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
                     try:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
+                        parse_drift += 1
                         continue
                     if not isinstance(obj, dict):
                         continue
@@ -10046,6 +10163,8 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
                         continue
                     info = payload.get("info")
                     if not isinstance(info, dict):
+                        if info is not None:
+                            parse_drift += 1
                         continue
                     raw_delta, counted_raw_totals, raw_totals_baseline, saw_divergent_totals = codex_session_token_raw_delta(
                         info,
@@ -10109,6 +10228,7 @@ def codex_sessions_snapshot(force_rebuild: bool = False, reconcile: bool = False
             "countedRawTotals": counted_raw_totals,
             "rawTotalsBaseline": raw_totals_baseline,
             "sawDivergentTotals": saw_divergent_totals,
+            "parseDrift": parse_drift,
         }
 
         if new_offset == size:
@@ -10138,6 +10258,8 @@ def _build_codex_sessions_snapshot(result: Dict[str, Any], cursor: Dict[str, Any
     model_classes: Dict[str, Dict[str, int]] = cursor.get("modelClasses") or {}
     projects: Dict[str, Any] = cursor.get("projects") or {}
     total_turns = int(cursor.get("turns") or 0)
+    result["parseDrift"] = {"invalidRecords": sum(nonnegative_int(meta.get("parseDrift")) or 0
+        for meta in cursor.get("files", {}).values() if isinstance(meta, dict))}
 
     periods = periods_from_daily_tokens(daily)
     if periods["all"] <= 0:
@@ -10507,6 +10629,8 @@ def merge_provider_with_usage_floor(
         merged_periods = periods_from_daily_tokens(int_map(daily))
         for period in ("today", "week", "month"):
             tokens[period] = merged_periods[period]
+        tokens["all"] = max(int(tokens.get("all") or 0), merged_periods["all"])
+        tokens["totalTokens"] = max(int(tokens.get("totalTokens") or 0), tokens["all"])
 
     models = merged.setdefault("models", {})
     floor_models = floor.get("models") if isinstance(floor.get("models"), dict) else {}
@@ -11059,6 +11183,8 @@ def load_journal_cursor() -> Dict[str, Any]:
             for key, value in usage_records.items()
             if isinstance(value, dict)
         },
+        "usageRecordEpoch": raw.get("usageRecordEpoch"),
+        "usageRecordCompactedAt": raw.get("usageRecordCompactedAt"),
         "projects_needs_rebuild": not has_projects,
         "usage_needs_rebuild": not (has_daily and has_hourly and has_models and has_usage_records),
     }
@@ -11376,6 +11502,30 @@ def _apply_home_record(home_daily: Dict[str, Any], hid: Optional[str], rec: Dict
         buckets[day] = buckets.get(day, 0) + sign * claude_record_total(rec)
 
 
+JOURNAL_RECENT_RECORDS_MAX = 50000
+JOURNAL_RECORD_RETENTION_DAYS = 365
+
+
+def compact_journal_usage_records(cursor: Dict[str, Any], now: dt.datetime) -> bool:
+    records = cursor.get("usageRecords") or {}
+    today = now.date().isoformat()
+    if cursor.get("usageRecordCompactedAt") == today and len(records) <= JOURNAL_RECENT_RECORDS_MAX:
+        return False
+    cutoff = now - dt.timedelta(days=JOURNAL_RECORD_RETENTION_DAYS)
+    old = {key: value for key, value in records.items()
+           if (parse_timestamp(value.get("timestamp")) or now) < cutoff}
+    if len(records) - len(old) > JOURNAL_RECENT_RECORDS_MAX:
+        # Batch spill rather than sorting/re-writing on every added event.
+        remaining = sorted(((key, value) for key, value in records.items() if key not in old),
+                           key=lambda pair: str(pair[1].get("timestamp") or ""))
+        old.update(remaining[:len(remaining) - int(JOURNAL_RECENT_RECORDS_MAX * .8)])
+    archive_usage_records(AGENTCAT_HOME / "journal-usage-archive.sqlite", cursor["usageRecordEpoch"], old)
+    for key in old:
+        records.pop(key, None)
+    cursor["usageRecordCompactedAt"] = today
+    return True
+
+
 def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     # The cursor holds the full usage-record history (multi-MB); serializing
     # it every 60s cycle was the daemon's main steady-state CPU cost, so the
@@ -11390,6 +11540,11 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     hourly_tokens: Dict[str, int] = cursor.setdefault("hourlyTokens", _empty_journal_hourly_tokens())
     models: Dict[str, Dict[str, int]] = cursor.setdefault("models", _empty_journal_models())
     usage_records: Dict[str, Dict[str, Any]] = cursor.setdefault("usageRecords", {})
+    if not isinstance(cursor.get("usageRecordEpoch"), str):
+        cursor["usageRecordEpoch"] = str(uuid.uuid4())
+        changed = True
+    archive_path = AGENTCAT_HOME / "journal-usage-archive.sqlite"
+    archive_available = archive_path.is_file()
     account_changed = _prepare_home_accounts("claude", cursor)
     changed = changed or account_changed
     grouped_files = claude_journal_files_by_root()
@@ -11408,6 +11563,9 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         hourly_tokens.clear()
         models.clear()
         usage_records.clear()
+        cursor["usageRecordEpoch"] = str(uuid.uuid4())
+        cursor.pop("usageRecordCompactedAt", None)
+        archive_available = False  # New generation never reuses an old rollup.
         home_daily.clear()
         cursor["projects_needs_rebuild"] = False
     if cursor.pop("projects_needs_rebuild", False):
@@ -11456,7 +11614,10 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                             hid = selected[path_str]
                             dedupe_key = rec.get("dedupeKey")
                             if isinstance(dedupe_key, str) and dedupe_key:
-                                previous = claude_record_from_cursor(usage_records.get(dedupe_key))
+                                previous_raw = usage_records.get(dedupe_key)
+                                if previous_raw is None and archive_available:
+                                    previous_raw = archived_usage_record(archive_path, cursor["usageRecordEpoch"], dedupe_key)
+                                previous = claude_record_from_cursor(previous_raw)
                                 if previous is not None:
                                     if claude_record_total(rec) <= claude_record_total(previous):
                                         continue
@@ -11471,7 +11632,7 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
                                         sign=-1,
                                     )
                                 if previous is not None:
-                                    previous_hid = usage_records[dedupe_key].get("homeId")
+                                    previous_hid = previous_raw.get("homeId")
                                     _apply_home_record(home_daily, previous_hid, previous, -1)
                                 usage_records[dedupe_key] = {**claude_record_for_cursor(rec), "homeId": hid}
                             _apply_home_record(home_daily, hid, rec)
@@ -11493,7 +11654,12 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
             offsets[path_str] = new_offset
             logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
                           path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
+    for obsolete in list(offsets):
+        if obsolete not in selected and not Path(obsolete).exists():
+            offsets.pop(obsolete, None)
+            changed = True
     if changed:
+        compact_journal_usage_records(cursor, now_utc)
         cursor["version"] = CLAUDE_JOURNAL_CURSOR_VERSION
     cursor["_dirty"] = changed
     cursor["_rebuilt"] = rebuilt
@@ -12276,7 +12442,7 @@ def freeze_identity_value(raw: Any) -> Any:
     return raw
 
 
-def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime], Optional[dt.datetime]]]:
+def gemini_metric_records(payload: Any, preferred_metric: str, diagnostics: Optional[Dict[str, Any]] = None) -> List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime], Optional[dt.datetime]]]:
     records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime], Optional[dt.datetime]]] = []
     if not isinstance(payload, dict):
         return records
@@ -12299,6 +12465,8 @@ def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tup
                     model = str(attributes.get("gen_ai.response.model") or attributes.get("gen_ai.request.model") or "unknown")
                 amount = metric_value(point.get("value"))
                 if token_key is None or amount is None:
+                    if diagnostics is not None:
+                        diagnostics["invalidPoints"] = (nonnegative_int(diagnostics.get("invalidPoints")) or 0) + 1
                     continue
                 start_raw = point.get("startTime") if point.get("startTime") is not None else point.get("startTimeUnixNano")
                 end_raw = (
@@ -12317,18 +12485,21 @@ def gemini_metric_records(payload: Any, preferred_metric: str) -> List[Tuple[Tup
                     token_key,
                     freeze_identity_value(start_raw),
                 )
+                temporality = metric.get("aggregationTemporality")
+                if temporality in (1, "DELTA", "delta", "AGGREGATION_TEMPORALITY_DELTA"):
+                    # Delta points are independent increments. Include the
+                    # interval end in the dedup identity so equal consecutive
+                    # deltas count, while rescanning the same interval does not.
+                    identity += ("delta", freeze_identity_value(end_raw))
                 records.append((identity, token_key, model, amount, when, start_when))
     return records
 
 
 def parse_gemini_telemetry(text: str) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]], Dict[str, int], Dict[str, int], int]:
     records: List[Tuple[Tuple[Any, ...], str, str, int, Optional[dt.datetime], Optional[dt.datetime]]] = []
+    stream_state: Dict[str, Any] = {}
     for payload in iter_json_objects(text):
-        records.extend(gemini_metric_records(payload, "gemini_cli.token.usage"))
-
-    if not records:
-        for payload in iter_json_objects(text):
-            records.extend(gemini_metric_records(payload, "gen_ai.client.token.usage"))
+        records.extend(gemini_stream_records(stream_state, payload))
 
     by_identity: Dict[Tuple[Any, ...], List[Tuple[str, str, int, Optional[dt.datetime], Optional[dt.datetime]]]] = {}
     for identity, token_key, model, amount, when, start_when in records:
@@ -12522,6 +12693,20 @@ def apply_gemini_records_to_state(
             identities[identity_key] = {"amount": previous_amount}
 
 
+def gemini_stream_records(state: Dict[str, Any], payload: Any) -> List[Any]:
+    """Keep one metric family per logical stream across exporter batches."""
+    families = state.setdefault("metricFamilies", {})
+    selected = []
+    for family in ("gemini_cli.token.usage", "gen_ai.client.token.usage"):
+        for record in gemini_metric_records(payload, family, state.setdefault("parseDrift", {})):
+            identity = record[0]
+            stream = gemini_identity_key(identity[1:4])
+            chosen = families.setdefault(stream, family)
+            if chosen == family:
+                selected.append(record)
+    return selected
+
+
 def iter_gemini_telemetry_payloads(offset: int = 0, telemetry_path: Optional[Path] = None) -> Iterable[Tuple[Any, int]]:
     telemetry_path = telemetry_path or GEMINI_TELEMETRY
     decoder = json.JSONDecoder()
@@ -12535,6 +12720,11 @@ def iter_gemini_telemetry_payloads(offset: int = 0, telemetry_path: Optional[Pat
             eof = not chunk
             if chunk:
                 buffer += chunk.decode("utf-8", errors="replace")
+                if len(buffer) > GEMINI_TELEMETRY_MAX_RECORD_CHARS:
+                    # An unterminated/malformed object used to retain the whole
+                    # multi-GB file. Keep the cursor unchanged and report an
+                    # honest parse failure; never guess a nested object boundary.
+                    raise ValueError("gemini_telemetry_record_too_large")
 
             index = 0
             while True:
@@ -12600,9 +12790,7 @@ def scan_gemini_telemetry_state(
 
     last_offset = offset
     for payload, end_offset in iter_gemini_telemetry_payloads(offset, telemetry_path=telemetry_path):
-        records = gemini_metric_records(payload, "gemini_cli.token.usage")
-        if not records:
-            records = gemini_metric_records(payload, "gen_ai.client.token.usage")
+        records = gemini_stream_records(state, payload)
         if records:
             apply_gemini_records_to_state(state, records)
         last_offset = max(last_offset, end_offset)
@@ -12733,6 +12921,7 @@ def gemini_usage_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
             for model, days in (raw_model_daily.items() if isinstance(raw_model_daily, dict) else [])
         },
         "events": int(state.get("events") or 0),
+        "parseDrift": {"invalidPoints": nonnegative_int((state.get("parseDrift") or {}).get("invalidPoints")) or 0},
         "cache": {
             "source": "full-log-index",
             "offset": int(state.get("offset") or 0),
@@ -14394,6 +14583,7 @@ def load_project_daily_state() -> Dict[str, Any]:
         baselines = {key: value for key, value in baselines.items() if not key.startswith(prefixes)}
         model_baselines = {key: value for key, value in model_baselines.items() if not key.startswith(prefixes)}
     return {"baselines": baselines, "modelBaselines": model_baselines,
+            "observedKeys": raw.get("observedKeys") if isinstance(raw.get("observedKeys"), list) else None,
             "_accountingRevisionChanged": bool(changed)}
 
 
@@ -14621,11 +14811,18 @@ def update_project_daily(
     model_baselines: Dict[str, Dict[str, Dict[str, Any]]] = state["modelBaselines"]
     days_changed = prune_project_daily(days, today)
     state_changed = bool(state.get("_accountingRevisionChanged"))
-    for key, observed in snapshot_project_cumulative(providers).items():
+    observations = snapshot_project_cumulative(providers)
+    # A top-N list is not a complete cumulative inventory. Re-entry must
+    # seed a baseline rather than book all usage during the gap to today.
+    previous_observed = state.get("observedKeys")
+    previously_visible = set(previous_observed) if isinstance(previous_observed, list) else None
+    observed_keys = sorted(observations)
+    state_changed = state_changed or previous_observed != observed_keys
+    for key, observed in observations.items():
         tokens = observed["tokens"]
         key_models = model_baselines.setdefault(key, {})
         previous = baselines.get(key)
-        if previous is None or tokens < previous:
+        if previous is None or tokens < previous or (previously_visible is not None and key not in previously_visible):
             baselines[key] = tokens
             _reseed_model_baselines(key_models, observed["models"])
             state_changed = True
@@ -14677,6 +14874,7 @@ def update_project_daily(
                 "copilotAccountingVersion": COPILOT_ACCOUNTING_STATE_VERSION,
                 "opencodeAccountingVersion": OPENCODE_ACCOUNTING_STATE_VERSION,
                 "baselines": baselines,
+                "observedKeys": observed_keys,
                 "modelBaselines": {k: v for k, v in model_baselines.items() if v},
             },
         )
@@ -14684,6 +14882,56 @@ def update_project_daily(
 
 
 _BUILD_SNAPSHOT_LOCK = threading.RLock()
+
+_DAEMON_BIND_PORT = 8765
+
+
+def connector_health_snapshot(providers: Dict[str, Any]) -> Dict[str, Any]:
+    """Bounded, token-only health from already collected local evidence.
+
+    Never run doctor, read credentials, scan files or call providers here.
+    Usage and quota have separate rows so a healthy journal cannot hide an
+    unreadable credential. The public status feed is independent of this.
+    """
+    sources: List[Dict[str, Any]] = []
+    known_reasons = {
+        "keychain_denied": "grant_keychain_access",
+        "token_missing": "relogin_provider",
+        "cli_login_expired": "relogin_provider",
+        "token_expired": "relogin_provider",
+        "not_configured": "run_provider_once",
+        "permission_denied": "grant_full_disk_access",
+    }
+    for provider, data in sorted(providers.items()):
+        if provider not in CONFIG_PROVIDER_IDS or not isinstance(data, dict):
+            continue
+        status = data.get("status")
+        if status == "disabled":
+            continue
+        state = "ok" if status == "ok" and not data.get("stale") else "error" if status == "error" else "warn"
+        row: Dict[str, Any] = {"id": provider + ".usage", "state": state}
+        if state != "ok":
+            row["reason"] = ("usage_error" if state == "error" else "snapshot_stale" if data.get("stale")
+                             else "no_local_activity" if status in ("not_found", "no_token_events_yet", "no_telemetry_yet")
+                             else "health_unknown")
+            row["fix"] = "run_provider_once"
+        sources.append(row)
+        limits = data.get("limits")
+        if not isinstance(limits, dict) or limits.get("status") == "disabled":
+            continue
+        reason = limits.get("reason")
+        if limits.get("stale") and reason not in known_reasons:
+            reason = "snapshot_stale"
+        qstate = "ok" if limits.get("status") in ("ok", "available") and not limits.get("stale") and reason not in known_reasons else "warn"
+        quota: Dict[str, Any] = {"id": provider + ".limits", "state": qstate}
+        if qstate != "ok":
+            quota["reason"] = (reason if reason in known_reasons or reason == "snapshot_stale"
+                               else "not_configured" if limits.get("status") == "not_configured" else "health_unknown")
+            if quota["reason"] in known_reasons:
+                quota["fix"] = known_reasons[quota["reason"]]
+        sources.append(quota)
+    return {"localhost": {"host": "127.0.0.1", "port": _DAEMON_BIND_PORT, "state": "ok"},
+            "sources": sources}
 
 
 def build_snapshot() -> Dict[str, Any]:
@@ -14852,6 +15100,11 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             insights_by_period[period] = {"status": "error", "error": str(exc)}
     snapshot["insightsByPeriod"] = insights_by_period
     snapshot["insights"] = insights_by_period["week"]
+    # Health failure must never prevent snapshot publication.
+    try:
+        snapshot["health"] = connector_health_snapshot(providers)
+    except Exception:
+        snapshot["capabilities"].remove("connector.health.v1")
     write_json_atomic(LATEST_SNAPSHOT, snapshot)
     return snapshot
 
@@ -19587,6 +19840,7 @@ def run_daemon(args: argparse.Namespace) -> int:
 
 
 def _run_daemon_impl(args: argparse.Namespace) -> int:
+    global _DAEMON_BIND_PORT
     ensure_dirs()
     # Connection clients read this file before their first authenticated request.
     # Creating it only inside the request guard makes a fresh install unable to
@@ -19610,6 +19864,7 @@ def _run_daemon_impl(args: argparse.Namespace) -> int:
     # snapshot instantly while it refreshes underneath them.
     try:
         server = ThreadingHTTPServer((args.host, args.port), AgentCatHandler)
+        _DAEMON_BIND_PORT = getattr(server, "server_address", (args.host, args.port))[1]
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE and healthy_daemon_on_port(args.host, args.port):
             return 0
@@ -19967,7 +20222,76 @@ def home_discovery_snapshot(force: bool = False) -> Dict[str, Any]:
     return block
 
 
-def doctor_report(check_network: bool = False) -> Dict[str, Any]:
+def doctor_system_checks(port: int, reachable: bool) -> List[Dict[str, Any]]:
+    """Explicit CLI-only system checks; never called by snapshot polling."""
+    checks: List[Dict[str, Any]] = []
+    snapshot = read_json(LATEST_SNAPSHOT)
+    version = snapshot.get("connectorVersion") if isinstance(snapshot, dict) else None
+    if isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version):
+        checks.append(_doctor_check("daemon.version", "ok" if version == CONNECTOR_VERSION else "warn",
+            reason=None if version == CONNECTOR_VERSION else "daemon_version_mismatch",
+            detail="CLI and last snapshot versions match" if version == CONNECTOR_VERSION else "CLI and last snapshot versions differ",
+            fix=None if version == CONNECTOR_VERSION else "restart_daemon"))
+    else:
+        checks.append(_doctor_check("daemon.version", "info", reason="health_unknown", detail="no version evidence"))
+    def bounded_run(command: List[str]) -> Optional[subprocess.CompletedProcess]:
+        try:
+            return subprocess.run(command, capture_output=True, text=True, timeout=3,
+                                  stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+        except (OSError, subprocess.SubprocessError):
+            return None
+    if sys.platform == "darwin":
+        service = bounded_run(["launchctl", "print", f"gui/{os.getuid()}/com.trappist.agentcatd"])
+        present = service is not None and service.returncode == 0
+        checks.append(_doctor_check("daemon.registration", "ok" if present else "warn",
+            reason=None if present else "daemon_not_registered", detail="LaunchAgent present" if present else "LaunchAgent not found",
+            fix=None if present else "reinstall_connector"))
+        if not reachable:
+            listener = bounded_run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"])
+            if listener is not None and listener.returncode == 0 and re.search(r"(?m)^p\d+$", listener.stdout):
+                checks.append(_doctor_check("daemon.port", "warn", reason="port_in_use", detail="a listener owns the configured port"))
+    elif IS_WINDOWS:
+        task = bounded_run(["schtasks.exe", "/Query", "/TN", "AgentCatD", "/FO", "LIST"])
+        present = task is not None and task.returncode == 0
+        checks.append(_doctor_check("daemon.registration", "ok" if present else "info",
+            reason=None if present else "health_unknown",
+            detail="scheduled task present" if present else "scheduled-task evidence unavailable; a Run entry may be used"))
+    # Metadata-only readability probes; no file content or paths enter checks.
+    for provider in DESKTOP_APP_PROVIDER_IDS:
+        denied = False
+        for root in desktop_app_data_roots(provider):
+            try:
+                root.stat()
+                next(root.iterdir(), None)
+            except PermissionError:
+                denied = True
+            except OSError:
+                pass
+        if denied:
+            checks.append(_doctor_check(provider + ".permissions", "warn", reason="permission_denied",
+                detail="desktop usage metadata is unreadable", fix="grant_full_disk_access"))
+    if EVENTS_DB.is_file():
+        try:
+            recent = read_foreign_sqlite(EVENTS_DB, lambda connection:
+                connection.execute("select provider, max(ts) from events group by provider").fetchall(), timeout=1)
+            current = dt.datetime.now(dt.timezone.utc)
+            for provider, timestamp in recent:
+                if provider not in CONFIG_PROVIDER_IDS:
+                    continue
+                checked = parse_timestamp(timestamp)
+                if checked is None:
+                    checks.append(_doctor_check(provider + ".events", "info", reason="health_unknown", detail="event recency unavailable"))
+                else:
+                    old = (current - checked).total_seconds() > 7 * 86400
+                    checks.append(_doctor_check(provider + ".events", "info" if old else "ok",
+                        reason="no_events_7d" if old else None,
+                        detail="last local event is older than seven days" if old else "recent local event metadata found"))
+        except (OSError, sqlite3.Error):
+            checks.append(_doctor_check("events.readable", "info", reason="health_unknown", detail="local event metadata unavailable"))
+    return checks
+
+
+def doctor_report(check_network: bool = False, check_system: bool = False) -> Dict[str, Any]:
     """Diagnose why providers are or aren't detected on this machine.
 
     Returns ``{"status": ok|degraded|broken, "connectorVersion", "checks": [...]}``
@@ -20107,6 +20431,8 @@ def doctor_report(check_network: bool = False) -> Dict[str, Any]:
                 reason=live.get("reason") or status, detail=live.get("error") or "no quota returned",
             ))
 
+    if check_system:
+        checks.extend(doctor_system_checks(port, healthz_ok))
     order = {"ok": 0, "info": 0, "warn": 1, "error": 2}
     worst = max((order.get(check["status"], 0) for check in checks), default=0)
     overall = {0: "ok", 1: "degraded", 2: "broken"}[worst]
@@ -20602,7 +20928,25 @@ def command_profile_list(args: argparse.Namespace) -> int:
 
 
 def command_doctor(args: argparse.Namespace) -> int:
-    report = doctor_report(check_network=bool(getattr(args, "network", False)))
+    repair_failed = False
+    if getattr(args, "fix", False):
+        # Separate explicit CLI action: patch hook/telemetry settings with a
+        # backup, restart an existing registration. Never install a new binary,
+        # refresh a CLI token, claim quota, open login or change a provider plan.
+        installer = Path(__file__).resolve().parent.parent / "scripts" / "install.py"
+        try:
+            fixed = subprocess.run([sys.executable, str(installer), "--repo-dir", str(installer.parent.parent), "repair"],
+                capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW)
+            repair_failed = fixed.returncode != 0
+        except (OSError, subprocess.SubprocessError):
+            repair_failed = True
+    report = doctor_report(check_network=bool(getattr(args, "network", False)), check_system=True)
+    if repair_failed:
+        report["checks"].append(_doctor_check("repair.local", "warn", reason="repair_failed",
+            detail="local repair did not finish; existing backups were retained", fix="reinstall_connector"))
+        if report["status"] == "ok":
+            report["status"] = "degraded"
     bundle = getattr(args, "bundle", None)
     if bundle:
         try:
@@ -21804,7 +22148,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     daemon = subparsers.add_parser("daemon")
     daemon.add_argument("--host", default="127.0.0.1")
-    daemon.add_argument("--port", default=8765, type=int)
+    daemon.add_argument("--port", default=os.environ.get("AGENTCAT_PORT") or "8765", type=int)
     daemon.set_defaults(func=run_daemon)
 
     snapshot = subparsers.add_parser("snapshot")
@@ -21859,6 +22203,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--network", action="store_true")
+    doctor.add_argument("--fix", action="store_true", help="Back up and repair local hook settings, then restart the registered daemon")
     doctor.add_argument("--bundle")
     doctor.set_defaults(func=command_doctor)
 

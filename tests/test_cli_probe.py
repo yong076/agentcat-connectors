@@ -192,7 +192,7 @@ class ClaudeProbeTests(unittest.TestCase):
                     self.assertEqual(row["status"], "ok")
                     self.assertEqual(row["email"], "selected@example.com")
                     self.assertEqual(row["accountID"], "selected-account")
-                    self.assertEqual(row["plan"], "Max 5x")
+                    self.assertEqual(row["plan"], "Max")
                     self.assertFalse(row["extraUsageEnabled"])
 
     def test_timeout_is_an_error_row_not_an_exception(self):
@@ -254,9 +254,9 @@ class AntigravityParsingTests(unittest.TestCase):
 
 
 class KimiParsingTests(unittest.TestCase):
-    def test_usage_is_weekly_and_limits_are_rate_windows(self):
+    def test_explicit_weekly_usage_and_limits_are_rate_windows(self):
         payload = {
-            "usage": {"limit": "100", "used": "21", "remaining": "79", "resetTime": "2026-09-28T07:40:39.489321Z"},
+            "usage": {"window": {"duration": 7, "timeUnit": "TIME_UNIT_DAY"}, "limit": "100", "used": "21", "remaining": "79", "resetTime": "2026-09-28T07:40:39.489321Z"},
             "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
                         "detail": {"limit": "100", "remaining": "100", "resetTime": "2026-09-24T15:40:39Z"}}],
         }
@@ -311,7 +311,7 @@ class BillingAndPassesTests(unittest.TestCase):
                 "organizationRateLimitTier": "default_claude_max_5x",
                 "subscriptionCreatedAt": "2026-09-05T04:42:31Z", "hasExtraUsageEnabled": True}}))
             details = cli_probe.claude_account_details(home, Path(tmp) / ".claude", self.NOW)
-        self.assertEqual(details["plan"], "Max 5x")
+        self.assertEqual(details["plan"], "Max")
         self.assertEqual(details["billing"], {"renewsAt": "2026-10-05T04:42:31Z", "estimated": True})
         self.assertTrue(details["extraUsageEnabled"])
 

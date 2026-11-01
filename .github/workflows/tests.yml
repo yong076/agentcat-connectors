@@ -13,7 +13,9 @@ permissions:
 jobs:
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
-    runs-on: ${{ matrix.os }}
+    # Python 3.9 has no setup-python build for Ubuntu 26.04 (ubuntu-latest).
+    # Preserve the supported Python floor on the compatible 24.04 runner.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.9' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false

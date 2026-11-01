@@ -436,8 +436,11 @@ def _number(value: Any) -> Optional[float]:
 
 
 def parse_kimi_usage(payload: Any) -> List[Dict[str, Any]]:
-    """Kimi Code /usages, mapped as CodexBar does: `usage` is the weekly pool,
-    each `limits[]` entry is a rate window of `window.duration` time units."""
+    """Kimi /usages: preserve actual windows; new plans have no weekly cap.
+
+    An unscoped `usage` object is not proof of a seven-day period. Legacy
+    membership names or an explicit window identify the old weekly pool.
+    """
     windows: List[Dict[str, Any]] = []
     if not isinstance(payload, dict):
         return windows
@@ -465,7 +468,15 @@ def parse_kimi_usage(payload: Any) -> List[Dict[str, Any]]:
             "primary": primary,
         })
 
-    window("kimi:7d", "7d", 10080, data.get("usage"), True)
+    usage = data.get("usage")
+    plan = str(data.get("plan") or data.get("membership") or "").lower()
+    usage_window = usage.get("window") if isinstance(usage, dict) else None
+    weekly = (isinstance(usage_window, dict)
+              and _number(usage_window.get("duration")) == 7
+              and str(usage_window.get("timeUnit") or "").upper() in ("DAY", "DAYS", "TIME_UNIT_DAY"))
+    legacy = plan in ("andante", "moderato", "allegretto", "allegro")
+    window("kimi:7d" if weekly or legacy else "kimi:usage",
+           "7d" if weekly or legacy else "Usage", 10080 if weekly or legacy else None, usage, True)
     for index, item in enumerate(data.get("limits") or []):
         if not isinstance(item, dict):
             continue
@@ -553,7 +564,7 @@ def codex_billing(home: Path, now: Optional[dt.datetime] = None) -> Optional[Dic
     return next_monthly_renewal(auth.get("chatgpt_subscription_active_until"), now)
 
 
-_CLAUDE_TIERS = {"max_5x": "Max 5x", "max_20x": "Max 20x", "pro": "Pro", "team": "Team", "enterprise": "Enterprise"}
+_CLAUDE_TIERS = {"ultra": "Ultra", "max_20x": "Ultra", "max_5x": "Max", "pro": "Pro", "team": "Team", "enterprise": "Enterprise"}
 
 
 def claude_account_details(home: Path, default_home: Path, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
@@ -565,7 +576,7 @@ def claude_account_details(home: Path, default_home: Path, now: Optional[dt.date
     account = raw.get("oauthAccount") if isinstance(raw, dict) else None
     if not isinstance(account, dict):
         return {}
-    tier = str(account.get("organizationRateLimitTier") or account.get("userRateLimitTier") or "")
+    tier = str(account.get("organizationRateLimitTier") or account.get("userRateLimitTier") or "").lower()
     plan = next((label for key, label in _CLAUDE_TIERS.items() if key in tier), None)
     details: Dict[str, Any] = {"plan": plan}
     billing = next_monthly_renewal(account.get("subscriptionCreatedAt"), now)
@@ -701,7 +712,7 @@ def parse_copilot_user(payload: Any) -> Dict[str, Any]:
     snapshots = payload.get("quota_snapshots") if isinstance(payload.get("quota_snapshots"), dict) else {}
     reset = _iso_epoch(payload.get("quota_reset_date_utc") or payload.get("quota_reset_date"))
     windows = []
-    for key, label in (("premium_interactions", "Premium"), ("chat", "Chat"), ("completions", "Completions")):
+    for key, label in (("ai_credits", "AI credits"), ("premium_interactions", "Premium"), ("chat", "Chat"), ("completions", "Completions")):
         snap = snapshots.get(key)
         if not isinstance(snap, dict) or snap.get("unlimited"):
             continue
@@ -716,7 +727,7 @@ def parse_copilot_user(payload: Any) -> Dict[str, Any]:
         windows.append({
             "id": f"copilot:{key}", "label": label, "windowDurationMins": None,
             "usedPercent": used, "remainingPercent": 100.0 - used, "resetsAt": reset,
-            "model": None, "primary": key == "premium_interactions",
+            "model": None, "primary": key == "ai_credits" or (key == "premium_interactions" and "ai_credits" not in snapshots),
             "remainingCount": remaining, "entitlement": entitlement,
         })
     return {
