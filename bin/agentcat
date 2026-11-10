@@ -48,6 +48,7 @@ from agentcat_codex_app_server import (
     app_server_prerequisite,
 )
 import agentcat_cli_probe as cli_probe
+from agentcat_statusline import merge_windows as merge_claude_statusline_windows
 import agentcat_home_signatures as home_signatures
 from agentcat_opencode_incremental import prepare_rows as prepare_opencode_rows
 from agentcat_jsonl_cursor import ProjectedJSONLCursor
@@ -262,7 +263,7 @@ COPILOT_ACCOUNTING_STATE_VERSION = 1
 OPENCODE_ACCOUNTING_STATE_VERSION = 1
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.44.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.46.0")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -3123,6 +3124,10 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            "create table if not exists claude_statusline_windows "
+            "(scope text primary key, windows_json text not null)"
+        )
         conn.commit()
     # The sqlite file is created on connect; lock it down owner-only afterward.
     _chmod_quiet(EVENTS_DB, 0o600)
@@ -3131,12 +3136,30 @@ def init_db() -> None:
 def store_event(provider: str, source: str, event_type: Optional[str], payload: Any) -> Dict[str, Any]:
     init_db()
     sanitized = sanitize_payload(payload)
+    now = int(time.time())
+    scope = None
+    if provider == "claude" and source == "claude-statusline" and isinstance(sanitized, dict):
+        scope = claude_statusline_scope()
+        # This is collector metadata, never a scope asserted by the caller.
+        sanitized["_agentcat_statusline_scope"] = scope
     with closing(sqlite3.connect(EVENTS_DB, timeout=5.0)) as conn:
         cur = conn.execute(
             "insert into events(ts, provider, source, event_type, payload_json) values (?, ?, ?, ?, ?)",
-            (int(time.time()), provider, source, event_type, json.dumps(sanitized, ensure_ascii=False, sort_keys=True)),
+            (now, provider, source, event_type, json.dumps(sanitized, ensure_ascii=False, sort_keys=True)),
         )
         event_id = int(cur.lastrowid)
+        if scope:
+            # The insert above owns the SQLite write lock; merge + save is one
+            # transaction even when several CLI sessions report simultaneously.
+            row = conn.execute(
+                "select windows_json from claude_statusline_windows where scope = ?", (scope,)
+            ).fetchone()
+            windows = merge_claude_statusline_windows(json.loads(row[0]) if row else {}, sanitized, now)
+            conn.execute(
+                "insert into claude_statusline_windows(scope, windows_json) values (?, ?) "
+                "on conflict(scope) do update set windows_json = excluded.windows_json",
+                (scope, json.dumps(windows)),
+            )
         conn.commit()
     return {
         "id": event_id,
@@ -4040,8 +4063,53 @@ def codex_runtime_limits() -> Dict[str, Any]:
     return limits
 
 
-def claude_runtime_limits() -> Dict[str, Any]:
+def claude_statusline_scope() -> Optional[str]:
+    """Local metadata only; never credentials, email, or a payload-supplied ID.
+
+    Include the home and organization so neither a profile switch nor a change
+    of organization inherits another quota. Unknown accounts are never merged.
+    """
+    home = claude_config_dir()
+    path = cli_probe._claude_account_config(home, HOME / ".claude")
+    raw = _read_bounded_json_object(path)
+    account = raw.get("oauthAccount") if isinstance(raw, dict) else None
+    if not isinstance(account, dict):
+        return None
+    account_id = account.get("accountUuid")
+    organization = account.get("organizationUuid")
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None
+    identity = json.dumps([str(home.resolve()), account_id.strip(), organization if isinstance(organization, str) else None])
+    return provider_instance_id("claude-statusline", identity)
+
+
+def claude_statusline_record() -> Optional[Dict[str, Any]]:
     record = latest_event_record("claude", "claude-statusline")
+    scope = claude_statusline_scope()
+    if not scope:
+        # Legacy observations have no trustworthy identity. Preserve their
+        # last-report behavior, but never expose a known account after logout.
+        return record if record and not record["payload"].get("_agentcat_statusline_scope") else None
+    with closing(sqlite3.connect(EVENTS_DB)) as conn:
+        row = conn.execute(
+            "select windows_json from claude_statusline_windows where scope = ?", (scope,)
+        ).fetchone()
+    windows = json.loads(row[0]) if row else {}
+    # Session context is not an account quota; retain it only from this scope's
+    # latest event, and do not let its newer timestamp refresh retained windows.
+    matching = record and record["payload"].get("_agentcat_statusline_scope") == scope
+    payload = dict(record["payload"]) if matching else {}
+    payload["rate_limits"] = windows
+    timestamps = [window["observed_at"] for window in windows.values()]
+    if matching and isinstance(payload.get("context_window"), dict):
+        timestamps.append(record["timestamp"])
+    if not timestamps:
+        return None
+    return {"payload": payload, "timestamp": min(timestamps)}
+
+
+def claude_runtime_limits() -> Dict[str, Any]:
+    record = claude_statusline_record()
     if not record:
         return empty_limits()
     payload = record["payload"]
