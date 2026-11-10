@@ -57,10 +57,13 @@ preserves observation freshness.
   identity, invalid numbers, context-only reports, forged payload scope,
   persistence and concurrent writers.
 - Tests run from a temporary copy with a fake HOME and closed stdin.
-- Local full suite: 1,117 tests passed (4 skipped) before the final concurrent
-  writer case was added; the final focused suite passed all 12 cases.
+- Final local full suite: 1,118 tests passed (4 skipped). The focused suite
+  passed all 12 cases, and concurrent first-run writers passed 30 repetitions.
 - Built-in diff review checked transaction ordering, account selection,
   timestamp propagation, legacy behavior and snapshot identity exposure.
+- The first CI run exposed a concurrent first-run WAL initialization lock on
+  Linux, macOS and Windows with Python 3.11. Initialization now retries only SQLite's transient lock,
+  bounded by the existing five-second database wait budget.
 - No live provider, installed daemon, native UI, Windows runtime, release, or
   update-promotion verification is claimed by these fixture tests.
 

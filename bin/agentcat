@@ -3100,8 +3100,19 @@ def init_db() -> None:
         # WAL is a persistent DB property (set once, applies to every later connection):
         # readers (the 60s refresh loop) no longer block the CLI-hook writers, so a
         # store_event racing a snapshot build isn't dropped with "database is locked".
-        conn.execute("pragma journal_mode=WAL")
         conn.execute("pragma busy_timeout=5000")
+        # First-run connections can race while promoting an empty database to
+        # WAL. SQLite may return SQLITE_BUSY immediately for this pragma even
+        # with busy_timeout set. Retry only that lock, within the same 5s budget.
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                conn.execute("pragma journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
         conn.execute(
             """
             create table if not exists events (
