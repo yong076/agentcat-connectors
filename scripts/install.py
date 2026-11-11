@@ -636,7 +636,7 @@ def install_claude_settings(backup_dir: Path) -> None:
 
     removed_status_line = remove_agentcat_status_line(settings)
     for event_name in ("SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest",
-                       "Notification", "PostToolUse", "SessionEnd"):
+                       "Notification", "PostToolUse", "PostToolUseFailure", "SessionEnd"):
         ensure_claude_hook(settings, event_name)
     write_json(path, settings)
     if removed_status_line:

@@ -18,6 +18,14 @@ class SessionProjectionTests(unittest.TestCase):
         self.assertEqual(experience.session_summary(events, 104)["completed"], 1)
         self.assertEqual(experience.session_summary(events, 705)["completed"], 0)
 
+    def test_failed_tool_continuation_and_session_end_clear_waiting(self):
+        for event, state in (("PostToolUseFailure", "running"), ("SessionEnd", "completed")):
+            events = [experience.session_observation("PermissionRequest", {}, "opaque", 100),
+                      experience.session_observation(event, {}, "opaque", 101)]
+            result = experience.session_summary(events, 102)
+            self.assertEqual(result["waiting"], 0)
+            self.assertEqual(result[state], 1)
+
     def test_concurrent_sessions_are_independent_and_future_events_rejected(self):
         events = [experience.session_observation("PermissionRequest", {}, "first", 100),
                   experience.session_observation("Stop", {}, "second", 100),

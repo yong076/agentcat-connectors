@@ -4,7 +4,7 @@ The snapshot includes `localExperience.sessions` and the two-second activity
 response includes `attentionSessions`. These are observations only: no quota
 claim, account action, approval reply or provider request occurs.
 
-Claude hooks: SessionStart, UserPromptSubmit and PostToolUse report running;
+Claude hooks: SessionStart, UserPromptSubmit, PostToolUse and PostToolUseFailure report running;
 PermissionRequest and permission/idle notifications report attention needed;
 Stop and SessionEnd clear it. The event store uses installation-scoped opaque
 session identities. The public projection carries counts only. Missing follow-up

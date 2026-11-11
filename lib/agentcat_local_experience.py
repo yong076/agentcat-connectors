@@ -11,6 +11,7 @@ def session_observation(event: str, payload: Any, session_key: str, now: int) ->
     if not session_key or not isinstance(payload, dict):
         return None
     state = {"SessionStart": "running", "UserPromptSubmit": "running", "PostToolUse": "running",
+             "PostToolUseFailure": "running",
              "Stop": "completed", "SessionEnd": "completed", "PermissionRequest": "waiting"}.get(event)
     if event == "Notification" and payload.get("notification_type") in ("permission_prompt", "idle_prompt"):
         state = "waiting"
