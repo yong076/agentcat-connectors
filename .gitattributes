@@ -1,0 +1,3 @@
+# The gateway feasibility lab is not an installed connector feature.
+experiments export-ignore
+tests/test_gateway_lab.py export-ignore

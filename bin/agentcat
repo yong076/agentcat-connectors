@@ -1201,8 +1201,6 @@ def provider_effective_usd_per_token(
 def provider_burn_rate(
     provider: Dict[str, Any], now: Optional[dt.datetime] = None
 ) -> Optional[Dict[str, Any]]:
-    if provider.get("usageAttribution") == "gateway_or_mixed":
-        return None
     hourly = provider.get("hourlyTokens")
     if not isinstance(hourly, dict) or not hourly:
         return None
@@ -1230,8 +1228,6 @@ def provider_burn_rate(
 def provider_auto_quota(
     provider: Dict[str, Any], now: Optional[dt.datetime] = None
 ) -> Optional[Dict[str, Any]]:
-    if provider.get("usageAttribution") == "gateway_or_mixed":
-        return None
     daily = provider.get("dailyTokens")
     if not isinstance(daily, dict):
         return None
@@ -1276,7 +1272,7 @@ def snapshot_recommendation(providers: Dict[str, Any]) -> Optional[Dict[str, Any
     entries: List[Tuple[str, float, Optional[int]]] = []
     for provider_id in sorted(providers or {}):
         data = providers[provider_id]
-        if not isinstance(data, dict) or data.get("status") != "ok" or data.get("usageAttribution") == "gateway_or_mixed":
+        if not isinstance(data, dict) or data.get("status") != "ok":
             continue
         headroom = provider_quota_headroom(data.get("limits"))
         if headroom is not None:
@@ -15027,9 +15023,6 @@ def connector_health_snapshot(providers: Dict[str, Any]) -> Dict[str, Any]:
             "sources": sources}
 
 
-_LOCAL_GATEWAY_READER = local_experience.GatewayReader()
-
-
 def local_session_summary() -> Dict[str, Any]:
     now = int(time.time())
     init_db()
@@ -15051,9 +15044,7 @@ def local_session_summary() -> Dict[str, Any]:
 
 
 def local_experience_snapshot() -> Dict[str, Any]:
-    configured = local_experience.configured_gateways(claude_config_dir(), active_codex_home())
-    return {"sessions": local_session_summary(),
-            "gateways": _LOCAL_GATEWAY_READER.snapshot(configured)}
+    return {"sessions": local_session_summary()}
 
 
 def build_snapshot() -> Dict[str, Any]:
@@ -15156,11 +15147,6 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     try:
         snapshot["localExperience"] = local_experience_snapshot()
         activity["attentionSessions"] = snapshot["localExperience"]["sessions"]
-        for gateway in snapshot["localExperience"]["gateways"]:
-            if gateway.get("name") == "magpie":
-                for client in gateway["clients"]:
-                    if client in providers:
-                        providers[client]["usageAttribution"] = "gateway_or_mixed"
     except Exception:
         pass  # Optional local evidence must not interrupt ordinary usage.
     for data in providers.values():
