@@ -49,6 +49,7 @@ from agentcat_codex_app_server import (
 )
 import agentcat_cli_probe as cli_probe
 from agentcat_statusline import merge_windows as merge_claude_statusline_windows
+import agentcat_local_experience as local_experience
 import agentcat_home_signatures as home_signatures
 from agentcat_opencode_incremental import prepare_rows as prepare_opencode_rows
 from agentcat_jsonl_cursor import ProjectedJSONLCursor
@@ -1200,6 +1201,8 @@ def provider_effective_usd_per_token(
 def provider_burn_rate(
     provider: Dict[str, Any], now: Optional[dt.datetime] = None
 ) -> Optional[Dict[str, Any]]:
+    if provider.get("usageAttribution") == "gateway_or_mixed":
+        return None
     hourly = provider.get("hourlyTokens")
     if not isinstance(hourly, dict) or not hourly:
         return None
@@ -1227,6 +1230,8 @@ def provider_burn_rate(
 def provider_auto_quota(
     provider: Dict[str, Any], now: Optional[dt.datetime] = None
 ) -> Optional[Dict[str, Any]]:
+    if provider.get("usageAttribution") == "gateway_or_mixed":
+        return None
     daily = provider.get("dailyTokens")
     if not isinstance(daily, dict):
         return None
@@ -1271,7 +1276,7 @@ def snapshot_recommendation(providers: Dict[str, Any]) -> Optional[Dict[str, Any
     entries: List[Tuple[str, float, Optional[int]]] = []
     for provider_id in sorted(providers or {}):
         data = providers[provider_id]
-        if not isinstance(data, dict) or data.get("status") != "ok":
+        if not isinstance(data, dict) or data.get("status") != "ok" or data.get("usageAttribution") == "gateway_or_mixed":
             continue
         headroom = provider_quota_headroom(data.get("limits"))
         if headroom is not None:
@@ -3149,6 +3154,15 @@ def store_event(provider: str, source: str, event_type: Optional[str], payload: 
     sanitized = sanitize_payload(payload)
     now = int(time.time())
     scope = None
+    if provider == "claude" and source == "claude-hook" and isinstance(sanitized, dict):
+        sanitized.pop("_agentcat_session", None)
+        session = payload.get("session_id") if isinstance(payload, dict) else None
+        if isinstance(session, str) and 0 < len(session) <= 256:
+            observation = local_experience.session_observation(
+                str(event_type), payload,
+                provider_instance_id("claude-session", str(claude_config_dir()) + ":" + session), now)
+            if observation:
+                sanitized["_agentcat_session"] = observation
     if provider == "claude" and source == "claude-statusline" and isinstance(sanitized, dict):
         scope = claude_statusline_scope()
         # This is collector metadata, never a scope asserted by the caller.
@@ -15013,6 +15027,35 @@ def connector_health_snapshot(providers: Dict[str, Any]) -> Dict[str, Any]:
             "sources": sources}
 
 
+_LOCAL_GATEWAY_READER = local_experience.GatewayReader()
+
+
+def local_session_summary() -> Dict[str, Any]:
+    now = int(time.time())
+    init_db()
+    with closing(sqlite3.connect(EVENTS_DB)) as conn:
+        rows = conn.execute(
+            "select payload_json from events where provider = 'claude' and source = 'claude-hook' "
+            "and ts >= ? order by ts desc, id desc limit 2000", (now - 600,)
+        ).fetchall()
+    observations = []
+    for row in reversed(rows):
+        try:
+            payload = json.loads(row[0])
+            observation = payload.get("_agentcat_session") if isinstance(payload, dict) else None
+            if isinstance(observation, dict):
+                observations.append(observation)
+        except ValueError:
+            continue
+    return local_experience.session_summary(observations, now)
+
+
+def local_experience_snapshot() -> Dict[str, Any]:
+    configured = local_experience.configured_gateways(claude_config_dir(), active_codex_home())
+    return {"sessions": local_session_summary(),
+            "gateways": _LOCAL_GATEWAY_READER.snapshot(configured)}
+
+
 def build_snapshot() -> Dict[str, Any]:
     # Serialize snapshot builds. build_snapshot() is invoked from the 60s refresh loop,
     # the POST /v1/config handler, the `agentcat event` path, and the cold-start thread;
@@ -15110,6 +15153,16 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         # subscriptions. Their USD amounts are only for the connected key.
         "connections": openrouter_connections_snapshot(),
     }
+    try:
+        snapshot["localExperience"] = local_experience_snapshot()
+        activity["attentionSessions"] = snapshot["localExperience"]["sessions"]
+        for gateway in snapshot["localExperience"]["gateways"]:
+            if gateway.get("name") == "magpie":
+                for client in gateway["clients"]:
+                    if client in providers:
+                        providers[client]["usageAttribution"] = "gateway_or_mixed"
+    except Exception:
+        pass  # Optional local evidence must not interrupt ordinary usage.
     for data in providers.values():
         try:
             burn_rate = provider_burn_rate(data)
@@ -15204,6 +15257,10 @@ def _refresh_http_activity() -> None:
     try:
         try:
             activity = terminal_activity_snapshot()
+            try:
+                activity["attentionSessions"] = local_session_summary()
+            except Exception:
+                pass  # Optional hook evidence must never hide process activity.
         except Exception as exc:
             activity = {"status": "error", "updatedAt": now_iso(),
                         "error": log_safe_error(exc)}
