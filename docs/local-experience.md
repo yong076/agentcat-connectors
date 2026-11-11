@@ -7,7 +7,9 @@ claim, account action, approval reply or provider request occurs.
 Claude hooks: SessionStart, UserPromptSubmit, PostToolUse and PostToolUseFailure report running;
 PermissionRequest and permission/idle notifications report attention needed;
 Stop and SessionEnd clear it. The event store uses installation-scoped opaque
-session identities. The public projection carries counts only. Missing follow-up
+session identities. The new observation hooks persist only collector-owned state, dropping tool
+arguments/results and other incoming fields before storage. The public projection
+carries counts only. Missing follow-up
 observations expire after ten minutes. An idle prompt is not necessarily a
 permission request.
 

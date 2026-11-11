@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import unittest
 from unittest.mock import patch
 
@@ -48,9 +49,15 @@ class HookStorageTests(unittest.TestCase):
         with patch.object(agentcat.time, "time", return_value=1000):
             agentcat.store_event("claude", "claude-hook", "PermissionRequest", {
                 "session_id": "private-session", "prompt": "private prompt", "cwd": "/private/repo",
+                "tool_input": {"query": "private customer information"},
+                "tool_response": {"result": "private source code"},
                 "_agentcat_session": {"session": "forged", "state": "completed", "observedAt": 1000},
             })
             result = agentcat.local_session_summary()
         self.assertEqual(result["waiting"], 1)
         self.assertNotIn("private", json.dumps(result))
         self.assertNotIn("forged", json.dumps(result))
+        with sqlite3.connect(agentcat.EVENTS_DB) as conn:
+            stored = conn.execute("select payload_json from events order by id desc limit 1").fetchone()[0]
+        self.assertNotIn("private", stored)
+        self.assertEqual(set(json.loads(stored)), {"_agentcat_session"})

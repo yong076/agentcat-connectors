@@ -3151,6 +3151,11 @@ def store_event(provider: str, source: str, event_type: Optional[str], payload: 
     now = int(time.time())
     scope = None
     if provider == "claude" and source == "claude-hook" and isinstance(sanitized, dict):
+        if event_type in ("PermissionRequest", "Notification", "PostToolUse", "PostToolUseFailure", "SessionEnd"):
+            # These new observation hooks need state only. Tool arguments/results
+            # can carry arbitrary private content under otherwise harmless keys;
+            # never persist that payload through the generic sanitizer.
+            sanitized = {}
         sanitized.pop("_agentcat_session", None)
         session = payload.get("session_id") if isinstance(payload, dict) else None
         if isinstance(session, str) and 0 < len(session) <= 256:
