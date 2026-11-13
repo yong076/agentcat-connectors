@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import sqlite3
 import unittest
@@ -57,7 +58,7 @@ class HookStorageTests(unittest.TestCase):
         self.assertEqual(result["waiting"], 1)
         self.assertNotIn("private", json.dumps(result))
         self.assertNotIn("forged", json.dumps(result))
-        with sqlite3.connect(agentcat.EVENTS_DB) as conn:
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
             stored = conn.execute("select payload_json from events order by id desc limit 1").fetchone()[0]
         self.assertNotIn("private", stored)
         self.assertEqual(set(json.loads(stored)), {"_agentcat_session"})
