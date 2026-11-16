@@ -510,6 +510,31 @@ class CreditProbeTests(unittest.TestCase):
         self.assertEqual(copilot["label"], "Copilot · yo**")
         self.assertEqual(copilot["account"], {"handle": "yong076", "plan": "individual"})
 
+    def test_claude_passes_include_spend_credits_and_codex_forwards_credit_units(self):
+        parsed = cli_probe.parse_claude_passes({
+            "cedar_ember": {"eligible": True, "at_limit": True, "grants": [{"resets_left": 2, "usable_now": True, "label": "Fable reset"}]},
+            "extra_usage": {"is_enabled": False, "monthly_limit": 5000, "used_credits": 0.0, "decimal_places": 2, "disabled_reason": "out_of_credits"},
+            "spend": {"enabled": False, "disabled_reason": "out_of_credits", "balance": None},
+        })
+        self.assertEqual(parsed["available"], 2)
+        self.assertEqual(parsed["balances"], {"remainingUsd": 0.0, "creditsExhausted": 1.0})
+        self.assertIs(parsed["extraUsageEnabled"], False)
+
+        class FakeServer:
+            def __init__(self, _home): pass
+            def start(self): pass
+            def close(self): pass
+            def account(self): return {"email": "dev@example.com", "planType": "prolite"}
+            def usage(self):
+                return {
+                    "windows": [{"id": "codex:primary", "limitID": "codex", "primary": True, "usedPercent": 63.0, "windowDurationMins": 10080, "resetsAt": 1800000000}],
+                    "credits": {"hasCredits": True, "unlimited": False, "balance": "52050.31"},
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_row = cli_probe.probe_codex_home(Path(tmp), FakeServer)
+        self.assertEqual(codex_row["balances"], {"creditUnits": 52050.31})
+
 
 class CliSurfaceTests(unittest.TestCase):
     def test_cli_has_no_reset_pass_command(self):

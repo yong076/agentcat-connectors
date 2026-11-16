@@ -237,9 +237,14 @@ def probe_claude_home(
             passes = fetch_claude_passes(token)
         except Exception:
             passes = None
-        if passes and passes["eligible"]:
-            details["resetCreditsAvailable"] = passes["available"]
-            details["resetCredits"] = passes["credits"]
+        if passes:
+            if passes["eligible"]:
+                details["resetCreditsAvailable"] = passes["available"]
+                details["resetCredits"] = passes["credits"]
+            if passes.get("balances"):
+                details["balances"] = passes["balances"]
+            if isinstance(passes.get("extraUsageEnabled"), bool):
+                details["extraUsageEnabled"] = passes["extraUsageEnabled"]
     if not windows:
         return _result("claude", home, status="error", reason="usage_unparsed", **identity, **details)
     return _result("claude", home, windows=windows, **identity, **details)
@@ -250,7 +255,17 @@ def _codex_window(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(used, (int, float)) or isinstance(used, bool):
         return None
     mins = raw.get("windowDurationMins")
-    label = "7d" if mins == 10080 else "5h" if mins == 300 else (raw.get("name") or "quota")
+    is_scoped = raw.get("limitID") not in (None, "default", "codex")
+    raw_model = raw.get("model") if isinstance(raw.get("model"), str) and raw.get("model").strip() else None
+    raw_name = raw.get("name") if isinstance(raw.get("name"), str) and raw.get("name").strip() else None
+    model = raw_model or (raw_name if is_scoped else None)
+    span = "7d" if mins == 10080 else "5h" if mins == 300 else None
+    if model and span:
+        label = f"{model} {span}"
+    elif span:
+        label = span
+    else:
+        label = raw_name or model or "quota"
     return {
         "id": "codex:" + str(raw.get("id") or label),
         "label": label,
@@ -258,8 +273,8 @@ def _codex_window(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "usedPercent": _clamp(used),
         "remainingPercent": 100.0 - _clamp(used),
         "resetsAt": raw.get("resetsAt") if isinstance(raw.get("resetsAt"), int) else None,
-        "model": raw.get("model") if isinstance(raw.get("model"), str) else None,
-        "primary": bool(raw.get("primary")) and raw.get("limitID") in (None, "default", "codex"),
+        "model": model,
+        "primary": bool(raw.get("primary")) and not is_scoped,
     }
 
 
@@ -286,6 +301,14 @@ def probe_codex_home(home: Path, server_factory: Callable[[Path], Any]) -> Dict[
             {k: str(v) for k, v in item.items() if k in ("status", "resetType", "expiresAt", "grantedAt") and v is not None}
             for item in reset.get("details") or [] if isinstance(item, dict)
         ]
+    credits = usage.get("credits") if isinstance(usage.get("credits"), dict) else None
+    if credits:
+        if credits.get("unlimited") is True:
+            extra["balances"] = {"unlimitedCredits": 1.0}
+        else:
+            bal = _number(credits.get("balance"))
+            if bal is not None and (credits.get("hasCredits") or bal > 0):
+                extra["balances"] = {"creditUnits": max(0.0, bal)}
     billing = codex_billing(home)
     if billing:
         extra["billing"] = billing
@@ -576,8 +599,14 @@ def claude_account_details(home: Path, default_home: Path, now: Optional[dt.date
     account = raw.get("oauthAccount") if isinstance(raw, dict) else None
     if not isinstance(account, dict):
         return {}
-    tier = str(account.get("organizationRateLimitTier") or account.get("userRateLimitTier") or "").lower()
-    plan = next((label for key, label in _CLAUDE_TIERS.items() if key in tier), None)
+    tier_candidates = [
+        str(account.get(field) or "").lower()
+        for field in ("organizationRateLimitTier", "userRateLimitTier", "seatTier", "organizationType")
+    ]
+    plan = next(
+        (label for candidate in tier_candidates for key, label in _CLAUDE_TIERS.items() if key in candidate),
+        None,
+    )
     details: Dict[str, Any] = {"plan": plan}
     billing = next_monthly_renewal(account.get("subscriptionCreatedAt"), now)
     if billing:
@@ -587,7 +616,7 @@ def claude_account_details(home: Path, default_home: Path, now: Optional[dt.date
     return details
 
 
-CLAUDE_PASSES_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+CLAUDE_PASSES_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1"
 
 
 def claude_keychain_service(home: Path, default_home: Path) -> str:
@@ -600,50 +629,90 @@ def claude_keychain_service(home: Path, default_home: Path) -> str:
 
 def claude_access_token(home: Path, default_home: Path, run: Callable[..., Any] = subprocess.run) -> Optional[str]:
     """The home's current Claude Code access token, read-only; None if expired."""
+    import getpass
+
+    service = claude_keychain_service(home, default_home)
+    queries = [["security", "find-generic-password", "-s", service, "-w"]]
     try:
-        completed = run(
-            ["security", "find-generic-password", "-s", claude_keychain_service(home, default_home), "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if completed.returncode != 0:
-            return None
-        oauth = json.loads(completed.stdout).get("claudeAiOauth") or {}
-    except (OSError, ValueError, subprocess.TimeoutExpired, AttributeError):
-        return None
-    token = oauth.get("accessToken")
-    expires = oauth.get("expiresAt")
-    if not isinstance(token, str) or not token:
-        return None
-    if isinstance(expires, (int, float)) and expires / 1000 <= time.time() + 60:
-        return None  # never refresh: that would rotate Claude Code's own login
-    return token
+        user = getpass.getuser()
+        if user:
+            queries.append(["security", "find-generic-password", "-s", service, "-a", user, "-w"])
+    except Exception:
+        pass
+    for query in queries:
+        try:
+            completed = run(query, capture_output=True, text=True, timeout=5)
+            if completed.returncode != 0:
+                continue
+            oauth = json.loads(completed.stdout).get("claudeAiOauth") or {}
+        except (OSError, ValueError, subprocess.TimeoutExpired, AttributeError):
+            continue
+        token = oauth.get("accessToken")
+        expires = oauth.get("expiresAt")
+        if not isinstance(token, str) or not token:
+            continue
+        if isinstance(expires, (int, float)) and expires / 1000 <= time.time() + 60:
+            continue  # never refresh: that would rotate Claude Code's own login
+        return token
+    return None
+
+
+def _minor_money_usd(value: Any) -> Optional[float]:
+    if isinstance(value, dict) and isinstance(value.get("amount_minor"), (int, float)) and not isinstance(value.get("amount_minor"), bool):
+        exponent = value.get("exponent")
+        scale = 10 ** int(exponent) if isinstance(exponent, int) and 0 <= exponent <= 6 else 100
+        return max(0.0, float(value["amount_minor"]) / scale)
+    return _number(value)
 
 
 def parse_claude_passes(payload: Any) -> Optional[Dict[str, Any]]:
-    """`cedar_ember` from /api/oauth/usage: usage-limit reset grants."""
-    block = payload.get("cedar_ember") if isinstance(payload, dict) else None
-    if not isinstance(block, dict):
+    """`cedar_ember` + credit/spend status from /api/oauth/usage."""
+    if not isinstance(payload, dict):
         return None
+    block = payload.get("cedar_ember") if isinstance(payload.get("cedar_ember"), dict) else None
     passes = []
-    for grant in block.get("grants") or []:
-        if not isinstance(grant, dict):
-            continue
-        left = grant.get("resets_left")
-        if not isinstance(left, int):
-            continue
-        for _ in range(max(0, left)):
-            passes.append({
-                "status": "available" if grant.get("usable_now") else "unavailable",
-                "resetType": "claudeUsageLimits",
-                "title": str(grant.get("label") or "")[:120],
-                "expiresAt": grant.get("ends_at"),
-            })
-    return {
+    if block:
+        for grant in block.get("grants") or []:
+            if not isinstance(grant, dict):
+                continue
+            left = grant.get("resets_left")
+            if not isinstance(left, int):
+                continue
+            for _ in range(max(0, left)):
+                passes.append({
+                    "status": "available" if grant.get("usable_now") else "unavailable",
+                    "resetType": "claudeUsageLimits",
+                    "title": str(grant.get("label") or "")[:120],
+                    "expiresAt": grant.get("ends_at"),
+                })
+    balances: Dict[str, float] = {}
+    spend = payload.get("spend") if isinstance(payload.get("spend"), dict) else {}
+    extra = payload.get("extra_usage") if isinstance(payload.get("extra_usage"), dict) else {}
+    prepaid = _minor_money_usd(spend.get("balance"))
+    if prepaid is not None:
+        balances["remainingUsd"] = prepaid
+    elif extra.get("is_enabled") is True and isinstance(extra.get("monthly_limit"), (int, float)):
+        dec = extra.get("decimal_places")
+        scale = 10 ** int(dec) if isinstance(dec, int) and 0 < dec <= 6 else 1
+        used_raw = float(extra.get("used_credits") or 0.0)
+        balances["remainingUsd"] = max(0.0, (float(extra["monthly_limit"]) - used_raw) / scale)
+    elif spend.get("disabled_reason") == "out_of_credits" or extra.get("disabled_reason") == "out_of_credits":
+        balances["remainingUsd"] = 0.0
+        balances["creditsExhausted"] = 1.0
+    extra_enabled = extra.get("is_enabled") if isinstance(extra.get("is_enabled"), bool) else None
+    if block is None and not balances and extra_enabled is None:
+        return None
+    result: Dict[str, Any] = {
         "available": len(passes),
         "credits": passes,
-        "atLimit": bool(block.get("at_limit")),
-        "eligible": bool(block.get("eligible")),
+        "atLimit": bool(block.get("at_limit")) if block else False,
+        "eligible": bool(block.get("eligible")) if block else False,
     }
+    if balances:
+        result["balances"] = balances
+    if extra_enabled is not None:
+        result["extraUsageEnabled"] = extra_enabled
+    return result
 
 
 def fetch_claude_passes(token: str, version: str = "2.1.280") -> Optional[Dict[str, Any]]:

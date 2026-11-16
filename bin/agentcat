@@ -2096,6 +2096,72 @@ def _home_account_periods(provider: str, candidate: Dict[str, Any]) -> Dict[str,
     return periods_from_daily_tokens({day: max(0, amount - baseline.get(day, 0)) for day, amount in daily.items()})
 
 
+_FAST_LAUNCHER_CACHE: Optional[Tuple[Tuple[str, str], float, Dict[str, List[Tuple[Path, Optional[str], List[str]]]]]] = None
+
+
+def _fast_provider_home_launchers() -> Dict[str, List[Tuple[Path, Optional[str], List[str]]]]:
+    """Lightweight (<10ms) launcher + accountKey scan independent of the 15s session walk."""
+    global _FAST_LAUNCHER_CACHE
+    scope = (str(HOME), str(AGENTCAT_HOME))
+    now = time.monotonic()
+    if _FAST_LAUNCHER_CACHE is not None and _FAST_LAUNCHER_CACHE[0] == scope and now - _FAST_LAUNCHER_CACHE[1] < 60.0:
+        return _FAST_LAUNCHER_CACHE[2]
+    out: Dict[str, List[Tuple[Path, Optional[str], List[str]]]] = {p: [] for p in PROVIDER_HOME_SPECS}
+    try:
+        candidates = home_signatures.collect_candidates(
+            HOME, (HOME / ".local" / "bin", *HOME_DISCOVERY_LAUNCHER_DIRS), (), os.environ, seconds=0.5
+        )
+    except Exception:
+        candidates = []
+    by_real: Dict[str, Dict[str, Any]] = {}
+    for item in candidates:
+        try:
+            real = str(Path(item["path"]).expanduser().resolve())
+        except OSError:
+            continue
+        entry = by_real.setdefault(real, {"path": Path(item["path"]), "launchers": []})
+        for launcher in item.get("launchers") or []:
+            if launcher not in entry["launchers"]:
+                entry["launchers"].append(launcher)
+    for provider, spec in PROVIDER_HOME_SPECS.items():
+        default_dir = HOME / spec["defaultName"]
+        if default_dir.is_dir():
+            try:
+                real_default = str(default_dir.resolve())
+            except OSError:
+                real_default = str(default_dir)
+            entry = by_real.setdefault(real_default, {"path": default_dir, "launchers": []})
+            if shutil.which(provider) or (HOME / ".local" / "bin" / provider).exists():
+                if provider not in entry["launchers"]:
+                    entry["launchers"].insert(0, provider)
+        for real, info in by_real.items():
+            hpath = info["path"]
+            if not hpath.is_dir():
+                continue
+            acct_key: Optional[str] = None
+            is_provider_home = real == real_default
+            if provider == "claude":
+                ident = cli_probe.claude_identity(hpath, default_dir)
+                acct_key = home_signatures.account_key("claude", ident.get("accountID") or ident.get("email"))
+                is_provider_home = is_provider_home or acct_key is not None or (hpath / ".claude.json").is_file()
+            elif provider == "codex":
+                acct_key = home_signatures.account_key("codex", cli_probe.codex_account_id(hpath))
+                is_provider_home = is_provider_home or acct_key is not None or (hpath / "auth.json").is_file()
+            if is_provider_home and (acct_key or info["launchers"]):
+                out[provider].append((hpath, acct_key, list(info["launchers"])))
+    _FAST_LAUNCHER_CACHE = (scope, now, out)
+    return out
+
+
+def _launcher_sort_key(provider: str, name: str) -> Tuple[int, int, str]:
+    if name == provider:
+        return (0, 0, name)
+    m = re.match(r"^" + re.escape(provider) + r"[-_]?(\d+)$", name)
+    if m:
+        return (1, int(m.group(1)), name)
+    return (2, 0, name)
+
+
 def _cli_home_metadata(provider: str, row: Dict[str, Any]) -> Dict[str, Any]:
     if provider not in PROVIDER_HOME_SPECS:
         return {}
@@ -2111,8 +2177,12 @@ def _cli_home_metadata(provider: str, row: Dict[str, Any]) -> Dict[str, Any]:
             matches = cli_probe.home_key(candidate["path"]) == row.get("homeKey")
         if matches:
             homes.append(candidate)
+    launcher_set = {name for c in homes for name in c["launchers"]}
+    for hpath, acct_key, fast_launchers in _fast_provider_home_launchers().get(provider, []):
+        if (key and acct_key == key) or (not key and cli_probe.home_key(hpath) == row.get("homeKey")):
+            launcher_set.update(fast_launchers)
+    launchers = sorted(launcher_set, key=lambda n: _launcher_sort_key(provider, n))
     usage = {p: 0 for p in ("today", "week", "month")}
-    launchers = sorted({name for c in homes for name in c["launchers"]})
     for home in homes:
         periods = _home_account_periods(provider, home)
         for period in usage:
@@ -2121,7 +2191,10 @@ def _cli_home_metadata(provider: str, row: Dict[str, Any]) -> Dict[str, Any]:
     if homes:
         result["profileCount"] = len(homes)
     if launchers:
-        result["label"] = f"{CLI_PROBE_PROVIDER_NAMES[provider]} · {launchers[0]}"
+        explicit_launchers = [n for n in launchers if n != provider]
+        if explicit_launchers:
+            result["label"] = f"{CLI_PROBE_PROVIDER_NAMES[provider]} · {explicit_launchers[0]}"
+        result["launchers"] = launchers
     return result
 
 
