@@ -6,7 +6,7 @@ import base64
 import copy
 import csv
 import importlib
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 import logging
 import datetime as dt
 import email.utils
@@ -48,10 +48,17 @@ from agentcat_codex_app_server import (
     app_server_prerequisite,
 )
 import agentcat_cli_probe as cli_probe
+from agentcat_statusline import merge_windows as merge_claude_statusline_windows
+import agentcat_local_experience as local_experience
 import agentcat_home_signatures as home_signatures
 from agentcat_opencode_incremental import prepare_rows as prepare_opencode_rows
 from agentcat_jsonl_cursor import ProjectedJSONLCursor
-from agentcat_usage_archive import lookup_record as archived_usage_record, archive_records as archive_usage_records
+from agentcat_usage_archive import (
+    lookup_record as archived_usage_record,
+    archive_records as archive_usage_records,
+    open_lookup_connection as open_archive_lookup_connection,
+    prune_stale_epochs as prune_archive_stale_epochs,
+)
 from agentcat_managed_accounts import ManagedAccounts, SAFE_ADAPTER_START_ERRORS, USAGE_FRESH_SECONDS, age_usage
 from agentcat_openrouter_managed import OpenRouterManagedAuth, OpenRouterManagedError, build_adapter as build_openrouter_managed_adapter
 
@@ -262,7 +269,7 @@ COPILOT_ACCOUNTING_STATE_VERSION = 1
 OPENCODE_ACCOUNTING_STATE_VERSION = 1
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.44.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.46.0")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -1615,13 +1622,14 @@ def dedupe_usage_paths(
     kept: List[Optional[Path]] = []
 
     for path in paths:
-        try:
-            identity: Any = str(path.resolve())
-        except OSError:
-            identity = str(path)
         stat_result = _stat_quiet(path, stat_cache)
-        if stat_result is not None:
-            identity = (stat_result.st_dev, stat_result.st_ino)
+        if stat_result is not None and (stat_result.st_dev or stat_result.st_ino):
+            identity: Any = (stat_result.st_dev, stat_result.st_ino)
+        else:
+            try:
+                identity = str(path.resolve())
+            except OSError:
+                identity = str(path)
         if identity in seen_identity:
             continue
         seen_identity.add(identity)
@@ -1944,12 +1952,61 @@ def _usage_provider_homes(provider: str) -> List[Path]:
     return [c["path"] for c in _discover_provider_homes().get(provider, []) if c["state"] in ("tracked", "mirror")]
 
 
-def _usage_home_id(provider: str, path: Path) -> Optional[str]:
-    for candidate in _HOME_CANDIDATES_VALUE.get(provider, []):
+def _scandir_jsonl_files(root: Path) -> List[Path]:
+    """Walk ``root`` recursively via ``os.scandir`` without redundant per-entry lstats."""
+    out: List[Path] = []
+    seen_dirs: Set[Tuple[int, int]] = set()
+    stack: List[str] = [str(root)]
+    while stack:
+        current = stack.pop()
         try:
-            path.relative_to(candidate["path"])
-        except ValueError:
+            dir_stat = os.stat(current)
+        except OSError:
             continue
+        dir_key = (dir_stat.st_dev, dir_stat.st_ino)
+        if dir_key != (0, 0):
+            if dir_key in seen_dirs:
+                continue
+            seen_dirs.add(dir_key)
+        try:
+            with os.scandir(current) as entries:
+                subdirs: List[str] = []
+                files: List[str] = []
+                for entry in entries:
+                    name = entry.name
+                    try:
+                        if name.endswith(".jsonl") and entry.is_file(follow_symlinks=True):
+                            files.append(entry.path)
+                        elif entry.is_dir(follow_symlinks=True):
+                            subdirs.append(entry.path)
+                    except OSError:
+                        continue
+                if files:
+                    files.sort()
+                    out.extend(Path(p) for p in files)
+                if subdirs:
+                    subdirs.sort(reverse=True)
+                    stack.extend(subdirs)
+        except OSError:
+            continue
+    return out
+
+
+def _usage_home_id(provider: str, path: Path) -> Optional[str]:
+    path_str = str(path)
+    sep = os.sep
+    needs_slow_check = os.name == "nt" or (".." + sep) in path_str
+    for candidate in _HOME_CANDIDATES_VALUE.get(provider, []):
+        cpath = candidate["path"]
+        root_str = str(cpath).rstrip(sep)
+        root_prefix = root_str + sep
+        if path_str != root_str and not path_str.startswith(root_prefix):
+            if not needs_slow_check:
+                continue
+            try:
+                path.relative_to(cpath)
+            except ValueError:
+                continue
         if candidate["state"] == "tracked":
             return candidate["id"]
         if candidate["state"] == "mirror":
@@ -1960,7 +2017,8 @@ def _usage_home_id(provider: str, path: Path) -> Optional[str]:
             if sid not in owners:
                 sources = [c for c in _HOME_CANDIDATES_VALUE.get(provider, [])
                            if c["id"] in candidate["_mirrorSourceIds"]]
-                owners[sid] = _session_owner_in_homes(sid, path.relative_to(candidate["path"]), sources)
+                rel_part = Path(path_str[len(root_prefix):]) if path_str.startswith(root_prefix) else path.relative_to(cpath)
+                owners[sid] = _session_owner_in_homes(sid, rel_part, sources)
             return owners[sid] or candidate["id"]
     return None
 
@@ -3099,8 +3157,19 @@ def init_db() -> None:
         # WAL is a persistent DB property (set once, applies to every later connection):
         # readers (the 60s refresh loop) no longer block the CLI-hook writers, so a
         # store_event racing a snapshot build isn't dropped with "database is locked".
-        conn.execute("pragma journal_mode=WAL")
         conn.execute("pragma busy_timeout=5000")
+        # First-run connections can race while promoting an empty database to
+        # WAL. SQLite may return SQLITE_BUSY immediately for this pragma even
+        # with busy_timeout set. Retry only that lock, within the same 5s budget.
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                conn.execute("pragma journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
         conn.execute(
             """
             create table if not exists events (
@@ -3123,6 +3192,10 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            "create table if not exists claude_statusline_windows "
+            "(scope text primary key, windows_json text not null)"
+        )
         conn.commit()
     # The sqlite file is created on connect; lock it down owner-only afterward.
     _chmod_quiet(EVENTS_DB, 0o600)
@@ -3131,12 +3204,44 @@ def init_db() -> None:
 def store_event(provider: str, source: str, event_type: Optional[str], payload: Any) -> Dict[str, Any]:
     init_db()
     sanitized = sanitize_payload(payload)
+    now = int(time.time())
+    scope = None
+    if provider == "claude" and source == "claude-hook" and isinstance(sanitized, dict):
+        if event_type in ("PermissionRequest", "Notification", "PostToolUse", "PostToolUseFailure", "SessionEnd"):
+            # These new observation hooks need state only. Tool arguments/results
+            # can carry arbitrary private content under otherwise harmless keys;
+            # never persist that payload through the generic sanitizer.
+            sanitized = {}
+        sanitized.pop("_agentcat_session", None)
+        session = payload.get("session_id") if isinstance(payload, dict) else None
+        if isinstance(session, str) and 0 < len(session) <= 256:
+            observation = local_experience.session_observation(
+                str(event_type), payload,
+                provider_instance_id("claude-session", str(claude_config_dir()) + ":" + session), now)
+            if observation:
+                sanitized["_agentcat_session"] = observation
+    if provider == "claude" and source == "claude-statusline" and isinstance(sanitized, dict):
+        scope = claude_statusline_scope()
+        # This is collector metadata, never a scope asserted by the caller.
+        sanitized["_agentcat_statusline_scope"] = scope
     with closing(sqlite3.connect(EVENTS_DB, timeout=5.0)) as conn:
         cur = conn.execute(
             "insert into events(ts, provider, source, event_type, payload_json) values (?, ?, ?, ?, ?)",
-            (int(time.time()), provider, source, event_type, json.dumps(sanitized, ensure_ascii=False, sort_keys=True)),
+            (now, provider, source, event_type, json.dumps(sanitized, ensure_ascii=False, sort_keys=True)),
         )
         event_id = int(cur.lastrowid)
+        if scope:
+            # The insert above owns the SQLite write lock; merge + save is one
+            # transaction even when several CLI sessions report simultaneously.
+            row = conn.execute(
+                "select windows_json from claude_statusline_windows where scope = ?", (scope,)
+            ).fetchone()
+            windows = merge_claude_statusline_windows(json.loads(row[0]) if row else {}, sanitized, now)
+            conn.execute(
+                "insert into claude_statusline_windows(scope, windows_json) values (?, ?) "
+                "on conflict(scope) do update set windows_json = excluded.windows_json",
+                (scope, json.dumps(windows)),
+            )
         conn.commit()
     return {
         "id": event_id,
@@ -4040,8 +4145,53 @@ def codex_runtime_limits() -> Dict[str, Any]:
     return limits
 
 
-def claude_runtime_limits() -> Dict[str, Any]:
+def claude_statusline_scope() -> Optional[str]:
+    """Local metadata only; never credentials, email, or a payload-supplied ID.
+
+    Include the home and organization so neither a profile switch nor a change
+    of organization inherits another quota. Unknown accounts are never merged.
+    """
+    home = claude_config_dir()
+    path = cli_probe._claude_account_config(home, HOME / ".claude")
+    raw = _read_bounded_json_object(path)
+    account = raw.get("oauthAccount") if isinstance(raw, dict) else None
+    if not isinstance(account, dict):
+        return None
+    account_id = account.get("accountUuid")
+    organization = account.get("organizationUuid")
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None
+    identity = json.dumps([str(home.resolve()), account_id.strip(), organization if isinstance(organization, str) else None])
+    return provider_instance_id("claude-statusline", identity)
+
+
+def claude_statusline_record() -> Optional[Dict[str, Any]]:
     record = latest_event_record("claude", "claude-statusline")
+    scope = claude_statusline_scope()
+    if not scope:
+        # Legacy observations have no trustworthy identity. Preserve their
+        # last-report behavior, but never expose a known account after logout.
+        return record if record and not record["payload"].get("_agentcat_statusline_scope") else None
+    with closing(sqlite3.connect(EVENTS_DB)) as conn:
+        row = conn.execute(
+            "select windows_json from claude_statusline_windows where scope = ?", (scope,)
+        ).fetchone()
+    windows = json.loads(row[0]) if row else {}
+    # Session context is not an account quota; retain it only from this scope's
+    # latest event, and do not let its newer timestamp refresh retained windows.
+    matching = record and record["payload"].get("_agentcat_statusline_scope") == scope
+    payload = dict(record["payload"]) if matching else {}
+    payload["rate_limits"] = windows
+    timestamps = [window["observed_at"] for window in windows.values()]
+    if matching and isinstance(payload.get("context_window"), dict):
+        timestamps.append(record["timestamp"])
+    if not timestamps:
+        return None
+    return {"payload": payload, "timestamp": min(timestamps)}
+
+
+def claude_runtime_limits() -> Dict[str, Any]:
+    record = claude_statusline_record()
     if not record:
         return empty_limits()
     payload = record["payload"]
@@ -8397,25 +8547,43 @@ def kimi_config_model(root: Path) -> str:
     return "kimi-for-coding"
 
 
+_KIMI_CODE_LOG_MEMO: Dict[str, Tuple[Tuple[int, int], List[Tuple[str, Dict[str, int], Optional[dt.datetime]]]]] = {}
+_KIMI_WIRE_LOG_MEMO: Dict[str, Tuple[Tuple[int, int, str], List[Tuple[str, Dict[str, int], Optional[dt.datetime]]]]] = {}
+
+
 def parse_kimi_code_log(path: Path, result: Dict[str, Any]) -> int:
-    text = read_text_limited(path)
-    if text is None:
-        return 0
-    current_model = "kimi-code"
+    key = str(path)
+    stat_result = _stat_quiet(path)
+    stamp = (stat_result.st_size, stat_result.st_mtime_ns) if stat_result is not None else None
+    cached = _KIMI_CODE_LOG_MEMO.get(key)
+    if stamp is not None and cached is not None and cached[0] == stamp:
+        records = cached[1]
+    else:
+        text = read_text_limited(path)
+        if text is None:
+            return 0
+        current_model = "kimi-code"
+        records = []
+        for line in text.splitlines():
+            model_match = KIMI_LOG_MODEL_ALIAS_RE.search(line) or KIMI_LOG_MODEL_RE.search(line)
+            if model_match:
+                current_model = normalized_model_name(model_match.group(1)) or current_model
+                continue
+            response_match = KIMI_LOG_RESPONSE_RE.search(line)
+            if not response_match:
+                continue
+            output_tokens = nonnegative_int(response_match.group(1)) or 0
+            if output_tokens <= 0:
+                continue
+            when = parse_timestamp(line.split(None, 1)[0] if line else None)
+            records.append((current_model, {"outputTokens": output_tokens}, when))
+        if stamp is not None:
+            if len(_KIMI_CODE_LOG_MEMO) > LOCAL_PROVIDER_MAX_FILES:
+                _KIMI_CODE_LOG_MEMO.clear()
+            _KIMI_CODE_LOG_MEMO[key] = (stamp, records)
     events = 0
-    for line in text.splitlines():
-        model_match = KIMI_LOG_MODEL_ALIAS_RE.search(line) or KIMI_LOG_MODEL_RE.search(line)
-        if model_match:
-            current_model = normalized_model_name(model_match.group(1)) or current_model
-            continue
-        response_match = KIMI_LOG_RESPONSE_RE.search(line)
-        if not response_match:
-            continue
-        output_tokens = nonnegative_int(response_match.group(1)) or 0
-        if output_tokens <= 0:
-            continue
-        when = parse_timestamp(line.split(None, 1)[0] if line else None)
-        if add_usage_metrics(result, current_model, {"outputTokens": output_tokens}, when):
+    for rec_model, metrics, when in records:
+        if add_usage_metrics(result, rec_model, metrics, when):
             events += 1
             update_breakdown(result["breakdown"], chat=1)
     return events
@@ -8457,13 +8625,27 @@ def kimi_wire_metrics(event: Dict[str, Any]) -> Dict[str, int]:
 
 
 def parse_kimi_wire_log(path: Path, result: Dict[str, Any], model: str) -> int:
+    key = str(path)
+    stat_result = _stat_quiet(path)
+    stamp = (stat_result.st_size, stat_result.st_mtime_ns, model) if stat_result is not None else None
+    cached = _KIMI_WIRE_LOG_MEMO.get(key)
+    if stamp is not None and cached is not None and cached[0] == stamp:
+        records = cached[1]
+    else:
+        records = []
+        for event in iter_jsonl_file(path):
+            metrics = kimi_wire_metrics(event)
+            if not metrics:
+                continue
+            when = parse_timestamp(event.get("timestamp") if event.get("timestamp") is not None else event.get("time"))
+            records.append((model, metrics, when))
+        if stamp is not None:
+            if len(_KIMI_WIRE_LOG_MEMO) > LOCAL_PROVIDER_MAX_FILES:
+                _KIMI_WIRE_LOG_MEMO.clear()
+            _KIMI_WIRE_LOG_MEMO[key] = (stamp, records)
     events = 0
-    for event in iter_jsonl_file(path):
-        metrics = kimi_wire_metrics(event)
-        if not metrics:
-            continue
-        when = parse_timestamp(event.get("timestamp") if event.get("timestamp") is not None else event.get("time"))
-        if add_usage_metrics(result, model, metrics, when):
+    for rec_model, metrics, when in records:
+        if add_usage_metrics(result, rec_model, metrics, when):
             events += 1
             update_breakdown(result["breakdown"], chat=1)
     return events
@@ -8644,8 +8826,17 @@ def grok_tool_call_id(update: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+_GROK_UPDATES_MEMO: Dict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = {}
+
+
 def parse_grok_updates(path: Path) -> Dict[str, Any]:
     """Read usage/tool metadata from one updates.jsonl. Ignores prompt text."""
+    key = str(path)
+    stat_result = _stat_quiet(path)
+    stamp = (stat_result.st_size, stat_result.st_mtime_ns) if stat_result is not None else None
+    cached = _GROK_UPDATES_MEMO.get(key)
+    if stamp is not None and cached is not None and cached[0] == stamp:
+        return cached[1]
     usage_by_prompt: Dict[str, Dict[str, Any]] = {}
     media_ids: Dict[str, Set[str]] = {"images": set(), "videos": set()}
     tool_names: List[str] = []
@@ -8674,12 +8865,17 @@ def parse_grok_updates(path: Path) -> Dict[str, Any]:
                     "when": grok_event_timestamp(event, update),
                     "model": grok_usage_model(usage if isinstance(usage, dict) else {}, None),
                 }
-    return {
+    parsed = {
         "usage": list(usage_by_prompt.values()),
         "images": len(media_ids["images"]),
         "videos": len(media_ids["videos"]),
         "tool_names": tool_names,
     }
+    if stamp is not None:
+        if len(_GROK_UPDATES_MEMO) > LOCAL_PROVIDER_MAX_FILES:
+            _GROK_UPDATES_MEMO.clear()
+        _GROK_UPDATES_MEMO[key] = (stamp, parsed)
+    return parsed
 
 
 def grok_snapshot() -> Dict[str, Any]:
@@ -9717,6 +9913,9 @@ def codex_session_token_raw_delta(
     return delta, next_counted, next_raw, next_saw_divergent
 
 
+CODEX_SESSION_FILES_MAX = 60000
+
+
 def codex_session_files() -> List[Path]:
     homes = _usage_provider_homes("codex")
     roots = [root for root in codex_session_roots() if root.is_dir()]
@@ -9725,11 +9924,7 @@ def codex_session_files() -> List[Path]:
     files: List[Path] = []
     seen: Set[str] = set()
     for root in roots:
-        try:
-            candidates = [p for p in root.glob("**/*.jsonl") if p.is_file()]
-        except OSError:
-            continue
-        for path in candidates:
+        for path in _scandir_jsonl_files(root):
             key = str(path)
             if key in seen:
                 continue
@@ -9742,10 +9937,14 @@ def codex_session_files() -> List[Path]:
     stat_cache: Dict[str, Any] = {}
     files = [p for p in files if _usage_home_id("codex", p)]
     files = dedupe_usage_paths(files, stat_cache, match_session_identity=len(homes) > 1)
-    # Heavy Codex users can exceed the scan cap. Prefer the newest rollouts so
-    # today/week windows do not get stranded on old history, then parse the
-    # selected files in path order for deterministic cursor updates.
-    files = recent_files(files, stat_cache)
+    # Cursor-backed scans touch only changed files via _CODEX_FILE_IDENTITY_CACHE,
+    # so keep a high ceiling to avoid dropping history and triggering pendingReconcile.
+    if len(files) > CODEX_SESSION_FILES_MAX:
+        files = sorted(
+            files,
+            key=lambda p: (stat_cache[str(p)].st_mtime if str(p) in stat_cache and stat_cache[str(p)] is not None else 0.0),
+            reverse=True,
+        )[:CODEX_SESSION_FILES_MAX]
     files.sort(key=lambda p: str(p))
     return files
 
@@ -10349,7 +10548,26 @@ def codex_state_sqlite_paths() -> List[Path]:
     return sorted(paths, key=sort_key)
 
 
+_CODEX_ROLLOUT_MODEL_CACHE: Dict[Tuple[str, str], Optional[str]] = {}
+_CODEX_SQLITE_SNAPSHOT_MEMO: Optional[Tuple[Any, Dict[str, Any]]] = None
+
+
+def _sqlite_db_stamp(db_path: Path) -> Optional[Tuple[Any, ...]]:
+    main = _stat_quiet(db_path)
+    if main is None:
+        return None
+    wal = _stat_quiet(Path(str(db_path) + "-wal"))
+    return (
+        main.st_dev,
+        main.st_ino,
+        main.st_size,
+        main.st_mtime_ns,
+        (wal.st_size, wal.st_mtime_ns) if wal is not None else None,
+    )
+
+
 def codex_sqlite_snapshot() -> Dict[str, Any]:
+    global _CODEX_SQLITE_SNAPSHOT_MEMO
     paths = codex_state_sqlite_paths()
     result: Dict[str, Any] = {
         "status": "not_found",
@@ -10365,6 +10583,11 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
         return result
 
     db_path = paths[-1]
+    today_key = day_key_for_timestamp(dt.datetime.now(dt.timezone.utc))
+    db_stamp = _sqlite_db_stamp(db_path)
+    memo_key = (str(db_path), db_stamp, today_key)
+    if db_stamp is not None and _CODEX_SQLITE_SNAPSHOT_MEMO is not None and _CODEX_SQLITE_SNAPSHOT_MEMO[0] == memo_key:
+        return attach_codex_usage_breakdown(copy.deepcopy(_CODEX_SQLITE_SNAPSHOT_MEMO[1]))
     result["source"] = snapshot_source_label(db_path)
 
     def read_rows(conn: sqlite3.Connection) -> Tuple[List[str], Optional[List[Any]]]:
@@ -10398,7 +10621,9 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
     project_tokens: Dict[str, int] = {}
     project_models: Dict[str, Dict[str, int]] = {}
     project_last: Dict[str, dt.datetime] = {}
-    rollout_model_cache: Dict[str, Optional[str]] = {}
+    db_scope = str(codex_home())
+    if len(_CODEX_ROLLOUT_MODEL_CACHE) > 100000:
+        _CODEX_ROLLOUT_MODEL_CACHE.clear()
     for tokens_raw, model_raw, updated_raw, rollout_raw, cwd_raw in rows:
         try:
             tokens = int(tokens_raw or 0)
@@ -10412,10 +10637,10 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
         add_to_hourly(result["hourlyTokens"], tokens, when)
         model = normalized_model_name(model_raw)
         if model is None and rollout_raw:
-            rollout_key = str(rollout_raw)
-            if rollout_key not in rollout_model_cache:
-                rollout_model_cache[rollout_key] = codex_model_from_rollout(rollout_raw)
-            model = rollout_model_cache[rollout_key]
+            cache_key = (db_scope, str(rollout_raw))
+            if cache_key not in _CODEX_ROLLOUT_MODEL_CACHE:
+                _CODEX_ROLLOUT_MODEL_CACHE[cache_key] = codex_model_from_rollout(rollout_raw)
+            model = _CODEX_ROLLOUT_MODEL_CACHE[cache_key]
         if model is None:
             model = "unknown"
         model_periods = models.setdefault(model, empty_periods())
@@ -10455,6 +10680,8 @@ def codex_sqlite_snapshot() -> Dict[str, Any]:
     if rows:
         result["breakdown"]["chat"] = len(rows)
         result["breakdown"]["status"] = "ok"
+    if db_stamp is not None:
+        _CODEX_SQLITE_SNAPSHOT_MEMO = (memo_key, copy.deepcopy(result))
     return attach_codex_usage_breakdown(result)
 
 
@@ -11117,7 +11344,33 @@ def _empty_journal_models() -> Dict[str, Dict[str, Any]]:
     return {}
 
 
+_JOURNAL_CURSOR_CACHE: Optional[Tuple[str, Any, Dict[str, Any]]] = None
+_PRUNED_ARCHIVE_EPOCHS: Set[Tuple[str, str]] = set()
+
+
+def _journal_cursor_stamp() -> Optional[Tuple[int, int]]:
+    try:
+        stat = JOURNAL_CURSOR_FILE.stat()
+        return (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
 def load_journal_cursor() -> Dict[str, Any]:
+    global _JOURNAL_CURSOR_CACHE
+    stamp = _journal_cursor_stamp()
+    key = str(JOURNAL_CURSOR_FILE)
+    if _JOURNAL_CURSOR_CACHE is not None:
+        cached_path, previous_stamp, cached_cursor = _JOURNAL_CURSOR_CACHE
+        if cached_path == key and previous_stamp == stamp and stamp is not None:
+            return cached_cursor
+    cursor = _read_journal_cursor()
+    if stamp is not None:
+        _JOURNAL_CURSOR_CACHE = (key, stamp, cursor)
+    return cursor
+
+
+def _read_journal_cursor() -> Dict[str, Any]:
     raw = read_json(JOURNAL_CURSOR_FILE)
     if not isinstance(raw, dict) or raw.get("version") != CLAUDE_JOURNAL_CURSOR_VERSION:
         needs_rebuild = isinstance(raw, dict)
@@ -11212,6 +11465,7 @@ def cursor_recently_saved(path: Path) -> bool:
 
 
 def save_journal_cursor(cursor: Dict[str, Any]) -> bool:
+    global _JOURNAL_CURSOR_CACHE
     tmp = unique_atomic_tmp_path(JOURNAL_CURSOR_FILE)
     try:
         AGENTCAT_HOME.mkdir(parents=True, exist_ok=True)
@@ -11221,6 +11475,7 @@ def save_journal_cursor(cursor: Dict[str, Any]) -> bool:
             json.dump(cursor, fh, ensure_ascii=False, separators=(",", ":"))
             fh.write("\n")
         tmp.replace(JOURNAL_CURSOR_FILE)
+        _JOURNAL_CURSOR_CACHE = (str(JOURNAL_CURSOR_FILE), _journal_cursor_stamp(), cursor)
         return True
     except Exception as exc:
         logging.debug("save_journal_cursor failed: %s", exc)
@@ -11375,10 +11630,8 @@ def claude_journal_files_by_root() -> List[Tuple[Path, List[Path]]]:
     ordered: List[Tuple[Path, Path]] = []
     cli_roots = {str(h / "projects") for h in _usage_provider_homes("claude")}
     for root in roots:
-        try:
-            paths = sorted(root.rglob("*.jsonl"))
-        except OSError:
-            continue
+        paths = _scandir_jsonl_files(root)
+        paths.sort()
         for path in paths:
             if str(root) in cli_roots and not _usage_home_id("claude", path):
                 continue
@@ -11550,7 +11803,9 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
     grouped_files = claude_journal_files_by_root()
     selected = {str(p): _usage_home_id("claude", p) for _, paths in grouped_files for p in paths}
     old_paths = cursor.get("usagePaths")
-    needs_home_rebuild = bool(offsets and "homeDaily" not in cursor) or (isinstance(old_paths, dict) and any(selected.get(p) != hid for p, hid in old_paths.items()))
+    needs_home_rebuild = bool(offsets and "homeDaily" not in cursor) or (
+        isinstance(old_paths, dict) and any(p in selected and selected[p] != hid for p, hid in old_paths.items())
+    )
     home_daily = cursor.setdefault("homeDaily", {})
     if cursor.pop("usage_needs_rebuild", False) or needs_home_rebuild:
         changed = True
@@ -11568,6 +11823,14 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         archive_available = False  # New generation never reuses an old rollup.
         home_daily.clear()
         cursor["projects_needs_rebuild"] = False
+    elif archive_available and isinstance(cursor.get("usageRecordEpoch"), str):
+        prune_key = (str(archive_path), cursor["usageRecordEpoch"])
+        if prune_key not in _PRUNED_ARCHIVE_EPOCHS:
+            try:
+                prune_archive_stale_epochs(archive_path, cursor["usageRecordEpoch"])
+            except Exception as exc:
+                logging.debug("prune_archive_stale_epochs failed: %s", exc)
+            _PRUNED_ARCHIVE_EPOCHS.add(prune_key)
     if cursor.pop("projects_needs_rebuild", False):
         # Existing cursors predate per-project attribution. Rebuild only
         # project totals from JSONL so historical project usage appears
@@ -11577,83 +11840,89 @@ def scan_claude_journal(cursor: Dict[str, Any]) -> Dict[str, Any]:
         projects.clear()
         projects.update(rebuild_claude_journal_projects(now_utc))
     cursor["usagePaths"] = selected
-    for _root, paths in grouped_files:
-        for path in paths:
-            path_str = str(path)
-            try:
-                file_size = path.stat().st_size
-            except OSError:
-                continue
-            stored_offset = offsets.get(path_str, 0)
-            if stored_offset > file_size:
-                stored_offset = 0
-            if stored_offset >= file_size:
-                continue
-            lines_parsed = lines_skipped = 0
-            new_offset = stored_offset
-            try:
-                with path.open("rb") as fh:
-                    fh.seek(stored_offset)
-                    for raw_line in fh:
-                        if not raw_line.endswith(b"\n"):
-                            # Incomplete trailing line (writer mid-append): stop before
-                            # advancing the cursor past it (audit #8). The next scan resumes
-                            # at this byte once the writer completes the record.
-                            break
-                        new_offset += len(raw_line)
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            lines_skipped += 1
-                            continue
-                        rec = parse_claude_usage_line(obj)
-                        if rec:
-                            hid = selected[path_str]
-                            dedupe_key = rec.get("dedupeKey")
-                            if isinstance(dedupe_key, str) and dedupe_key:
-                                previous_raw = usage_records.get(dedupe_key)
-                                if previous_raw is None and archive_available:
-                                    previous_raw = archived_usage_record(archive_path, cursor["usageRecordEpoch"], dedupe_key)
-                                previous = claude_record_from_cursor(previous_raw)
-                                if previous is not None:
-                                    if claude_record_total(rec) <= claude_record_total(previous):
-                                        continue
-                                    _apply_record_to_totals(
-                                        totals,
-                                        previous,
-                                        now_utc,
-                                        projects,
-                                        daily_tokens,
-                                        hourly_tokens,
-                                        models,
-                                        sign=-1,
-                                    )
-                                if previous is not None:
-                                    previous_hid = previous_raw.get("homeId")
-                                    _apply_home_record(home_daily, previous_hid, previous, -1)
-                                usage_records[dedupe_key] = {**claude_record_for_cursor(rec), "homeId": hid}
-                            _apply_home_record(home_daily, hid, rec)
-                            _apply_record_to_totals(
-                                totals,
-                                rec,
-                                now_utc,
-                                projects,
-                                daily_tokens,
-                                hourly_tokens,
-                                models,
-                            )
-                            lines_parsed += 1
-            except OSError as exc:
-                warn_unreadable_path("scan_claude_journal", path, exc)
-                continue
-            if offsets.get(path_str) != new_offset:
-                changed = True
-            offsets[path_str] = new_offset
-            logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
-                          path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
+    with (open_archive_lookup_connection(archive_path) if archive_available else nullcontext(None)) as archive_conn:
+        for _root, paths in grouped_files:
+            for path in paths:
+                path_str = str(path)
+                try:
+                    file_size = path.stat().st_size
+                except OSError:
+                    continue
+                stored_offset = offsets.get(path_str, 0)
+                if stored_offset > file_size:
+                    stored_offset = 0
+                if stored_offset >= file_size:
+                    continue
+                lines_parsed = lines_skipped = 0
+                new_offset = stored_offset
+                try:
+                    with path.open("rb") as fh:
+                        fh.seek(stored_offset)
+                        for raw_line in fh:
+                            if not raw_line.endswith(b"\n"):
+                                # Incomplete trailing line (writer mid-append): stop before
+                                # advancing the cursor past it (audit #8). The next scan resumes
+                                # at this byte once the writer completes the record.
+                                break
+                            new_offset += len(raw_line)
+                            line = raw_line.decode("utf-8", errors="replace").strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                            except json.JSONDecodeError:
+                                lines_skipped += 1
+                                continue
+                            rec = parse_claude_usage_line(obj)
+                            if rec:
+                                hid = selected[path_str]
+                                dedupe_key = rec.get("dedupeKey")
+                                if isinstance(dedupe_key, str) and dedupe_key:
+                                    previous_raw = usage_records.get(dedupe_key)
+                                    if previous_raw is None and archive_available:
+                                        previous_raw = archived_usage_record(
+                                            archive_path,
+                                            cursor["usageRecordEpoch"],
+                                            dedupe_key,
+                                            connection=archive_conn,
+                                        )
+                                    previous = claude_record_from_cursor(previous_raw)
+                                    if previous is not None:
+                                        if claude_record_total(rec) <= claude_record_total(previous):
+                                            continue
+                                        _apply_record_to_totals(
+                                            totals,
+                                            previous,
+                                            now_utc,
+                                            projects,
+                                            daily_tokens,
+                                            hourly_tokens,
+                                            models,
+                                            sign=-1,
+                                        )
+                                    if previous is not None:
+                                        previous_hid = previous_raw.get("homeId")
+                                        _apply_home_record(home_daily, previous_hid, previous, -1)
+                                    usage_records[dedupe_key] = {**claude_record_for_cursor(rec), "homeId": hid}
+                                _apply_home_record(home_daily, hid, rec)
+                                _apply_record_to_totals(
+                                    totals,
+                                    rec,
+                                    now_utc,
+                                    projects,
+                                    daily_tokens,
+                                    hourly_tokens,
+                                    models,
+                                )
+                                lines_parsed += 1
+                except OSError as exc:
+                    warn_unreadable_path("scan_claude_journal", path, exc)
+                    continue
+                if offsets.get(path_str) != new_offset:
+                    changed = True
+                offsets[path_str] = new_offset
+                logging.debug("journal scan: %s bytes_read=%d parsed=%d skipped=%d",
+                              path.name, new_offset - stored_offset, lines_parsed, lines_skipped)
     for obsolete in list(offsets):
         if obsolete not in selected and not Path(obsolete).exists():
             offsets.pop(obsolete, None)
@@ -13689,9 +13958,40 @@ def safe_activity_command(provider: str, pid: int) -> str:
     return f"{provider} pid {pid}"
 
 
-def motion_stage(process_count: int, total_cpu: float, runnable_process_count: int) -> str:
+def has_recent_motion_activity(active_providers: Any) -> bool:
+    """Use recorded hook/notify activity, not periodic statusline refreshes."""
+    providers = tuple(set(active_providers))
+    if not providers or not EVENTS_DB.is_file():
+        return False
+    current = time.time()
+    try:
+        with closing(sqlite3.connect(EVENTS_DB.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as conn:
+            return any(
+                conn.execute(
+                    "select 1 from events where provider = ? and ts >= ? and ts <= ? "
+                    "and source in ('claude-hook', 'gemini-hook', 'codex-notify') limit 1",
+                    (provider, current - 60, current),
+                ).fetchone() is not None
+                for provider in providers
+            )
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def motion_stage(
+    process_count: int,
+    total_cpu: float,
+    runnable_process_count: int,
+    *,
+    recent_activity: bool = False,
+) -> str:
     if process_count <= 0:
         return "sleeping"
+
+    # ps CPU can remain high while agents wait for input. Require a runnable
+    # process or a recent recorded activity event before using faster stages.
+    if runnable_process_count <= 0 and not recent_activity:
+        return "walking"
 
     activity_score = total_cpu + float(runnable_process_count) * 4.0
     if activity_score >= 22:
@@ -13763,7 +14063,14 @@ def windows_activity_from_rows(
             "totalMemoryBytes": total_memory,
             "runnableProcessCount": runnable_process_count,
             "activityScore": activity_score,
-            "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
+            "motionStage": motion_stage(
+                len(rows),
+                total_cpu,
+                runnable_process_count,
+                recent_activity=has_recent_motion_activity(
+                    provider for provider, count in counts.items() if count > 0
+                ) if rows and runnable_process_count == 0 and total_cpu >= 7 else False,
+            ),
             "runtimeModes": safe_runtime_modes_snapshot(
                 active_providers=[provider for provider, count in counts.items() if count > 0]
             ),
@@ -14049,7 +14356,14 @@ def terminal_activity_snapshot() -> Dict[str, Any]:
             "totalMemoryBytes": total_memory,
             "runnableProcessCount": runnable_process_count,
             "activityScore": activity_score,
-            "motionStage": motion_stage(len(rows), total_cpu, runnable_process_count),
+            "motionStage": motion_stage(
+                len(rows),
+                total_cpu,
+                runnable_process_count,
+                recent_activity=has_recent_motion_activity(
+                    provider for provider, count in counts.items() if count > 0
+                ) if rows and runnable_process_count == 0 and total_cpu >= 7 else False,
+            ),
             "runtimeModes": safe_runtime_modes_snapshot(
                 active_providers=[provider for provider, count in counts.items() if count > 0]
             ),
@@ -14886,7 +15200,10 @@ _BUILD_SNAPSHOT_LOCK = threading.RLock()
 _DAEMON_BIND_PORT = 8765
 
 
-def connector_health_snapshot(providers: Dict[str, Any]) -> Dict[str, Any]:
+def connector_health_snapshot(
+    providers: Dict[str, Any],
+    provider_instances: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """Bounded, token-only health from already collected local evidence.
 
     Never run doctor, read credentials, scan files or call providers here.
@@ -14902,6 +15219,22 @@ def connector_health_snapshot(providers: Dict[str, Any]) -> Dict[str, Any]:
         "not_configured": "run_provider_once",
         "permission_denied": "grant_full_disk_access",
     }
+    healthy_instance_providers: Set[str] = set()
+    for instance in provider_instances or ():
+        if not isinstance(instance, dict) or instance.get("stale") or instance.get("isStale"):
+            continue
+        inst_limits = instance.get("limits")
+        if not isinstance(inst_limits, dict):
+            continue
+        quotas = inst_limits.get("quotas")
+        if not isinstance(quotas, list) or not quotas:
+            continue
+        pid = str(instance.get("providerID") or instance.get("provider") or "").strip()
+        if pid:
+            healthy_instance_providers.add(pid)
+        for q in quotas:
+            if isinstance(q, dict) and str(q.get("id") or "").startswith("antigravity:"):
+                healthy_instance_providers.add("antigravity")
     for provider, data in sorted(providers.items()):
         if provider not in CONFIG_PROVIDER_IDS or not isinstance(data, dict):
             continue
@@ -14922,7 +15255,12 @@ def connector_health_snapshot(providers: Dict[str, Any]) -> Dict[str, Any]:
         reason = limits.get("reason")
         if limits.get("stale") and reason not in known_reasons:
             reason = "snapshot_stale"
-        qstate = "ok" if limits.get("status") in ("ok", "available") and not limits.get("stale") and reason not in known_reasons else "warn"
+        has_live_instance = provider in healthy_instance_providers
+        qstate = (
+            "ok"
+            if has_live_instance or (limits.get("status") in ("ok", "available") and not limits.get("stale") and reason not in known_reasons)
+            else "warn"
+        )
         quota: Dict[str, Any] = {"id": provider + ".limits", "state": qstate}
         if qstate != "ok":
             quota["reason"] = (reason if reason in known_reasons or reason == "snapshot_stale"
@@ -14932,6 +15270,30 @@ def connector_health_snapshot(providers: Dict[str, Any]) -> Dict[str, Any]:
         sources.append(quota)
     return {"localhost": {"host": "127.0.0.1", "port": _DAEMON_BIND_PORT, "state": "ok"},
             "sources": sources}
+
+
+def local_session_summary() -> Dict[str, Any]:
+    now = int(time.time())
+    init_db()
+    with closing(sqlite3.connect(EVENTS_DB)) as conn:
+        rows = conn.execute(
+            "select payload_json from events where provider = 'claude' and source = 'claude-hook' "
+            "and ts >= ? order by ts desc, id desc limit 2000", (now - 600,)
+        ).fetchall()
+    observations = []
+    for row in reversed(rows):
+        try:
+            payload = json.loads(row[0])
+            observation = payload.get("_agentcat_session") if isinstance(payload, dict) else None
+            if isinstance(observation, dict):
+                observations.append(observation)
+        except ValueError:
+            continue
+    return local_experience.session_summary(observations, now)
+
+
+def local_experience_snapshot() -> Dict[str, Any]:
+    return {"sessions": local_session_summary()}
 
 
 def build_snapshot() -> Dict[str, Any]:
@@ -15031,6 +15393,11 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         # subscriptions. Their USD amounts are only for the connected key.
         "connections": openrouter_connections_snapshot(),
     }
+    try:
+        snapshot["localExperience"] = local_experience_snapshot()
+        activity["attentionSessions"] = snapshot["localExperience"]["sessions"]
+    except Exception:
+        pass  # Optional local evidence must not interrupt ordinary usage.
     for data in providers.values():
         try:
             burn_rate = provider_burn_rate(data)
@@ -15102,7 +15469,7 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     snapshot["insights"] = insights_by_period["week"]
     # Health failure must never prevent snapshot publication.
     try:
-        snapshot["health"] = connector_health_snapshot(providers)
+        snapshot["health"] = connector_health_snapshot(providers, snapshot.get("providerInstances"))
     except Exception:
         snapshot["capabilities"].remove("connector.health.v1")
     write_json_atomic(LATEST_SNAPSHOT, snapshot)
@@ -15125,6 +15492,10 @@ def _refresh_http_activity() -> None:
     try:
         try:
             activity = terminal_activity_snapshot()
+            try:
+                activity["attentionSessions"] = local_session_summary()
+            except Exception:
+                pass  # Optional hook evidence must never hide process activity.
         except Exception as exc:
             activity = {"status": "error", "updatedAt": now_iso(),
                         "error": log_safe_error(exc)}
