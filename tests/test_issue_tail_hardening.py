@@ -135,6 +135,41 @@ class IssueTailHardeningTests(unittest.TestCase):
             self.assertEqual(cursor['totals']['all_input'], 50)
             self.assertEqual(cursor['totals']['all_output'], 20)
 
+    def test_archive_compacts_orphaned_epochs_and_vanished_journal_keeps_epoch(self):
+        from agentcat_usage_archive import archive_records, prune_stale_epochs
+        archive = app.AGENTCAT_HOME / "journal-usage-archive.sqlite"
+        archive_records(archive, "stale-epoch-1", {"req:1": {"input": 5}})
+        archive_records(archive, "stale-epoch-2", {"req:2": {"input": 7}})
+        self.assertIsNotNone(lookup_record(archive, "stale-epoch-2", "req:2"))
+        self.assertIsNone(lookup_record(archive, "stale-epoch-1", "req:1"))
+
+        archive_records(archive, "active-epoch", {"req:live": {"input": 11}})
+        self.assertIsNone(lookup_record(archive, "stale-epoch-2", "req:2"))
+        self.assertEqual(lookup_record(archive, "active-epoch", "req:live"), {"input": 11})
+        self.assertFalse(prune_stale_epochs(archive, "active-epoch"))
+
+        kept = self.root / "kept.jsonl"
+        vanished = self.root / "vanished.jsonl"
+        ts = dt.datetime.now(dt.timezone.utc).isoformat()
+        line = json.dumps({
+            "type": "assistant", "timestamp": ts, "requestId": "req-keep",
+            "message": {"model": "claude-opus-5", "usage": {"input_tokens": 12, "output_tokens": 3}},
+        }) + "\n"
+        kept.write_text(line)
+        vanished.write_text(line.replace("req-keep", "req-gone"))
+        with patch.object(app, "claude_journal_files_by_root", return_value=[(self.root, [kept, vanished])]), \
+             patch.object(app, "_usage_home_id", return_value="home-1"), \
+             patch.object(app, "_prepare_home_accounts", return_value=False):
+            cursor = app.scan_claude_journal(app.load_journal_cursor())
+            initial_epoch = cursor["usageRecordEpoch"]
+        vanished.unlink()
+        with patch.object(app, "claude_journal_files_by_root", return_value=[(self.root, [kept])]), \
+             patch.object(app, "_usage_home_id", return_value="home-1"), \
+             patch.object(app, "_prepare_home_accounts", return_value=False):
+            cursor = app.scan_claude_journal(cursor)
+            self.assertEqual(cursor["usageRecordEpoch"], initial_epoch)
+            self.assertFalse(cursor["_rebuilt"])
+
     @unittest.skipIf(os.name == 'nt', 'POSIX entrypoint; Windows uses uninstall.ps1')
     def test_posix_uninstall_uses_local_installer_without_replacing_source(self):
         source = self.root / "installed source"; (source / "scripts").mkdir(parents=True)

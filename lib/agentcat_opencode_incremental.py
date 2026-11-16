@@ -35,8 +35,8 @@ def prepare_rows(connection, read_rows, cached=None):
         if not {"id", "time_updated", "session_id"}.issubset(columns):
             rows, warnings = read_rows(connection)
             return rows, warnings, None
-        rows = list(connection.execute(f"select id, time_updated, session_id from {table} limit 10001"))
-        if len(rows) > 10000:
+        rows = list(connection.execute(f"select id, time_updated, session_id from {table} limit 100001"))
+        if len(rows) > 100000:
             result, warnings = read_rows(connection)
             return result, warnings, None
         if any(not isinstance(identifier, str) or not identifier or not isinstance(updated, int)
@@ -84,7 +84,7 @@ def prepare_rows(connection, read_rows, cached=None):
     result = [row for row in result if ("session_message" if row[0] else "message", row[1]) in versions]
     result.sort(key=lambda row: (not row[0], str(row[1])))
     candidate = None
-    if len(result) <= 10000 and not warnings:
+    if len(result) <= 100000 and not warnings:
         candidate = {"context": context, "versions": versions, "warnings": list(warnings),
                      "rows": {("session_message" if row[0] else "message", row[1]): row for row in result}}
     return result, warnings, candidate
