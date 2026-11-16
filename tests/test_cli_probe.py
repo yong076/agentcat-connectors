@@ -500,6 +500,16 @@ class CreditProbeTests(unittest.TestCase):
         self.assertFalse(amp["limits"]["stale"])
         self.assertEqual(amp["balances"], {"remainingUsd": 3.0})
 
+    def test_copilot_row_exposes_local_handle_without_unmasking_sync_label(self):
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as tmp, patch.object(agentcat, "CLI_PROBE_CACHE", Path(tmp) / "cache.json"):
+            (Path(tmp) / "cache.json").write_text(json.dumps({"results": [
+                {"provider": "copilot", "homeKey": "f" * 16, "accountID": "yong076", "plan": "individual",
+                 "status": "ok", "windows": [], "fetchedAt": now}]}))
+            copilot = agentcat.cli_probe_provider_instances()[0]
+        self.assertEqual(copilot["label"], "Copilot · yo**")
+        self.assertEqual(copilot["account"], {"handle": "yong076", "plan": "individual"})
+
 
 class CliSurfaceTests(unittest.TestCase):
     def test_cli_has_no_reset_pass_command(self):

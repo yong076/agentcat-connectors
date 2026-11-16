@@ -15869,6 +15869,10 @@ def cli_probe_provider_instances(now: Optional[float] = None) -> List[Dict[str, 
         if email:
             # Local display only (see the app's LocalConnectorAccount privacy note).
             instance["account"] = {"email": email, "plan": row.get("plan")}
+        elif login and login.strip():
+            # Copilot reports a GitHub handle rather than an email; keep it in
+            # local-only `account.handle` while `label` stays masked for sync.
+            instance["account"] = {"handle": login.strip(), "plan": row.get("plan")}
         if isinstance(row.get("billing"), dict):
             instance["billing"] = {k: row["billing"].get(k) for k in ("renewsAt", "estimated")}
         if isinstance(row.get("extraUsageEnabled"), bool):
