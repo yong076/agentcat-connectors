@@ -535,6 +535,47 @@ class CreditProbeTests(unittest.TestCase):
             codex_row = cli_probe.probe_codex_home(Path(tmp), FakeServer)
         self.assertEqual(codex_row["balances"], {"creditUnits": 52050.31})
 
+    def test_antigravity_merges_active_gemini_5h_and_skips_disabled_3p_5h(self):
+        summary = {
+            "groups": [{
+                "displayName": "Claude and GPT models",
+                "buckets": [
+                    {"bucketId": "3p-weekly", "window": "weekly", "resetTime": "2026-11-21T04:49:56Z", "remainingFraction": 0},
+                    {"bucketId": "3p-5h", "window": "5h", "resetTime": "2026-11-16T13:25:24Z", "disabled": True, "remainingFraction": 0.0038},
+                ],
+            }]
+        }
+        quota = {
+            "buckets": [
+                {"modelId": "gemini-2.5-pro", "resetTime": "2026-11-16T16:04:07Z", "remainingFraction": 1.0},
+                {"modelId": "claude-opus-5-5-high", "resetTime": "2026-11-21T04:49:56Z", "remainingFraction": 0},
+            ]
+        }
+        windows = cli_probe.parse_antigravity_quota_summary(summary, quota)
+        by_id = {w["id"]: w for w in windows}
+        self.assertNotIn("antigravity:3p-5h", by_id)
+        self.assertEqual(by_id["antigravity:3p-weekly"]["remainingPercent"], 0.0)
+        self.assertEqual(by_id["antigravity:gemini-5h"]["windowDurationMins"], 300)
+        self.assertEqual(by_id["antigravity:gemini-5h"]["remainingPercent"], 100.0)
+        self.assertEqual(by_id["antigravity:model:gemini-2.5-pro"]["model"], "Gemini")
+
+    def test_cursor_probe_reads_weekly_ultra_quota_without_refreshing(self):
+        about_out = json.dumps({"subscriptionTier": "Ultra", "userEmail": "yong@example.com"})
+        run = lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=about_out, stderr="")
+        fetcher = lambda _tok: (
+            {"planInfo": {"planName": "Ultra", "billingCycleEnd": "1797262421516", "includedUsagePeriod": "INCLUDED_USAGE_PERIOD_WEEKLY", "includedUsageResetsAt": "1795275297783"}},
+            {"planUsage": {"totalPercentUsed": 38.0, "autoPercentUsed": 38.0}},
+            {"individualUsage": {"onDemand": {"enabled": True, "remaining": 1250}}},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            row = cli_probe.probe_cursor("/bin/cursor-agent", Path(tmp), run=run, token_reader=lambda: "tok", fetcher=fetcher)
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["email"], "yong@example.com")
+        self.assertEqual(row["plan"], "Ultra")
+        self.assertEqual(row["windows"][0]["windowDurationMins"], 10080)
+        self.assertEqual(row["windows"][0]["remainingPercent"], 62.0)
+        self.assertEqual(row["balances"], {"remainingUsd": 12.5})
+
 
 class CliSurfaceTests(unittest.TestCase):
     def test_cli_has_no_reset_pass_command(self):

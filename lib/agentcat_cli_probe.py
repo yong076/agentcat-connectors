@@ -23,7 +23,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 HOME = Path((os.environ.get("USERPROFILE") if os.name == "nt" else None)
             or os.environ.get("HOME") or os.path.expanduser("~"))
@@ -358,7 +358,8 @@ def probe_token_home(provider: str, home: Path, module: Any, token_key: str) -> 
         except Exception:
             return _result(provider, home, status="error", reason="usage_unavailable", email=email)
         return _result(
-            provider, home, email=email, windows=grok["windows"], balances=grok.get("balances") or {},
+            provider, home, email=email, plan=grok.get("plan"),
+            windows=grok["windows"], balances=grok.get("balances") or {},
             status="ok" if grok["windows"] else "error",
             reason=None if grok["windows"] else "usage_unavailable",
         )
@@ -404,10 +405,19 @@ def probe_token_home(provider: str, home: Path, module: Any, token_key: str) -> 
     )
 
 
-def parse_antigravity_quota_summary(payload: Any) -> List[Dict[str, Any]]:
-    """`retrieveUserQuotaSummary` groups -> windows, the same data agy shows."""
+def parse_antigravity_quota_summary(payload: Any, quota_payload: Any = None) -> List[Dict[str, Any]]:
+    """`retrieveUserQuotaSummary` groups (+ optional `retrieveUserQuota` buckets) -> windows."""
     windows: List[Dict[str, Any]] = []
     groups = payload.get("groups") if isinstance(payload, dict) else None
+    group_names: List[str] = []
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get("displayName") or "")
+        short = "Gemini" if "gemini" in name.lower() else "Claude+GPT" if ("claude" in name.lower() or "gpt" in name.lower()) else (name or "Models")
+        if short not in group_names:
+            group_names.append(short)
+    multi_group = len(group_names) > 1
     for group in groups if isinstance(groups, list) else []:
         if not isinstance(group, dict):
             continue
@@ -422,13 +432,11 @@ def parse_antigravity_quota_summary(payload: Any) -> List[Dict[str, Any]]:
             span = str(bucket.get("window") or bucket.get("bucketId") or "").lower()
             weekly = "week" in span or span.endswith("7d")
             short_window = "5h" in span or "hour" in span
+            if short_window and bucket.get("disabled") is True:
+                continue
             used = _clamp((1.0 - float(fraction)) * 100.0)
-            reset = None
-            if isinstance(bucket.get("resetTime"), str):
-                try:
-                    reset = int(dt.datetime.fromisoformat(bucket["resetTime"].replace("Z", "+00:00")).timestamp())
-                except ValueError:
-                    reset = None
+            reset = _iso_epoch(bucket.get("resetTime"))
+            is_secondary_group = multi_group and short != "Gemini"
             windows.append({
                 "id": "antigravity:" + str(bucket.get("bucketId") or f"{short}:{span}"),
                 "label": f"{short} {'7d' if weekly else '5h' if short_window else span}",
@@ -436,9 +444,53 @@ def parse_antigravity_quota_summary(payload: Any) -> List[Dict[str, Any]]:
                 "usedPercent": used,
                 "remainingPercent": 100.0 - used,
                 "resetsAt": reset,
-                "model": None,
-                "primary": weekly,
+                "model": short if (is_secondary_group and weekly) else None,
+                "primary": weekly and not is_secondary_group,
             })
+
+    # Consumer Antigravity accounts often omit Gemini from retrieveUserQuotaSummary
+    # while retrieveUserQuota exposes the active 5-hour Gemini model buckets.
+    buckets = quota_payload.get("buckets") if isinstance(quota_payload, dict) else None
+    if isinstance(buckets, list) and "Gemini" not in group_names:
+        gemini_buckets = []
+        for b in buckets:
+            if not isinstance(b, dict):
+                continue
+            mid = str(b.get("modelId") or "").lower()
+            frac = b.get("remainingFraction")
+            reset = _iso_epoch(b.get("resetTime"))
+            if not mid.startswith("gemini-") or reset is None:
+                continue
+            if not isinstance(frac, (int, float)) or isinstance(frac, bool):
+                continue
+            gemini_buckets.append((0 if "pro" in mid else 1, float(frac), reset, mid))
+        if gemini_buckets:
+            gemini_buckets.sort(key=lambda item: (item[0], item[1]))
+            _, frac, reset, mid = gemini_buckets[0]
+            gem_used = _clamp((1.0 - frac) * 100.0)
+            has_active_5h = any(w.get("windowDurationMins") == 300 and not w.get("model") for w in windows)
+            if not has_active_5h:
+                windows.append({
+                    "id": "antigravity:gemini-5h",
+                    "label": "Gemini 5h",
+                    "windowDurationMins": 300,
+                    "usedPercent": gem_used,
+                    "remainingPercent": 100.0 - gem_used,
+                    "resetsAt": reset,
+                    "model": None,
+                    "primary": not any(w.get("primary") for w in windows),
+                })
+            if group_names:
+                windows.append({
+                    "id": f"antigravity:model:{mid}",
+                    "label": "Gemini",
+                    "windowDurationMins": 300,
+                    "usedPercent": gem_used,
+                    "remainingPercent": 100.0 - gem_used,
+                    "resetsAt": reset,
+                    "model": "Gemini",
+                    "primary": False,
+                })
     return windows
 
 
@@ -570,6 +622,16 @@ def codex_account_id(home: Path) -> Optional[str]:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def codex_account_email(home: Path) -> Optional[str]:
+    try:
+        raw = json.loads((Path(home) / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    tokens = raw.get("tokens") if isinstance(raw, dict) and isinstance(raw.get("tokens"), dict) else {}
+    claims = _jwt_claims(tokens["id_token"]) if isinstance(tokens.get("id_token"), str) else {}
+    return _email(claims.get("email")) or _email(raw.get("email") if isinstance(raw, dict) else None)
 
 
 def codex_billing(home: Path, now: Optional[dt.datetime] = None) -> Optional[Dict[str, Any]]:
@@ -756,9 +818,28 @@ def parse_grok_billing(payload: Any) -> Dict[str, Any]:
         raw = config.get(key)
         return _number(raw.get("val")) if isinstance(raw, dict) else None
 
+    prepaid_raw = val("prepaidBalance")
+    cap_raw = val("onDemandCap")
+    used_raw = val("onDemandUsed")
+    balances: Dict[str, float] = {}
+    if prepaid_raw is not None:
+        balances["prepaid"] = prepaid_raw / 100.0
+        if prepaid_raw > 0:
+            balances["remainingUsd"] = prepaid_raw / 100.0
+    if cap_raw is not None:
+        balances["onDemandCap"] = cap_raw / 100.0
+    if used_raw is not None:
+        balances["onDemandUsed"] = used_raw / 100.0
+    tier_raw = config.get("subscriptionTier")
+    plan: Optional[str] = None
+    if isinstance(tier_raw, str) and 1 <= len(tier_raw.strip()) <= 64:
+        plan = tier_raw.strip()
+    elif config.get("isUnifiedBillingUser") is True:
+        plan = "Unified"
     return {
         "windows": windows,
-        "balances": {k: v for k, v in (("prepaid", val("prepaidBalance")), ("onDemandCap", val("onDemandCap")), ("onDemandUsed", val("onDemandUsed"))) if v is not None},
+        "balances": balances,
+        "plan": plan,
     }
 
 
@@ -927,3 +1008,185 @@ def probe_copilot(run: Callable[..., Any] = subprocess.run) -> List[Dict[str, An
                             status="ok" if parsed["windows"] else "error",
                             reason=None if parsed["windows"] else "usage_unavailable"))
     return rows
+
+
+CURSOR_PLAN_INFO_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
+CURSOR_PERIOD_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+CURSOR_USAGE_SUMMARY_URL = "https://cursor.com/api/usage-summary"
+
+
+def cursor_access_token(run: Callable[..., Any] = subprocess.run) -> Optional[str]:
+    """Read Cursor CLI's Keychain access token read-only; never touch cursor-refresh-token (R1)."""
+    try:
+        completed = run(
+            ["/usr/bin/security", "find-generic-password", "-s", "cursor-access-token", "-w"],
+            capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL,
+        )
+        token = (completed.stdout or "").strip() if completed.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError, AttributeError):
+        return None
+    if not token:
+        return None
+    claims = _jwt_claims(token)
+    exp = _number(claims.get("exp"))
+    if exp is not None and exp <= time.time() + 60:
+        return None
+    return token
+
+
+def _ms_epoch(value: Any) -> Optional[int]:
+    num = _number(value)
+    if num is not None and num > 1_000_000_000_000:
+        return int(num // 1000)
+    if num is not None and num > 1_000_000_000:
+        return int(num)
+    if isinstance(value, str):
+        return _iso_epoch(value)
+    return None
+
+
+def parse_cursor_usage(
+    plan_payload: Any,
+    usage_payload: Any,
+    summary_payload: Any = None,
+    fallback_plan: Optional[str] = None,
+) -> Dict[str, Any]:
+    plan_info = plan_payload.get("planInfo") if isinstance(plan_payload, dict) and isinstance(plan_payload.get("planInfo"), dict) else {}
+    plan_name = plan_info.get("planName") if isinstance(plan_info.get("planName"), str) and plan_info.get("planName").strip() else fallback_plan
+    period_kind = str(plan_info.get("includedUsagePeriod") or "").upper()
+    is_weekly = "WEEK" in period_kind
+    reset_at = _ms_epoch(plan_info.get("includedUsageResetsAt")) or _ms_epoch(
+        usage_payload.get("billingCycleEnd") if isinstance(usage_payload, dict) else None
+    )
+    renews_epoch = _ms_epoch(plan_info.get("billingCycleEnd"))
+    billing = (
+        {"renewsAt": dt.datetime.fromtimestamp(renews_epoch, dt.timezone.utc).isoformat().replace("+00:00", "Z"), "estimated": False}
+        if renews_epoch else None
+    )
+
+    plan_usage = usage_payload.get("planUsage") if isinstance(usage_payload, dict) and isinstance(usage_payload.get("planUsage"), dict) else {}
+    total_used = _number(plan_usage.get("totalPercentUsed"))
+    auto_used = _number(plan_usage.get("autoPercentUsed"))
+    api_used = _number(plan_usage.get("apiPercentUsed"))
+
+    windows: List[Dict[str, Any]] = []
+    if total_used is not None:
+        clamped = _clamp(total_used)
+        windows.append({
+            "id": "cursor:7d" if is_weekly else "cursor:period",
+            "label": "7d" if is_weekly else "30d",
+            "windowDurationMins": 10080 if is_weekly else None,
+            "usedPercent": clamped,
+            "remainingPercent": 100.0 - clamped,
+            "resetsAt": reset_at,
+            "model": None,
+            "primary": True,
+        })
+        for model_label, val in (("API", api_used), ("Auto", auto_used)):
+            if val is not None and abs(val - total_used) >= 0.5:
+                m_used = _clamp(val)
+                windows.append({
+                    "id": f"cursor:{model_label.lower()}",
+                    "label": model_label,
+                    "windowDurationMins": 10080 if is_weekly else None,
+                    "usedPercent": m_used,
+                    "remainingPercent": 100.0 - m_used,
+                    "resetsAt": reset_at,
+                    "model": model_label,
+                    "primary": False,
+                })
+
+    balances: Dict[str, float] = {}
+    if isinstance(summary_payload, dict):
+        indiv = summary_payload.get("individualUsage") if isinstance(summary_payload.get("individualUsage"), dict) else {}
+        ondemand = indiv.get("onDemand") if isinstance(indiv.get("onDemand"), dict) else {}
+        if ondemand.get("enabled") is True:
+            rem_cents = _number(ondemand.get("remaining"))
+            if rem_cents is not None and rem_cents >= 0:
+                balances["remainingUsd"] = rem_cents / 100.0
+
+    result: Dict[str, Any] = {
+        "plan": plan_name,
+        "windows": windows,
+        "status": "ok" if windows else "error",
+        "reason": None if windows else ("not_subscribed" if str(plan_name or "").lower() == "free" else "usage_unavailable"),
+    }
+    if billing:
+        result["billing"] = billing
+    if balances:
+        result["balances"] = balances
+    return result
+
+
+def fetch_cursor_usage(token: str) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+    from urllib.request import Request, urlopen
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
+    plan_req = Request(CURSOR_PLAN_INFO_URL, data=b"{}", headers=headers, method="POST")
+    with urlopen(plan_req, timeout=10) as resp:
+        plan_payload = json.loads(resp.read(500_000).decode("utf-8"))
+    usage_req = Request(CURSOR_PERIOD_USAGE_URL, data=b"{}", headers=headers, method="POST")
+    with urlopen(usage_req, timeout=10) as resp:
+        usage_payload = json.loads(resp.read(500_000).decode("utf-8"))
+    summary_payload: Optional[Dict[str, Any]] = None
+    try:
+        claims = _jwt_claims(token)
+        sub = str(claims.get("sub") or "").split("|")[-1]
+        if sub:
+            sum_headers = {"Accept": "application/json", "Cookie": f"WorkosCursorSessionToken={sub}%3A%3A{token}"}
+            sum_req = Request(CURSOR_USAGE_SUMMARY_URL, headers=sum_headers, method="GET")
+            with urlopen(sum_req, timeout=6) as resp:
+                summary_payload = json.loads(resp.read(500_000).decode("utf-8"))
+    except Exception:
+        summary_payload = None
+    return plan_payload, usage_payload, summary_payload
+
+
+def probe_cursor(
+    executable: Optional[str],
+    home: Optional[Path] = None,
+    run: Callable[..., Any] = subprocess.run,
+    token_reader: Optional[Callable[[], Optional[str]]] = None,
+    fetcher: Callable[[str], Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]] = fetch_cursor_usage,
+) -> Dict[str, Any]:
+    cursor_home = Path(home) if home is not None else (HOME / ".cursor")
+    email: Optional[str] = None
+    plan_fallback: Optional[str] = None
+    cfg_path = cursor_home / "cli-config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        auth_info = cfg.get("authInfo") if isinstance(cfg, dict) and isinstance(cfg.get("authInfo"), dict) else {}
+        email = _email(auth_info.get("email"))
+    except (OSError, ValueError):
+        pass
+
+    if executable:
+        try:
+            env = {**os.environ, "NO_OPEN_BROWSER": "1"}
+            proc = run(
+                [executable, "about", "--format", "json"],
+                capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL, env=env,
+            )
+            if proc.returncode == 0:
+                about = json.loads(proc.stdout)
+                if isinstance(about, dict):
+                    email = _email(about.get("userEmail")) or email
+                    tier = about.get("subscriptionTier")
+                    if isinstance(tier, str) and tier.strip():
+                        plan_fallback = tier.strip()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+
+    token = token_reader() if token_reader is not None else cursor_access_token(run)
+    if not token:
+        if not email and not cfg_path.is_file():
+            return _result("cursor", cursor_home, status="error", reason="not_signed_in")
+        return _result("cursor", cursor_home, status="error", reason="cli_login_expired", email=email, plan=plan_fallback)
+
+    try:
+        plan_payload, usage_payload, summary_payload = fetcher(token)
+    except Exception:
+        return _result("cursor", cursor_home, status="error", reason="usage_unavailable", email=email, plan=plan_fallback)
+
+    parsed = parse_cursor_usage(plan_payload, usage_payload, summary_payload, fallback_plan=plan_fallback)
+    return _result("cursor", cursor_home, email=email, **parsed)

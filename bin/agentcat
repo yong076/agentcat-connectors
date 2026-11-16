@@ -2138,17 +2138,23 @@ def _fast_provider_home_launchers() -> Dict[str, List[Tuple[Path, Optional[str],
             hpath = info["path"]
             if not hpath.is_dir():
                 continue
-            acct_key: Optional[str] = None
+            acct_keys: Set[str] = set()
             is_provider_home = real == real_default
             if provider == "claude":
                 ident = cli_probe.claude_identity(hpath, default_dir)
-                acct_key = home_signatures.account_key("claude", ident.get("accountID") or ident.get("email"))
-                is_provider_home = is_provider_home or acct_key is not None or (hpath / ".claude.json").is_file()
+                for val in (ident.get("accountID"), ident.get("email")):
+                    k = home_signatures.account_key("claude", val)
+                    if k:
+                        acct_keys.add(k)
+                is_provider_home = is_provider_home or bool(acct_keys) or (hpath / ".claude.json").is_file()
             elif provider == "codex":
-                acct_key = home_signatures.account_key("codex", cli_probe.codex_account_id(hpath))
-                is_provider_home = is_provider_home or acct_key is not None or (hpath / "auth.json").is_file()
-            if is_provider_home and (acct_key or info["launchers"]):
-                out[provider].append((hpath, acct_key, list(info["launchers"])))
+                for val in (cli_probe.codex_account_id(hpath), cli_probe.codex_account_email(hpath)):
+                    k = home_signatures.account_key("codex", val)
+                    if k:
+                        acct_keys.add(k)
+                is_provider_home = is_provider_home or bool(acct_keys) or (hpath / "auth.json").is_file()
+            if is_provider_home and (acct_keys or info["launchers"]):
+                out[provider].append((hpath, acct_keys, list(info["launchers"])))
     _FAST_LAUNCHER_CACHE = (scope, now, out)
     return out
 
@@ -2162,24 +2168,65 @@ def _launcher_sort_key(provider: str, name: str) -> Tuple[int, int, str]:
     return (2, 0, name)
 
 
+def _resolve_cli_binary(names: Tuple[str, ...], extra_dirs: Tuple[Path, ...] = ()) -> Optional[str]:
+    search_dirs = list(extra_dirs) + [HOME / ".local" / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+        for folder in search_dirs:
+            candidate = folder / name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    return None
+
+
+def _non_home_provider_launchers(provider: str) -> List[str]:
+    specs: Dict[str, Tuple[Tuple[str, ...], Tuple[Path, ...]]] = {
+        "gemini": (("gemini", "agy"), ()),
+        "grok": (("grok", "grok-code"), (HOME / ".grok" / "bin",)),
+        "cursor": (("cursor", "cursor-agent"), ()),
+        "kimi": (("kimi", "kimi-code"), ()),
+        "auggie": (("auggie",), ()),
+        "amp": (("amp",), ()),
+        "copilot": (("gh",), ()),
+    }
+    entry = specs.get(provider)
+    if not entry:
+        return []
+    names, extra = entry
+    found: List[str] = []
+    for name in names:
+        if _resolve_cli_binary((name,), extra):
+            found.append(name)
+    return found
+
+
 def _cli_home_metadata(provider: str, row: Dict[str, Any]) -> Dict[str, Any]:
     if provider not in PROVIDER_HOME_SPECS:
-        return {}
-    key = home_signatures.account_key(provider, row.get("accountID") or row.get("email"))
+        launchers = _non_home_provider_launchers(provider)
+        return {"launchers": launchers} if launchers else {}
+    row_keys = {
+        k for k in (
+            home_signatures.account_key(provider, row.get("accountID")),
+            home_signatures.account_key(provider, row.get("email")),
+        ) if k
+    }
+    key = next(iter(row_keys), None)
     homes = []
     for candidate in _discover_provider_homes().get(provider, []):
         if candidate["state"] not in ("tracked", "mirror"):
             continue
         current = _home_account_key(provider, candidate)
-        if key and current:
-            matches = key == current
+        if row_keys and current:
+            matches = current in row_keys
         else:
             matches = cli_probe.home_key(candidate["path"]) == row.get("homeKey")
         if matches:
             homes.append(candidate)
     launcher_set = {name for c in homes for name in c["launchers"]}
-    for hpath, acct_key, fast_launchers in _fast_provider_home_launchers().get(provider, []):
-        if (key and acct_key == key) or (not key and cli_probe.home_key(hpath) == row.get("homeKey")):
+    for hpath, acct_keys, fast_launchers in _fast_provider_home_launchers().get(provider, []):
+        if (row_keys and (row_keys & acct_keys)) or (not row_keys and cli_probe.home_key(hpath) == row.get("homeKey")):
             launcher_set.update(fast_launchers)
     launchers = sorted(launcher_set, key=lambda n: _launcher_sort_key(provider, n))
     usage = {p: 0 for p in ("today", "week", "month")}
@@ -2217,7 +2264,7 @@ def _home_snapshot_path(candidate: Dict[str, Any]) -> str:
     return value if value.startswith("~") else f"~/<external-{candidate['id']}>"
 
 
-CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot", "kimi", "grok", "hermes")
+CONFIG_PROVIDER_IDS = ("codex", "claude", "gemini", "antigravity", "opencode", "copilot", "kimi", "grok", "cursor", "hermes")
 DESKTOP_APP_PROVIDER_IDS = ("claude", "codex")
 
 DESKTOP_APP_SPECS: Dict[str, Dict[str, Any]] = {
@@ -14016,6 +14063,11 @@ def classify_process(command: str, *, windows: Optional[bool] = None) -> Optiona
         return "kimi"
     if executable in {"grok", "grok.exe", "grok.cmd", "grok-code", "grok-code.exe", "grok-code.cmd", "grock"}:
         return "grok"
+    if (
+        executable in {"cursor-agent", "cursor-agent.exe", "cursor-agent.cmd", "cursor-agent-cli"}
+        or "/cursor-agent/" in executable_path_normalized
+    ):
+        return "cursor"
     if executable in {"hermes", "hermes.exe", "hermes.cmd"}:
         return "hermes"
     if executable in {"opencode", "opencode.exe", "opencode.cmd"}:
@@ -15430,6 +15482,7 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         "copilot": disabled_provider_snapshot("copilot") if (provider_config.get("copilot") or {}).get("enabled") is False else _safe_provider("copilot", copilot_snapshot),
         "kimi": disabled_provider_snapshot("kimi") if (provider_config.get("kimi") or {}).get("enabled") is False else _safe_provider("kimi", kimi_snapshot),
         "grok": disabled_provider_snapshot("grok") if (provider_config.get("grok") or {}).get("enabled") is False else _safe_provider("grok", grok_snapshot),
+        "cursor": disabled_provider_snapshot("cursor") if (provider_config.get("cursor") or {}).get("enabled") is False else _safe_provider("cursor", cursor_snapshot),
         "hermes": disabled_provider_snapshot("hermes") if (provider_config.get("hermes") or {}).get("enabled") is False else _safe_provider("hermes", hermes_snapshot),
     }
     if (provider_config.get("gemini") or {}).get("enabled") is False:
@@ -15718,40 +15771,74 @@ def managed_quota_refresh_loop(interval_seconds: float) -> None:
         time.sleep(interval_seconds)
 
 
+def cursor_snapshot() -> Dict[str, Any]:
+    cursor_home = HOME / ".cursor"
+    exe = _resolve_cli_binary(("cursor-agent", "cursor-agent-cli", "cursor"))
+    has_config = (cursor_home / "cli-config.json").is_file() or (cursor_home / "chats").is_dir()
+    if not exe and not has_config:
+        snap = empty_provider_usage(status="not_found", source=str(cursor_home))
+        snap["displayName"] = "Cursor"
+        return snap
+    snap = empty_provider_usage(status="ok", source=str(cursor_home))
+    snap["displayName"] = "Cursor"
+    snap["sources"] = {"cursorCli": {"displayName": "Cursor CLI", "installed": bool(exe), "status": "ok"}}
+    return snap
+
+
 # --- CLI probe: ask each CLI, per home, who it is and how much is left ------
 CLI_PROBE_INTERVAL_SECONDS = 300.0
 # Two missed rounds before a reading is shown as stale.
 CLI_PROBE_FRESH_SECONDS = 2 * CLI_PROBE_INTERVAL_SECONDS
-CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi", "gemini": "Antigravity", "copilot": "Copilot", "auggie": "Augment", "amp": "Amp"}
+CLI_PROBE_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "kimi": "Kimi", "gemini": "Gemini", "copilot": "Copilot", "auggie": "Augment", "amp": "Amp", "cursor": "Cursor"}
 # agy's own quota source (from its logs): a different host than Code Assist's
 # cloudcode-pa, which answers 403 without an onboarded project.
 ANTIGRAVITY_QUOTA_SUMMARY_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+ANTIGRAVITY_USER_QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+
+
+def _local_google_account_email() -> Optional[str]:
+    gemini_dir = HOME / ".gemini"
+    accounts_raw = read_json(gemini_dir / "google_accounts.json")
+    if isinstance(accounts_raw, dict):
+        active = cli_probe._email(accounts_raw.get("active"))
+        if active:
+            return active
+    oauth_raw = read_json(gemini_dir / "oauth_creds.json")
+    if isinstance(oauth_raw, dict) and isinstance(oauth_raw.get("id_token"), str):
+        claims = cli_probe._jwt_claims(oauth_raw["id_token"])
+        found = cli_probe._email(claims.get("email"))
+        if found:
+            return found
+    return None
 
 
 def probe_antigravity() -> Optional[Dict[str, Any]]:
-    """Antigravity quota as agy sees it. The apps fold it into the gemini tile."""
+    """Antigravity + Gemini quota as agy/gemini see it. The apps fold it into the gemini tile."""
     creds = read_antigravity_oauth_credentials()
     if not creds:
         return None
     home = ANTIGRAVITY_CLI_DIR
     claims = cli_probe._jwt_claims(str(creds.get("id_token") or ""))
-    email = cli_probe._email(claims.get("email"))
+    email = cli_probe._email(claims.get("email")) or _local_google_account_email()
     try:
         # Refreshes in memory only; agy's own token file is never rewritten.
         token = antigravity_access_token()
         if not token:
             return cli_probe._result("gemini", home, status="error", reason="cli_login_expired", email=email)
-        req = urllib.request.Request(
-            ANTIGRAVITY_QUOTA_SUMMARY_URL,
-            data=b"{}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "antigravity"},
-            method="POST",
-        )
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "antigravity"}
+        req = urllib.request.Request(ANTIGRAVITY_QUOTA_SUMMARY_URL, data=b"{}", headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=15) as resp:
             payload = json.loads(resp.read(1_000_000).decode("utf-8") or "{}")
+        quota_payload: Optional[Dict[str, Any]] = None
+        try:
+            qreq = urllib.request.Request(ANTIGRAVITY_USER_QUOTA_URL, data=b"{}", headers=headers, method="POST")
+            with urllib.request.urlopen(qreq, timeout=10) as qresp:
+                quota_payload = json.loads(qresp.read(1_000_000).decode("utf-8") or "{}")
+        except Exception:
+            quota_payload = None
     except Exception:
         return cli_probe._result("gemini", home, status="error", reason="usage_unavailable", email=email)
-    windows = cli_probe.parse_antigravity_quota_summary(payload)
+    windows = cli_probe.parse_antigravity_quota_summary(payload, quota_payload)
     return cli_probe._result(
         "gemini", home, email=email, windows=windows,
         status="ok" if windows else "error", reason=None if windows else "usage_unavailable",
@@ -15797,7 +15884,7 @@ def run_cli_probes() -> Dict[str, Any]:
         if current is None or (current["status"] != "ok" and row["status"] == "ok"):
             seen[key] = row
     results.extend(r for r in seen.values() if r.get("email") or r["status"] == "ok")
-    claude = shutil.which("claude") or (str(HOME / ".local" / "bin" / "claude") if (HOME / ".local" / "bin" / "claude").exists() else None)
+    claude = _resolve_cli_binary(("claude",))
     # The CLI's default credential service/config location is canonical even
     # when the daemon inherited an alternate CLAUDE_CONFIG_DIR from a launcher.
     default_claude = HOME / PROVIDER_HOME_SPECS["claude"]["defaultName"]
@@ -15811,13 +15898,19 @@ def run_cli_probes() -> Dict[str, Any]:
                 results.append(cli_probe._result(provider, home, status="error", reason="cli_failed"))
     # Credit balances straight from each CLI's own account command.
     for provider, probe in (("auggie", cli_probe.probe_auggie), ("amp", cli_probe.probe_amp)):
-        executable = shutil.which(provider)
+        executable = _resolve_cli_binary((provider,))
         if executable:
             try:
                 results.append(probe(executable))
             except Exception:
                 results.append(cli_probe._result(provider, HOME, status="error", reason="cli_failed"))
-    if shutil.which("gh"):
+    cursor_exe = _resolve_cli_binary(("cursor-agent", "cursor-agent-cli"))
+    if cursor_exe or (HOME / ".cursor" / "cli-config.json").is_file():
+        try:
+            results.append(cli_probe.probe_cursor(cursor_exe, HOME / ".cursor"))
+        except Exception:
+            results.append(cli_probe._result("cursor", HOME / ".cursor", status="error", reason="cli_failed"))
+    if _resolve_cli_binary(("gh",)):
         try:
             # Copilot rides the GitHub login the gh CLI already holds.
             results.extend(cli_probe.probe_copilot())
