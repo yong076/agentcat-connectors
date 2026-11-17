@@ -691,6 +691,41 @@ def collect_candidates(home: Path, launcher_dirs, runtime_homes, env: Mapping[st
                                 break
             except (OSError, UnicodeError):
                 continue
+    alias_re = re.compile(r"^\s*alias\s+([A-Za-z0-9_.-]+)=(.+)$")
+    for rc_name in (".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile"):
+        if fs.now() >= deadline:
+            break
+        rc_path = home / rc_name
+        try:
+            if fs.is_symlink(rc_path) or not fs.is_file(rc_path) or fs.stat(rc_path).st_size > 262144:
+                continue
+            rc_text = fs.read(rc_path, 262144).decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        if not any(var in rc_text for var in variables):
+            continue
+        for line in rc_text.splitlines():
+            m = alias_re.match(line)
+            if not m:
+                continue
+            alias_name, rhs = m.group(1), m.group(2).strip()
+            try:
+                rhs_parts = shlex.split(rhs, comments=True, posix=True)
+                if not rhs_parts:
+                    continue
+                inner = shlex.shlex(rhs_parts[0], posix=True, punctuation_chars=";&|")
+                inner.whitespace_split = True
+                inner_tokens = list(inner)
+            except ValueError:
+                continue
+            if inner_tokens and inner_tokens[0] in ("export", "env"):
+                inner_tokens = inner_tokens[1:]
+            for token in inner_tokens:
+                name, separator, value = token.partition("=")
+                if separator and name in variables:
+                    add(_expand(value, home), "launcher", alias_name)
+                elif not separator and not token.startswith("-"):
+                    break
     for index, path in enumerate(fs.children(home)):
         if index >= 4096 or fs.now() >= deadline:
             status["partial"] = True
