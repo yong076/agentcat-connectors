@@ -2170,15 +2170,18 @@ def _launcher_sort_key(provider: str, name: str) -> Tuple[int, int, str]:
 
 
 def _resolve_cli_binary(names: Tuple[str, ...], extra_dirs: Tuple[Path, ...] = ()) -> Optional[str]:
-    search_dirs = list(extra_dirs) + [HOME / ".local" / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+    search_dirs = list(extra_dirs) + [HOME / ".local" / "bin"]
     for name in names:
         found = shutil.which(name)
         if found:
             return found
         for folder in search_dirs:
             candidate = folder / name
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return str(candidate)
+            try:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+            except OSError:
+                continue
     return None
 
 
