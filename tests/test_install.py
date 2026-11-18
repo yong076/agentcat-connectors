@@ -185,6 +185,7 @@ class AgentCatInstallTests(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "installer-codex")}),
             mock.patch.object(install, "IS_WINDOWS", False),
+            mock.patch.object(install, "IS_LINUX", False),
             mock.patch.object(install.os, "getuid", return_value=501, create=True),
             mock.patch.object(install, "PLIST_PATH", plist),
             mock.patch.object(install, "unload_launch_agent"),
@@ -239,6 +240,7 @@ class AgentCatInstallTests(unittest.TestCase):
                     mock.patch.object(install.os, "name", "posix"),
                     mock.patch.object(install.os, "getuid", return_value=501, create=True),
                     mock.patch.object(install, "IS_WINDOWS", False),
+                    mock.patch.object(install, "IS_LINUX", False),
                     mock.patch.object(install, "PLIST_PATH", plist),
                     mock.patch.object(install, "mkdirs"),
                     mock.patch.object(install, "install_binary"),
