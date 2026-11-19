@@ -906,7 +906,7 @@ class WP10AntigravityAttributionTests(SandboxedCase):
         source = antigravity["sources"]["antigravityCli"]
         self.assertEqual(source["status"], "inferred_from_history")
         self.assertEqual(source["collectionMethod"], "history_day_inference")
-        self.assertEqual(source["source"], "/fixture/gemini.log")
+        self.assertEqual(source["source"], "gemini.log")
         self.assertEqual(gemini["tokens"]["totalTokens"] + antigravity["tokens"]["totalTokens"], 300)
 
     def test_dedicated_telemetry_wins_without_filtering_common_usage(self):
