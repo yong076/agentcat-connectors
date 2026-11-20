@@ -86,6 +86,10 @@ REGISTRY = (
         (CODEBUDDY, CODEBUDDY_NAME, CODEBUDDY_CONFIG), CLAUDE_GLOBS,
         IdentityExtractor(".claude.json", ("oauthAccount.accountUuid", "oauthAccount.accountId"),
                           ("oauthAccount.emailAddress",), ("oauthAccount.organizationRateLimitTier",), "../.claude.json"),
+        ("Library/Application Support/orca/claude-runtime-home/home",
+         "Library/Application Support/orca/claude-accounts/*/home",
+         "Library/Application Support/orca/claude-accounts/*",
+         "Library/Application Support/orca/claude-profiles/*/home"),
     ),
     HomeSignature(
         "codex", "provider", "codex", ("CODEX_HOME",), (".codex",),

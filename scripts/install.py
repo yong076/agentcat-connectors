@@ -241,20 +241,40 @@ def install_binary(repo_dir: Path, backup_dir: Path) -> None:
     log(f"installed {BIN_PATH}")
 
 
+_EPHEMERAL_CLAUDE_HOME_MARKERS = (
+    "/orca/claude-profiles/",
+    "/orca/claude-accounts/",
+    "/orca/claude-runtime-home",
+    "/.agentcat/managed-connection-profiles/",
+    "/.agentcat/codex-connection-profiles/",
+)
+
+
+def _is_ephemeral_claude_config_dir(value: str) -> bool:
+    normalized = value.replace("\\", "/").rstrip("/") + "/"
+    return any(marker in normalized for marker in _EPHEMERAL_CLAUDE_HOME_MARKERS)
+
+
+def _plist_escape(value: Any) -> str:
+    import html as _html
+    return _html.escape(str(value), quote=False)
+
+
 def plist_text() -> str:
     env_entries = [
         ("AGENTCAT_HOME", str(AGENTCAT_HOME)),
         ("HOME", str(HOME)),
         ("PATH", f"{LOCAL_BIN}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
     ]
-    # Preserve Claude's config override, but never pin Codex to the installer's
-    # account. Rewriting the plist also removes CODEX_HOME from older installs.
+    # Preserve explicit user Claude config overrides, but never pin Codex or
+    # ephemeral Orca/AgentCat multi-account session homes into launchd.
     for var in ("CLAUDE_CONFIG_DIR",):
         value = os.environ.get(var)
-        if value:
+        if value and not _is_ephemeral_claude_config_dir(value):
             env_entries.append((var, value))
     env_xml = "\n".join(
-        f"    <key>{key}</key>\n    <string>{value}</string>" for key, value in env_entries
+        f"    <key>{_plist_escape(key)}</key>\n    <string>{_plist_escape(value)}</string>"
+        for key, value in env_entries
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -262,10 +282,10 @@ def plist_text() -> str:
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>{LABEL}</string>
+  <string>{_plist_escape(LABEL)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{BIN_PATH}</string>
+    <string>{_plist_escape(BIN_PATH)}</string>
     <string>daemon</string>
   </array>
   <key>RunAtLoad</key>
@@ -276,9 +296,9 @@ def plist_text() -> str:
     <false/>
   </dict>
   <key>StandardOutPath</key>
-  <string>{AGENTCAT_HOME}/agentcatd.out.log</string>
+  <string>{_plist_escape(AGENTCAT_HOME)}/agentcatd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>{AGENTCAT_HOME}/agentcatd.err.log</string>
+  <string>{_plist_escape(AGENTCAT_HOME)}/agentcatd.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
 {env_xml}

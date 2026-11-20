@@ -30,7 +30,7 @@ PUBLIC_CAPABILITIES = (
     "connector.daemon", "connector.daemon.status.v1", "connector.health.v1", "activity.terminal", "activity.memory",
     "activity.runtimeModes", "connector.config", "desktopApps.localMetadata", "events.sqlite",
     "usage.dailyTokens", "usage.hourlyTokens", "usage.breakdown", "usage.projects",
-    "usage.coverage", "projects.daily", "homes.discovery", "providerInstances.v1", "pricing.feed",
+    "usage.coverage", "projects.daily", "homes.discovery", "providerInstances.v1", "agents.catalog.v1", "pricing.feed",
     "usage.opencode.sqlite", "usage.antigravity.sqlite", "usage.copilot.localLogs",
     "limits.liveCache", "limits.errorBackoff", "limits.quotaFallbackOn429", "limits.codex.oauthUsage",
     "limits.claude.oauthUsage", "limits.claude.statusline", "limits.claude.statuslineQuotas",

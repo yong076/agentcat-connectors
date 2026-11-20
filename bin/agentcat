@@ -51,6 +51,7 @@ import agentcat_cli_probe as cli_probe
 from agentcat_statusline import merge_windows as merge_claude_statusline_windows
 import agentcat_local_experience as local_experience
 import agentcat_home_signatures as home_signatures
+import agentcat_orca_catalog as orca_catalog
 from agentcat_opencode_incremental import prepare_rows as prepare_opencode_rows
 from agentcat_jsonl_cursor import ProjectedJSONLCursor
 from agentcat_usage_archive import (
@@ -335,6 +336,7 @@ CONNECTOR_CAPABILITIES = (
     "insights.recommendation",
     "homes.discovery",
     "providerInstances.v1",
+    "agents.catalog.v1",
     "pricing.feed",
     "usage.opencode.sqlite",
     "usage.antigravity.sqlite",
@@ -2169,18 +2171,22 @@ def _launcher_sort_key(provider: str, name: str) -> Tuple[int, int, str]:
 
 
 def _resolve_cli_binary(names: Tuple[str, ...], extra_dirs: Tuple[Path, ...] = ()) -> Optional[str]:
-    search_dirs = list(extra_dirs) + [HOME / ".local" / "bin"]
+    search_dirs = list(extra_dirs) + orca_catalog.user_cli_fallback_dirs(
+        HOME, HOME_DISCOVERY_LAUNCHER_DIRS
+    )
+    suffixes = ("", ".exe", ".cmd", ".bat") if IS_WINDOWS else ("",)
     for name in names:
         found = shutil.which(name)
         if found:
             return found
         for folder in search_dirs:
-            candidate = folder / name
-            try:
-                if candidate.is_file() and os.access(candidate, os.X_OK):
-                    return str(candidate)
-            except OSError:
-                continue
+            for suffix in suffixes:
+                candidate = folder / f"{name}{suffix}"
+                try:
+                    if candidate.is_file() and os.access(candidate, os.X_OK):
+                        return str(candidate)
+                except OSError:
+                    continue
     return None
 
 
@@ -3515,34 +3521,75 @@ def _is_under_agentcat_home(path: Path) -> bool:
 ATOMIC_REPLACE_ATTEMPTS = 24
 
 
+_STALE_ATOMIC_TMP_RE = re.compile(r"^\..+\.\d+\.\d+\.\d+\.tmp$")
+
+
+def _unlink_quiet(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def sweep_stale_atomic_tmp_files(
+    directory: Optional[Path] = None,
+    *,
+    max_age_seconds: float = 3600.0,
+) -> int:
+    """Remove orphaned `unique_atomic_tmp_path` files older than `max_age_seconds`."""
+    root = directory or AGENTCAT_HOME
+    try:
+        if not root.is_dir():
+            return 0
+    except OSError:
+        return 0
+    cutoff = time.time() - max(60.0, max_age_seconds)
+    removed = 0
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return 0
+    for entry in entries:
+        if not _STALE_ATOMIC_TMP_RE.match(entry.name):
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+            if st.st_mtime <= cutoff:
+                Path(entry.path).unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = unique_atomic_tmp_path(path)
-    with tmp_path.open("w", encoding="utf-8") as fh:
-        # Snapshot readers do not need whitespace for years of usage history.
-        json.dump(payload, fh, ensure_ascii=False, sort_keys=True,
-                  **({"separators": (",", ":")} if path == LATEST_SNAPSHOT else {"indent": 2}))
-        fh.write("\n")
-    # Lock down private state files (snapshot, caches, update channel/state) to
-    # owner-only before publishing. External configs (e.g. ~/.gemini) keep their
-    # own permissions so other tools are unaffected.
-    if _is_under_agentcat_home(path):
-        _chmod_quiet(tmp_path, 0o600)
-    # Windows rejects os.replace while a reader (the app, an antivirus scan, a
-    # concurrent writer) holds the target open. 8 short tries (~0.36 s) were not
-    # enough under load; back off to ~2.5 s and never leave the temp file behind.
-    for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
-        try:
-            tmp_path.replace(path)
-            break
-        except PermissionError:
-            if attempt == ATOMIC_REPLACE_ATTEMPTS - 1:
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-                raise
-            time.sleep(min(0.01 * (attempt + 1), 0.2))
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            # Snapshot readers do not need whitespace for years of usage history.
+            json.dump(payload, fh, ensure_ascii=False, sort_keys=True,
+                      **({"separators": (",", ":")} if path == LATEST_SNAPSHOT else {"indent": 2}))
+            fh.write("\n")
+        # Lock down private state files (snapshot, caches, update channel/state) to
+        # owner-only before publishing. External configs (e.g. ~/.gemini) keep their
+        # own permissions so other tools are unaffected.
+        if _is_under_agentcat_home(path):
+            _chmod_quiet(tmp_path, 0o600)
+        # Windows rejects os.replace while a reader (the app, an antivirus scan, a
+        # concurrent writer) holds the target open. 8 short tries (~0.36 s) were not
+        # enough under load; back off to ~2.5 s and never leave the temp file behind.
+        for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+            try:
+                tmp_path.replace(path)
+                break
+            except PermissionError:
+                if attempt == ATOMIC_REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(min(0.01 * (attempt + 1), 0.2))
+    except BaseException:
+        _unlink_quiet(tmp_path)
+        raise
 
 
 def unique_atomic_tmp_path(path: Path) -> Path:
@@ -4031,11 +4078,7 @@ def write_live_limits_cache(provider: str, limits: Dict[str, Any]) -> None:
             }
             if reset_signal_at is not None:
                 cache[provider]["resetSignalAt"] = reset_signal_at
-            tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
-            with tmp_path.open("w", encoding="utf-8") as fh:
-                json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
-                fh.write("\n")
-            tmp_path.replace(LIVE_LIMITS_CACHE)
+            write_json_atomic(LIVE_LIMITS_CACHE, cache)
         except Exception:
             pass
 
@@ -4060,11 +4103,7 @@ def record_live_limit_reset_signal(provider: str, observed_at: Optional[int] = N
                 reset_signal_at=signal_at,
             )
             cache[provider] = entry
-            tmp_path = unique_atomic_tmp_path(LIVE_LIMITS_CACHE)
-            with tmp_path.open("w", encoding="utf-8") as fh:
-                json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
-                fh.write("\n")
-            tmp_path.replace(LIVE_LIMITS_CACHE)
+            write_json_atomic(LIVE_LIMITS_CACHE, cache)
         except Exception:
             logging.debug("failed to record live-limit reset signal for %s", provider)
 
@@ -8188,7 +8227,8 @@ def snapshot_source_label(value: Any) -> Any:
     """Keep source-field names, replace absolute paths with the leaf name.
 
     Joined descriptors and suffixes like `/**/*.jsonl` or `+jsonl` are
-    preserved; URLs and already-relative labels pass through.
+    preserved; duplicate labels (e.g. hundreds of per-session `wire.jsonl` or
+    `updates.jsonl` files) are deduplicated in first-seen order.
     """
     if value is None:
         return None
@@ -8199,9 +8239,14 @@ def snapshot_source_label(value: Any) -> Any:
         return text
     for joiner in (" + ", ", ", ","):
         if joiner in text:
-            return joiner.join(
-                str(snapshot_source_label(part) or "") for part in text.split(joiner)
-            )
+            deduped: List[str] = []
+            seen: Set[str] = set()
+            for part in text.split(joiner):
+                label = str(snapshot_source_label(part) or "").strip()
+                if label and label not in seen:
+                    seen.add(label)
+                    deduped.append(label)
+            return joiner.join(deduped)
     suffix = ""
     for marker in ("/**/*.jsonl", "+jsonl"):
         if text.endswith(marker):
@@ -13071,8 +13116,14 @@ def save_gemini_usage_state(state: Dict[str, Any], cache_path: Optional[Path] = 
     ensure_dirs()
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = unique_atomic_tmp_path(cache_path)
-    tmp.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-    tmp.replace(cache_path)
+    try:
+        tmp.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        if _is_under_agentcat_home(cache_path):
+            _chmod_quiet(tmp, 0o600)
+        tmp.replace(cache_path)
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
 
 
 def gemini_identity_key(identity: Tuple[Any, ...]) -> str:
@@ -14146,7 +14197,7 @@ def classify_process(command: str, *, windows: Optional[bool] = None) -> Optiona
         r"(?:^|/)@github/copilot/(?:index|dist/index)\.(?:m|c)?js$", executable_path_normalized
     ):
         return "copilot"
-    return None
+    return orca_catalog.classify_orca_agent_process(executable_path_normalized, normalized)
 
 
 def safe_activity_command(provider: str, pid: int) -> str:
@@ -15620,6 +15671,7 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         # Explicit API connections are independent from observed CLI/provider
         # subscriptions. Their USD amounts are only for the connected key.
         "connections": openrouter_connections_snapshot(),
+        "availableAgents": available_agents_snapshot(),
     }
     try:
         snapshot["localExperience"] = local_experience_snapshot()
@@ -20361,16 +20413,67 @@ def _fd_refers_to(fd: int, path: Path) -> bool:
     return bool(path_stat.st_ino) and (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino)
 
 
+_AVAILABLE_AGENTS_LOCK = threading.Lock()
+_AVAILABLE_AGENTS_CACHE: Optional[Tuple[Tuple[str, Tuple[str, ...]], float, Dict[str, Any]]] = None
+AVAILABLE_AGENTS_CACHE_TTL_SECONDS = 60.0
+
+
+def available_agents_snapshot(*, force: bool = False) -> Dict[str, Any]:
+    """Return the Orca-aligned coding agent & model catalog (cached 60s)."""
+    global _AVAILABLE_AGENTS_CACHE
+    cache_key = (str(HOME), tuple(str(d) for d in HOME_DISCOVERY_LAUNCHER_DIRS))
+    now = time.monotonic()
+    with _AVAILABLE_AGENTS_LOCK:
+        if (
+            not force
+            and _AVAILABLE_AGENTS_CACHE is not None
+            and _AVAILABLE_AGENTS_CACHE[0] == cache_key
+            and (now - _AVAILABLE_AGENTS_CACHE[1]) < AVAILABLE_AGENTS_CACHE_TTL_SECONDS
+        ):
+            return copy.deepcopy(_AVAILABLE_AGENTS_CACHE[2])
+    built = orca_catalog.build_available_agents_catalog(
+        HOME,
+        resolve_binary=_resolve_cli_binary,
+    )
+    with _AVAILABLE_AGENTS_LOCK:
+        _AVAILABLE_AGENTS_CACHE = (cache_key, now, built)
+    return copy.deepcopy(built)
+
+
+_MALLOC_DEBUG_ENV_VARS = (
+    "MallocStackLogging",
+    "MallocStackLoggingNoCompact",
+    "MallocScribble",
+    "MallocPreScribble",
+    "MallocGuardEdges",
+)
+
+
+def strip_malloc_debug_env(environ: Optional[Dict[str, str]] = None) -> List[str]:
+    """Remove inherited macOS malloc-debug env vars that spam subprocess stderr."""
+    target = os.environ if environ is None else environ
+    removed: List[str] = []
+    for key in _MALLOC_DEBUG_ENV_VARS:
+        if key in target:
+            target.pop(key, None)
+            removed.append(key)
+    return removed
+
+
 def _copy_log_tail(source: Path, target: Path, max_bytes: int) -> None:
     """Write the last ``max_bytes`` of ``source`` (from a line start) to ``target``."""
     size = source.stat().st_size
     tmp = unique_atomic_tmp_path(target)
-    with source.open("rb") as src, tmp.open("wb") as dst:
-        if size > max_bytes:
-            src.seek(size - max_bytes)
-            src.readline()  # drop the partial first line
-        shutil.copyfileobj(src, dst)
-    os.replace(tmp, target)
+    try:
+        with source.open("rb") as src, tmp.open("wb") as dst:
+            if size > max_bytes:
+                src.seek(size - max_bytes)
+                src.readline()  # drop the partial first line
+            shutil.copyfileobj(src, dst)
+        os.replace(tmp, target)
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
 
 
 def _reopen_stderr(path: Path) -> None:
@@ -20485,7 +20588,9 @@ def run_daemon(args: argparse.Namespace) -> int:
 
 def _run_daemon_impl(args: argparse.Namespace) -> int:
     global _DAEMON_BIND_PORT
+    strip_malloc_debug_env()
     ensure_dirs()
+    sweep_stale_atomic_tmp_files()
     # Connection clients read this file before their first authenticated request.
     # Creating it only inside the request guard makes a fresh install unable to
     # issue that request at all.
