@@ -269,7 +269,7 @@ COPILOT_ACCOUNTING_STATE_VERSION = 1
 OPENCODE_ACCOUNTING_STATE_VERSION = 1
 PROJECT_DAILY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_COST_CLASS_KEYS = ("input", "output", "cacheRead", "cacheWrite")
-CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.47.0")
+CONNECTOR_VERSION = os.environ.get("AGENTCAT_CONNECTOR_VERSION", "26.47.1")
 SCHEMA_VERSION = 4
 CONTRACT_VERSION = 1
 WINDOWS_TASK_NAME = "AgentCatD"
@@ -1713,24 +1713,16 @@ def _home_path_list(entry: Dict[str, Any], key: str) -> List[Path]:
 
 
 def default_provider_home(provider: str) -> Path:
-    """The home the connector reads today, before any adoption.
-
-    Resolved at call time so it tracks both a swapped module HOME (tests) and an
-    env var injected into the daemon's launch environment.
-    """
+    """The canonical CLI home, independent of the daemon's launch environment."""
     spec = PROVIDER_HOME_SPECS.get(provider) or {}
-    env_var = spec.get("envVar")
-    override = os.environ.get(str(env_var)) if env_var else None
-    if override:
-        return Path(override).expanduser()
     return HOME / str(spec.get("defaultName") or f".{provider}")
 
 
 def active_codex_home(candidates: Optional[List[Dict[str, Any]]] = None) -> Path:
     """Use an explicit runtime override, else the most recently used tracked home."""
     default = default_provider_home("codex")
-    if os.environ.get("CODEX_HOME"):
-        return default
+    if override := os.environ.get("CODEX_HOME"):
+        return Path(override).expanduser()
     selected = default
     newest = 0.0
     for candidate in candidates if candidates is not None else provider_home_candidates("codex"):
@@ -1744,8 +1736,10 @@ def active_codex_home(candidates: Optional[List[Dict[str, Any]]] = None) -> Path
 
 
 def _explicit_home_rows(settings):
-    for provider in PROVIDER_HOME_SPECS:
+    for provider, spec in PROVIDER_HOME_SPECS.items():
         yield provider, default_provider_home(provider), "default"
+        if override := os.environ.get(spec["envVar"]):
+            yield provider, Path(override).expanduser(), "env"
         for path in _home_path_list(_home_settings(provider, settings), "adopted"):
             yield provider, path, "adopted"
 
@@ -1758,8 +1752,10 @@ def _home_discovery_fallback(settings, previous):
     """Keep the last good scan, applying explicit choices without candidate IO."""
     grouped = copy.deepcopy(previous)
     for provider in HOME_DISCOVERY_PROVIDER_IDS:
-        explicit = {_home_lexical_key(path): (path, source)
-                    for p, path, source in _explicit_home_rows(settings) if p == provider}
+        explicit = {}
+        for p, path, source in _explicit_home_rows(settings):
+            if p == provider:
+                explicit.setdefault(_home_lexical_key(path), (path, source))
         excluded = {_home_lexical_key(path) for path in _home_path_list(_home_settings(provider, settings), "excluded")}
         candidates = grouped.setdefault(provider, [])
         candidates[:] = [c for c in candidates if not c.get("_explicit") or _home_lexical_key(c["path"]) in explicit]
@@ -1772,7 +1768,7 @@ def _home_discovery_fallback(settings, previous):
                              "state": "tracked", "tracked": True, "excluded": False,
                              "evidence": ["scan.budget"], "identity": {},
                              "stats": {"files": 0, "newestMtime": None, "capped": True},
-                             "_explicit": True, "_priority": 0 if source == "default" else 1}
+                             "_explicit": True, "_priority": 0 if source == "default" else 1 if source == "adopted" else 2}
                 candidates.append(candidate)
             candidate.update(_explicit=True, state="tracked", tracked=True, excluded=False)
         for candidate in candidates:
@@ -1884,7 +1880,7 @@ def _scan_provider_homes(settings, deadline):
                 if excluded:
                     state = "excluded"
                 sources = list(row["sources"])
-                source = "default" if "default" in sources else "adopted" if "adopted" in sources else "launcher" if row["launchers"] else "auto"
+                source = "default" if "default" in sources else "adopted" if "adopted" in sources else "launcher" if row["launchers"] else "env" if "env" in sources else "auto"
                 candidate = {
                     "path": path, "id": home_signatures.home_id(path, fs=candidate_fs), "source": source,
                     "sources": sources, "launchers": sorted(row["launchers"]),
@@ -2047,7 +2043,10 @@ def _home_usage_periods(provider: str) -> Dict[str, Dict[str, int]]:
 
 def _home_account_key(provider: str, candidate: Dict[str, Any]) -> Optional[str]:
     native = candidate["identity"].get("accountKey")
-    if provider == "codex":
+    # Claude metadata can exceed discovery's bounded JSON read. Reuse the
+    # existing per-home probe identity then, while readable local identity
+    # still wins immediately when the user switches a Claude login.
+    if provider == "codex" or (provider == "claude" and not native):
         raw = read_json(CLI_PROBE_CACHE)
         rows = raw.get("results") if isinstance(raw, dict) else None
         for row in rows if isinstance(rows, list) else []:

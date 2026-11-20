@@ -78,6 +78,35 @@ class HomeSignatureTests(unittest.TestCase):
         (home / ".claude.json").write_text('{"oauthAccount":{"accountUuid":"local"}}')
         self.assertEqual(signatures.classify_home(home)["identity"]["accountKey"], signatures.account_key("claude", "local"))
 
+    def test_large_claude_config_classifies_without_reading_past_limit(self):
+        for name in (".claude", ".claude2", ".claude-work"):
+            with self.subTest(name=name):
+                home = self.root / name
+                (home / "projects").mkdir(parents=True)
+                (home / "settings.json").write_text("{}")
+                config = self.root / ".claude.json" if name == ".claude" else home / ".claude.json"
+                config.write_text(json.dumps({"projects": {"padding": "x" * 70000},
+                                              "oauthAccount": {"accountUuid": "beyond-budget"}}))
+                fs = RecordingFS()
+                self.assertTrue(signatures.structure_matches(home, fs=fs))
+                result = signatures.classify_home(home, fs=fs)
+                self.assertEqual((result["provider"], result["kind"]), ("claude", "provider"))
+                self.assertIn("config.claude", result["evidence"])
+                self.assertNotIn("classification.ambiguous", result["evidence"])
+                self.assertEqual(result["identity"], {})  # identity waits for the existing probe reader
+                self.assertTrue(fs.reads)
+                self.assertTrue(all(limit <= signatures.ScanLimits().bytes_per_file for _, limit in fs.reads))
+                (home / ".codebuddy.json").write_text("{}")
+                self.assertEqual(signatures.classify_home(home)["kind"], "foreign")
+
+    def test_claude_named_siblings_still_require_positive_fingerprints(self):
+        home = self.root / ".claude-lookalike"
+        (home / "projects").mkdir(parents=True)
+        (home / "settings.json").write_text("{}")
+        result = signatures.classify_home(home)
+        self.assertIsNone(result["provider"])
+        self.assertEqual(result["kind"], "ambiguous")
+
     def test_all_config_fingerprints_precede_jsonl_reads(self):
         home = self.home("cheap-first")
         (home / "auth.json").write_text('{"tokens":{"id_token":"fixture","account_id":"native"}}')

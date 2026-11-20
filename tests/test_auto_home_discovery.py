@@ -199,6 +199,50 @@ class AutoHomeDiscoveryTests(HomeDiscoveryTestCase):
         self.assertEqual(sum(item["usage"]["all"] for item in block), 150)
         self.assertNotIn("account-", json.dumps(block))
 
+    def test_large_claude_siblings_without_launchers_merge_only_the_same_login(self):
+        homes = [agentcat.HOME / name for name in (".claude", ".claude2", ".claude3", ".claude-work", ".claude5")]
+        accounts = ("personal", "shared", "second", "work", "shared")
+        for i, (home, account) in enumerate(zip(homes, accounts)):
+            journal = self._claude_journal(home, f"00000000-0000-4000-8000-{i:012d}")
+            journal.write_text('{}\n' * 24 + journal.read_text())
+            config = agentcat.HOME / ".claude.json" if i == 0 else home / ".claude.json"
+            config.write_text(json.dumps({"projects": {"padding": "x" * 70000},
+                                          "oauthAccount": {"accountUuid": account,
+                                                           "emailAddress": f"{account}@example.test"}}))
+        for name, home in (("claude2", homes[1]), ("claude5", homes[4])):
+            self.launcher(name, "claude", home)
+
+        def probe(home, default, executable, **kwargs):
+            identity = agentcat.cli_probe.claude_identity(home, default)
+            return dict(self.probe_row("claude", home, identity["accountID"]), **identity)
+
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(homes[1])}), \
+             patch.object(agentcat.cli_probe, "probe_claude_home", side_effect=probe) as claude_probe, \
+             patch.object(agentcat.cli_probe, "probe_codex_home", return_value={"status": "error", "homeKey": "unknown"}), \
+             patch.object(agentcat.shutil, "which", return_value=None), \
+             patch.object(agentcat, "probe_antigravity", return_value=None):
+            candidates = agentcat.provider_home_candidates("claude")
+            self.assertEqual({c["path"] for c in candidates if c["state"] == "tracked"}, set(homes))
+            self.assertTrue(all("classification.ambiguous" not in c["evidence"] for c in candidates))
+            self.assertTrue(all(not c["launchers"] for c in candidates if c["path"] in (homes[2], homes[3])))
+            result = agentcat.run_cli_probes()
+            self.assertEqual({c.args[0] for c in claude_probe.call_args_list}, set(homes))
+            agentcat.write_json_atomic(agentcat.CLI_PROBE_CACHE, result)
+            snapshot = agentcat.claude_snapshot()
+            instances = agentcat.cli_probe_provider_instances()
+        self.assertEqual(len(instances), 4)
+        self.assertEqual({c["account"]["email"] for c in instances},
+                         {f"{account}@example.test" for account in accounts})
+        shared = next(c for c in instances if c["account"]["email"] == "shared@example.test")
+        self.assertEqual(shared["launchers"], ["claude2", "claude5"])
+        self.assertEqual(shared["profileCount"], 2)
+        self.assertEqual(shared["usage"]["today"], 60)
+        self.assertEqual(sum(c["usage"]["today"] for c in instances), snapshot["tokens"]["today"])
+
+        agentcat.write_agentcat_settings({"homes": {"claude": {"excluded": [str(homes[2])]}}})
+        self.assertNotIn(homes[2], agentcat.tracked_provider_homes("claude"))
+        self.assertEqual(len(agentcat.cli_probe_provider_instances()), 3)
+
     def test_automatic_foreign_and_unidentified_homes_are_not_counted(self):
         buddy = agentcat.HOME / ".codebuddy"
         self._claude_journal(buddy, UUID_A)

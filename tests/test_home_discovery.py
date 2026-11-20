@@ -260,11 +260,47 @@ class TrackedHomesTests(HomeDiscoveryTestCase):
             agentcat.tracked_provider_homes("claude"), [agentcat.HOME / ".claude"]
         )
 
-    def test_env_var_overrides_default_home(self) -> None:
-        elsewhere = agentcat.HOME / "profile-two"
-        (elsewhere / "sessions").mkdir(parents=True)
-        with patch.dict(os.environ, {"CODEX_HOME": str(elsewhere)}):
-            self.assertEqual(agentcat.tracked_provider_homes("codex"), [elsewhere])
+    def test_env_var_adds_to_default_home(self) -> None:
+        for provider, variable in (("codex", "CODEX_HOME"), ("claude", "CLAUDE_CONFIG_DIR")):
+            with self.subTest(provider=provider):
+                default = agentcat.HOME / f".{provider}"
+                elsewhere = agentcat.HOME / f"{provider}-profile-two"
+                default.mkdir()
+                elsewhere.mkdir()
+                with patch.dict(os.environ, {variable: str(elsewhere)}):
+                    candidates = agentcat.provider_home_candidates(provider)
+                    self.assertEqual(agentcat.default_provider_home(provider), default)
+                    self.assertEqual(agentcat.tracked_provider_homes(provider), [default, elsewhere])
+                    self.assertIn("default", candidates[0]["sources"])
+                    self.assertIn("env", candidates[1]["sources"])
+                    if provider == "codex":
+                        self.assertEqual(agentcat.active_codex_home(candidates), elsewhere)
+
+    def test_env_and_default_homes_survive_timeout_and_respect_exclusions(self) -> None:
+        for provider, variable in (("codex", "CODEX_HOME"), ("claude", "CLAUDE_CONFIG_DIR")):
+            with self.subTest(provider=provider):
+                default = agentcat.HOME / f".{provider}"
+                elsewhere = agentcat.HOME / f"{provider}-profile-two"
+                agentcat.write_agentcat_settings({"homes": {provider: {"excluded": [str(default)]}}})
+                with patch.dict(os.environ, {variable: str(elsewhere)}), \
+                     patch.object(agentcat, "HOME_DISCOVERY_TIME_BUDGET_SECONDS", 0):
+                    states = {c["path"]: c["state"] for c in agentcat.provider_home_candidates(provider)}
+                    self.assertEqual(states[default], "excluded")
+                    self.assertEqual(states[elsewhere], "tracked")
+                agentcat.write_agentcat_settings({"homes": {provider: {"excluded": [str(elsewhere)]}}})
+                with patch.dict(os.environ, {variable: str(elsewhere)}):
+                    self.assertEqual(agentcat.tracked_provider_homes(provider), [default])
+
+    def test_env_equal_to_default_is_one_home(self) -> None:
+        default = agentcat.HOME / ".claude"
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(default)}):
+            candidates = agentcat.provider_home_candidates("claude")
+            self.assertEqual([c["path"] for c in candidates], [default])
+            self.assertEqual(candidates[0]["sources"], ["default", "env"])
+            with patch.object(agentcat, "HOME_DISCOVERY_TIME_BUDGET_SECONDS", 0):
+                candidates = agentcat._discover_provider_homes(force=True)["claude"]
+                self.assertEqual([c["path"] for c in candidates], [default])
+                self.assertEqual(candidates[0]["source"], "default")
 
     def test_adopted_home_is_appended(self) -> None:
         second = agentcat.HOME / "profile-two"

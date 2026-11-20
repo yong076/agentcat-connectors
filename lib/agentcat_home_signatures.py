@@ -77,7 +77,10 @@ REGISTRY = (
     HomeSignature(
         "claude", "provider", "claude", ("CLAUDE_CONFIG_DIR",), (".claude",),
         ("projects",), ("settings.json", ".claude.json"),
-        (Fingerprint("identity.claude_oauth", "json_key", ".claude.json", "oauthAccount"),
+        # Large configs exceed the bounded JSON read; the branded metadata file
+        # plus the required projects layout still establishes Claude ownership.
+        (Fingerprint("config.claude", "exists", ".claude.json"),
+         Fingerprint("identity.claude_oauth", "json_key", ".claude.json", "oauthAccount"),
          Fingerprint("identity.claude_user", "json_key", ".claude.json", "userID"),
          Fingerprint("model.claude", "jsonl_prefix", key="message.model", value="claude-")),
         (CODEBUDDY, CODEBUDDY_NAME, CODEBUDDY_CONFIG), CLAUDE_GLOBS,

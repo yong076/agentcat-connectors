@@ -13,6 +13,9 @@ Orca account homes, and the daemon environment. HOME expansion uses the supplied
 home; scripts are never executed. Symlinks and large/binary scripts are skipped.
 Personal folders, caches, toolchains, and application data are denylisted for the
 depth-one scan; explicit runtime and launcher sources can reach nested homes.
+The canonical `~/.claude` and `~/.codex` homes are always included. Inherited
+`CLAUDE_CONFIG_DIR` / `CODEX_HOME` overrides add explicit homes alongside them;
+an override never replaces the default. Exclusions still take precedence.
 
 Each signature declares a provider, kind (`provider` or `foreign`), layout,
 environment variables, default names, all/any structure markers, positive and
@@ -34,16 +37,24 @@ provider fingerprints are ambiguous. A partial scan never demotes a positive
 cheap fingerprint. Generic directories with no positive CLI evidence are
 omitted, and confident homes appear only under their owning layout.
 
+A `.claude.json` metadata file together with the projects layout is also a
+positive Claude fingerprint. Real configs can exceed the 64 KiB read limit;
+truncating them makes full JSON parsing fail, and the sampled journal prefix
+may contain no model field. The branded file keeps those homes classified
+without raising the read budget or relying on directory names or launchers.
+If identity does not fit in the bounded read, the existing probe identity
+cache supplies it later; same-account homes still merge by account ID/email.
+
 The configured model provider and model name do not establish foreign CLI
 ownership. Codex can use Grok or Kimi models. Foreign ownership requires CLI
 originators, dedicated home names, or CLI-specific config/brand files.
 
-Default/adopted homes always retain the previous reading behavior, including
+Default/env/adopted homes always retain the previous reading behavior, including
 foreign/conflicting fingerprints, missing directories, and exhausted budgets.
 An explicit exclusion still wins. Classification evidence remains visible.
 
 Discovery is cached for ten minutes. At most 32 automatically discovered homes
-are classified; default/adopted homes do not consume this cap. Collection,
+are classified; default/env/adopted homes do not consume this cap. Collection,
 classification, inventory and mirror comparison share one five-second deadline.
 Collection additionally stops after two seconds; classification additionally
 stops after 250 ms per home. An exhausted global deadline keeps the last good
