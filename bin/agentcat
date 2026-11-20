@@ -2500,11 +2500,16 @@ def _scan_desktop_app_data_root(root: Path) -> Dict[str, Any]:
             result["latestModifiedAt"] = iso_from_timestamp(latest_mtime)
         return result
     except Exception as exc:
-        result["error"] = str(exc)
+        result["error"] = snapshot_safe_text(exc)
         return result
 
 
-def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+def desktop_app_source_snapshot(
+    provider: str,
+    settings: Dict[str, Any],
+    *,
+    redact_paths: bool = False,
+) -> Dict[str, Any]:
     spec = DESKTOP_APP_SPECS.get(provider) or {}
     raw_apps = settings.get("desktopApps") if isinstance(settings.get("desktopApps"), dict) else {}
     raw_entry = raw_apps.get(provider) if isinstance(raw_apps, dict) else None
@@ -2517,6 +2522,11 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
     default_path = first_existing_default_app_path(provider)
     selected_path = configured_path or default_path
     configured = bool(configured_path)
+    exposed_path = (
+        (snapshot_source_label(selected_path) if selected_path else None)
+        if redact_paths
+        else selected_path
+    )
 
     usage_import = "allowlisted_usage" if provider == "claude" else "metadata_only"
     tokens_included = usage_import == "allowlisted_usage"
@@ -2524,8 +2534,9 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
         "provider": provider,
         "displayName": spec.get("displayName") or provider,
         "hostApp": None,
-        # User-chosen (or default-detected) app bundle; Settings reads this back.
-        "path": selected_path,
+        # /v1/config returns the full bundle path for Settings round-trip;
+        # /v1/snapshot and latest-snapshot.json emit the bundle leaf name only.
+        "path": exposed_path,
         "configured": configured,
         "detectedDefault": (not configured and default_path is not None),
         "privacy": "metadata_only",
@@ -2546,7 +2557,7 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
         is_dir = path.is_dir()
     except OSError as exc:
         base["status"] = "error"
-        base["error"] = str(exc)
+        base["error"] = snapshot_safe_text(exc)
         return base
     if not exists:
         base["status"] = "not_found"
@@ -2587,10 +2598,14 @@ def desktop_app_source_snapshot(provider: str, settings: Dict[str, Any]) -> Dict
     return base
 
 
-def desktop_app_sources_snapshot(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def desktop_app_sources_snapshot(
+    settings: Optional[Dict[str, Any]] = None,
+    *,
+    redact_paths: bool = False,
+) -> Dict[str, Any]:
     resolved = settings if isinstance(settings, dict) else agentcat_settings()
     return {
-        provider: desktop_app_source_snapshot(provider, resolved)
+        provider: desktop_app_source_snapshot(provider, resolved, redact_paths=redact_paths)
         for provider in DESKTOP_APP_PROVIDER_IDS
     }
 
@@ -3225,8 +3240,8 @@ def runtime_modes_snapshot(
                 "provider": provider_s,
                 "mode": mode,
                 "confidence": str(raw_mode.get("confidence") or "inferred"),
-                "source": str(raw_mode.get("source") or source or "event"),
-                "detectedFrom": str(raw_mode.get("detectedFrom") or "event"),
+                "source": snapshot_source_label(str(raw_mode.get("source") or source or "event")),
+                "detectedFrom": snapshot_source_label(str(raw_mode.get("detectedFrom") or "event")),
                 "detectedAt": str(raw_mode.get("detectedAt") or dt.datetime.fromtimestamp(int(ts), dt.timezone.utc).isoformat().replace("+00:00", "Z")),
                 "expiresAt": raw_mode["expiresAt"],
                 "privacy": str(raw_mode.get("privacy") or "metadata_only"),
@@ -3460,7 +3475,7 @@ def parse_event_row(row: Tuple[Any, ...]) -> Dict[str, Any]:
         "id": event_id,
         "timestamp": dt.datetime.fromtimestamp(int(ts), dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "provider": provider,
-        "source": source,
+        "source": snapshot_source_label(source) if source else source,
         "eventType": event_type,
         "tokens": extract_tokens(payload),
         "model": display_model(find_first_key(payload, ["model", "modelName", "model_name"])),
@@ -8198,6 +8213,58 @@ def snapshot_source_label(value: Any) -> Any:
     if _is_absolute_snapshot_path(stripped):
         return display_project_name(stripped) + suffix
     return stripped + suffix
+
+
+_SNAPSHOT_QUOTED_SEG_RE = re.compile(r"(['\"])([^'\"]+)\1")
+_SNAPSHOT_ABS_SUBSTR_RE = re.compile(
+    r"(?<![A-Za-z0-9_:/\\])(?:"
+    r"(?:[A-Za-z]:[\\/]|\\\\)[^\s'\"<>|,:;)]+"
+    r"|/(?:Users|home|Volumes|Applications|Library|private|var|opt|usr|etc|tmp)(?:/[^\s'\"<>|,:;)]+)+"
+    r")"
+)
+_SNAPSHOT_DIAGNOSTIC_KEYS = frozenset({"error", "liveError", "_agentcat_error", "reason", "message"})
+
+
+def snapshot_safe_text(value: Any) -> Any:
+    """Replace absolute filesystem paths inside diagnostic/error text with leaf names."""
+    if value is None or not isinstance(value, (str, BaseException)):
+        return value
+    text = str(value)
+    if not text or text.startswith(("http://", "https://")):
+        return text
+    if _is_absolute_snapshot_path(text.strip()):
+        return display_project_name(text.strip())
+
+    def _scrub_quoted(match: "re.Match[str]") -> str:
+        quote, inner = match.group(1), match.group(2)
+        if _is_absolute_snapshot_path(inner):
+            return f"{quote}{display_project_name(inner) or 'path'}{quote}"
+        return match.group(0)
+
+    text = _SNAPSHOT_QUOTED_SEG_RE.sub(_scrub_quoted, text)
+    home = str(HOME).rstrip("/\\")
+    if home and home not in {"/", "\\"} and home in text:
+        home_re = re.compile(re.escape(home) + r"(?:[\\/][^\s'\"<>|,:;)]+)?")
+        text = home_re.sub(lambda m: display_project_name(m.group(0)) or "home", text)
+    return _SNAPSHOT_ABS_SUBSTR_RE.sub(
+        lambda m: display_project_name(m.group(0)) or "path",
+        text,
+    )
+
+
+def sanitize_snapshot_diagnostic_fields(node: Any) -> Any:
+    """Walk a snapshot structure in place so diagnostic text never leaks paths."""
+    if isinstance(node, dict):
+        for key, val in list(node.items()):
+            if key in _SNAPSHOT_DIAGNOSTIC_KEYS and isinstance(val, str):
+                node[key] = snapshot_safe_text(val)
+            elif isinstance(val, (dict, list)):
+                sanitize_snapshot_diagnostic_fields(val)
+    elif isinstance(node, list):
+        for item in node:
+            if isinstance(item, (dict, list)):
+                sanitize_snapshot_diagnostic_fields(item)
+    return node
 
 
 SHELL_TOOL_NAMES = {
@@ -13938,7 +14005,7 @@ def split_google_cli_snapshots(
                 status_if_empty="no_token_events_yet",
             )
             inferred_source_status = dict(antigravity_source_status)
-            inferred_source_status["source"] = gemini_source_path or str(GEMINI_TELEMETRY)
+            inferred_source_status["source"] = snapshot_source_label(gemini_source_path or GEMINI_TELEMETRY)
             inferred_source_status["collectionMethod"] = "history_day_inference"
             antigravity_provider = antigravity_provider_snapshot(
                 gemini_snapshot_data,
@@ -14647,6 +14714,11 @@ def auto_update_status_snapshot() -> Dict[str, Any]:
     status.setdefault("rollout", {"percent": 0, "bucketAllowed": False, "halted": False, "reason": "not_checked"})
     status["installDir"] = _safe_auto_update_path(status.get("installDir"))
     status["repoDir"] = _safe_auto_update_path(status.get("repoDir"))
+    for text_key in ("reason", "message", "error"):
+        if isinstance(status.get(text_key), str):
+            status[text_key] = snapshot_safe_text(status[text_key])
+    if isinstance(status.get("rollout"), dict) and isinstance(status["rollout"].get("reason"), str):
+        status["rollout"] = dict(status["rollout"], reason=snapshot_safe_text(status["rollout"]["reason"]))
     return status
 
 
@@ -14850,7 +14922,7 @@ def check_auto_update_once(apply_update: bool = True, force: bool = False) -> Di
         write_auto_update_state(state)
         return state
     except Exception as exc:
-        state.update({"status": "error", "error": str(exc)})
+        state.update({"status": "error", "error": snapshot_safe_text(exc)})
         write_auto_update_state(state)
         return state
 
@@ -15100,7 +15172,11 @@ def project_daily_snapshot_slice(
         except ValueError:
             continue
         if parsed >= cutoff and labels:
-            out[day] = {label: int(entry["total"]) for label, entry in labels.items()}
+            day_out: Dict[str, int] = {}
+            for label, entry in labels.items():
+                safe_label = display_project_name(str(label)) or str(label)
+                day_out[safe_label] = day_out.get(safe_label, 0) + int(entry["total"])
+            out[day] = day_out
     return out
 
 
@@ -15121,17 +15197,40 @@ def project_daily_cost_snapshot_slice(
             continue
         day_out: Dict[str, Any] = {}
         for label, entry in labels.items():
-            day_out[label] = {
-                "total": int(entry["total"]),
-                "providers": {
-                    provider: {
+            safe_label = display_project_name(str(label)) or str(label)
+            existing = day_out.get(safe_label)
+            if existing is None:
+                day_out[safe_label] = {
+                    "total": int(entry["total"]),
+                    "providers": {
+                        provider: {
+                            "tokens": int(pentry["tokens"]),
+                            "estCostUSD": pentry["estCostUSD"],
+                            "topModel": pentry["topModel"],
+                        }
+                        for provider, pentry in entry["providers"].items()
+                    },
+                }
+                continue
+            existing["total"] = int(existing["total"]) + int(entry["total"])
+            for provider, pentry in entry["providers"].items():
+                prev_prov = existing["providers"].get(provider)
+                if prev_prov is None:
+                    existing["providers"][provider] = {
                         "tokens": int(pentry["tokens"]),
                         "estCostUSD": pentry["estCostUSD"],
                         "topModel": pentry["topModel"],
                     }
-                    for provider, pentry in entry["providers"].items()
-                },
-            }
+                else:
+                    prev_tokens = int(prev_prov["tokens"])
+                    add_tokens = int(pentry["tokens"])
+                    prev_prov["tokens"] = prev_tokens + add_tokens
+                    prev_cost = prev_prov.get("estCostUSD")
+                    add_cost = pentry.get("estCostUSD")
+                    if prev_cost is not None or add_cost is not None:
+                        prev_prov["estCostUSD"] = round(float(prev_cost or 0.0) + float(add_cost or 0.0), 6)
+                    if add_tokens > prev_tokens and pentry.get("topModel"):
+                        prev_prov["topModel"] = pentry["topModel"]
         out[day] = day_out
     return out
 
@@ -15444,7 +15543,7 @@ def _build_snapshot_impl() -> Dict[str, Any]:
     try:
         latest_by_provider: Dict[str, Any] = latest_events_by_provider()
     except Exception as exc:
-        latest_by_provider = {"_agentcat_error": str(exc), "path": snapshot_source_label(EVENTS_DB)}
+        latest_by_provider = {"_agentcat_error": snapshot_safe_text(exc), "path": snapshot_source_label(EVENTS_DB)}
     limits_by_provider = configured_limits()
     runtime_limits_by_provider = runtime_limits()
     def _safe_provider(provider_id: str, fn: Any) -> Dict[str, Any]:
@@ -15457,14 +15556,14 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         except Exception as exc:
             logging.debug("provider %s snapshot failed: %s", provider_id, exc)
             snap = empty_provider_usage(status="error")
-            snap["error"] = str(exc)
+            snap["error"] = snapshot_safe_text(exc)
             return snap
 
     try:
         activity = terminal_activity_snapshot()
     except Exception as exc:
         logging.debug("terminal_activity_snapshot failed: %s", exc)
-        activity = {"status": "error", "error": str(exc)}
+        activity = {"status": "error", "error": snapshot_safe_text(exc)}
     if (provider_config.get("gemini") or {}).get("enabled") is False and (provider_config.get("antigravity") or {}).get("enabled") is False:
         gemini_provider = disabled_provider_snapshot("gemini")
         antigravity_provider = disabled_provider_snapshot("antigravity")
@@ -15474,9 +15573,9 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         except Exception as exc:
             logging.debug("gemini/antigravity snapshot failed: %s", exc)
             gemini_provider = empty_provider_usage(status="error")
-            gemini_provider["error"] = str(exc)
+            gemini_provider["error"] = snapshot_safe_text(exc)
             antigravity_provider = empty_provider_usage(status="error")
-            antigravity_provider["error"] = str(exc)
+            antigravity_provider["error"] = snapshot_safe_text(exc)
     providers = {
         "codex": disabled_provider_snapshot("codex") if (provider_config.get("codex") or {}).get("enabled") is False else _safe_provider("codex", codex_snapshot),
         "claude": disabled_provider_snapshot("claude") if (provider_config.get("claude") or {}).get("enabled") is False else _safe_provider("claude", claude_snapshot),
@@ -15503,7 +15602,7 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             limits_by_provider.get(provider, empty_limits()),
             runtime_limits_by_provider.get(provider, empty_limits()),
         )
-    desktop_apps = desktop_app_sources_snapshot(settings)
+    desktop_apps = desktop_app_sources_snapshot(settings, redact_paths=True)
     attach_desktop_app_sources(providers, desktop_apps)
     snapshot = {
         "schemaVersion": SCHEMA_VERSION,
@@ -15594,7 +15693,7 @@ def _build_snapshot_impl() -> Dict[str, Any]:
             derived = derive_insights(snapshot, period=period)
             insights_by_period[period] = {"status": "ok", **derived}
         except Exception as exc:
-            insights_by_period[period] = {"status": "error", "error": str(exc)}
+            insights_by_period[period] = {"status": "error", "error": snapshot_safe_text(exc)}
     snapshot["insightsByPeriod"] = insights_by_period
     snapshot["insights"] = insights_by_period["week"]
     # Health failure must never prevent snapshot publication.
@@ -15602,6 +15701,7 @@ def _build_snapshot_impl() -> Dict[str, Any]:
         snapshot["health"] = connector_health_snapshot(providers, snapshot.get("providerInstances"))
     except Exception:
         snapshot["capabilities"].remove("connector.health.v1")
+    sanitize_snapshot_diagnostic_fields(snapshot)
     write_json_atomic(LATEST_SNAPSHOT, snapshot)
     return snapshot
 

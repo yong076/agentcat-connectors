@@ -33,30 +33,17 @@ def _forbidden_needles(home: Path) -> tuple[str, ...]:
     return (
         "/Users/",
         "/home/",
+        "/Applications/",
+        "/Volumes/",
         "C:\\",
         r"C:\Users",
+        "\\\\",
         str(home),
     )
 
 
-def _strip_allowed_paths(serialized: str, allow: tuple[str, ...]) -> str:
-    for allowed in allow:
-        if not allowed:
-            continue
-        serialized = serialized.replace(allowed, "")
-        encoded = json.dumps(allowed)
-        if len(encoded) >= 2 and encoded[0] == encoded[-1] == '"':
-            serialized = serialized.replace(encoded[1:-1], "")
-    return serialized
-
-
-def _assert_no_absolute_paths(
-    payload: object,
-    home: Path,
-    *,
-    allow: tuple[str, ...] = (),
-) -> None:
-    serialized = _strip_allowed_paths(json.dumps(payload, ensure_ascii=False), allow)
+def _assert_no_absolute_paths(payload: object, home: Path) -> None:
+    serialized = json.dumps(payload, ensure_ascii=False)
     for needle in _forbidden_needles(home):
         if needle in serialized:
             raise AssertionError(f"snapshot leaked {needle!r}: {serialized[:2000]}")
@@ -233,11 +220,138 @@ class SnapshotPathPrivacyTests(unittest.TestCase):
         self.assertEqual(claude_item["id"], agentcat.short_stable_hash(MAC_PROJECT))
         self.assertEqual(snapshot["update"]["installDir"], "connectors")
         self.assertEqual(snapshot["update"]["repoDir"], "agentcat-connectors")
-        self.assertEqual(snapshot["desktopApps"]["codex"]["path"], str(app_path))
-        self.assertEqual(snapshot["providers"]["codex"]["desktopApp"]["path"], str(app_path))
+        self.assertEqual(snapshot["desktopApps"]["codex"]["path"], "Codex.app")
+        self.assertEqual(snapshot["providers"]["codex"]["desktopApp"]["path"], "Codex.app")
+        self.assertEqual(agentcat.connector_config_payload()["desktopApps"]["codex"]["path"], str(app_path))
         for root in snapshot["desktopApps"]["codex"].get("dataRoots") or []:
             _assert_no_absolute_paths(root, self.home)
-        _assert_no_absolute_paths(snapshot, self.home, allow=(str(app_path),))
+        _assert_no_absolute_paths(snapshot, self.home)
+
+    def test_auto_update_same_version_scrubs_persisted_reason_and_error_paths(self) -> None:
+        agentcat.write_auto_update_state(
+            {
+                "status": "error",
+                "currentVersion": agentcat.CONNECTOR_VERSION,
+                "enabled": True,
+                "installDir": str(self.home / "Library" / "Application Support" / "connectors"),
+                "repoDir": str(self.home / "Code" / "agentcat-connectors"),
+                "reason": f"git_checkout:{self.home / 'Code' / 'agentcat-connectors'}",
+                "error": f"[Errno 13] Permission denied: '{self.home / 'Library' / 'Application Support' / 'connectors' / 'install.sh'}'",
+                "rollout": {
+                    "percent": 0,
+                    "bucketAllowed": False,
+                    "halted": False,
+                    "reason": r"C:\Users\alice\AppData\Local\AgentCat\rollout.json",
+                },
+            }
+        )
+        with patch.object(agentcat, "auto_update_enabled_status", return_value=(True, "enabled")):
+            snapshot = agentcat.auto_update_status_snapshot()
+        self.assertIn("agentcat-connectors", snapshot["reason"])
+        self.assertIn("install.sh", snapshot["error"])
+        self.assertEqual(snapshot["rollout"]["reason"], "rollout.json")
+        _assert_no_absolute_paths(snapshot, self.home)
+
+    def test_events_runtime_modes_errors_and_google_fallback_omit_absolute_paths(self) -> None:
+        future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+        agentcat.init_db()
+        import sqlite3
+        from contextlib import closing
+
+        with closing(sqlite3.connect(agentcat.EVENTS_DB)) as conn:
+            conn.execute(
+                "insert into events(ts, provider, source, event_type, payload_json) values (?, ?, ?, ?, ?)",
+                (
+                    int(dt.datetime.now(dt.timezone.utc).timestamp()),
+                    "claude",
+                    f"{MAC_PROJECT}/.claude/hook.sh",
+                    "usage",
+                    json.dumps(
+                        {
+                            "model": "claude-sonnet-4-6",
+                            "input_tokens": 12,
+                            "agentcatRuntimeMode": {
+                                "mode": "fast",
+                                "confidence": "exact",
+                                "source": f"{MAC_PROJECT}/.claude/settings.json",
+                                "detectedFrom": WIN_PROJECT,
+                                "expiresAt": future,
+                            },
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+
+        events = agentcat.latest_events_by_provider()
+        modes = agentcat.runtime_modes_snapshot()
+        self.assertEqual(events["claude"]["source"], "hook.sh")
+        self.assertEqual(modes[0]["source"], "settings.json")
+        self.assertEqual(modes[0]["detectedFrom"], "win-repo")
+        _assert_no_absolute_paths(events, self.home)
+        _assert_no_absolute_paths(modes, self.home)
+
+        today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+        gemini_data = {
+            "status": "ok",
+            "source": None,
+            "sources": {"geminiCli": {"telemetryConfigured": False, "source": None}, "antigravityCli": {"installed": True}},
+            "tokens": {"today": 10, "week": 10, "month": 10, "all": 10, "totalTokens": 10},
+            "models": {},
+            "dailyTokens": {today: 10},
+            "hourlyTokens": {},
+            "events": 1,
+            "cache": {"source": "none"},
+            "breakdown": agentcat.empty_breakdown(),
+            "_sourceUsages": {
+                "geminiCli": {
+                    "tokens": {"today": 10, "week": 10, "month": 10, "all": 10, "totalTokens": 10},
+                    "dailyTokens": {today: 10},
+                    "hourlyTokens": {},
+                    "models": {},
+                    "events": 1,
+                }
+            },
+        }
+        with patch.object(agentcat, "antigravity_sqlite_usage", return_value=None), \
+                patch.object(agentcat, "antigravity_inference_days", return_value={today}):
+            gemini_out, agy_out = agentcat.split_google_cli_snapshots(gemini_data, {"countsByProvider": {"antigravity": 1}})
+        self.assertEqual(agy_out["source"], "telemetry.log")
+        _assert_no_absolute_paths(gemini_out, self.home)
+        _assert_no_absolute_paths(agy_out, self.home)
+
+        with patch.object(
+            agentcat,
+            "grok_snapshot",
+            side_effect=PermissionError(13, "Permission denied", f"{MAC_PROJECT}/session.jsonl"),
+        ), patch.object(agentcat, "terminal_activity_snapshot", return_value={"status": "ok", "processes": []}):
+            snapshot = agentcat.build_snapshot()
+        self.assertEqual(snapshot["providers"]["grok"]["status"], "error")
+        self.assertIn("session.jsonl", snapshot["providers"]["grok"]["error"])
+        _assert_no_absolute_paths(snapshot, self.home)
+
+    def test_project_daily_slices_collapse_legacy_path_keys_to_basenames(self) -> None:
+        today = dt.date(2026, 11, 19)
+        day_key = today.isoformat()
+        legacy_days = {
+            day_key: {
+                MAC_PROJECT: {
+                    "total": 120,
+                    "providers": {"claude": {"tokens": 120, "estCostUSD": 0.15, "topModel": "claude-sonnet-4-6"}},
+                },
+                WIN_PROJECT: {
+                    "total": 80,
+                    "providers": {"codex": {"tokens": 80, "estCostUSD": 0.05, "topModel": "gpt-5.4"}},
+                },
+            }
+        }
+        flat = agentcat.project_daily_snapshot_slice(legacy_days, today)
+        rich = agentcat.project_daily_cost_snapshot_slice(legacy_days, today)
+        self.assertEqual(flat[day_key], {"secret-repo": 120, "win-repo": 80})
+        self.assertEqual(set(rich[day_key].keys()), {"secret-repo", "win-repo"})
+        self.assertEqual(rich[day_key]["secret-repo"]["total"], 120)
+        _assert_no_absolute_paths(flat, self.home)
+        _assert_no_absolute_paths(rich, self.home)
 
 
 if __name__ == "__main__":
