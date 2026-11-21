@@ -53,6 +53,11 @@
       ],
       "fallback": "render provider token totals without provenance details"
     },
+    "agents.catalog.v1": {
+      "owner": "shared",
+      "fields": ["availableAgents"],
+      "fallback": "ignore optional availableAgents catalog; render tracked providers only"
+    },
     "homes.discovery": {
       "owner": "shared",
       "fields": [
