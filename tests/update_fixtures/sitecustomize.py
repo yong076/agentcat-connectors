@@ -34,12 +34,19 @@ if os.environ.get("AGENTCAT_SURVIVAL_SANDBOX"):
             if "Stop-Process" in args[-1]:
                 kill_daemon()
             return subprocess.CompletedProcess(args, 0, "", "")
+        if name in ("pkill", "pgrep") and any("agentcat daemon" in str(arg) for arg in args):
+            if name == "pkill":
+                kill_daemon()
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 1, "", "")
         return real_run(args, *a, **kw)
 
     def popen(args, *a, **kw):
         if os.name == "nt" and args[-1] == "daemon" and str(args[0]).endswith("agentcat.cmd"):
             (home / "bootstrapped").write_text("ok")
             return type("FakeProcess", (), {"pid": 0})()
+        if os.name != "nt" and args[-1] == "daemon" and Path(str(args[0])).name == "agentcat":
+            (home / "bootstrapped").write_text("ok")
         return real_popen(args, *a, **kw)
 
     def urlopen(request, *a, **kw):
