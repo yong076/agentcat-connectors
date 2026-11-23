@@ -107,6 +107,32 @@ class ClaudeProbeTests(unittest.TestCase):
         self.assertEqual(row["status"], "ok")
         self.assertNotIn(str(other), json.dumps(row))
 
+    def test_probe_drops_inherited_session_login_pins(self):
+        # A daemon launched from a Claude Code session must not make every home
+        # read that session's login.
+        inherited = {
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/elsewhere/.claude2",
+            "CLAUDE_CODE_OAUTH_TOKEN": "x", "CLAUDE_CODE_SESSION_ID": "s", "CLAUDECODE": "1",
+            "ANTHROPIC_AUTH_TOKEN": "x", "CLAUDE_CONFIG_DIR": "/elsewhere/.claude2",
+        }
+        for default_home in (True, False):
+            with self.subTest(default_home=default_home), tempfile.TemporaryDirectory() as tmp:
+                default = Path(tmp) / ".claude"
+                home = default if default_home else Path(tmp) / ".claude3"
+                home.mkdir()
+                seen = {}
+
+                def run(args, **kwargs):
+                    seen["env"] = kwargs["env"]
+                    return subprocess.CompletedProcess(args, 0, stdout=USAGE_TEXT, stderr="")
+
+                with patch.dict("os.environ", inherited):
+                    cli_probe.probe_claude_home(home, default, "/bin/claude", run=run, token_reader=lambda *_: None)
+                for key in inherited:
+                    if key != "CLAUDE_CONFIG_DIR":
+                        self.assertNotIn(key, seen["env"], key)
+                self.assertEqual(seen["env"].get("CLAUDE_CONFIG_DIR"), None if default_home else str(home))
+
     def test_subscription_ignores_daemon_api_credentials(self):
         for default_home in (True, False):
             with self.subTest(default_home=default_home), tempfile.TemporaryDirectory() as tmp:
