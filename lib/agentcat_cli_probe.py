@@ -190,6 +190,17 @@ def claude_api_billing_mode(home: Path) -> Optional[str]:
     return from_env(env_block) if isinstance(env_block, dict) else None
 
 
+_CLAUDE_SESSION_ENV = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_HOST_CREDS_FILE", "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_CHILD_NOTES_DIR",
+    "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+)
+
+
 def probe_claude_home(
     home: Path,
     default_home: Path,
@@ -206,7 +217,12 @@ def probe_claude_home(
     if not executable:
         return _result("claude", home, status="error", reason="cli_not_found", **identity)
     env = dict(os.environ)
-    env.pop("ANTHROPIC_API_KEY", None)
+    # A daemon started from inside a Claude Code session (an agent launching the
+    # app, a terminal that exports a launcher profile) inherits variables that pin
+    # which login the CLI reads, whatever CLAUDE_CONFIG_DIR says. Left in place,
+    # every probed home reports that one session's account and usage.
+    for key in _CLAUDE_SESSION_ENV:
+        env.pop(key, None)
     if Path(home) == Path(default_home):
         env.pop("CLAUDE_CONFIG_DIR", None)
     else:
